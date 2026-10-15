@@ -6,7 +6,7 @@ Spikes are throwaway code in `spikes/` that answers "will this work?" with real 
 |---|---|---|---|
 | A | Can we use libsignal (PQXDH + Triple Ratchet) from our own workspace, and does it give the properties the brief requires? | **Yes, 11/11 checks pass** | [`spikes/libsignal/RESULT.txt`](../spikes/libsignal/RESULT.txt) |
 | B | Does the Linux webview (WebKitGTK) support WebRTC for calls? | **No.** Ubuntu 24.04 WebKitGTK 2.52.6 has no WebRTC backend, even with `enable-webrtc` | [`spikes/webrtc-probe/RESULT-linux.md`](../spikes/webrtc-probe/RESULT-linux.md) |
-| C | Can Tauri 2 build and run on Android, with WebRTC in the Android WebView, and does libsignal build and pass on Android? | _see §C_ | CI workflow `spike-android` |
+| C | Can Tauri 2 build and run on Android, with WebRTC in the Android WebView, and does libsignal build and pass on Android? | **Yes.** APK runs on Android 14; WebView data channel works; libsignal 11/11 on-device | [CI run 38746889576](https://github.com/bewwe01/ataraxia/actions/runs/38746889576), §C |
 
 ---
 
@@ -54,6 +54,42 @@ A Tauri 2.12.4 probe app creates its window on a blank page, optionally sets Web
 - Linux calls use **webrtc-rs 0.20** (TURN client included) with native audio I/O. **Audio first, video later.**
 - Track webrtc-rs TURN issues #890 (srflx gathering when STUN and TURN share an address; affects Direct mode only) and #894 (TURN allocation not released on ICE restart).
 
-## C. Tauri 2 on Android
+## C. Tauri 2 on Android (GitHub Actions, emulator)
 
-_Pending: filled in from the CI run of `.github/workflows/spike-android.yml`._
+**Setup.** Workflow `.github/workflows/spike-android.yml`, [run 38746889576](https://github.com/bewwe01/ataraxia/actions/runs/38746889576) (success, 2026-10-15):
+- Tauri CLI 2.12.3 / tauri 2.12.4;
+- NDK 30.0.16248370, Rust 1.97.0;
+- universal debug APK, about 38 MB;
+- installed on an **Android 14 (API 34) x86_64 emulator** with system WebView **113.0.5672.136**.
+
+| Check | Result |
+|---|---|
+| `tauri android init` + `android build --apk` | PASS |
+| APK installs and cold-starts | PASS (`am start -W`: 3.6 s cold start on the emulator) |
+| `RTCPeerConnection` / `RTCDataChannel` in the WebView | PASS: both `function` |
+| **Loopback data channel** (two peer connections, message round-trip) | **PASS** in 1431 ms |
+| `iceTransportPolicy: "relay"` accepted | PASS |
+| `RTCPeerConnection.generateCertificate` + `a=fingerprint:sha-256` in SDP | PASS |
+| Media devices enumerated | PASS: audioinput, videoinput, audiooutput |
+| **libsignal spike, run natively on the device** | **PASS, 11/11** (identical to Spike A) |
+| libsignal cross-compiles for **aarch64-linux-android** (real phones) | PASS: `ELF 64-bit LSB pie executable, ARM aarch64 … /system/bin/linker64` |
+
+Raw probe report (from logcat, tag `VeilProbe`):
+
+```
+VEIL_PROBE_RESULT {"userAgent":"Mozilla/5.0 (Linux; Android 14; sdk_gphone64_x86_64 Build/UE1A.230829.050; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/113.0.5672.136 Mobile Safari/537.36","origin":"http://tauri.localhost","secureContext":true,"RTCPeerConnection":"function","RTCDataChannel":"function","getUserMedia":true,"RTCRtpScriptTransform":"undefined","loopbackAll":{"ok":true,"ms":1431,"candidates":{"a":["host/udp","host/udp"],"b":["host/udp","host/udp"]},"fingerprintInSdp":true},"relayPolicyAccepted":true,"generateCertificate":true,"mediaDeviceKinds":["audioinput","videoinput","audiooutput"]}
+```
+
+**Findings.**
+1. **Tauri 2 is viable for Android** for Veil's needs → ADR-0002 can be accepted.
+2. **The Android WebView gathers `host` ICE candidates** even with no STUN/TURN configured. The probe did not record the address values, so whether they were raw local IPs or mDNS-obfuscated is **not established**; the Phase 6 test must capture it. Either way, the Rust-side candidate filter (PROTOCOL §8, INV-NET-1) is **mandatory**. Never rely on the webview to hide addresses.
+3. The page origin on Android is `http://tauri.localhost` (still a secure context). The CSP and IPC allowlist must cover both `tauri://localhost` (desktop) and `http://tauri.localhost` (Android).
+4. Not yet proven, scheduled for Phase 6:
+   - `getUserMedia` with a real permission grant needs the Kotlin `onPermissionRequest` shim plus manifest permissions (tauri-apps #12041, discussion #12732);
+   - real-device calls through TURN.
+5. Emulator system images ship an old WebView (113). Real devices update it through Google Play, so set a minimum supported WebView version and show a clear message below it.
+
+**CI lessons:**
+- the runner ran out of disk while fetching the system image: free about 10 GB first;
+- Android rejects app version `0.0.0`;
+- navigating with `eval()` immediately after window creation is unreliable on Android.

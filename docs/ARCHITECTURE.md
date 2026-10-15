@@ -82,7 +82,7 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
 | Platform | Shell | Messaging | Calls (media) | Status |
 |---|---|---|---|---|
 | Linux (x86_64) | Tauri 2 + WebKitGTK | ✅ | ❌ in webview (no WebRTC in distro WebKitGTK 2.52) → **webrtc-rs** in Rust; audio first | Built and probed here |
-| Android 8+ (arm64, x86_64) | Tauri 2 + Android System WebView (Chromium) | ✅ | ✅ webview WebRTC (permission glue needed for mic/camera) | Spike C in CI; see SPIKES.md |
+| Android 10+ (arm64, x86_64) | Tauri 2 + Android System WebView (Chromium) | ✅ | ✅ webview WebRTC: data channel proven; mic/camera need the Kotlin permission shim | Spike C passed in CI (API 34 emulator) |
 | Windows | Tauri 2 + WebView2 (Chromium) | ✅ | ✅ webview WebRTC expected | Not buildable here; CI workflow later |
 | macOS | Tauri 2 + WKWebView | ✅ | ✅ expected (with known permission-prompt quirks) | Not buildable here; CI workflow later |
 | iOS | out of scope for v1 | | | |
@@ -119,9 +119,13 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
   - (−) App-store redistribution under AGPL is legally unclear (signalapp/libsignal#684, #691 still unanswered). **v1 distribution is GitHub Releases** (owner request), where AGPL is unproblematic: every release links the exact source.
   - Build needs `protoc`, `clang`, `cmake` (documented in CLAUDE.md and CI).
 
-### ADR-0002: Tauri 2 for desktop and Android. **Proposed (Spike C pending/complete, see SPIKES.md).**
+### ADR-0002: Tauri 2 for desktop and Android. **Proposed. Spike C passed (SPIKES.md §C).**
 - Tauri 2.12 stable; Tauri 3 is alpha and not used.
 - Android needs a small Kotlin shim for WebView `onPermissionRequest` (mic/camera) and Android Keystore access. This is known community territory: tauri-apps discussion #12732, issue #12041.
+- Spike C: the APK builds and runs on Android 14; the WebView data channel works; libsignal passes 11/11 natively.
+- The WebView gathers **host ICE candidates** (whether raw or mDNS-obfuscated is still to be captured), so the Rust candidate filter is mandatory.
+- Origins differ: `tauri://localhost` (desktop) vs `http://tauri.localhost` (Android).
+- Minimum: Android 10 (the WebView's own `minSdkVersion=29`).
 - Fallback if Android is unworkable: a PWA with the WASM core is **not** a drop-in (see ADR-0007). The realistic fallback would be a native Kotlin UI over the same Rust core via UniFFI. Not needed if Spike C passes.
 
 ### ADR-0003: Calls on Linux use webrtc-rs in Rust; elsewhere the webview's WebRTC. **Proposed.**

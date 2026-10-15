@@ -72,7 +72,39 @@ This is a negative result: WebRTC is unavailable in the Linux webview. See `docs
 
 ### Spike C: Tauri 2 on Android (GitHub Actions, emulator)
 
-_Filled in from CI; see `docs/SPIKES.md` §C._
+GitHub Actions `spike-android`, run 38746889576 (conclusion: **success**). Excerpt of the job log:
+
+```
+android_version=14
+abi=x86_64
+webview_versionName=113.0.5672.136
+Performing Streamed Install
+Success
+Status: ok
+LaunchState: COLD
+TotalTime: 3613
+I VeilProbe: veil_webrtc_probe_lib: VEIL_PROBE_RESULT {"userAgent":"Mozilla/5.0 (Linux; Android 14; sdk_gphone64_x86_64 Build/UE1A.230829.050; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/113.0.5672.136 Mobile Safari/537.36","origin":"http://tauri.localhost","secureContext":true,"RTCPeerConnection":"function","RTCDataChannel":"function","getUserMedia":true,"RTCRtpScriptTransform":"undefined","loopbackAll":{"ok":true,"ms":1431,"candidates":{"a":["host/udp","host/udp"],"b":["host/udp","host/udp"]},"fingerprintInSdp":true},"relayPolicyAccepted":true,"generateCertificate":true,"mediaDeviceKinds":["audioinput","videoinput","audiooutput"]}
+=== libsignal spike on device
+PASS PQXDH: Alice processes Bob's bundle (EC + signed Kyber1024 prekey) (Ok(()))
+PASS first message is PreKeySignalMessage v4+ with ML-KEM ciphertext (version 4, KEM ciphertext 1569 bytes)
+PASS Bob decrypts first message
+PASS 40 alternating messages decrypt (Double Ratchet steps)
+PASS SPQR triple ratchet active: post-quantum ratchet data present in messages (40/40 messages carried SPQR data)
+PASS bit-flip at every byte of a SignalMessage is rejected (105/105 rejected)
+PASS genuine message still decrypts after tamper attempts
+PASS replayed message is rejected (Err(DuplicatedMessage(2, 1)))
+PASS out-of-order delivery (reverse order) decrypts
+PASS changed identity key is refused (UntrustedIdentity) (Err(UntrustedIdentity(ProtocolAddress { name: "bob", device_id: DeviceId(1) })))
+PASS bundle with forged Kyber prekey signature is rejected (Err(SignatureValidationFailed))
+ALL CHECKS PASSED
+```
+
+Also from that run: `target/aarch64-linux-android/release/veil-spike-libsignal: ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /system/bin/linker64`.
+
+Earlier runs, kept for honesty:
+- 38741826807 failed: Android rejects app version `0.0.0`.
+- 38742060429 failed: APK and libsignal Android builds succeeded, then "No space left on device" while fetching the emulator image.
+- 38744023740 failed: the probe page never reported, because the eval-navigation was lost on Android. libsignal passed 11/11 on the device in that run.
 
 ## Phase 0: design checks (2026-10-15)
 
