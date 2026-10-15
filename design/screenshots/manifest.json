@@ -1,0 +1,2242 @@
+[
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/aurora/mobile/dark/01-welcome.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "keygen",
+  "title": "Key generation",
+  "file": "screenshots/aurora/mobile/dark/02-keygen.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "passphrase",
+  "title": "Set passphrase",
+  "file": "screenshots/aurora/mobile/dark/03-passphrase.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "protection",
+  "title": "What's protected",
+  "file": "screenshots/aurora/mobile/dark/04-protection.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "lock",
+  "title": "Lock screen",
+  "file": "screenshots/aurora/mobile/dark/05-lock.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/aurora/mobile/dark/06-chats.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/aurora/mobile/dark/07-chat-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat:mira",
+  "title": "Chat (direct mode)",
+  "file": "screenshots/aurora/mobile/dark/08-chat-mira.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat-empty:jonas",
+  "title": "New chat (unverified)",
+  "file": "screenshots/aurora/mobile/dark/09-chat-empty-jonas.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "contacts",
+  "title": "Contacts",
+  "file": "screenshots/aurora/mobile/dark/10-contacts.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/aurora/mobile/dark/11-add.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "scan",
+  "title": "Add contact: scan",
+  "file": "screenshots/aurora/mobile/dark/12-scan.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "verified",
+  "title": "Verified success",
+  "file": "screenshots/aurora/mobile/dark/13-verified.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/aurora/mobile/dark/14-profile-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "safety:jonas",
+  "title": "Safety number (unverified)",
+  "file": "screenshots/aurora/mobile/dark/15-safety-jonas.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "safety:ada",
+  "title": "Safety number (verified)",
+  "file": "screenshots/aurora/mobile/dark/16-safety-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/aurora/mobile/dark/17-call-audio-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "call-video:mira",
+  "title": "Video call · direct",
+  "file": "screenshots/aurora/mobile/dark/18-call-video-mira.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings",
+  "title": "Settings",
+  "file": "screenshots/aurora/mobile/dark/19-settings.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/aurora/mobile/dark/20-settings-privacy.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings-appearance",
+  "title": "Appearance",
+  "file": "screenshots/aurora/mobile/dark/21-settings-appearance.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings-relays",
+  "title": "Relay servers",
+  "file": "screenshots/aurora/mobile/dark/22-settings-relays.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings-security",
+  "title": "Security",
+  "file": "screenshots/aurora/mobile/dark/23-settings-security.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "panic",
+  "title": "Panic wipe confirm",
+  "file": "screenshots/aurora/mobile/dark/24-panic.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chats-empty",
+  "title": "Empty",
+  "file": "screenshots/aurora/mobile/dark/25-chats-empty.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/aurora/mobile/dark/26-chats-loading.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chats-offline",
+  "title": "Reconnecting",
+  "file": "screenshots/aurora/mobile/dark/27-chats-offline.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat-offline:theo",
+  "title": "Offline + message failed",
+  "file": "screenshots/aurora/mobile/dark/28-chat-offline-theo.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/aurora/mobile/dark/29-chat-keychange-lena.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "error",
+  "title": "Relay unreachable",
+  "file": "screenshots/aurora/mobile/dark/30-error.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/aurora/mobile/light/01-welcome.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "keygen",
+  "title": "Key generation",
+  "file": "screenshots/aurora/mobile/light/02-keygen.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "passphrase",
+  "title": "Set passphrase",
+  "file": "screenshots/aurora/mobile/light/03-passphrase.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "protection",
+  "title": "What's protected",
+  "file": "screenshots/aurora/mobile/light/04-protection.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "lock",
+  "title": "Lock screen",
+  "file": "screenshots/aurora/mobile/light/05-lock.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/aurora/mobile/light/06-chats.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/aurora/mobile/light/07-chat-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat:mira",
+  "title": "Chat (direct mode)",
+  "file": "screenshots/aurora/mobile/light/08-chat-mira.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat-empty:jonas",
+  "title": "New chat (unverified)",
+  "file": "screenshots/aurora/mobile/light/09-chat-empty-jonas.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "contacts",
+  "title": "Contacts",
+  "file": "screenshots/aurora/mobile/light/10-contacts.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/aurora/mobile/light/11-add.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "scan",
+  "title": "Add contact: scan",
+  "file": "screenshots/aurora/mobile/light/12-scan.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "verified",
+  "title": "Verified success",
+  "file": "screenshots/aurora/mobile/light/13-verified.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/aurora/mobile/light/14-profile-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "safety:jonas",
+  "title": "Safety number (unverified)",
+  "file": "screenshots/aurora/mobile/light/15-safety-jonas.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "safety:ada",
+  "title": "Safety number (verified)",
+  "file": "screenshots/aurora/mobile/light/16-safety-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/aurora/mobile/light/17-call-audio-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "call-video:mira",
+  "title": "Video call · direct",
+  "file": "screenshots/aurora/mobile/light/18-call-video-mira.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings",
+  "title": "Settings",
+  "file": "screenshots/aurora/mobile/light/19-settings.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/aurora/mobile/light/20-settings-privacy.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings-appearance",
+  "title": "Appearance",
+  "file": "screenshots/aurora/mobile/light/21-settings-appearance.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings-relays",
+  "title": "Relay servers",
+  "file": "screenshots/aurora/mobile/light/22-settings-relays.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings-security",
+  "title": "Security",
+  "file": "screenshots/aurora/mobile/light/23-settings-security.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "panic",
+  "title": "Panic wipe confirm",
+  "file": "screenshots/aurora/mobile/light/24-panic.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chats-empty",
+  "title": "Empty",
+  "file": "screenshots/aurora/mobile/light/25-chats-empty.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/aurora/mobile/light/26-chats-loading.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chats-offline",
+  "title": "Reconnecting",
+  "file": "screenshots/aurora/mobile/light/27-chats-offline.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat-offline:theo",
+  "title": "Offline + message failed",
+  "file": "screenshots/aurora/mobile/light/28-chat-offline-theo.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/aurora/mobile/light/29-chat-keychange-lena.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "error",
+  "title": "Relay unreachable",
+  "file": "screenshots/aurora/mobile/light/30-error.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/ink/mobile/dark/01-welcome.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "keygen",
+  "title": "Key generation",
+  "file": "screenshots/ink/mobile/dark/02-keygen.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "passphrase",
+  "title": "Set passphrase",
+  "file": "screenshots/ink/mobile/dark/03-passphrase.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "protection",
+  "title": "What's protected",
+  "file": "screenshots/ink/mobile/dark/04-protection.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "lock",
+  "title": "Lock screen",
+  "file": "screenshots/ink/mobile/dark/05-lock.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/ink/mobile/dark/06-chats.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/ink/mobile/dark/07-chat-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat:mira",
+  "title": "Chat (direct mode)",
+  "file": "screenshots/ink/mobile/dark/08-chat-mira.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat-empty:jonas",
+  "title": "New chat (unverified)",
+  "file": "screenshots/ink/mobile/dark/09-chat-empty-jonas.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "contacts",
+  "title": "Contacts",
+  "file": "screenshots/ink/mobile/dark/10-contacts.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/ink/mobile/dark/11-add.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "scan",
+  "title": "Add contact: scan",
+  "file": "screenshots/ink/mobile/dark/12-scan.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "verified",
+  "title": "Verified success",
+  "file": "screenshots/ink/mobile/dark/13-verified.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/ink/mobile/dark/14-profile-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "safety:jonas",
+  "title": "Safety number (unverified)",
+  "file": "screenshots/ink/mobile/dark/15-safety-jonas.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "safety:ada",
+  "title": "Safety number (verified)",
+  "file": "screenshots/ink/mobile/dark/16-safety-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/ink/mobile/dark/17-call-audio-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "call-video:mira",
+  "title": "Video call · direct",
+  "file": "screenshots/ink/mobile/dark/18-call-video-mira.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings",
+  "title": "Settings",
+  "file": "screenshots/ink/mobile/dark/19-settings.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/ink/mobile/dark/20-settings-privacy.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings-appearance",
+  "title": "Appearance",
+  "file": "screenshots/ink/mobile/dark/21-settings-appearance.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings-relays",
+  "title": "Relay servers",
+  "file": "screenshots/ink/mobile/dark/22-settings-relays.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "settings-security",
+  "title": "Security",
+  "file": "screenshots/ink/mobile/dark/23-settings-security.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "panic",
+  "title": "Panic wipe confirm",
+  "file": "screenshots/ink/mobile/dark/24-panic.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chats-empty",
+  "title": "Empty",
+  "file": "screenshots/ink/mobile/dark/25-chats-empty.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/ink/mobile/dark/26-chats-loading.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chats-offline",
+  "title": "Reconnecting",
+  "file": "screenshots/ink/mobile/dark/27-chats-offline.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat-offline:theo",
+  "title": "Offline + message failed",
+  "file": "screenshots/ink/mobile/dark/28-chat-offline-theo.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/ink/mobile/dark/29-chat-keychange-lena.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "dark",
+  "route": "error",
+  "title": "Relay unreachable",
+  "file": "screenshots/ink/mobile/dark/30-error.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/ink/mobile/light/01-welcome.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "keygen",
+  "title": "Key generation",
+  "file": "screenshots/ink/mobile/light/02-keygen.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "passphrase",
+  "title": "Set passphrase",
+  "file": "screenshots/ink/mobile/light/03-passphrase.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "protection",
+  "title": "What's protected",
+  "file": "screenshots/ink/mobile/light/04-protection.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "lock",
+  "title": "Lock screen",
+  "file": "screenshots/ink/mobile/light/05-lock.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/ink/mobile/light/06-chats.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/ink/mobile/light/07-chat-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat:mira",
+  "title": "Chat (direct mode)",
+  "file": "screenshots/ink/mobile/light/08-chat-mira.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat-empty:jonas",
+  "title": "New chat (unverified)",
+  "file": "screenshots/ink/mobile/light/09-chat-empty-jonas.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "contacts",
+  "title": "Contacts",
+  "file": "screenshots/ink/mobile/light/10-contacts.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/ink/mobile/light/11-add.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "scan",
+  "title": "Add contact: scan",
+  "file": "screenshots/ink/mobile/light/12-scan.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "verified",
+  "title": "Verified success",
+  "file": "screenshots/ink/mobile/light/13-verified.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/ink/mobile/light/14-profile-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "safety:jonas",
+  "title": "Safety number (unverified)",
+  "file": "screenshots/ink/mobile/light/15-safety-jonas.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "safety:ada",
+  "title": "Safety number (verified)",
+  "file": "screenshots/ink/mobile/light/16-safety-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/ink/mobile/light/17-call-audio-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "call-video:mira",
+  "title": "Video call · direct",
+  "file": "screenshots/ink/mobile/light/18-call-video-mira.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings",
+  "title": "Settings",
+  "file": "screenshots/ink/mobile/light/19-settings.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/ink/mobile/light/20-settings-privacy.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings-appearance",
+  "title": "Appearance",
+  "file": "screenshots/ink/mobile/light/21-settings-appearance.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings-relays",
+  "title": "Relay servers",
+  "file": "screenshots/ink/mobile/light/22-settings-relays.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "settings-security",
+  "title": "Security",
+  "file": "screenshots/ink/mobile/light/23-settings-security.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "panic",
+  "title": "Panic wipe confirm",
+  "file": "screenshots/ink/mobile/light/24-panic.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chats-empty",
+  "title": "Empty",
+  "file": "screenshots/ink/mobile/light/25-chats-empty.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/ink/mobile/light/26-chats-loading.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chats-offline",
+  "title": "Reconnecting",
+  "file": "screenshots/ink/mobile/light/27-chats-offline.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat-offline:theo",
+  "title": "Offline + message failed",
+  "file": "screenshots/ink/mobile/light/28-chat-offline-theo.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/ink/mobile/light/29-chat-keychange-lena.png"
+ },
+ {
+  "style": "ink",
+  "layout": "mobile",
+  "mode": "light",
+  "route": "error",
+  "title": "Relay unreachable",
+  "file": "screenshots/ink/mobile/light/30-error.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/aurora/tablet/dark/01-welcome.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/aurora/tablet/dark/02-chats.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/aurora/tablet/dark/03-chat-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/aurora/tablet/dark/04-add.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/aurora/tablet/dark/05-profile-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/aurora/tablet/dark/06-call-audio-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/aurora/tablet/dark/07-settings-privacy.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/aurora/tablet/dark/08-chats-loading.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/aurora/tablet/dark/09-chat-keychange-lena.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/aurora/tablet/light/01-welcome.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/aurora/tablet/light/02-chats.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/aurora/tablet/light/03-chat-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/aurora/tablet/light/04-add.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/aurora/tablet/light/05-profile-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/aurora/tablet/light/06-call-audio-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/aurora/tablet/light/07-settings-privacy.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/aurora/tablet/light/08-chats-loading.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/aurora/tablet/light/09-chat-keychange-lena.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/ink/tablet/dark/01-welcome.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/ink/tablet/dark/02-chats.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/ink/tablet/dark/03-chat-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/ink/tablet/dark/04-add.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/ink/tablet/dark/05-profile-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/ink/tablet/dark/06-call-audio-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/ink/tablet/dark/07-settings-privacy.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/ink/tablet/dark/08-chats-loading.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "dark",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/ink/tablet/dark/09-chat-keychange-lena.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/ink/tablet/light/01-welcome.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/ink/tablet/light/02-chats.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/ink/tablet/light/03-chat-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/ink/tablet/light/04-add.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/ink/tablet/light/05-profile-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/ink/tablet/light/06-call-audio-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/ink/tablet/light/07-settings-privacy.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/ink/tablet/light/08-chats-loading.png"
+ },
+ {
+  "style": "ink",
+  "layout": "tablet",
+  "mode": "light",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/ink/tablet/light/09-chat-keychange-lena.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/aurora/desktop/dark/01-welcome.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "keygen",
+  "title": "Key generation",
+  "file": "screenshots/aurora/desktop/dark/02-keygen.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "passphrase",
+  "title": "Set passphrase",
+  "file": "screenshots/aurora/desktop/dark/03-passphrase.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "protection",
+  "title": "What's protected",
+  "file": "screenshots/aurora/desktop/dark/04-protection.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "lock",
+  "title": "Lock screen",
+  "file": "screenshots/aurora/desktop/dark/05-lock.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/aurora/desktop/dark/06-chats.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/aurora/desktop/dark/07-chat-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat:mira",
+  "title": "Chat (direct mode)",
+  "file": "screenshots/aurora/desktop/dark/08-chat-mira.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat-empty:jonas",
+  "title": "New chat (unverified)",
+  "file": "screenshots/aurora/desktop/dark/09-chat-empty-jonas.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "contacts",
+  "title": "Contacts",
+  "file": "screenshots/aurora/desktop/dark/10-contacts.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/aurora/desktop/dark/11-add.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "scan",
+  "title": "Add contact: scan",
+  "file": "screenshots/aurora/desktop/dark/12-scan.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "verified",
+  "title": "Verified success",
+  "file": "screenshots/aurora/desktop/dark/13-verified.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/aurora/desktop/dark/14-profile-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "safety:jonas",
+  "title": "Safety number (unverified)",
+  "file": "screenshots/aurora/desktop/dark/15-safety-jonas.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "safety:ada",
+  "title": "Safety number (verified)",
+  "file": "screenshots/aurora/desktop/dark/16-safety-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/aurora/desktop/dark/17-call-audio-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "call-video:mira",
+  "title": "Video call · direct",
+  "file": "screenshots/aurora/desktop/dark/18-call-video-mira.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings",
+  "title": "Settings",
+  "file": "screenshots/aurora/desktop/dark/19-settings.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/aurora/desktop/dark/20-settings-privacy.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings-appearance",
+  "title": "Appearance",
+  "file": "screenshots/aurora/desktop/dark/21-settings-appearance.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings-relays",
+  "title": "Relay servers",
+  "file": "screenshots/aurora/desktop/dark/22-settings-relays.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings-security",
+  "title": "Security",
+  "file": "screenshots/aurora/desktop/dark/23-settings-security.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "panic",
+  "title": "Panic wipe confirm",
+  "file": "screenshots/aurora/desktop/dark/24-panic.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chats-empty",
+  "title": "Empty",
+  "file": "screenshots/aurora/desktop/dark/25-chats-empty.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/aurora/desktop/dark/26-chats-loading.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chats-offline",
+  "title": "Reconnecting",
+  "file": "screenshots/aurora/desktop/dark/27-chats-offline.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat-offline:theo",
+  "title": "Offline + message failed",
+  "file": "screenshots/aurora/desktop/dark/28-chat-offline-theo.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/aurora/desktop/dark/29-chat-keychange-lena.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "error",
+  "title": "Relay unreachable",
+  "file": "screenshots/aurora/desktop/dark/30-error.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "shortcuts",
+  "title": "Keyboard shortcuts",
+  "file": "screenshots/aurora/desktop/dark/31-shortcuts.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/aurora/desktop/light/01-welcome.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "keygen",
+  "title": "Key generation",
+  "file": "screenshots/aurora/desktop/light/02-keygen.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "passphrase",
+  "title": "Set passphrase",
+  "file": "screenshots/aurora/desktop/light/03-passphrase.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "protection",
+  "title": "What's protected",
+  "file": "screenshots/aurora/desktop/light/04-protection.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "lock",
+  "title": "Lock screen",
+  "file": "screenshots/aurora/desktop/light/05-lock.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/aurora/desktop/light/06-chats.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/aurora/desktop/light/07-chat-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat:mira",
+  "title": "Chat (direct mode)",
+  "file": "screenshots/aurora/desktop/light/08-chat-mira.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat-empty:jonas",
+  "title": "New chat (unverified)",
+  "file": "screenshots/aurora/desktop/light/09-chat-empty-jonas.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "contacts",
+  "title": "Contacts",
+  "file": "screenshots/aurora/desktop/light/10-contacts.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/aurora/desktop/light/11-add.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "scan",
+  "title": "Add contact: scan",
+  "file": "screenshots/aurora/desktop/light/12-scan.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "verified",
+  "title": "Verified success",
+  "file": "screenshots/aurora/desktop/light/13-verified.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/aurora/desktop/light/14-profile-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "safety:jonas",
+  "title": "Safety number (unverified)",
+  "file": "screenshots/aurora/desktop/light/15-safety-jonas.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "safety:ada",
+  "title": "Safety number (verified)",
+  "file": "screenshots/aurora/desktop/light/16-safety-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/aurora/desktop/light/17-call-audio-ada.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "call-video:mira",
+  "title": "Video call · direct",
+  "file": "screenshots/aurora/desktop/light/18-call-video-mira.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings",
+  "title": "Settings",
+  "file": "screenshots/aurora/desktop/light/19-settings.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/aurora/desktop/light/20-settings-privacy.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings-appearance",
+  "title": "Appearance",
+  "file": "screenshots/aurora/desktop/light/21-settings-appearance.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings-relays",
+  "title": "Relay servers",
+  "file": "screenshots/aurora/desktop/light/22-settings-relays.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings-security",
+  "title": "Security",
+  "file": "screenshots/aurora/desktop/light/23-settings-security.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "panic",
+  "title": "Panic wipe confirm",
+  "file": "screenshots/aurora/desktop/light/24-panic.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chats-empty",
+  "title": "Empty",
+  "file": "screenshots/aurora/desktop/light/25-chats-empty.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/aurora/desktop/light/26-chats-loading.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chats-offline",
+  "title": "Reconnecting",
+  "file": "screenshots/aurora/desktop/light/27-chats-offline.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat-offline:theo",
+  "title": "Offline + message failed",
+  "file": "screenshots/aurora/desktop/light/28-chat-offline-theo.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/aurora/desktop/light/29-chat-keychange-lena.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "error",
+  "title": "Relay unreachable",
+  "file": "screenshots/aurora/desktop/light/30-error.png"
+ },
+ {
+  "style": "aurora",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "shortcuts",
+  "title": "Keyboard shortcuts",
+  "file": "screenshots/aurora/desktop/light/31-shortcuts.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/ink/desktop/dark/01-welcome.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "keygen",
+  "title": "Key generation",
+  "file": "screenshots/ink/desktop/dark/02-keygen.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "passphrase",
+  "title": "Set passphrase",
+  "file": "screenshots/ink/desktop/dark/03-passphrase.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "protection",
+  "title": "What's protected",
+  "file": "screenshots/ink/desktop/dark/04-protection.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "lock",
+  "title": "Lock screen",
+  "file": "screenshots/ink/desktop/dark/05-lock.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/ink/desktop/dark/06-chats.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/ink/desktop/dark/07-chat-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat:mira",
+  "title": "Chat (direct mode)",
+  "file": "screenshots/ink/desktop/dark/08-chat-mira.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat-empty:jonas",
+  "title": "New chat (unverified)",
+  "file": "screenshots/ink/desktop/dark/09-chat-empty-jonas.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "contacts",
+  "title": "Contacts",
+  "file": "screenshots/ink/desktop/dark/10-contacts.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/ink/desktop/dark/11-add.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "scan",
+  "title": "Add contact: scan",
+  "file": "screenshots/ink/desktop/dark/12-scan.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "verified",
+  "title": "Verified success",
+  "file": "screenshots/ink/desktop/dark/13-verified.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/ink/desktop/dark/14-profile-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "safety:jonas",
+  "title": "Safety number (unverified)",
+  "file": "screenshots/ink/desktop/dark/15-safety-jonas.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "safety:ada",
+  "title": "Safety number (verified)",
+  "file": "screenshots/ink/desktop/dark/16-safety-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/ink/desktop/dark/17-call-audio-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "call-video:mira",
+  "title": "Video call · direct",
+  "file": "screenshots/ink/desktop/dark/18-call-video-mira.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings",
+  "title": "Settings",
+  "file": "screenshots/ink/desktop/dark/19-settings.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/ink/desktop/dark/20-settings-privacy.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings-appearance",
+  "title": "Appearance",
+  "file": "screenshots/ink/desktop/dark/21-settings-appearance.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings-relays",
+  "title": "Relay servers",
+  "file": "screenshots/ink/desktop/dark/22-settings-relays.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "settings-security",
+  "title": "Security",
+  "file": "screenshots/ink/desktop/dark/23-settings-security.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "panic",
+  "title": "Panic wipe confirm",
+  "file": "screenshots/ink/desktop/dark/24-panic.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chats-empty",
+  "title": "Empty",
+  "file": "screenshots/ink/desktop/dark/25-chats-empty.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/ink/desktop/dark/26-chats-loading.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chats-offline",
+  "title": "Reconnecting",
+  "file": "screenshots/ink/desktop/dark/27-chats-offline.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat-offline:theo",
+  "title": "Offline + message failed",
+  "file": "screenshots/ink/desktop/dark/28-chat-offline-theo.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/ink/desktop/dark/29-chat-keychange-lena.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "error",
+  "title": "Relay unreachable",
+  "file": "screenshots/ink/desktop/dark/30-error.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "dark",
+  "route": "shortcuts",
+  "title": "Keyboard shortcuts",
+  "file": "screenshots/ink/desktop/dark/31-shortcuts.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "welcome",
+  "title": "Welcome",
+  "file": "screenshots/ink/desktop/light/01-welcome.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "keygen",
+  "title": "Key generation",
+  "file": "screenshots/ink/desktop/light/02-keygen.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "passphrase",
+  "title": "Set passphrase",
+  "file": "screenshots/ink/desktop/light/03-passphrase.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "protection",
+  "title": "What's protected",
+  "file": "screenshots/ink/desktop/light/04-protection.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "lock",
+  "title": "Lock screen",
+  "file": "screenshots/ink/desktop/light/05-lock.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chats",
+  "title": "Conversation list",
+  "file": "screenshots/ink/desktop/light/06-chats.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat:ada",
+  "title": "Chat (verified, rich)",
+  "file": "screenshots/ink/desktop/light/07-chat-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat:mira",
+  "title": "Chat (direct mode)",
+  "file": "screenshots/ink/desktop/light/08-chat-mira.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat-empty:jonas",
+  "title": "New chat (unverified)",
+  "file": "screenshots/ink/desktop/light/09-chat-empty-jonas.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "contacts",
+  "title": "Contacts",
+  "file": "screenshots/ink/desktop/light/10-contacts.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "add",
+  "title": "Add contact: my code",
+  "file": "screenshots/ink/desktop/light/11-add.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "scan",
+  "title": "Add contact: scan",
+  "file": "screenshots/ink/desktop/light/12-scan.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "verified",
+  "title": "Verified success",
+  "file": "screenshots/ink/desktop/light/13-verified.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "profile:ada",
+  "title": "Contact profile",
+  "file": "screenshots/ink/desktop/light/14-profile-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "safety:jonas",
+  "title": "Safety number (unverified)",
+  "file": "screenshots/ink/desktop/light/15-safety-jonas.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "safety:ada",
+  "title": "Safety number (verified)",
+  "file": "screenshots/ink/desktop/light/16-safety-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "call-audio:ada",
+  "title": "Voice call · relayed",
+  "file": "screenshots/ink/desktop/light/17-call-audio-ada.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "call-video:mira",
+  "title": "Video call · direct",
+  "file": "screenshots/ink/desktop/light/18-call-video-mira.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings",
+  "title": "Settings",
+  "file": "screenshots/ink/desktop/light/19-settings.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings-privacy",
+  "title": "Privacy",
+  "file": "screenshots/ink/desktop/light/20-settings-privacy.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings-appearance",
+  "title": "Appearance",
+  "file": "screenshots/ink/desktop/light/21-settings-appearance.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings-relays",
+  "title": "Relay servers",
+  "file": "screenshots/ink/desktop/light/22-settings-relays.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "settings-security",
+  "title": "Security",
+  "file": "screenshots/ink/desktop/light/23-settings-security.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "panic",
+  "title": "Panic wipe confirm",
+  "file": "screenshots/ink/desktop/light/24-panic.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chats-empty",
+  "title": "Empty",
+  "file": "screenshots/ink/desktop/light/25-chats-empty.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chats-loading",
+  "title": "Loading skeletons",
+  "file": "screenshots/ink/desktop/light/26-chats-loading.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chats-offline",
+  "title": "Reconnecting",
+  "file": "screenshots/ink/desktop/light/27-chats-offline.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat-offline:theo",
+  "title": "Offline + message failed",
+  "file": "screenshots/ink/desktop/light/28-chat-offline-theo.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "chat-keychange:lena",
+  "title": "Key changed warning",
+  "file": "screenshots/ink/desktop/light/29-chat-keychange-lena.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "error",
+  "title": "Relay unreachable",
+  "file": "screenshots/ink/desktop/light/30-error.png"
+ },
+ {
+  "style": "ink",
+  "layout": "desktop",
+  "mode": "light",
+  "route": "shortcuts",
+  "title": "Keyboard shortcuts",
+  "file": "screenshots/ink/desktop/light/31-shortcuts.png"
+ }
+]

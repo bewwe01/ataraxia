@@ -140,7 +140,7 @@
   // ---------------------------------------------------------------- chat
   function meta(time, status, extra) {
     var st = { sending: ["clock", "Sending"], sent: ["check", "Sent"], delivered: ["check-double", "Delivered"], read: ["check-double", "Read"], queued: ["clock", "Queued"] }[status];
-    return html`<span class="meta">${extra || ""}<time>${time}</time>${st ? html`${icon(st[0])}<span class="sr-only">${st[1]}</span>${status === "read" ? html`<span aria-hidden="true">Read</span>` : ""}` : ""}</span>`;
+    return html`<span class="meta">${extra || ""}<time>${time}</time>${st ? html`${icon(st[0])}<span class="sr-only">${st[1]}</span>${status === "read" || status === "queued" ? html`<span aria-hidden="true">${st[1]}</span>` : ""}` : ""}</span>`;
   }
   function msg(dir, body, o) {
     o = o || {};
@@ -219,8 +219,10 @@
       <button class="icon-btn accent send-btn" type="submit" aria-label="Send or hold to record voice note">${icon("mic", "i-mic")}${icon("send", "i-send")}</button>
     </form>`;
   }
+  var HAS_HISTORY = { ada: 1, mira: 1, lena: 1, theo: 1 };
   function chatPane(id, variant, o) {
     o = o || {};
+    if (!variant && !HAS_HISTORY[id]) variant = "empty";
     var p = c(id);
     var top = "", body, foot = composer(p);
     if (variant === "keychange") {
@@ -244,8 +246,8 @@
     return html`<section class="chat" aria-label="Conversation with ${p.name}">${chatHeader(p, o)}${top}${body}${foot}</section>`;
   }
   function chatSkeleton() {
-    return html`<div class="chat" aria-busy="true" aria-label="Loading conversation"><div class="chat-hdr"><span class="skel av-skel"></span><span class="lines"><span class="skel l1"></span></span></div>
-      <div class="msgs skel-msgs" aria-hidden="true"><span class="skel b w60"></span><span class="skel b w40 r"></span><span class="skel b w70"></span><span class="skel b w50 r"></span><span class="skel b w30"></span></div></div>`;
+    return html`<section class="chat" aria-busy="true" aria-label="Loading conversation"><div class="chat-hdr"><span class="skel av-skel"></span><span class="lines"><span class="skel l1"></span></span></div>
+      <div class="msgs skel-msgs" aria-hidden="true"><span class="skel b w60"></span><span class="skel b w40 r"></span><span class="skel b w70"></span><span class="skel b w50 r"></span><span class="skel b w30"></span></div></section>`;
   }
 
   // ------------------------------------------------------------- profile
@@ -471,7 +473,7 @@
           <li>${icon("shield")}<span><b>The relay sees sealed envelopes</b><small>Not what you say, and not who you're talking to.</small></span></li>
         </ul></div>
       <div class="onb-actions"><a class="btn btn-primary btn-block" href="#keygen">Create my identity</a><button class="btn btn-ghost btn-block" type="button">${icon("archive")}Restore from backup</button>
-      <div class="pager" aria-label="Step 1 of 4"><i class="on"></i><i></i><i></i><i></i></div></div></div>`;
+      <div class="pager" aria-hidden="true"><i class="on"></i><i></i><i></i><i></i></div><p class="sr-only">Step 1 of 4</p></div></div>`;
   }
   function keygenContent() {
     var parts = [];
@@ -486,7 +488,7 @@
         <li class="step" data-step="1"><span class="st">${icon("check")}</span>Creating one-time prekeys</li>
         <li class="step" data-step="2"><span class="st">${icon("check")}</span>Sealing the encrypted vault</li></ol>
       <div class="onb-actions"><p class="hint center">${icon("lock", "icon-xs")} Keys are created on this device and never leave it.</p>
-        <a class="btn btn-primary btn-block" href="#passphrase" data-kg-next aria-disabled="true">Continue</a><div class="pager" aria-label="Step 2 of 4"><i></i><i class="on"></i><i></i><i></i></div></div></div>`;
+        <a class="btn btn-primary btn-block" href="#passphrase" data-kg-next aria-disabled="true">Continue</a><div class="pager" aria-hidden="true"><i></i><i class="on"></i><i></i><i></i></div><p class="sr-only">Step 2 of 4</p></div></div>`;
   }
   function passphraseContent() {
     return html`<form class="onb passphrase" data-pass autocomplete="off">
@@ -498,7 +500,7 @@
       <div class="field"><label for="pp2">Repeat passphrase</label><div class="input"><input id="pp2" type="password" value="lantern orbit maple quietly" autocomplete="new-password"></div></div>
       <div class="group card">${toggleRow({ id: "bio-onb", icon: "fingerprint", tone: "accent", title: "Also unlock with fingerprint", sub: "Passphrase still required after every restart.", on: true })}</div>
       <div class="banner warning slim">${icon("alert-triangle")}<p><b>No one can recover it for you.</b> Not us, not the relay. Without it, only an encrypted backup can restore your messages.</p></div>
-      <div class="onb-actions"><a class="btn btn-primary btn-block" href="#protection">Continue</a><div class="pager" aria-label="Step 3 of 4"><i></i><i></i><i class="on"></i><i></i></div></div></form>`;
+      <div class="onb-actions"><a class="btn btn-primary btn-block" href="#protection">Continue</a><div class="pager" aria-hidden="true"><i></i><i></i><i class="on"></i><i></i></div><p class="sr-only">Step 3 of 4</p></div></form>`;
   }
   function protectionContent() {
     return html`<div class="onb protection">
@@ -514,7 +516,7 @@
         <li><span class="pi">${icon("eye", "icon-sm")}</span><span>An unlocked or compromised device<small>Anyone holding your unlocked phone, or malware on it, can read your chats.</small></span></li>
         <li><span class="pi">${icon("image", "icon-sm")}</span><span>What others do with your messages<small>Recipients can screenshot or photograph them.</small></span></li>
         <li><span class="pi">${icon("globe", "icon-sm")}</span><span>Your IP in Direct mode<small>Contacts you allow Direct with can see your IP address.</small></span></li></ul></section>
-      <div class="onb-actions"><a class="btn btn-primary btn-block" href="#chats">I understand · start messaging</a><div class="pager" aria-label="Step 4 of 4"><i></i><i></i><i></i><i class="on"></i></div></div></div>`;
+      <div class="onb-actions"><a class="btn btn-primary btn-block" href="#chats">I understand · start messaging</a><div class="pager" aria-hidden="true"><i></i><i></i><i></i><i class="on"></i></div><p class="sr-only">Step 4 of 4</p></div></div>`;
   }
   function lockContent() {
     return html`<form class="onb lock" data-lock autocomplete="off">

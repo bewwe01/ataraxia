@@ -44,12 +44,12 @@ for (const layoutKey of LAYOUT_KEYS) {
       page.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") problems.push(`[${layoutKey}/${style}/${mode}] console ${m.type()}: ${m.text()}`); });
       page.on("pageerror", (e) => problems.push(`[${layoutKey}/${style}/${mode}] pageerror: ${e.message}`));
       page.on("request", (r) => { const u = r.url(); if (!u.startsWith("file:") && !u.startsWith("data:")) problems.push(`[${layoutKey}] NETWORK REQUEST: ${u}`); });
-      const screens = SCREENS.filter(L.filter).filter((s) => !onlyRoute || s.route === onlyRoute);
+      const all = SCREENS.filter(L.filter);
+      const screens = all.filter((s) => !onlyRoute || s.route === onlyRoute);
       const dir = path.join(outRoot, style, layoutKey, mode);
       mkdirSync(dir, { recursive: true });
-      let n = 0;
       for (const s of screens) {
-        n++;
+        const n = all.indexOf(s) + 1;
         const url = pathToFileURL(path.join(design, L.file)).href + `?capture=1&style=${style}&theme=${mode}#${s.route}`;
         await page.goto("about:blank");
         await page.goto(url);

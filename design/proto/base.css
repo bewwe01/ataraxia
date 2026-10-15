@@ -243,7 +243,7 @@ a.row:hover, button.row:hover { opacity: 0.86; }
 .segmented { display: flex; padding: 4px; gap: 4px; border-radius: var(--radius-pill); background: var(--surface-2); border: 1px solid var(--border-subtle); }
 .segmented label { flex: 1; position: relative; }
 .segmented input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
-.segmented span { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 40px; padding: 0 var(--space-3); border-radius: var(--radius-pill); font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--text-2); transition: opacity var(--dur-fast); white-space: nowrap; }
+.segmented span { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: var(--tap-min); min-width: var(--tap-min); padding: 0 var(--space-3); border-radius: var(--radius-pill); font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--text-2); transition: opacity var(--dur-fast); white-space: nowrap; }
 .segmented input:checked + span { background: var(--surface-1); color: var(--text-1); box-shadow: var(--shadow-1); }
 :root[data-theme="dark"] .segmented input:checked + span { background: var(--surface-3); }
 .segmented input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 1px; }
@@ -422,7 +422,7 @@ a.row:hover, button.row:hover { opacity: 0.86; }
 .msg.failed .bubble { box-shadow: none; outline: 2px solid var(--danger); outline-offset: 2px; }
 .fail-row { display: inline-flex; align-items: center; gap: 4px; margin-top: 6px; color: var(--danger); font-size: var(--text-xs); font-weight: var(--weight-semibold); min-height: var(--tap-min); padding: 0 var(--space-2); border-radius: var(--radius-pill); }
 .fail-row .icon { width: 16px; height: 16px; }
-.msg.pending .bubble { opacity: 0.8; }
+/* Pending/queued: shown by the clock icon + "Queued" text, never by dimming (keeps contrast) */
 
 /* Typing indicator */
 .typing-bubble { align-self: flex-start; display: inline-flex; gap: 5px; padding: 14px 16px; border-radius: var(--bubble-radius); border-bottom-left-radius: var(--bubble-radius-tail); background: var(--received-bg); border: 1px solid var(--received-border); margin-top: var(--space-2); }
@@ -446,7 +446,7 @@ a.row:hover, button.row:hover { opacity: 0.86; }
 .composer { display: flex; align-items: flex-end; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-3); position: relative; z-index: var(--z-sticky); }
 .composer .box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; min-height: 48px; padding: 2px 4px 2px var(--space-4); border-radius: var(--composer-radius); background: var(--surface-glass-strong); border: 1px solid var(--border-default); }
 .composer .box:focus-within { border-color: var(--accent); }
-.composer textarea { flex: 1; min-width: 0; resize: none; height: 24px; max-height: 120px; line-height: 24px; font-size: var(--bubble-font-size); padding: 0; }
+.composer textarea { flex: 1; min-width: 0; resize: none; height: var(--tap-min); max-height: 120px; line-height: 24px; font-size: var(--bubble-font-size); padding: 10px 0; }
 .composer textarea::placeholder { color: var(--text-3); }
 .composer .send-btn { width: 48px; height: 48px; }
 .composer .send-btn .i-send { display: none; }
@@ -590,8 +590,8 @@ details.err-details pre { font-family: var(--font-mono); font-size: var(--text-x
   radial-gradient(50% 40% at 20% 90%, rgb(0 184 217 / 0.28), transparent 70%),
   radial-gradient(40% 30% at 90% 80%, rgb(255 143 107 / 0.18), transparent 70%), #080920; }
 .call.video .call-bg { background:
-  radial-gradient(circle at 50% 41%, #c78d70 0, #b67a5e 13%, rgb(182 122 94 / 0) 17%),
-  radial-gradient(60% 30% at 50% 100%, #3c4f8a 0, #34477e 70%, rgb(52 71 126 / 0) 74%),
+  radial-gradient(circle 70px at 50% 46%, #c78d70 0, #b67a5e 78%, rgb(182 122 94 / 0) 100%),
+  radial-gradient(210px 150px at 50% 78%, #3c4f8a 0, #34477e 75%, rgb(52 71 126 / 0) 100%),
   radial-gradient(60% 50% at 80% 10%, #4a3a7a, transparent 70%),
   linear-gradient(160deg, #1d2547, #2a2050 60%, #121a33); }
 .call.video .call-bg::after { content: ""; position: absolute; inset: 0; background: linear-gradient(180deg, rgb(0 0 0 / 0.55), transparent 22%, transparent 70%, rgb(0 0 0 / 0.65)); }
@@ -694,3 +694,16 @@ details.err-details pre { font-family: var(--font-mono); font-size: var(--text-x
 .theme-card:has(input:checked) .tc-check { background: var(--accent); border-color: var(--accent); color: var(--bg-1); }
 .theme-card:has(input:checked) .tc-check .icon { opacity: 1; transform: none; }
 .theme-card:has(input:focus-visible) .tc-preview { outline: 2px solid var(--focus); outline-offset: 6px; }
+
+/* Reduced motion: global clamp (system preference OR in-app setting).
+ * Every animation jumps to its end state once; nothing loops or drifts. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; animation-delay: 0s !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}
+:root[data-motion="reduced"] *, :root[data-motion="reduced"] *::before, :root[data-motion="reduced"] *::after {
+  animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; animation-delay: 0s !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important;
+}
+
+/* Small visual targets keep a ≥44px hit area via an invisible extension */
+.reaction { position: relative; }
+.reaction::after { content: ""; position: absolute; left: 50%; top: 50%; width: max(100%, var(--tap-min)); height: var(--tap-min); transform: translate(-50%, -50%); }

@@ -27,7 +27,7 @@
 
 /* List pane */
 .pane-list { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface-glass); -webkit-backdrop-filter: blur(var(--blur-glass)); backdrop-filter: blur(var(--blur-glass)); border-right: 1px solid var(--border-subtle); }
-.list-head { padding: var(--space-5) var(--space-4) var(--space-3); display: grid; gap: var(--space-3); }
+.list-head { padding: var(--space-5) var(--space-4) var(--space-3); display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-3); }
 .list-head h1 { font-size: var(--text-xl); font-weight: var(--weight-bold); letter-spacing: var(--tracking-display); }
 .list-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: var(--space-6); }
 .list-scroll.pad { padding: 0 var(--space-4) var(--space-6); }

@@ -23,8 +23,8 @@
 .lock-hero { display: grid; justify-items: center; gap: var(--space-3); text-align: center; margin-top: auto; }
 .lock .stack { margin-bottom: auto; }
 .lead-icon { color: var(--text-3); display: inline-flex; }
-.input.slim { min-height: var(--tap-min); border-radius: var(--radius-pill); padding-left: var(--space-3); }
-.input.slim input { height: 40px; font-size: var(--text-base); }
+.input.slim { min-height: 46px; border-radius: var(--radius-pill); padding-left: var(--space-3); }
+.input.slim input { height: var(--tap-min); font-size: var(--text-base); }
 .input .kbd { margin-right: var(--space-2); }
 .forgot { text-align: center; }
 .forgot .hint { text-align: center; padding: 0 var(--space-2); }
@@ -87,6 +87,7 @@
 .top-gap { margin-top: var(--space-5); }
 .danger-card { border-color: var(--danger); background: var(--danger-soft); }
 .danger-card .row + .row { border-top: 0; padding-top: 0; }
+.danger-card .btn-danger-ghost { background: var(--surface-1); }
 .app-ver { margin-top: var(--space-6); }
 .small-art { width: 96px; height: 96px; margin: 0 auto var(--space-3); }
 .small-art .core { width: 64px; height: 64px; }
