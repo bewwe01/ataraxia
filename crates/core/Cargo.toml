@@ -1,0 +1,33 @@
+[package]
+name = "veil-core"
+version = "0.1.0"
+description = "Veil core: identity, sessions, sealed envelopes, invites, vault and attachment crypto. Pure logic, no I/O."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+libsignal-protocol.workspace = true
+aead-stream.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+argon2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+secrecy.workspace = true
+rand.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+futures-executor.workspace = true
+
+[lints]
+workspace = true

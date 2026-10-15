@@ -1,0 +1,5 @@
+# unwrap/expect/panic/indexing are denied in product code (CLAUDE.md) but fine in tests.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
