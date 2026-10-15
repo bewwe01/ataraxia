@@ -1,0 +1,105 @@
+# Phase 1 spike (not a release pipeline): can Tauri 2 build an Android app whose WebView
+# has working WebRTC, and does libsignal build and pass its checks on Android?
+name: spike-android
+
+on:
+  push:
+    branches: [ccr-1230ecdf-lvfqsm]
+    paths: ["spikes/**", ".github/workflows/spike-android.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spike-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      CARGO_TERM_COLOR: always
+      API_LEVEL: 34
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: "10.28.0"
+
+      - name: Rust toolchain + Android targets
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+          rustup target add x86_64-linux-android aarch64-linux-android
+          rustc -V
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "NDK: $ANDROID_NDK_LATEST_HOME"
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+
+      - name: Build probe APK (x86_64 for the emulator)
+        working-directory: spikes/webrtc-probe
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm tauri android init --ci
+          pnpm tauri android build --debug --target x86_64 --apk --ci
+          APK=$(find src-tauri/gen/android -name '*.apk' | head -1)
+          echo "APK_PATH=$GITHUB_WORKSPACE/spikes/webrtc-probe/$APK" >> "$GITHUB_ENV"
+          ls -la "$APK"
+
+      - name: Cross-compile libsignal spike for Android (x86_64 to run, aarch64 to prove phone builds)
+        working-directory: spikes/libsignal
+        run: |
+          TC="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TC/x86_64-linux-android26-clang"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/aarch64-linux-android26-clang"
+          export CC_x86_64_linux_android="$TC/x86_64-linux-android26-clang"
+          export CC_aarch64_linux_android="$TC/aarch64-linux-android26-clang"
+          export AR_x86_64_linux_android="$TC/llvm-ar"
+          export AR_aarch64_linux_android="$TC/llvm-ar"
+          cargo build --release --locked --target x86_64-linux-android
+          cargo build --release --locked --target aarch64-linux-android
+          file target/aarch64-linux-android/release/veil-spike-libsignal
+          echo "LIBSIGNAL_BIN=$PWD/target/x86_64-linux-android/release/veil-spike-libsignal" >> "$GITHUB_ENV"
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run on emulator (API 34, x86_64)
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          OUT_DIR: ${{ github.workspace }}/spike-out
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: mkdir -p "$OUT_DIR" && bash spikes/webrtc-probe/ci/run-on-emulator.sh
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spike-android-evidence
+          path: |
+            spike-out/
+            ${{ env.APK_PATH }}
+          if-no-files-found: warn
+          retention-days: 14

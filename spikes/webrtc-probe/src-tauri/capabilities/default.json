@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Probe window: no plugins, only the app's own report command.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

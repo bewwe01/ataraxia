@@ -1,0 +1,16 @@
+# Phase 1 spike: prove libsignal (PQXDH + Triple Ratchet/SPQR) builds and behaves
+# as required when consumed from our own workspace. Not product code.
+[package]
+name = "veil-spike-libsignal"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+# Not published on crates.io; pinned to an exact release tag (and the lockfile pins the commit).
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.105.0" }
+rand = "0.9.4"
+futures-executor = "0.3"
+
+[workspace]
