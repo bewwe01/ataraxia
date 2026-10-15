@@ -27,6 +27,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Free runner disk space (emulator image needs several GB)
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/lib/node_modules/@angular
+          df -h /
+
       - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
@@ -74,6 +80,16 @@ jobs:
           cargo build --release --locked --target aarch64-linux-android
           file target/aarch64-linux-android/release/veil-spike-libsignal
           echo "LIBSIGNAL_BIN=$PWD/target/x86_64-linux-android/release/veil-spike-libsignal" >> "$GITHUB_ENV"
+
+      - name: Keep only the two binaries, drop build trees
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp "$APK_PATH" "$RUNNER_TEMP/bin/probe.apk"
+          cp "$LIBSIGNAL_BIN" "$RUNNER_TEMP/bin/veil-spike-libsignal"
+          echo "APK_PATH=$RUNNER_TEMP/bin/probe.apk" >> "$GITHUB_ENV"
+          echo "LIBSIGNAL_BIN=$RUNNER_TEMP/bin/veil-spike-libsignal" >> "$GITHUB_ENV"
+          rm -rf spikes/libsignal/target spikes/webrtc-probe/src-tauri/target spikes/webrtc-probe/src-tauri/gen/android/app/build ~/.gradle/caches ~/.cargo/registry
+          df -h /
 
       - name: Enable KVM
         run: |
