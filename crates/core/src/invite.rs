@@ -49,8 +49,22 @@ const AAD_LABEL: &[u8] = b"veil/v1/invite";
 /// In person (mutual scan) or remote (link).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteMode {
-    InPerson = 0,
-    Remote = 1,
+    InPerson,
+    Remote,
+}
+
+impl InviteMode {
+    /// Wire encoding.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::InPerson => 0,
+            Self::Remote => 1,
+        }
+    }
+
+    pub(crate) fn to_u32(self) -> u32 {
+        u32::from(self.to_u8())
+    }
 }
 
 /// Contents of an invite QR code / link. Holds a secret: treat like a password.
@@ -66,7 +80,10 @@ pub struct Invite {
 
 impl core::fmt::Debug for Invite {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Invite").field("mode", &self.mode).field("expires_at", &self.expires_at).finish_non_exhaustive()
+        f.debug_struct("Invite")
+            .field("mode", &self.mode)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
     }
 }
 
@@ -114,7 +131,15 @@ impl Invite {
         rng.fill(&mut id);
         let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
         rng.fill(&mut secret[..]);
-        Ok(Self { mode, identity, id, secret, expires_at, relay_spki_sha256, relay_url: relay_url.to_owned() })
+        Ok(Self {
+            mode,
+            identity,
+            id,
+            secret,
+            expires_at,
+            relay_spki_sha256,
+            relay_url: relay_url.to_owned(),
+        })
     }
 
     /// `veil://i/<base64url>`.
@@ -122,7 +147,7 @@ impl Invite {
         let url = self.relay_url.as_bytes();
         let mut b = Zeroizing::new(Vec::with_capacity(FIXED_LEN.saturating_add(url.len())));
         b.push(VERSION);
-        b.push(self.mode as u8);
+        b.push(self.mode.to_u8());
         b.extend_from_slice(&self.identity.serialize());
         b.extend_from_slice(&self.id);
         b.extend_from_slice(&self.secret[..]);
@@ -160,7 +185,15 @@ impl Invite {
             return Err(CoreError::Malformed);
         }
         validate_url(url)?;
-        Ok(Self { mode, identity, id, secret, expires_at, relay_spki_sha256, relay_url: url.to_owned() })
+        Ok(Self {
+            mode,
+            identity,
+            id,
+            secret,
+            expires_at,
+            relay_spki_sha256,
+            relay_url: url.to_owned(),
+        })
     }
 
     fn hkdf(&self) -> Hkdf<Sha256> {
@@ -193,7 +226,13 @@ impl Invite {
         rng.fill(&mut nonce_bytes);
         let nonce = XNonce::try_from(&nonce_bytes[..]).map_err(|_| CoreError::Protocol)?;
         let ct = cipher
-            .encrypt(&nonce, Payload { msg: &plain, aad: &self.aad() })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &plain,
+                    aad: &self.aad(),
+                },
+            )
             .map_err(|_| CoreError::Protocol)?;
         let mut out = Vec::with_capacity(SEALED_PACKAGE_LEN);
         out.extend_from_slice(&nonce);
@@ -211,7 +250,15 @@ impl Invite {
         let cipher = XChaCha20Poly1305::new_from_slice(&key[..]).map_err(|_| CoreError::Protocol)?;
         let nonce = XNonce::try_from(nonce).map_err(|_| CoreError::Malformed)?;
         let plain = Zeroizing::new(
-            cipher.decrypt(&nonce, Payload { msg: ct, aad: &self.aad() }).map_err(|_| CoreError::AuthFailed)?,
+            cipher
+                .decrypt(
+                    &nonce,
+                    Payload {
+                        msg: ct,
+                        aad: &self.aad(),
+                    },
+                )
+                .map_err(|_| CoreError::AuthFailed)?,
         );
         let body = unpad_to(&plain)?;
         let pkg = PackagePb::decode(body).map_err(|_| CoreError::Malformed)?;
@@ -229,7 +276,8 @@ impl Invite {
 
     fn proof_mac(&self, redeemer: &IdentityKey) -> Result<Hmac<Sha256>> {
         let key = self.proof_key()?;
-        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&key[..]).map_err(|_| CoreError::Protocol)?;
+        let mut mac =
+            <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&key[..]).map_err(|_| CoreError::Protocol)?;
         mac.update(INFO_PROOF);
         mac.update(&self.id);
         mac.update(&redeemer.serialize());
@@ -249,7 +297,8 @@ impl Invite {
 
 /// Verifies a redemption proof in constant time given the stored proof key.
 pub(crate) fn verify_proof(proof_key: &[u8], id: &[u8], redeemer: &IdentityKey, proof: &[u8]) -> Result<()> {
-    let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(proof_key).map_err(|_| CoreError::Protocol)?;
+    let mut mac =
+        <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(proof_key).map_err(|_| CoreError::Protocol)?;
     mac.update(INFO_PROOF);
     mac.update(id);
     mac.update(&redeemer.serialize());
@@ -258,7 +307,8 @@ pub(crate) fn verify_proof(proof_key: &[u8], id: &[u8], redeemer: &IdentityKey, 
 
 fn derive(hk: &Hkdf<Sha256>, label: &[u8], id: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let mut out = Zeroizing::new([0u8; 32]);
-    hk.expand_multi_info(&[label, id], &mut out[..]).map_err(|_| CoreError::Protocol)?;
+    hk.expand_multi_info(&[label, id], &mut out[..])
+        .map_err(|_| CoreError::Protocol)?;
     Ok(out)
 }
 
@@ -320,11 +370,24 @@ mod tests {
     fn invite() -> Invite {
         let mut rng = OsRng.unwrap_err();
         let ik = *IdentityKeyPair::generate(&mut rng).identity_key();
-        Invite::generate(&mut rng, InviteMode::Remote, ik, 1_800_000_000, "wss://relay.example.org", [9; 32]).unwrap()
+        Invite::generate(
+            &mut rng,
+            InviteMode::Remote,
+            ik,
+            1_800_000_000,
+            "wss://relay.example.org",
+            [9; 32],
+        )
+        .unwrap()
     }
 
     fn pkg() -> PackagePb {
-        PackagePb { registration_id: 5, mailbox_id: vec![1; 32], delivery_token: vec![2; 32], ..Default::default() }
+        PackagePb {
+            registration_id: 5,
+            mailbox_id: vec![1; 32],
+            delivery_token: vec![2; 32],
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -353,7 +416,10 @@ mod tests {
             Invite::from_link(&format!("{LINK_PREFIX}{}", URL_SAFE_NO_PAD.encode(&raw))).err(),
             Some(CoreError::UnsupportedVersion)
         );
-        assert_eq!(Invite::from_link(&"x".repeat(MAX_LINK_LEN + 1)).err(), Some(CoreError::TooLarge));
+        assert_eq!(
+            Invite::from_link(&"x".repeat(MAX_LINK_LEN + 1)).err(),
+            Some(CoreError::TooLarge)
+        );
         assert!(Invite::from_link("https://evil/").is_err());
     }
 
@@ -380,7 +446,11 @@ mod tests {
         let sealed = a.seal_package(&mut rng, &pkg()).unwrap();
         // Same secret but a different claimed identity (AAD mismatch) must fail.
         let other_ik = *IdentityKeyPair::generate(&mut rng).identity_key();
-        let forged = Invite { identity: other_ik, secret: a.secret.clone(), ..invite_with(&a) };
+        let forged = Invite {
+            identity: other_ik,
+            secret: a.secret.clone(),
+            ..invite_with(&a)
+        };
         assert_eq!(forged.open_package(&sealed).err(), Some(CoreError::AuthFailed));
     }
 
@@ -405,10 +475,19 @@ mod tests {
         let p = inv.proof(&r1).unwrap();
         let pk = inv.proof_key_bytes().unwrap();
         assert!(verify_proof(&pk[..], &inv.id, &r1, &p).is_ok());
-        assert_eq!(verify_proof(&pk[..], &inv.id, &r2, &p).err(), Some(CoreError::AuthFailed));
-        assert_eq!(verify_proof(&pk[..], &[0; 16], &r1, &p).err(), Some(CoreError::AuthFailed));
+        assert_eq!(
+            verify_proof(&pk[..], &inv.id, &r2, &p).err(),
+            Some(CoreError::AuthFailed)
+        );
+        assert_eq!(
+            verify_proof(&pk[..], &[0; 16], &r1, &p).err(),
+            Some(CoreError::AuthFailed)
+        );
         let other = invite();
-        assert_eq!(verify_proof(&other.proof_key_bytes().unwrap()[..], &inv.id, &r1, &p).err(), Some(CoreError::AuthFailed));
+        assert_eq!(
+            verify_proof(&other.proof_key_bytes().unwrap()[..], &inv.id, &r1, &p).err(),
+            Some(CoreError::AuthFailed)
+        );
     }
 
     #[test]

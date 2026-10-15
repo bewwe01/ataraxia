@@ -24,7 +24,10 @@ pub struct Address(String);
 impl Address {
     /// Derives the address of an identity key.
     pub fn of(identity: &IdentityKey) -> Self {
-        let digest = Sha256::new().chain_update(ADDR_LABEL).chain_update(identity.serialize()).finalize();
+        let digest = Sha256::new()
+            .chain_update(ADDR_LABEL)
+            .chain_update(identity.serialize())
+            .finalize();
         let mut hex = to_hex(&digest);
         hex.truncate(ADDR_HEX_LEN);
         Self(format!("{ADDR_PREFIX}{hex}"))
@@ -60,19 +63,25 @@ pub struct Identity {
 
 impl fmt::Debug for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Identity").field("address", &self.address()).finish_non_exhaustive()
+        f.debug_struct("Identity")
+            .field("address", &self.address())
+            .finish_non_exhaustive()
     }
 }
 
 impl Identity {
     /// Generates a fresh identity on this device.
     pub fn generate<R: Rng + CryptoRng>(rng: &mut R) -> Self {
-        Self { pair: IdentityKeyPair::generate(rng) }
+        Self {
+            pair: IdentityKeyPair::generate(rng),
+        }
     }
 
     /// Restores an identity from [`Identity::to_secret_bytes`] output.
     pub fn from_secret_bytes(bytes: &[u8]) -> Result<Self> {
-        IdentityKeyPair::try_from(bytes).map(|pair| Self { pair }).map_err(|_| CoreError::Malformed)
+        IdentityKeyPair::try_from(bytes)
+            .map(|pair| Self { pair })
+            .map_err(|_| CoreError::Malformed)
     }
 
     /// Serialized key pair, wiped from memory on drop. Store only inside the vault.
@@ -104,7 +113,10 @@ impl Identity {
 
 /// See [`Identity::display_fingerprint`].
 pub fn display_fingerprint(key: &IdentityKey) -> String {
-    let digest = Sha256::new().chain_update(FP_LABEL).chain_update(key.serialize()).finalize();
+    let digest = Sha256::new()
+        .chain_update(FP_LABEL)
+        .chain_update(key.serialize())
+        .finalize();
     let hex = to_hex(digest.get(..16).unwrap_or(&[])).to_ascii_uppercase();
     hex.as_bytes()
         .chunks(4)
@@ -118,7 +130,9 @@ fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len().saturating_mul(2));
     for b in bytes {
         s.push(char::from(HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0')));
-        s.push(char::from(HEX.get(usize::from(b & 0x0f)).copied().unwrap_or(b'0')));
+        s.push(char::from(
+            HEX.get(usize::from(b & 0x0f)).copied().unwrap_or(b'0'),
+        ));
     }
     s
 }

@@ -18,7 +18,12 @@ pub struct SafetyNumber {
 
 impl SafetyNumber {
     /// Computes the safety number from both identities.
-    pub fn new(local: &Address, local_key: &IdentityKey, remote: &Address, remote_key: &IdentityKey) -> Result<Self> {
+    pub fn new(
+        local: &Address,
+        local_key: &IdentityKey,
+        remote: &Address,
+        remote_key: &IdentityKey,
+    ) -> Result<Self> {
         let fp = Fingerprint::new(
             VERSION,
             ITERATIONS,
@@ -43,7 +48,11 @@ impl SafetyNumber {
 
     /// The 12 groups of 5 digits shown in the UI.
     pub fn groups(&self) -> Vec<&str> {
-        (0..12).filter_map(|i| self.digits.get(i * 5..i * 5 + 5)).collect()
+        self.digits
+            .as_bytes()
+            .chunks(5)
+            .filter_map(|c| core::str::from_utf8(c).ok())
+            .collect()
     }
 
     /// Bytes to encode in the QR code.
@@ -83,7 +92,11 @@ mod tests {
         let (a, b) = pair();
         let ab = sn(&a, &b);
         let ba = sn(&b, &a);
-        assert_eq!(ab.digits(), ba.digits(), "INV-ID-3: both sides see the same number");
+        assert_eq!(
+            ab.digits(),
+            ba.digits(),
+            "INV-ID-3: both sides see the same number"
+        );
         assert_eq!(ab.groups().len(), 12);
         assert_eq!(ab.matches_scanned(ba.scannable()), Ok(true));
         assert_eq!(ba.matches_scanned(ab.scannable()), Ok(true));

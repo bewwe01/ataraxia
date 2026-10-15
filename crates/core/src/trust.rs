@@ -27,7 +27,9 @@ pub enum TrustState {
     Verified(VerifiedBy),
     /// The identity key changed and the user has not reviewed it yet.
     /// Incoming messages are held and sending is paused.
-    KeyChanged { was_verified: bool },
+    KeyChanged {
+        was_verified: bool,
+    },
 }
 
 /// Events that can change trust.
@@ -56,6 +58,8 @@ impl TrustState {
     }
 
     /// Applies an event. Unlisted combinations leave the state unchanged.
+    // Arms are spelled out one per rule so the state machine reads as its specification.
+    #[allow(clippy::match_same_arms)]
     #[must_use]
     pub fn apply(self, event: TrustEvent) -> Self {
         use TrustEvent as E;
@@ -123,10 +127,16 @@ mod tests {
                 // from a non-verified state.
                 if n.is_verified() && !s.is_verified() {
                     assert!(
-                        matches!(e, TrustEvent::MutualScan { keys_match: true } | TrustEvent::SafetyNumberConfirmed),
+                        matches!(
+                            e,
+                            TrustEvent::MutualScan { keys_match: true } | TrustEvent::SafetyNumberConfirmed
+                        ),
                         "{s:?} --{e:?}--> {n:?}"
                     );
-                    assert!(!matches!(s, TrustState::KeyChanged { .. }), "pending change must block verification");
+                    assert!(
+                        !matches!(s, TrustState::KeyChanged { .. }),
+                        "pending change must block verification"
+                    );
                 }
                 // An identity change always blocks sending.
                 if e == TrustEvent::IdentityChanged {

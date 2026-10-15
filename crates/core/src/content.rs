@@ -283,7 +283,10 @@ impl Content {
                 opt(a.expire_timer_secs.as_ref(), |s| *s <= MAX_TIMER_SECS)
             }
             Body::Receipt(r) => {
-                ensure(matches!(ReceiptKind::try_from(r.kind), Ok(ReceiptKind::Delivered | ReceiptKind::Read)))?;
+                ensure(matches!(
+                    ReceiptKind::try_from(r.kind),
+                    Ok(ReceiptKind::Delivered | ReceiptKind::Read)
+                ))?;
                 ensure(!r.ids.is_empty() && r.ids.len() <= MAX_IDS)?;
                 ensure(r.ids.iter().all(|i| i.len() == ID_LEN))
             }
@@ -292,10 +295,16 @@ impl Content {
             Body::Call(c) => {
                 ensure(c.call_id.len() == ID_LEN)?;
                 match c.kind.as_ref().ok_or(CoreError::Malformed)? {
-                    CallKind::Offer(s) | CallKind::Answer(s) => ensure(!s.is_empty() && s.len() <= MAX_SDP_LEN),
+                    CallKind::Offer(s) | CallKind::Answer(s) => {
+                        ensure(!s.is_empty() && s.len() <= MAX_SDP_LEN)
+                    }
                     CallKind::Ice(i) => {
                         ensure(!i.candidates.is_empty() && i.candidates.len() <= MAX_CANDIDATES)?;
-                        ensure(i.candidates.iter().all(|c| c.len() <= MAX_CANDIDATE_LEN && !has_control(c)))
+                        ensure(
+                            i.candidates
+                                .iter()
+                                .all(|c| c.len() <= MAX_CANDIDATE_LEN && !has_control(c)),
+                        )
                     }
                     CallKind::Hangup(r) => ensure(r.len() <= 64 && !has_control(r)),
                     CallKind::Busy(_) => Ok(()),
@@ -335,7 +344,8 @@ fn opt<T>(v: Option<&T>, f: impl FnOnce(&T) -> bool) -> Result<()> {
 /// prevent spoofing; message bodies may contain newlines and are rendered as plain text.
 fn has_control(s: &str) -> bool {
     s.chars().any(|c| {
-        c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
+        c.is_control()
+            || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}')
     })
 }
 
@@ -345,7 +355,14 @@ pub(crate) mod tests {
     use proptest::prelude::*;
 
     pub(crate) fn text(body: &str) -> Content {
-        Content { id: vec![7; 16], sent_at_ms: 1, body: Some(Body::Text(Text { body: body.into(), ..Default::default() })) }
+        Content {
+            id: vec![7; 16],
+            sent_at_ms: 1,
+            body: Some(Body::Text(Text {
+                body: body.into(),
+                ..Default::default()
+            })),
+        }
     }
 
     #[test]
@@ -371,12 +388,20 @@ pub(crate) mod tests {
         let mut c = text("x");
         c.id = vec![1; 15];
         assert_eq!(c.validate(), Err(CoreError::Malformed));
-        let c = Content { id: vec![1; 16], sent_at_ms: 0, body: None };
+        let c = Content {
+            id: vec![1; 16],
+            sent_at_ms: 0,
+            body: None,
+        };
         assert_eq!(c.validate(), Err(CoreError::Malformed));
         let c = Content {
             id: vec![1; 16],
             sent_at_ms: 0,
-            body: Some(Body::Reaction(Reaction { target_id: vec![2; 16], emoji: "\u{202E}x".into(), remove: false })),
+            body: Some(Body::Reaction(Reaction {
+                target_id: vec![2; 16],
+                emoji: "\u{202E}x".into(),
+                remove: false,
+            })),
         };
         assert_eq!(c.validate(), Err(CoreError::Malformed), "bidi override rejected");
         let c = Content {
@@ -394,7 +419,10 @@ pub(crate) mod tests {
 
     #[test]
     fn size_limit_checked_before_parsing() {
-        assert_eq!(Content::decode_strict(&vec![0u8; MAX_CONTENT_LEN + 1]), Err(CoreError::TooLarge));
+        assert_eq!(
+            Content::decode_strict(&vec![0u8; MAX_CONTENT_LEN + 1]),
+            Err(CoreError::TooLarge)
+        );
     }
 
     proptest! {

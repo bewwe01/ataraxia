@@ -1,6 +1,6 @@
 //! Protocol state storage.
 //!
-//! [`KvBackend`] is the persistence boundary: the client implements it over SQLCipher,
+//! [`KvBackend`] is the persistence boundary: the client implements it over `SQLCipher`,
 //! and tests use [`MemoryBackend`]. [`VeilStore`] implements libsignal's store traits
 //! on top, with two Veil-specific properties:
 //!
@@ -15,9 +15,10 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use libsignal_protocol::{
-    Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore, KyberPreKeyId,
-    KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, PublicKey,
-    SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair, IdentityKeyStore,
+    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress,
+    PublicKey, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord,
+    SignedPreKeyStore,
 };
 use zeroize::Zeroizing;
 
@@ -59,7 +60,12 @@ impl KvBackend for MemoryBackend {
         Ok(())
     }
     fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
-        Ok(self.map.keys().filter(|k| k.starts_with(prefix)).cloned().collect())
+        Ok(self
+            .map
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
     }
 }
 
@@ -91,9 +97,15 @@ pub struct VeilStore<B: KvBackend> {
 
 impl<B: KvBackend> VeilStore<B> {
     pub(crate) fn new(backend: B, identity: IdentityKeyPair, registration_id: u32) -> Self {
-        Self { backend, overlay: BTreeMap::new(), identity, registration_id }
+        Self {
+            backend,
+            overlay: BTreeMap::new(),
+            identity,
+            registration_id,
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn backend(&self) -> &B {
         &self.backend
     }
@@ -174,10 +186,14 @@ pub(crate) struct StoreHandle<'a, B: KvBackend>(pub(crate) &'a core::cell::RefCe
 
 impl<B: KvBackend> StoreHandle<'_, B> {
     fn read(&self) -> libsignal_protocol::error::Result<core::cell::Ref<'_, VeilStore<B>>> {
-        self.0.try_borrow().map_err(|_| SignalProtocolError::InvalidState("store-borrow", String::new()))
+        self.0
+            .try_borrow()
+            .map_err(|_| SignalProtocolError::InvalidState("store-borrow", String::new()))
     }
     fn write(&self) -> libsignal_protocol::error::Result<core::cell::RefMut<'_, VeilStore<B>>> {
-        self.0.try_borrow_mut().map_err(|_| SignalProtocolError::InvalidState("store-borrow", String::new()))
+        self.0
+            .try_borrow_mut()
+            .map_err(|_| SignalProtocolError::InvalidState("store-borrow", String::new()))
     }
 }
 
@@ -212,9 +228,8 @@ impl<B: KvBackend> IdentityKeyStore for StoreHandle<'_, B> {
         match existing {
             Some(k) if &k == identity => Ok(IdentityChange::NewOrUnchanged),
             // libsignal only calls this after `is_trusted_identity` passed, which requires an
-            // exact match; refuse to overwrite here as defence in depth (INV-ID-2).
-            Some(_) => Err(SignalProtocolError::UntrustedIdentity(address.clone())),
-            None => Err(SignalProtocolError::UntrustedIdentity(address.clone())),
+            // exact match; refuse to record or overwrite here as defence in depth (INV-ID-2).
+            _ => Err(SignalProtocolError::UntrustedIdentity(address.clone())),
         }
     }
 
@@ -224,18 +239,30 @@ impl<B: KvBackend> IdentityKeyStore for StoreHandle<'_, B> {
         identity: &IdentityKey,
         _direction: Direction,
     ) -> libsignal_protocol::error::Result<bool> {
-        Ok(self.read()?.peer_identity(address.name()).map_err(storage_err)?.as_ref() == Some(identity))
+        Ok(self
+            .read()?
+            .peer_identity(address.name())
+            .map_err(storage_err)?
+            .as_ref()
+            == Some(identity))
     }
 
-    async fn get_identity(&self, address: &ProtocolAddress) -> libsignal_protocol::error::Result<Option<IdentityKey>> {
+    async fn get_identity(
+        &self,
+        address: &ProtocolAddress,
+    ) -> libsignal_protocol::error::Result<Option<IdentityKey>> {
         self.read()?.peer_identity(address.name()).map_err(storage_err)
     }
 }
 
 #[async_trait(?Send)]
 impl<B: KvBackend> SessionStore for StoreHandle<'_, B> {
-    async fn load_session(&self, address: &ProtocolAddress) -> libsignal_protocol::error::Result<Option<SessionRecord>> {
-        self.read()?.get(&keys::with(keys::SESSION, address.name().as_bytes()))
+    async fn load_session(
+        &self,
+        address: &ProtocolAddress,
+    ) -> libsignal_protocol::error::Result<Option<SessionRecord>> {
+        self.read()?
+            .get(&keys::with(keys::SESSION, address.name().as_bytes()))
             .map_err(storage_err)?
             .map(|v| SessionRecord::deserialize(&v).map_err(decode_err))
             .transpose()
@@ -247,7 +274,8 @@ impl<B: KvBackend> SessionStore for StoreHandle<'_, B> {
         record: &SessionRecord,
     ) -> libsignal_protocol::error::Result<()> {
         let bytes = Zeroizing::new(record.serialize()?);
-        self.write()?.put(keys::with(keys::SESSION, address.name().as_bytes()), &bytes);
+        self.write()?
+            .put(keys::with(keys::SESSION, address.name().as_bytes()), &bytes);
         Ok(())
     }
 }
@@ -263,7 +291,11 @@ impl<B: KvBackend> PreKeyStore for StoreHandle<'_, B> {
         PreKeyRecord::deserialize(&v).map_err(decode_err)
     }
 
-    async fn save_pre_key(&mut self, id: PreKeyId, record: &PreKeyRecord) -> libsignal_protocol::error::Result<()> {
+    async fn save_pre_key(
+        &mut self,
+        id: PreKeyId,
+        record: &PreKeyRecord,
+    ) -> libsignal_protocol::error::Result<()> {
         let bytes = Zeroizing::new(record.serialize()?);
         self.write()?.put(id_key(keys::PREKEY, u32::from(id)), &bytes);
         Ok(())
@@ -277,7 +309,10 @@ impl<B: KvBackend> PreKeyStore for StoreHandle<'_, B> {
 
 #[async_trait(?Send)]
 impl<B: KvBackend> SignedPreKeyStore for StoreHandle<'_, B> {
-    async fn get_signed_pre_key(&self, id: SignedPreKeyId) -> libsignal_protocol::error::Result<SignedPreKeyRecord> {
+    async fn get_signed_pre_key(
+        &self,
+        id: SignedPreKeyId,
+    ) -> libsignal_protocol::error::Result<SignedPreKeyRecord> {
         let v = self
             .read()?
             .get(&id_key(keys::SIGNED_PREKEY, u32::from(id)))
@@ -292,14 +327,18 @@ impl<B: KvBackend> SignedPreKeyStore for StoreHandle<'_, B> {
         record: &SignedPreKeyRecord,
     ) -> libsignal_protocol::error::Result<()> {
         let bytes = Zeroizing::new(record.serialize()?);
-        self.write()?.put(id_key(keys::SIGNED_PREKEY, u32::from(id)), &bytes);
+        self.write()?
+            .put(id_key(keys::SIGNED_PREKEY, u32::from(id)), &bytes);
         Ok(())
     }
 }
 
 #[async_trait(?Send)]
 impl<B: KvBackend> KyberPreKeyStore for StoreHandle<'_, B> {
-    async fn get_kyber_pre_key(&self, id: KyberPreKeyId) -> libsignal_protocol::error::Result<KyberPreKeyRecord> {
+    async fn get_kyber_pre_key(
+        &self,
+        id: KyberPreKeyId,
+    ) -> libsignal_protocol::error::Result<KyberPreKeyRecord> {
         let v = self
             .read()?
             .get(&id_key(keys::KYBER_PREKEY, u32::from(id)))
@@ -314,7 +353,8 @@ impl<B: KvBackend> KyberPreKeyStore for StoreHandle<'_, B> {
         record: &KyberPreKeyRecord,
     ) -> libsignal_protocol::error::Result<()> {
         let bytes = Zeroizing::new(record.serialize()?);
-        self.write()?.put(id_key(keys::KYBER_PREKEY, u32::from(id)), &bytes);
+        self.write()?
+            .put(id_key(keys::KYBER_PREKEY, u32::from(id)), &bytes);
         Ok(())
     }
 
@@ -337,7 +377,11 @@ mod tests {
     use rand::rngs::OsRng;
 
     fn store() -> VeilStore<MemoryBackend> {
-        VeilStore::new(MemoryBackend::new(), IdentityKeyPair::generate(&mut OsRng.unwrap_err()), 7)
+        VeilStore::new(
+            MemoryBackend::new(),
+            IdentityKeyPair::generate(&mut OsRng.unwrap_err()),
+            7,
+        )
     }
 
     #[test]
@@ -345,13 +389,19 @@ mod tests {
         let mut s = store();
         s.put(b"a".to_vec(), b"1");
         assert!(s.has_pending());
-        assert_eq!(s.get(b"a").ok().flatten().map(|v| v.to_vec()), Some(b"1".to_vec()));
+        assert_eq!(
+            s.get(b"a").ok().flatten().map(|v| v.to_vec()),
+            Some(b"1".to_vec())
+        );
         s.rollback();
         assert_eq!(s.get(b"a").ok().flatten(), None);
         s.put(b"a".to_vec(), b"2");
         assert!(s.commit().is_ok());
         assert!(!s.has_pending());
-        assert_eq!(s.backend().get(b"a").ok().flatten().map(|v| v.to_vec()), Some(b"2".to_vec()));
+        assert_eq!(
+            s.backend().get(b"a").ok().flatten().map(|v| v.to_vec()),
+            Some(b"2".to_vec())
+        );
         s.delete(b"a".to_vec());
         assert_eq!(s.get(b"a").ok().flatten(), None, "uncommitted delete hides value");
         s.rollback();
@@ -377,13 +427,25 @@ mod tests {
             let k1 = *IdentityKeyPair::generate(&mut OsRng.unwrap_err()).identity_key();
             let k2 = *IdentityKeyPair::generate(&mut OsRng.unwrap_err()).identity_key();
             // Unknown peer: untrusted, and save_identity refuses (no TOFU inside libsignal).
-            assert_eq!(s.is_trusted_identity(&addr, &k1, Direction::Receiving).await.ok(), Some(false));
+            assert_eq!(
+                s.is_trusted_identity(&addr, &k1, Direction::Receiving).await.ok(),
+                Some(false)
+            );
             assert!(s.save_identity(&addr, &k1).await.is_err());
             // Explicitly recorded: trusted, and a different key is not.
             cell.borrow_mut().set_peer_identity(addr.name(), &k1);
-            assert_eq!(s.is_trusted_identity(&addr, &k1, Direction::Sending).await.ok(), Some(true));
-            assert_eq!(s.is_trusted_identity(&addr, &k2, Direction::Sending).await.ok(), Some(false));
-            assert!(s.save_identity(&addr, &k2).await.is_err(), "never overwrite silently");
+            assert_eq!(
+                s.is_trusted_identity(&addr, &k1, Direction::Sending).await.ok(),
+                Some(true)
+            );
+            assert_eq!(
+                s.is_trusted_identity(&addr, &k2, Direction::Sending).await.ok(),
+                Some(false)
+            );
+            assert!(
+                s.save_identity(&addr, &k2).await.is_err(),
+                "never overwrite silently"
+            );
         });
     }
 }

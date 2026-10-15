@@ -1,0 +1,59 @@
+[package]
+name = "veil-core-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.10"
+veil-core = { path = ".." }
+futures-executor = "=0.3.34"
+rand = "=0.9.5"
+
+[workspace]
+
+[[bin]]
+name = "envelope_unframe"
+path = "fuzz_targets/envelope_unframe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "content_decode"
+path = "fuzz_targets/content_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "invite_link"
+path = "fuzz_targets/invite_link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_header"
+path = "fuzz_targets/vault_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ice_sdp"
+path = "fuzz_targets/ice_sdp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "account_open"
+path = "fuzz_targets/account_open.rs"
+test = false
+doc = false
+bench = false

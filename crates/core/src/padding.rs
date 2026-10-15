@@ -18,7 +18,11 @@ pub const ENVELOPE_BUCKETS: [usize; 4] = [1024, 4096, 16_384, 65_536];
 /// Always adds at least one byte, so the padding is unambiguous.
 pub fn pad_block(data: &[u8]) -> Vec<u8> {
     let target = data.len().div_ceil(BLOCK).max(1).saturating_mul(BLOCK);
-    let target = if target == data.len() { target.saturating_add(BLOCK) } else { target };
+    let target = if target == data.len() {
+        target.saturating_add(BLOCK)
+    } else {
+        target
+    };
     let mut out = Vec::with_capacity(target);
     out.extend_from_slice(data);
     out.push(0x80);
@@ -28,7 +32,7 @@ pub fn pad_block(data: &[u8]) -> Vec<u8> {
 
 /// Removes ISO/IEC 7816-4 padding added by [`pad_block`]. Rejects any other shape.
 pub fn unpad_block(data: &[u8]) -> Result<&[u8]> {
-    if data.is_empty() || data.len() % BLOCK != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(BLOCK) {
         return Err(CoreError::Malformed);
     }
     let marker = data.iter().rposition(|&b| b != 0).ok_or(CoreError::Malformed)?;
@@ -41,7 +45,11 @@ pub fn unpad_block(data: &[u8]) -> Result<&[u8]> {
 
 /// Smallest envelope bucket that fits `len` bytes, or `TooLarge`.
 pub fn bucket_for(len: usize) -> Result<usize> {
-    ENVELOPE_BUCKETS.iter().copied().find(|&b| b >= len).ok_or(CoreError::TooLarge)
+    ENVELOPE_BUCKETS
+        .iter()
+        .copied()
+        .find(|&b| b >= len)
+        .ok_or(CoreError::TooLarge)
 }
 
 /// Padmé: the padded length for an attachment of `len` bytes.

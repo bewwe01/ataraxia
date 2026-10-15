@@ -27,6 +27,7 @@ base64.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+zeroize.workspace = true
 futures-executor.workspace = true
 
 [lints]

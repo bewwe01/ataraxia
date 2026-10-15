@@ -8,11 +8,11 @@ use core::cell::RefCell;
 use std::time::{Duration, SystemTime};
 
 use libsignal_protocol::{
-    CiphertextMessage, CiphertextMessageType, DeviceId, GenericSignedPreKey as _, IdentityKey, IdentityKeyPair,
-    IdentityKeyStore as _, KeyPair, KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle, PreKeyRecord,
-    PreKeySignalMessage, PreKeyStore as _, ProtocolAddress, PublicKey, SenderCertificate, ServerCertificate,
-    SignalMessage, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem, message_decrypt, process_prekey_bundle,
-    sealed_sender_decrypt_to_usmc, sealed_sender_encrypt,
+    CiphertextMessage, CiphertextMessageType, DeviceId, GenericSignedPreKey as _, IdentityKey,
+    IdentityKeyPair, IdentityKeyStore as _, KeyPair, KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle,
+    PreKeyRecord, PreKeySignalMessage, PreKeyStore as _, ProtocolAddress, PublicKey, SenderCertificate,
+    ServerCertificate, SignalMessage, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem,
+    message_decrypt, process_prekey_bundle, sealed_sender_decrypt_to_usmc, sealed_sender_encrypt,
 };
 use prost::Message as _;
 use rand::{CryptoRng, Rng};
@@ -68,7 +68,12 @@ pub enum Opened {
     Message { from: Address, content: Content },
     /// Someone redeemed one of our invites. The caller creates the contact
     /// (initially unverified unless a mutual in-person scan confirms the key).
-    NewContact { from: Address, identity: IdentityKey, intro: ContactIntro, invite_mode: InviteMode },
+    NewContact {
+        from: Address,
+        identity: IdentityKey,
+        intro: ContactIntro,
+        invite_mode: InviteMode,
+    },
 }
 
 /// Stored metadata for an invite we issued.
@@ -96,7 +101,9 @@ pub struct Account<B: KvBackend> {
 
 impl<B: KvBackend> core::fmt::Debug for Account<B> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Account").field("address", &self.identity.address()).finish_non_exhaustive()
+        f.debug_struct("Account")
+            .field("address", &self.identity.address())
+            .finish_non_exhaustive()
     }
 }
 
@@ -105,7 +112,9 @@ fn device() -> Result<DeviceId> {
 }
 
 fn system_time(now: u64) -> SystemTime {
-    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(now)).unwrap_or(SystemTime::UNIX_EPOCH)
+    SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(now))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 fn timestamp(now: u64) -> Timestamp {
@@ -141,7 +150,10 @@ impl<B: KvBackend> Account<B> {
 
     fn assemble(backend: B, identity: Identity, reg_id: u32) -> Self {
         let pair: IdentityKeyPair = *identity.key_pair();
-        Self { identity, store: RefCell::new(VeilStore::new(backend, pair, reg_id)) }
+        Self {
+            identity,
+            store: RefCell::new(VeilStore::new(backend, pair, reg_id)),
+        }
     }
 
     /// Our identity.
@@ -159,7 +171,10 @@ impl<B: KvBackend> Account<B> {
     }
 
     fn local_address(&self) -> Result<ProtocolAddress> {
-        Ok(ProtocolAddress::new(self.identity.address().as_str().to_owned(), device()?))
+        Ok(ProtocolAddress::new(
+            self.identity.address().as_str().to_owned(),
+            device()?,
+        ))
     }
 
     fn with_store<T>(&self, f: impl FnOnce(&mut VeilStore<B>) -> Result<T>) -> Result<T> {
@@ -225,7 +240,14 @@ impl<B: KvBackend> Account<B> {
             return Err(CoreError::Malformed);
         }
         let expires_at = now.checked_add(ttl_secs).ok_or(CoreError::Malformed)?;
-        let invite = Invite::generate(rng, mode, *self.identity.public(), expires_at, relay_url, relay_spki_sha256)?;
+        let invite = Invite::generate(
+            rng,
+            mode,
+            *self.identity.public(),
+            expires_at,
+            relay_url,
+            relay_spki_sha256,
+        )?;
         let private = *self.identity.key_pair().private_key();
 
         let prekey_id: u32 = rng.random();
@@ -233,8 +255,9 @@ impl<B: KvBackend> Account<B> {
         let kyber_id: u32 = rng.random();
         let ec_otk = KeyPair::generate(rng);
         let signed = KeyPair::generate(rng);
-        let signed_sig =
-            private.calculate_signature(&signed.public_key.serialize(), rng).map_err(|_| CoreError::Protocol)?;
+        let signed_sig = private
+            .calculate_signature(&signed.public_key.serialize(), rng)
+            .map_err(|_| CoreError::Protocol)?;
         let kyber = KyberPreKeyRecord::generate(kem::KeyType::Kyber1024, kyber_id.into(), &private)?;
         let kyber_pub = kyber.public_key()?;
         let kyber_sig = kyber.signature()?;
@@ -260,7 +283,7 @@ impl<B: KvBackend> Account<B> {
             signed_prekey_id: signed_id,
             kyber_prekey_id: kyber_id,
             proof_key: invite.proof_key_bytes()?.to_vec(),
-            mode: mode as u32,
+            mode: mode.to_u32(),
         };
 
         self.transact(async {
@@ -272,7 +295,8 @@ impl<B: KvBackend> Account<B> {
             {
                 return Err(CoreError::Protocol);
             }
-            h.save_pre_key(prekey_id.into(), &PreKeyRecord::new(prekey_id.into(), &ec_otk)).await?;
+            h.save_pre_key(prekey_id.into(), &PreKeyRecord::new(prekey_id.into(), &ec_otk))
+                .await?;
             h.save_signed_pre_key(
                 signed_id.into(),
                 &SignedPreKeyRecord::new(signed_id.into(), timestamp(now), &signed, &signed_sig),
@@ -286,7 +310,10 @@ impl<B: KvBackend> Account<B> {
             })
         })
         .await?;
-        Ok(CreatedInvite { invite, sealed_package })
+        Ok(CreatedInvite {
+            invite,
+            sealed_package,
+        })
     }
 
     /// Redeems someone else's invite (PROTOCOL §4.3).
@@ -312,7 +339,10 @@ impl<B: KvBackend> Account<B> {
         let bundle = PreKeyBundle::new(
             pkg.registration_id,
             device()?,
-            Some((pkg.prekey_id.into(), PublicKey::deserialize(&pkg.prekey_pub).map_err(|_| CoreError::Malformed)?)),
+            Some((
+                pkg.prekey_id.into(),
+                PublicKey::deserialize(&pkg.prekey_pub).map_err(|_| CoreError::Malformed)?,
+            )),
             pkg.signed_prekey_id.into(),
             PublicKey::deserialize(&pkg.signed_prekey_pub).map_err(|_| CoreError::Malformed)?,
             pkg.signed_prekey_sig.clone(),
@@ -345,16 +375,36 @@ impl<B: KvBackend> Account<B> {
                 })?;
                 let mut session = self.handle();
                 let mut ids = self.handle();
-                process_prekey_bundle(&remote, &self.local_address()?, &mut session, &mut ids, &bundle, system_time(now), rng)
-                    .await?;
+                process_prekey_bundle(
+                    &remote,
+                    &self.local_address()?,
+                    &mut session,
+                    &mut ids,
+                    &bundle,
+                    system_time(now),
+                    rng,
+                )
+                .await?;
                 self.seal_in_tx(rng, &remote, &content, now).await
             })
             .await?;
-        Ok(Redeemed { contact, contact_identity: ik, contact_mailbox_id, contact_delivery_token, envelope })
+        Ok(Redeemed {
+            contact,
+            contact_identity: ik,
+            contact_mailbox_id,
+            contact_delivery_token,
+            envelope,
+        })
     }
 
     /// Seals `content` for an existing contact (PROTOCOL §6.1).
-    pub async fn seal<R: Rng + CryptoRng>(&self, rng: &mut R, to: &Address, content: &Content, now: u64) -> Result<Vec<u8>> {
+    pub async fn seal<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        to: &Address,
+        content: &Content,
+        now: u64,
+    ) -> Result<Vec<u8>> {
         content.validate()?;
         if self.contact_identity(to)?.is_none() {
             return Err(CoreError::NoSession);
@@ -374,7 +424,16 @@ impl<B: KvBackend> Account<B> {
         let cert = self.sender_certificate(rng, now)?;
         let mut session = self.handle();
         let mut ids = self.handle();
-        let sealed = sealed_sender_encrypt(remote, &cert, &plaintext, &mut session, &mut ids, system_time(now), rng).await?;
+        let sealed = sealed_sender_encrypt(
+            remote,
+            &cert,
+            &plaintext,
+            &mut session,
+            &mut ids,
+            system_time(now),
+            rng,
+        )
+        .await?;
         envelope::frame(&sealed)
     }
 
@@ -441,7 +500,10 @@ impl<B: KvBackend> Account<B> {
                     if let Some(Body::ContactIntro(intro)) = &content.body {
                         self.consume_invite_if_proven(intro, &sender_ik, now)?;
                     }
-                    Ok(Opened::Message { from: from.clone(), content })
+                    Ok(Opened::Message {
+                        from: from.clone(),
+                        content,
+                    })
                 })
                 .await
             }
@@ -468,12 +530,17 @@ impl<B: KvBackend> Account<B> {
                     let proof = intro.invite_proof.as_deref().ok_or(CoreError::InviteInvalid)?;
                     verify_proof(&record.proof_key, &invite_id, &sender_ik, proof)?;
                     self.delete_invite(&invite_id, &record);
-                    let invite_mode = if record.mode == InviteMode::InPerson as u32 {
+                    let invite_mode = if record.mode == InviteMode::InPerson.to_u32() {
                         InviteMode::InPerson
                     } else {
                         InviteMode::Remote
                     };
-                    Ok(Opened::NewContact { from: from.clone(), identity: sender_ik, intro: intro.clone(), invite_mode })
+                    Ok(Opened::NewContact {
+                        from: from.clone(),
+                        identity: sender_ik,
+                        intro: intro.clone(),
+                        invite_mode,
+                    })
                 })
                 .await
             }
@@ -493,13 +560,28 @@ impl<B: KvBackend> Account<B> {
         let mut kyber = self.handle();
         let local = self.local_address()?;
         let padded = Zeroizing::new(
-            message_decrypt(ciphertext, remote, &local, &mut session, &mut ids, &mut pre, &signed, &mut kyber, rng).await?,
+            message_decrypt(
+                ciphertext,
+                remote,
+                &local,
+                &mut session,
+                &mut ids,
+                &mut pre,
+                &signed,
+                &mut kyber,
+                rng,
+            )
+            .await?,
         );
         Content::decode_strict(unpad_block(&padded)?)
     }
 
-    /// Finds the live invite whose one-time prekeys this PreKey message uses.
-    fn find_invite_for(&self, msg: &PreKeySignalMessage, now: u64) -> Result<Option<(Vec<u8>, InviteRecordPb)>> {
+    /// Finds the live invite whose one-time prekeys this `PreKey` message uses.
+    fn find_invite_for(
+        &self,
+        msg: &PreKeySignalMessage,
+        now: u64,
+    ) -> Result<Option<(Vec<u8>, InviteRecordPb)>> {
         let signed_id = u32::from(msg.signed_pre_key_id());
         let kyber_id = msg.kyber_pre_key_id().map(u32::from);
         let pre_id = msg.pre_key_id().map(u32::from);
@@ -541,7 +623,10 @@ impl<B: KvBackend> Account<B> {
         if let Ok(mut s) = self.store.try_borrow_mut() {
             s.delete(keys::with(keys::INVITE, id));
             s.delete(keys::with(keys::PREKEY, &rec.prekey_id.to_be_bytes()));
-            s.delete(keys::with(keys::SIGNED_PREKEY, &rec.signed_prekey_id.to_be_bytes()));
+            s.delete(keys::with(
+                keys::SIGNED_PREKEY,
+                &rec.signed_prekey_id.to_be_bytes(),
+            ));
             s.delete(keys::with(keys::KYBER_PREKEY, &rec.kyber_prekey_id.to_be_bytes()));
         }
     }
@@ -549,7 +634,9 @@ impl<B: KvBackend> Account<B> {
     /// Revokes an unused invite: its prekeys are deleted, so it can never be redeemed.
     pub async fn revoke_invite(&self, id: &[u8; 16]) -> Result<()> {
         self.transact(async {
-            let raw = self.with_store(|s| s.get(&keys::with(keys::INVITE, id)))?.ok_or(CoreError::InviteInvalid)?;
+            let raw = self
+                .with_store(|s| s.get(&keys::with(keys::INVITE, id)))?
+                .ok_or(CoreError::InviteInvalid)?;
             let rec = InviteRecordPb::decode(raw.as_slice()).map_err(|_| CoreError::Storage)?;
             self.delete_invite(id, &rec);
             Ok(())
@@ -563,7 +650,9 @@ impl<B: KvBackend> Account<B> {
             let mut removed = 0usize;
             let keys_list = self.with_store(|s| s.keys_with_prefix(keys::INVITE))?;
             for key in keys_list {
-                let Some(raw) = self.with_store(|s| s.get(&key))? else { continue };
+                let Some(raw) = self.with_store(|s| s.get(&key))? else {
+                    continue;
+                };
                 let rec = InviteRecordPb::decode(raw.as_slice()).map_err(|_| CoreError::Storage)?;
                 if now >= rec.expires_at {
                     let id = key.get(keys::INVITE.len()..).ok_or(CoreError::Storage)?.to_vec();
@@ -598,11 +687,13 @@ mod pq_tests {
 
     async fn inner(acc: &Account<MemoryBackend>, env: &[u8]) -> CiphertextMessage {
         let sealed = envelope::unframe(env).unwrap();
-        let usmc = sealed_sender_decrypt_to_usmc(sealed, &acc.handle()).await.unwrap();
+        let usmc = sealed_sender_decrypt_to_usmc(sealed, &acc.handle())
+            .await
+            .unwrap();
         match usmc.msg_type().unwrap() {
-            CiphertextMessageType::PreKey => {
-                CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::try_from(usmc.contents().unwrap()).unwrap())
-            }
+            CiphertextMessageType::PreKey => CiphertextMessage::PreKeySignalMessage(
+                PreKeySignalMessage::try_from(usmc.contents().unwrap()).unwrap(),
+            ),
             CiphertextMessageType::Whisper => {
                 CiphertextMessage::SignalMessage(SignalMessage::try_from(usmc.contents().unwrap()).unwrap())
             }
@@ -617,11 +708,28 @@ mod pq_tests {
             let alice = Account::create(MemoryBackend::new(), &mut rng).unwrap();
             let bob = Account::create(MemoryBackend::new(), &mut rng).unwrap();
             let c = bob
-                .create_invite(&mut rng, InviteMode::Remote, "wss://r.example", [0; 32], [1; 32], [2; 32], NOW, 600)
+                .create_invite(
+                    &mut rng,
+                    InviteMode::Remote,
+                    "wss://r.example",
+                    [0; 32],
+                    [1; 32],
+                    [2; 32],
+                    NOW,
+                    600,
+                )
                 .await
                 .unwrap();
-            let intro = IntroFields { mailbox_id: [5; 32], delivery_token: [6; 32], display_name: None, rekey: None };
-            let red = alice.redeem_invite(&mut rng, &c.invite, &c.sealed_package, intro, NOW).await.unwrap();
+            let intro = IntroFields {
+                mailbox_id: [5; 32],
+                delivery_token: [6; 32],
+                display_name: None,
+                rekey: None,
+            };
+            let red = alice
+                .redeem_invite(&mut rng, &c.invite, &c.sealed_package, intro, NOW)
+                .await
+                .unwrap();
             // INV-CRY-1: first message is v4 with an ML-KEM (Kyber1024) ciphertext.
             match inner(&bob, &red.envelope).await {
                 CiphertextMessage::PreKeySignalMessage(m) => {
@@ -630,17 +738,30 @@ mod pq_tests {
                 }
                 _ => panic!("first message must be PreKey"),
             }
-            assert!(matches!(bob.open(&mut rng, &red.envelope, NOW).await, Ok(Opened::NewContact { .. })));
+            assert!(matches!(
+                bob.open(&mut rng, &red.envelope, NOW).await,
+                Ok(Opened::NewContact { .. })
+            ));
             // INV-CRY-2: every subsequent message carries SPQR (post-quantum ratchet) data.
             let mut with_spqr = 0;
             for i in 0..20 {
-                let (from, to) = if i % 2 == 0 { (&bob, &alice) } else { (&alice, &bob) };
+                let (from, to) = if i % 2 == 0 {
+                    (&bob, &alice)
+                } else {
+                    (&alice, &bob)
+                };
                 let content = Content {
                     id: random_id(&mut rng),
                     sent_at_ms: 0,
-                    body: Some(Body::Text(Text { body: format!("{i}"), ..Default::default() })),
+                    body: Some(Body::Text(Text {
+                        body: format!("{i}"),
+                        ..Default::default()
+                    })),
                 };
-                let env = from.seal(&mut rng, &to.identity().address(), &content, NOW).await.unwrap();
+                let env = from
+                    .seal(&mut rng, &to.identity().address(), &content, NOW)
+                    .await
+                    .unwrap();
                 match inner(to, &env).await {
                     CiphertextMessage::SignalMessage(m) => {
                         assert!(m.message_version() >= MIN_MESSAGE_VERSION);
@@ -649,7 +770,9 @@ mod pq_tests {
                         }
                     }
                     // Alice's first reply-direction message may still be PreKey until Bob answers.
-                    CiphertextMessage::PreKeySignalMessage(m) => assert!(m.message_version() >= MIN_MESSAGE_VERSION),
+                    CiphertextMessage::PreKeySignalMessage(m) => {
+                        assert!(m.message_version() >= MIN_MESSAGE_VERSION);
+                    }
                     _ => panic!("unexpected"),
                 }
                 assert!(to.open(&mut rng, &env, NOW).await.is_ok());

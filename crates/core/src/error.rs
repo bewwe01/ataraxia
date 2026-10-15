@@ -78,9 +78,7 @@ impl From<SignalProtocolError> for CoreError {
             E::UnrecognizedMessageVersion(_)
             | E::UnrecognizedCiphertextVersion(_)
             | E::LegacyCiphertextVersion(_)
-            | E::UnknownSealedSenderVersion(_) => {
-                Self::UnsupportedVersion
-            }
+            | E::UnknownSealedSenderVersion(_) => Self::UnsupportedVersion,
             _ => Self::Protocol,
         }
     }
