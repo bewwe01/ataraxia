@@ -1,0 +1,14 @@
+{
+  "name": "veil-design-tools",
+  "private": true,
+  "type": "module",
+  "description": "Screenshot capture and automated checks for the Veil design prototype (dev-only; never shipped).",
+  "scripts": {
+    "capture": "node capture.mjs",
+    "check": "node check.mjs"
+  },
+  "devDependencies": {
+    "axe-core": "4.10.3",
+    "playwright": "1.56.1"
+  }
+}

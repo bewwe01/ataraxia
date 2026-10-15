@@ -1,0 +1,56 @@
+/* Mobile shell: single pane + bottom navigation.
+ * On wide viewports the 390×844 device is framed and centred for review. */
+.stage { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg-0); }
+.device { position: relative; width: 100%; height: 100%; overflow: hidden; isolation: isolate; container-type: inline-size; }
+@media (min-width: 600px) and (min-height: 700px) {
+  .stage { background: radial-gradient(60% 60% at 50% 40%, var(--bg-2), var(--bg-0)); }
+  .device { width: 390px; height: min(844px, calc(100vh - 48px)); border-radius: 48px; box-shadow: var(--shadow-3), 0 0 0 1px var(--border-default), 0 0 0 10px var(--bg-0), 0 0 0 11px var(--border-default); }
+}
+#app { position: relative; z-index: 1; height: 100%; }
+.m-screen { position: absolute; inset: 0; display: flex; flex-direction: column; animation: fade-in var(--dur-base) var(--ease-out) both; }
+.m-body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-bottom: var(--space-4); }
+.m-screen.tab .m-body { padding-bottom: calc(var(--bottom-nav-h) + var(--space-8)); }
+.m-pad { padding: 0 var(--space-4); }
+
+/* App bar (tab roots) */
+.m-appbar { display: flex; align-items: center; gap: var(--space-1); min-height: 64px; padding: var(--space-4) var(--space-3) 0 var(--space-5); }
+.m-appbar h1 { font-size: var(--text-2xl); font-weight: var(--weight-bold); letter-spacing: var(--tracking-display); }
+.m-search { padding: var(--space-2) var(--space-4) var(--space-1); }
+.m-loading-note { display: flex; align-items: center; gap: 6px; padding: var(--space-3) var(--space-5); color: var(--text-2); font-size: var(--text-sm); }
+
+/* Top bar (pushed screens) */
+.m-topbar { display: flex; align-items: center; gap: var(--space-1); min-height: 56px; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border-subtle); position: relative; z-index: var(--z-sticky); }
+.m-topbar h1 { font-size: var(--text-md); font-weight: var(--weight-semibold); letter-spacing: var(--tracking-tight); }
+
+/* Bottom navigation */
+.m-nav { position: absolute; left: var(--space-3); right: var(--space-3); bottom: var(--space-3); z-index: var(--z-nav); border-radius: var(--radius-xl); border: 1px solid var(--border-default); box-shadow: var(--shadow-3); }
+.m-nav ul { display: flex; padding: 6px; }
+.m-nav li { flex: 1; }
+.m-nav a { display: grid; justify-items: center; gap: 2px; min-height: 52px; padding: 6px 0 4px; border-radius: var(--radius-lg); font-size: var(--text-xs); font-weight: var(--weight-semibold); color: var(--text-2); position: relative; transition: transform var(--dur-fast) var(--ease-out); }
+.m-nav a:active { transform: scale(0.94); }
+.m-nav a[aria-current="page"] { color: var(--text-1); background: var(--accent-soft); }
+.m-nav a[aria-current="page"] .icon { color: var(--accent); }
+.m-nav .nav-ic { position: relative; display: inline-grid; }
+.m-nav .nav-badge { position: absolute; top: -6px; left: 14px; min-width: 20px; height: 18px; font-size: 10px; }
+.m-fab { position: absolute; right: var(--space-5); bottom: calc(var(--bottom-nav-h) + var(--space-8)); z-index: var(--z-nav); width: 56px; height: 56px; border-radius: 20px; }
+.m-fab::before { border-radius: 20px; }
+
+/* Chat screen */
+.chat-screen .chat-hdr { padding-left: var(--space-1); }
+.chat-screen .composer { padding-bottom: var(--space-4); }
+
+/* Full-bleed screens */
+.m-screen.full { overflow-y: auto; }
+.onb-screen .onb { padding-top: var(--space-5); }
+.m-screen.full > .verified-view { margin: auto; }
+.call-screen .call { min-height: 100%; }
+.call-screen .call-top { padding-top: var(--space-10); }
+
+/* Push screens with dialog */
+.m-screen .scrim { padding: var(--space-4); }
+.m-screen .dialog { width: 100%; }
+.m-screen .pairing { padding: var(--space-4) var(--space-4) var(--space-8); }
+
+/* Mobile list tweaks */
+.m-body .conv { margin: 0 var(--space-2); }
+.m-body .state { min-height: 70%; }
