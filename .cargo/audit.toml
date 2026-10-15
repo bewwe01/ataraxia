@@ -1,0 +1,7 @@
+# cargo-audit policy. Keep in sync with deny.toml [advisories]: every ignore needs a reason and review date.
+[advisories]
+ignore = [
+    # proc-macro-error2: unmaintained, not vulnerable. Build-time proc-macro only, via
+    # hax-lib-macros <- libcrux-* <- libsignal/spqr. Review: 2027-01-15.
+    "RUSTSEC-2026-0173",
+]

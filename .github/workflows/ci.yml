@@ -40,7 +40,7 @@ jobs:
       - run: cargo test --workspace --locked
 
   supply-chain:
-    name: cargo deny + audit + secret scan
+    name: cargo deny + audit + vet + secret scan
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -53,8 +53,10 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
           cargo install cargo-deny --version 0.20.2 --locked
           cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-vet --version 0.10.2 --locked
       - run: cargo deny --locked check
       - run: cargo audit --deny warnings
+      - run: cargo vet --locked
       - name: Secret scan (gitleaks, checksum-verified release)
         run: |
           V=8.30.1
