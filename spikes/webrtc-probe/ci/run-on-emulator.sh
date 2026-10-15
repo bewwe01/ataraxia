@@ -19,6 +19,8 @@ for _ in $(seq 1 90); do
   sleep 2
 done
 adb logcat -d > "$OUT/logcat-full.txt" || true
+echo "=== relevant logcat (VeilProbe / chromium / Tauri / crashes)"
+grep -E "VeilProbe|chromium|Tauri|RustStdoutStderr|AndroidRuntime|FATAL|webrtcprobe" "$OUT/logcat-full.txt" | tail -60 || true
 echo "$result" | tee "$OUT/probe-result.txt"
 adb shell screencap -p /sdcard/probe.png && adb pull /sdcard/probe.png "$OUT/probe-screen.png" || true
 

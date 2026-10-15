@@ -1,5 +1,7 @@
 // Veil Phase 1 spike: what WebRTC does this webview actually provide?
 "use strict";
+window.addEventListener("error", (e) => { try { invoke("report", { result: JSON.stringify({ jsError: String(e.message), at: e.filename + ":" + e.lineno }) }); } catch (_) { /* no bridge */ } });
+window.addEventListener("unhandledrejection", (e) => { try { invoke("report", { result: JSON.stringify({ unhandledRejection: String(e.reason) }) }); } catch (_) { /* no bridge */ } });
 function invoke(cmd, args) {
   return window.__TAURI__.core.invoke(cmd, args);
 }
