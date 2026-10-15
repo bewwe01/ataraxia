@@ -256,6 +256,19 @@ mod tests {
         assert_eq!(&out[..], data);
     }
 
+    /// INV-CRY-5: one million fresh attachment keys never repeat a key or a STREAM nonce prefix.
+    #[test]
+    fn keys_and_nonce_prefixes_unique() {
+        let mut rng = OsRng.unwrap_err();
+        let mut keys = std::collections::HashSet::new();
+        let mut prefixes = std::collections::HashSet::new();
+        for _ in 0..1_000_000 {
+            let k = AttachmentKey::generate(&mut rng);
+            assert!(keys.insert(*k.key));
+            assert!(prefixes.insert(*k.nonce_prefix()));
+        }
+    }
+
     #[test]
     fn sizes() {
         for n in [0, 1, 100, CHUNK - 1, CHUNK, CHUNK + 1, 3 * CHUNK + 17] {

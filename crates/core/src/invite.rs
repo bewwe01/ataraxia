@@ -439,6 +439,18 @@ mod tests {
         assert!(inv.open_package(&sealed[..sealed.len() - 1]).is_err());
     }
 
+    /// INV-CRY-5: re-sealing under the same invite key always draws a fresh 192-bit nonce.
+    #[test]
+    fn package_nonces_unique() {
+        let inv = invite();
+        let mut rng = OsRng.unwrap_err();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2_000 {
+            let sealed = inv.seal_package(&mut rng, &pkg()).unwrap();
+            assert!(seen.insert(sealed[..NONCE_LEN].to_vec()));
+        }
+    }
+
     #[test]
     fn package_bound_to_invite_identity_and_id() {
         let a = invite();

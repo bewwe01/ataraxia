@@ -2,10 +2,8 @@
 # has working WebRTC, and does libsignal build and pass its checks on Android?
 name: spike-android
 
+# Manual only since Phase 2: the spike is concluded (docs/SPIKES.md §C).
 on:
-  push:
-    branches: [ccr-1230ecdf-lvfqsm]
-    paths: ["spikes/**", ".github/workflows/spike-android.yml"]
   workflow_dispatch:
 
 permissions:

@@ -77,11 +77,12 @@ Status: **Phase 1 draft, awaiting approval.** Every "protected" claim below poin
 
 | Scenario | Outcome | Where handled |
 |---|---|---|
-| Relay serves a forged prekey bundle | Rejected: the bundle's identity key must equal the identity key in the invite; prekey signatures are checked | PROTOCOL §4.3, INV-PAIR-1 |
+| Relay serves a forged prekey bundle | Impossible to read or forge: bundles travel only inside invite packages sealed under the invite secret, bound to the inviter's identity key; prekey signatures are checked | PROTOCOL §3–4, INV-PAIR-1 |
+| Relay redeems a leaked invite id | Fails: it never saw the one-time public keys, and cannot produce the HMAC proof without the invite secret | INV-PAIR-4 |
 | Relay replays an old envelope | libsignal rejects the duplicate message key (Spike A: `DuplicatedMessage`) | INV-MSG-3 |
 | Relay withholds messages | Detected via missing delivery receipts and `server_seq` gaps; not preventable | PROTOCOL §11 |
 | Relay MITMs a call | Fails: DTLS fingerprint comes from authenticated signaling | INV-NET-4 |
-| Contact's key changes (reinstall or attack) | Messages held, sending paused, loud warning; never auto-accepted | INV-ID-2 |
+| Contact's key changes (reinstall or attack) | Structurally impossible in place: addresses are hashes of identity keys, so a new key is a new, unverified contact. The UI warns when a new identity claims an existing name, and never merges automatically | INV-ID-2, PROTOCOL §5 |
 | Malformed message from a contact | Strict decoding; size limits; fuzzed parsers; no panic | INV-MSG-5, INV-ROB-1 |
 | XSS in a message | Rendered as plain text; CSP forbids inline script; IPC exposes no secrets | INV-UI-1…3 |
 | Link-preview IP leak | Previews off by default; when on, fetched by Rust with a fixed User-Agent, no cookies, and only after a warning | INV-UI-4 |

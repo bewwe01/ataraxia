@@ -43,53 +43,74 @@ A **mailbox** is where others deposit envelopes for you.
 
 ## 3. Prekeys
 
-The PQXDH bundle (libsignal `PreKeyBundle`) contains:
-- the identity key;
-- a **signed EC prekey** (rotated weekly);
-- a **signed Kyber1024 last-resort prekey** (rotated weekly) and up to 50 **signed one-time Kyber prekeys**;
-- up to 100 **one-time EC prekeys**.
+**Prekey bundles never reach the relay in readable form.** A bundle contains the identity key, so uploading one under a mailbox would let the relay link an identity to a mailbox (INV-META-1). Instead:
 
-- Bundles are uploaded to the relay under the owner's mailbox (authenticated as in §2). They are served **only** to holders of a valid invite (§4) or delivery token. That blocks enumeration and prekey draining by strangers.
-- Clients MUST verify both prekey signatures (libsignal does: Spike A shows a forged Kyber signature is rejected) and MUST reject sessions whose first message is not message version ≥ 4 (PQ-capable). **No downgrade to non-PQ X3DH** (INV-CRY-3).
-- One-time keys are deleted by the recipient on use (libsignal), and the relay deletes a served one-time key immediately.
+- Every invite (§4) carries its **own** PQXDH bundle, sealed inside the invite package:
+  - one one-time EC prekey;
+  - one signed EC prekey;
+  - one **signed one-time Kyber1024** prekey;
+  - the identity key.
+  
+  All ids are random 32-bit values. The inviter refuses to create an invite whose ids collide with existing keys.
+- There are no last-resort keys. A redemption consumes the invite's one-time keys (libsignal deletes the EC one-time key; Veil deletes the Kyber key on use), and the inviter then deletes the signed prekey and the invite record. Expired or revoked invites have all their prekeys deleted (`sweep_expired_invites`, `revoke_invite`).
+- **Re-keying** (after a restore from backup, §12) uses a **standing re-key invite** that each side hands the other inside its E2EE `ContactIntro.rekey`. It is consumed like any invite and replaced afterwards.
+- Clients MUST verify both prekey signatures (libsignal does; Spike A and the session tests show a forged Kyber signature is rejected). They MUST reject any session message below libsignal message version 4, and any `PreKeySignalMessage` without a Kyber prekey id. **No downgrade to non-PQ X3DH** (INV-CRY-3).
 
 ## 4. Invites and pairing
 
 ### 4.1 Invite payload (QR code or link)
 
+Fixed binary layout, big-endian, then base64url without padding (`crates/core/src/invite.rs`):
+
 ```
-Invite = {
-  v:        1,
-  ik:       identity_pub (33 bytes),
-  relay:    { url: "wss://relay.example.org", spki_sha256: 32 bytes },   // pin
-  id:       16 random bytes,        // invite_id (relay lookup key)
-  secret:   32 random bytes,        // never sent to the relay
-  exp:      unix seconds (default now + 24 h),
-  mode:     in_person | remote
-}
-link = "veil://i/" || base64url(canonical CBOR(Invite))       // ≈ 160 bytes → QR version ≈ 10, error correction M
+v (1) = 1 | mode (1: 0 = in person, 1 = remote) | ik (33) | id (16) | secret (32)
+  | expires_at (u64) | relay_spki_sha256 (32) | url_len (1) | relay_url (url_len, "wss://…", ≤ 200 B)
+link = "veil://i/" || base64url(…)        // ≈ 230 characters → QR version ≈ 10, error correction M
 ```
+
+Parsing is strict:
+- the length is checked before decoding (≤ 512 characters);
+- unknown versions are rejected (`UnsupportedVersion`);
+- trailing bytes are rejected;
+- the URL must be printable ASCII starting `wss://`.
 
 ### 4.2 Publishing
 
-The inviter derives `k_inv = HKDF-SHA-256(ikm = secret, salt = "veil/v1/invite", info = id)` and uploads to the relay, keyed by `id`:
-
 ```
-sealed_invite = XChaCha20-Poly1305(k_inv, nonce = random 24 B, aad = "veil/v1/invite" || id || ik,
-                  plaintext = { prekey_bundle, mailbox_id, delivery_token_for_redeemer, padding to 4 KiB })
+prk        = HKDF-Extract(salt = "veil/v1/invite", ikm = secret)
+k_package  = HKDF-Expand(prk, info = "veil/v1/invite-key"   || id, 32)
+k_proof    = HKDF-Expand(prk, info = "veil/v1/invite-proof" || id, 32)
+package    = protobuf { registration_id, prekey/signed-prekey/kyber-prekey ids, public keys and signatures,
+                        identity_key, mailbox_id, delivery_token }, ISO/IEC 7816-4-padded to exactly 4096 bytes
+sealed     = nonce (24, random) || XChaCha20-Poly1305(k_package, nonce, aad = "veil/v1/invite" || id || ik, package)
 ```
 
-The relay stores it with **TTL = exp** and **deletes it on first successful fetch** (single use, INV-PAIR-2). The relay cannot read it: it never sees `secret`.
+`sealed` is exactly **4136 bytes**. The relay stores it under `id` with **TTL = expires_at** and **deletes it on first successful fetch** (single use, INV-PAIR-2). It never sees `secret`, so it can read neither the bundle nor the identity key. The inviter stores only `k_proof`, the prekey ids, the expiry and the mode, not the secret.
 
 ### 4.3 Redeeming
 
-1. Scan the QR or open the link → fetch `sealed_invite` by `id` from the pinned relay → decrypt with `k_inv`. Failure means the invite is invalid or expired; show a generic error.
-2. MUST check `prekey_bundle.identity_key == Invite.ik` (binds the bundle to the identity in the QR/link; INV-PAIR-1).
-3. libsignal `process_prekey_bundle` (signature checks, PQXDH).
-4. Send the first message: a sealed-sender `PreKeySignalMessage` (§6) to the inviter's mailbox using `delivery_token_for_redeemer`. Its `Content` is a `ContactIntro { my_mailbox_id, my_delivery_token_for_you, display_name? }`.
-5. The inviter receives it, establishes the session, stores the contact, and replies with its own `ContactIntro` ack.
+1. Parse the link. Fetch `sealed` by `id` from the pinned relay and open it with `k_package`. Any failure means "invalid or expired"; show a generic error.
+2. MUST check `package.identity_key == Invite.ik`. The AEAD's associated data already binds the package to `ik` and `id`, and this explicit check makes the binding visible (INV-PAIR-1).
+3. Record the inviter's identity, then run libsignal `process_prekey_bundle` (signature checks, PQXDH).
+4. Send the first message: a sealed-sender `PreKeySignalMessage` (§6) to the inviter's mailbox, using the package's delivery token. Its `Content` is:
+
+   ```
+   ContactIntro { mailbox_id, delivery_token, display_name?, invite_id = id,
+                  invite_proof = HMAC-SHA-256(k_proof, "veil/v1/invite-proof" || id || redeemer_identity_key),
+                  rekey? }
+   ```
+5. The inviter's `open` sees an unknown sender and proceeds **only if all of these hold**:
+   - the message is a `PreKey` message whose EC, signed and Kyber prekey ids are exactly those of one live, unexpired invite;
+   - inside a store transaction, the sender's identity is recorded *provisionally* and the message decrypts;
+   - the content is a `ContactIntro` naming that invite;
+   - the proof verifies in constant time against the sender's authenticated identity key (INV-PAIR-4).
+
+   Then the invite is consumed and the transaction commits; otherwise everything rolls back. A relay that knows `id` but not `secret` can forge neither the decryption (it never saw the one-time public keys) nor the proof.
+6. The inviter replies with its own `ContactIntro` (no invite fields) over the new session.
 
 ### 4.4 Verification state
+
+`crates/core/src/trust.rs` implements this as a pure state machine and tests it exhaustively over every state and event:
 
 | How the contact was added | Initial state |
 |---|---|
@@ -100,39 +121,51 @@ The UI MUST show these states exactly as designed (verified shield vs "Not verif
 
 A leaked invite link lets a third party redeem it. Mitigations:
 - the inviter sees "New contact via invite link · not verified", with the redeemer's safety number;
-- invites are single use with a short expiry, and the user can revoke them from the invite screen (deletes `id` at the relay).
+- invites are single use with a short expiry (≤ 7 days, default 24 h);
+- the user can revoke an invite, which deletes its prekeys locally and its `id` at the relay.
 
 ## 5. Safety numbers and key changes
 
 - Use libsignal `Fingerprint::new(version = 2, iterations = 5200, local_id = addr_local, local_key, remote_id = addr_remote, remote_key)`.
 - Displayable: **60 digits** shown as 12 groups of 5. Scannable: the libsignal protobuf, compared in constant time.
-- **Key change.** Veil's `IdentityKeyStore::is_trusted_identity` returns `false` for any address whose stored key differs: **never auto-accept** (INV-ID-2).
-  - Incoming messages under a new key are **held encrypted** (quarantine), not decrypted or shown.
-  - Sending to that contact is **paused**, and the UI shows the key-changed warning (design: "Lena's safety number changed").
-  - Only after the user reviews the new safety number and accepts does the client `save_identity` and process the held messages.
-  - A previously *verified* contact drops to *unverified* on any change.
+- **Key changes are structurally impossible in place.** An address is a hash of the identity key (§1), so a different key is a different address and therefore a different contact. A contact who reinstalls Veil, or anyone impersonating them, arrives as a **new, unverified contact** via a new invite. The store's identity policy is exact-match-only and never records or overwrites a key on libsignal's behalf, which keeps this true even if libsignal's internals change (INV-ID-2).
+- **The UI's "safety number changed" flow** covers the case where a new identity claims to be an existing contact, for example a matching display name after a reinstall:
+  - the client MUST NOT merge it into the old conversation automatically;
+  - it shows the key-changed warning;
+  - sending stays paused until the user compares safety numbers with the new identity and explicitly links them;
+  - a link never inherits "verified": the trust state machine's `IdentityChanged → ChangeAccepted` path always lands in *Unverified*.
 
 ## 6. Envelopes (what crosses the relay)
 
 ### 6.1 Sealing
 
-1. Serialize `Content` (§7) with `prost`.
-2. Pad with ISO/IEC 7816-4 (`0x80` then `0x00…`) to the next multiple of 256 bytes.
-3. Encrypt with the libsignal session → `CiphertextMessage` (PreKey or Signal message).
-4. Wrap in a sealed sender v1 `UnidentifiedSenderMessageContent` with a **self-issued sender certificate**:
-   - `ServerCertificate` signed by the sender's identity key (the sender is its own trust root; key ID 0);
-   - `SenderCertificate { sender_uuid = addr, device_id = 1, key = identity_pub, expires = now + 30 days }` signed by that server key;
-   - content hint 0, no group ID.
-5. `sealed_sender_encrypt` to the recipient's identity key.
-6. Pad the resulting bytes to a **size bucket** of {**1 KiB, 4 KiB, 16 KiB, 64 KiB**} (INV-META-3). Larger payloads MUST go through attachments (§9).
+1. Validate, then serialize `Content` (§7) with `prost`.
+2. Pad with ISO/IEC 7816-4 (`0x80` then `0x00…`) to the next multiple of 256 bytes (always at least one padding byte).
+3. Wrap in sealed sender v1 with a **self-issued sender certificate** (ADR-0006), issued per message:
+   - a fresh ephemeral signer key;
+   - `ServerCertificate { key_id = 1, key = signer_pub }` signed by the sender's **identity key** (the sender is its own trust root);
+   - `SenderCertificate { sender_uuid = address, device_id = 1, key = identity_pub, expires = now + 30 days }` signed by the signer.
+   
+   `sealed_sender_encrypt` encrypts the padded content with the libsignal session (Triple Ratchet) and seals it to the recipient's identity key.
+4. Frame: `version (1) = 1 || len (u32 BE) || sealed || zero padding`, with the total exactly one of {**1 KiB, 4 KiB, 16 KiB, 64 KiB**}, using the smallest that fits (INV-META-3). Larger payloads MUST go through attachments (§9).
 
 ### 6.2 Unsealing (recipient)
 
-1. `sealed_sender_decrypt_to_usmc`. libsignal checks, in constant time, that the certificate key == the static key authenticated by the outer ECDH.
-2. Look up the contact by `usmc.sender().key()`. **Unknown identity keys are dropped**, except a `PreKey` message that redeems one of our live invites (§4.3).
-3. Validate the certificate chain against **that contact's identity key** as trust root, plus expiry.
-4. Decrypt with libsignal (`message_decrypt_signal` / `_prekey`): ratchet, replay and order checks.
-5. Unpad; strict `prost` decode; drop on any error. No partial processing.
+Every step runs inside a store transaction that commits only on success, so **rejected input never changes state** (INV-STATE-1).
+
+1. Strict unframe:
+   - the size is exactly a bucket and the smallest that fits;
+   - the version is known;
+   - the length is in range;
+   - every padding byte is zero.
+2. `sealed_sender_decrypt_to_usmc`. libsignal checks, in constant time, that the certificate key == the static key authenticated by the outer ECDH.
+3. Derive the sender address from that key, then require:
+   - the certificate names exactly that address and device 1;
+   - it validates with that key as trust root and is unexpired;
+   - the sender is not ourselves.
+4. Require message version ≥ 4; for `PreKey` messages also require a Kyber prekey id.
+5. Known contact (stored key == sender key): decrypt with libsignal, which applies the ratchet, replay and order checks. Unknown sender: only the invite-redemption path of §4.3 step 5 is allowed; anything else is dropped (`UnknownSender`).
+6. Unpad, strict canonical `prost` decode (re-encoding must reproduce the exact bytes), and field validation. Drop on any error; no partial processing.
 
 ### 6.3 Wire form to the relay
 
@@ -157,7 +190,7 @@ The relay stores `{ mailbox_id, server_seq, received_at (rounded to the minute),
 | `Typing` | `started \| stopped` | only if opted in |
 | `TimerUpdate` | `seconds (0 = off)` | per conversation |
 | `Call` | `call_id`, one of `Offer{sdp}`, `Answer{sdp}`, `Ice{candidates[]}`, `Hangup{reason}`, `Busy` | §8 |
-| `ContactIntro` | `mailbox_id`, `delivery_token`, `display_name?` | §4 |
+| `ContactIntro` | `mailbox_id`, `delivery_token`, `display_name?`, `invite_id?` + `invite_proof?` (both or neither), `rekey?` | §3, §4 |
 | `MailboxUpdate` | `new_mailbox_id`, `new_token`, `relay?` | §2 |
 | `SessionReset` | — | after restore (§12) |
 
@@ -173,6 +206,7 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
   - The peer connection uses `iceTransportPolicy: "relay"`.
   - Independently, **Rust filters every outgoing SDP and candidate**: any `a=candidate` / `candidate:` line whose `typ` ≠ `relay` is removed before encryption.
   - Incoming non-relay candidates are dropped too.
+  - Kept candidates have `raddr`/`rport` rewritten to `0.0.0.0 0`. Even a relay candidate's related address can reveal our reflexive or local IP.
   - Tests assert that no non-relay candidate is ever sent (INV-NET-1, the brief's key test).
 - **Direct mode** (per-contact opt-in, warned):
   - host/srflx candidates are allowed, but private, link-local, CGNAT and ULA addresses (RFC 1918, 169.254/16, 100.64/10, fc00::/7, fe80::/10) and mDNS `.local` hosts are filtered;
@@ -216,7 +250,10 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
     - Android: wrapped by a non-exportable AES-256-GCM key in Android Keystore, StrongBox when present;
     - desktop: Keychain / DPAPI-backed Credential Manager / Secret Service.
   - `KEK = HKDF-SHA-256(ikm = pw || dev, salt = vault_id, info = "veil/v1/kek")`.
-- **Vault header** (unencrypted file): `{ v, vault_id, argon2 params, salt, XChaCha20-Poly1305(KEK, nonce, aad = header fields, DB key) }`.
+- **Vault header** (unencrypted file, exactly 124 bytes, `crates/core/src/vault.rs`): `"VEILVLT" | v=1 | vault_id (16) | m_kib, t, p (u32 BE each) | salt (16) | nonce (24) | XChaCha20-Poly1305(KEK, nonce, aad = all preceding header bytes, DB key) (48)`.
+  - The Argon2 parameters are authenticated, so lowering them in the header only makes unlocking fail.
+  - New vaults may not use less than **m = 19 MiB, t = 2** (OWASP's Argon2id minimum); defaults are higher.
+  - Passphrases are limited to 1–1024 bytes, UTF-8 as entered (the UI normalises to NFC).
 - **Biometric unlock** (optional) releases `dev` plus a passphrase-derived key cached in the keystore. The passphrase is required after every restart (design copy), so biometrics only guard warm unlocks.
 - **Auto-lock** zeroizes the DB key and session caches in memory.
 - **Panic wipe**: delete the keystore entry → overwrite and delete the vault header → delete the DB and attachment store. Destroying `dev` and the header crypto-shreds everything, even if file deletion is imperfect on flash storage (INV-REST-3).
