@@ -32,6 +32,7 @@ const MAX_TIMER_SECS: u32 = 4 * 7 * 24 * 3600;
 
 /// Top-level message.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Content {
     /// Random 16-byte message id (idempotency key).
     #[prost(bytes = "vec", tag = "1")]
@@ -45,6 +46,7 @@ pub struct Content {
 
 /// Content variants.
 #[derive(Clone, PartialEq, prost::Oneof)]
+#[prost(skip_debug)]
 pub enum Body {
     #[prost(message, tag = "10")]
     Text(Text),
@@ -73,6 +75,7 @@ pub enum Body {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Text {
     #[prost(string, tag = "1")]
     pub body: String,
@@ -83,6 +86,7 @@ pub struct Text {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Reaction {
     #[prost(bytes = "vec", tag = "1")]
     pub target_id: Vec<u8>,
@@ -93,6 +97,7 @@ pub struct Reaction {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Edit {
     #[prost(bytes = "vec", tag = "1")]
     pub target_id: Vec<u8>,
@@ -101,12 +106,14 @@ pub struct Edit {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Delete {
     #[prost(bytes = "vec", tag = "1")]
     pub target_id: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Attachment {
     #[prost(bytes = "vec", tag = "1")]
     pub blob_id: Vec<u8>,
@@ -143,6 +150,7 @@ pub enum ReceiptKind {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Receipt {
     #[prost(enumeration = "ReceiptKind", tag = "1")]
     pub kind: i32,
@@ -151,18 +159,21 @@ pub struct Receipt {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Typing {
     #[prost(bool, tag = "1")]
     pub started: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct TimerUpdate {
     #[prost(uint32, tag = "1")]
     pub seconds: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Call {
     #[prost(bytes = "vec", tag = "1")]
     pub call_id: Vec<u8>,
@@ -171,6 +182,7 @@ pub struct Call {
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
+#[prost(skip_debug)]
 pub enum CallKind {
     #[prost(string, tag = "10")]
     Offer(String),
@@ -185,6 +197,7 @@ pub enum CallKind {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct IceCandidates {
     #[prost(string, repeated, tag = "1")]
     pub candidates: Vec<String>,
@@ -192,6 +205,7 @@ pub struct IceCandidates {
 
 /// First message of a new contact (PROTOCOL §4.3), and the reply.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct ContactIntro {
     #[prost(bytes = "vec", tag = "1")]
     pub mailbox_id: Vec<u8>,
@@ -211,6 +225,7 @@ pub struct ContactIntro {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct RekeyInvite {
     #[prost(string, tag = "1")]
     pub link: String,
@@ -219,6 +234,7 @@ pub struct RekeyInvite {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct MailboxUpdate {
     #[prost(bytes = "vec", tag = "1")]
     pub new_mailbox_id: Vec<u8>,
@@ -229,6 +245,7 @@ pub struct MailboxUpdate {
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct SessionReset {}
 
 impl Content {
@@ -438,3 +455,23 @@ pub(crate) mod tests {
         }
     }
 }
+
+crate::redacted_debug!(
+    Content,
+    Body,
+    Text,
+    Reaction,
+    Edit,
+    Delete,
+    Attachment,
+    Receipt,
+    Typing,
+    TimerUpdate,
+    Call,
+    CallKind,
+    IceCandidates,
+    ContactIntro,
+    RekeyInvite,
+    MailboxUpdate,
+    SessionReset
+);

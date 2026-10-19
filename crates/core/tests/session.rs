@@ -665,3 +665,255 @@ fn failed_commit_changes_nothing_and_retry_succeeds() {
         }
     });
 }
+
+/// Review round 1, M2: no protobuf type prints its fields. prost's derived `Debug` printed
+/// message text, tokens, proofs, attachment keys and invite secrets (re-key links).
+#[test]
+fn debug_output_never_contains_content_or_secrets() {
+    use veil_core::content::{Attachment, ContactIntro, RekeyInvite};
+    let (alice, bob, _) = paired();
+    let canary = "CANARY-7f3a91";
+    let env = send(&alice, &bob, canary);
+    let opened = block_on(bob.open(&mut rng(), &env, NOW)).unwrap();
+    let printed = format!("{opened:?} {opened:#?}");
+    assert!(!printed.contains(canary), "{printed}");
+    assert!(printed.contains("Content(<redacted>)"), "{printed}");
+
+    let intro = ContactIntro {
+        mailbox_id: vec![0xA1; 32],
+        delivery_token: vec![0xB2; 32],
+        display_name: Some(canary.into()),
+        invite_id: Some(vec![0xC3; 16]),
+        invite_proof: Some(vec![0xD4; 32]),
+        rekey: Some(RekeyInvite {
+            link: format!("veil://i/{canary}"),
+            ..Default::default()
+        }),
+    };
+    let att = Attachment {
+        key: vec![0xE5; 32],
+        file_name: Some(canary.into()),
+        ..Default::default()
+    };
+    for printed in [
+        format!("{intro:?}"),
+        format!("{att:#?}"),
+        format!("{:?}", text(canary)),
+    ] {
+        assert!(!printed.contains(canary), "{printed}");
+        for byte in ["161", "178", "195", "212", "229", "a1", "b2", "e5"] {
+            assert!(!printed.contains(byte), "{printed}");
+        }
+        assert!(printed.ends_with("(<redacted>)"), "{printed}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Hand-built hostile envelopes, using libsignal's public API directly (review round 1, M3).
+// ---------------------------------------------------------------------------------------
+
+mod forged {
+    use super::*;
+    use libsignal_protocol::{
+        CiphertextMessageType, ContentHint, DeviceId, IdentityKey, IdentityKeyPair, IdentityKeyStore as _,
+        InMemSignalProtocolStore, KeyPair, PreKeySignalMessage, ProtocolAddress, SenderCertificate,
+        ServerCertificate, SignalMessage, Timestamp, UnidentifiedSenderMessageContent,
+        sealed_sender_encrypt_from_usmc,
+    };
+
+    pub fn pair_of(acc: &Acc) -> IdentityKeyPair {
+        IdentityKeyPair::try_from(&acc.identity().to_secret_bytes()[..]).unwrap()
+    }
+
+    /// A self-issued certificate exactly like Veil's: `subject` is named, `signer_root` signs.
+    pub fn cert(subject: &IdentityKeyPair, signer_root: &IdentityKeyPair) -> SenderCertificate {
+        let name = veil_core::identity::Address::of(subject.identity_key());
+        cert_named(name.as_str(), subject, signer_root)
+    }
+
+    pub fn cert_named(
+        name: &str,
+        subject: &IdentityKeyPair,
+        signer_root: &IdentityKeyPair,
+    ) -> SenderCertificate {
+        let mut r = rng();
+        let signer = KeyPair::generate(&mut r);
+        let server = ServerCertificate::new(1, signer.public_key, signer_root.private_key(), &mut r).unwrap();
+        SenderCertificate::new(
+            name.to_owned(),
+            None,
+            *subject.public_key(),
+            DeviceId::new(1).unwrap(),
+            Timestamp::from_epoch_millis((NOW + 86_400) * 1000),
+            server,
+            &signer.private_key,
+            &mut r,
+        )
+        .unwrap()
+    }
+
+    /// Seals `inner` to `to` with the outer static key `sealer`, filling a bucket exactly.
+    pub fn envelope(
+        sealer: &IdentityKeyPair,
+        to: &Acc,
+        cert: &SenderCertificate,
+        ty: CiphertextMessageType,
+        inner: &[u8],
+    ) -> Vec<u8> {
+        let mut store = InMemSignalProtocolStore::new(*sealer, 1).unwrap();
+        let dest = ProtocolAddress::new(
+            to.identity().address().as_str().to_owned(),
+            DeviceId::new(1).unwrap(),
+        );
+        block_on(store.save_identity(&dest, &ik(to))).unwrap();
+        let seal = |hint, filler: Option<usize>| {
+            let usmc = UnidentifiedSenderMessageContent::new(
+                ty,
+                cert.clone(),
+                inner.to_vec(),
+                hint,
+                filler.map(|n| vec![0; n]),
+            )
+            .unwrap();
+            block_on(sealed_sender_encrypt_from_usmc(&dest, &usmc, &store, &mut rng())).unwrap()
+        };
+        let base = seal(ContentHint::Default, None).len();
+        for bucket in [1024usize, 4096, 16_384, 65_536] {
+            for hint in [ContentHint::Default, ContentHint::Implicit] {
+                for filler in (bucket - 1).saturating_sub(base + 6)..=(bucket - 1).saturating_sub(base) {
+                    let s = seal(hint, Some(filler));
+                    if s.len() + 1 == bucket {
+                        let mut env = vec![veil_core::envelope::VERSION];
+                        env.extend_from_slice(&s);
+                        return env;
+                    }
+                }
+            }
+        }
+        panic!("no bucket fits");
+    }
+
+    pub fn ik(acc: &Acc) -> IdentityKey {
+        *acc.identity().public()
+    }
+
+    /// Asserts `env` is refused with `want` and leaves the recipient's state untouched.
+    pub fn refused(at: Acc, env: &[u8], want: Option<CoreError>) -> Acc {
+        let before = at.into_backend();
+        let at = Account::load(before.clone()).unwrap();
+        let err = block_on(at.open(&mut rng(), env, NOW)).unwrap_err();
+        if let Some(want) = want {
+            assert_eq!(err, want);
+        }
+        let after = at.into_backend();
+        assert!(after == before, "state changed by a refused envelope");
+        Account::load(after).unwrap()
+    }
+
+    pub fn v3_message(from: &Acc, to: &Acc) -> SignalMessage {
+        SignalMessage::new(
+            3,
+            &[7; 32],
+            None,
+            KeyPair::generate(&mut rng()).public_key,
+            0,
+            0,
+            &[0x55; 32],
+            &ik(from),
+            &ik(to),
+            &[],
+        )
+        .unwrap()
+    }
+
+    pub fn prekey_without_kyber(from: &Acc, to: &Acc) -> Option<PreKeySignalMessage> {
+        let inner = SignalMessage::new(
+            4,
+            &[7; 32],
+            None,
+            KeyPair::generate(&mut rng()).public_key,
+            0,
+            0,
+            &[0x55; 32],
+            &ik(from),
+            &ik(to),
+            &[],
+        )
+        .unwrap();
+        PreKeySignalMessage::new(
+            4,
+            1,
+            Some(1.into()),
+            1.into(),
+            None,
+            KeyPair::generate(&mut rng()).public_key,
+            ik(from),
+            inner,
+        )
+        .ok()
+    }
+}
+
+/// INV-CRY-3: a legitimate contact (valid certificate, valid sealing) sending a version-3
+/// message, or a `PreKey` message without a Kyber prekey, is refused before decryption.
+#[test]
+fn downgraded_messages_refused() {
+    use libsignal_protocol::CiphertextMessageType;
+    let (alice, bob, _) = paired();
+    let a = forged::pair_of(&alice);
+    let cert = forged::cert(&a, &a);
+    let v3 = forged::v3_message(&alice, &bob);
+    let env = forged::envelope(&a, &bob, &cert, CiphertextMessageType::Whisper, v3.serialized());
+    let bob = forged::refused(bob, &env, Some(CoreError::UnsupportedVersion));
+    // libsignal's parser already refuses this ("Kyber pre key must be present"), before Veil's
+    // own `kyber_pre_key_id().is_none()` check (defence in depth). If libsignal ever stops
+    // even constructing one, that is an equally good outcome.
+    if let Some(pk) = forged::prekey_without_kyber(&alice, &bob) {
+        let env = forged::envelope(&a, &bob, &cert, CiphertextMessageType::PreKey, pk.serialized());
+        forged::refused(bob, &env, Some(CoreError::AuthFailed));
+    }
+    // Control: the same path with a genuine message still works.
+    let (alice, bob, _) = paired();
+    assert_eq!(recv(&bob, &send(&alice, &bob, "ok")).unwrap().1, "ok");
+}
+
+/// INV-MSG-6: the certificate's key must equal the outer static key that sealed the message.
+/// Mallory seals with her own key but presents a genuine certificate for Alice.
+#[test]
+fn certificate_key_must_match_sealing_key() {
+    use libsignal_protocol::CiphertextMessageType;
+    let (alice, bob, _) = paired();
+    let mallory = account();
+    let (a, m) = (forged::pair_of(&alice), forged::pair_of(&mallory));
+    let v4 = forged::v3_message(&alice, &bob); // content is irrelevant: refused before decryption
+    let alice_cert = forged::cert(&a, &a);
+    let env = forged::envelope(
+        &m,
+        &bob,
+        &alice_cert,
+        CiphertextMessageType::Whisper,
+        v4.serialized(),
+    );
+    // libsignal: "sender certificate key does not match message key".
+    let bob = forged::refused(bob, &env, Some(CoreError::AuthFailed));
+    // A certificate for Mallory's key but signed under another root fails validation.
+    let wrong_root = forged::cert(&m, &a);
+    let env = forged::envelope(
+        &m,
+        &bob,
+        &wrong_root,
+        CiphertextMessageType::Whisper,
+        v4.serialized(),
+    );
+    let bob = forged::refused(bob, &env, Some(CoreError::AuthFailed));
+    // A certificate naming Alice's address over Mallory's own key fails the address check.
+    let impostor = forged::cert_named(alice.identity().address().as_str(), &m, &m);
+    let env = forged::envelope(
+        &m,
+        &bob,
+        &impostor,
+        CiphertextMessageType::Whisper,
+        v4.serialized(),
+    );
+    forged::refused(bob, &env, Some(CoreError::AuthFailed));
+}

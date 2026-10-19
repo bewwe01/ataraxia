@@ -89,6 +89,7 @@ impl core::fmt::Debug for Invite {
 
 /// Fields placed in the sealed package next to the prekey bundle.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub(crate) struct PackagePb {
     #[prost(uint32, tag = "1")]
     pub registration_id: u32,
@@ -522,3 +523,5 @@ mod tests {
         }
     }
 }
+
+crate::redacted_debug!(PackagePb);

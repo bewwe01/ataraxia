@@ -20,6 +20,21 @@
     )
 )]
 
+/// Implements a `Debug` that prints only the type name. Used for every protobuf type:
+/// prost's derived `Debug` would print message text, keys, tokens, proofs and invite
+/// secrets (review M2), and CLAUDE.md forbids secrets and content in any log.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! redacted_debug {
+    ($($t:ty),* $(,)?) => {
+        $(impl core::fmt::Debug for $t {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(concat!(stringify!($t), "(<redacted>)"))
+            }
+        })*
+    };
+}
+
 pub mod account;
 pub mod attachment;
 pub mod content;

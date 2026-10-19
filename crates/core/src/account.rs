@@ -81,6 +81,7 @@ pub enum Opened {
 
 /// Stored metadata for an invite we issued.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 struct InviteRecordPb {
     #[prost(uint64, tag = "1")]
     expires_at: u64,
@@ -94,6 +95,12 @@ struct InviteRecordPb {
     proof_key: Vec<u8>,
     #[prost(uint32, tag = "6")]
     mode: u32,
+}
+
+impl Drop for InviteRecordPb {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.proof_key);
+    }
 }
 
 /// One user's protocol state.
@@ -865,3 +872,5 @@ mod pq_tests {
         });
     }
 }
+
+crate::redacted_debug!(InviteRecordPb);
