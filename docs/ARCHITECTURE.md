@@ -208,9 +208,18 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
   - The cost: redb's file reached an apparent size of 3.4× the stored payload in that test (it grows in large steps), with about 2× actually allocated. Disk is sized from the caps, including the token-row and upload-token caps (`deploy/README.md`).
 - **Schema version (P3R2-9).** The store records its layout version and refuses a database of another version, or an unversioned one that holds data. An older layout would otherwise open with no expiry entries, and its records would never expire.
 
+### ADR-0011: Phase 4 scope cut (owner request, 2026-10-19). **Accepted.**
+The owner asked to finish the mandatory parts and ship installers within a limited budget. Phase 4 therefore ships:
+- `crates/client`: SQLCipher store (vendored OpenSSL, the only OpenSSL in the tree, enforced by `deny.toml`), pinned TLS 1.3 relay link, a single-threaded actor around `Account` (which is `!Send`).
+- `app/`: onboarding with the vault, unlock, auto-lock after 5 minutes idle, invites by link (QR shows the link; there is no camera scanner), 1:1 text chat over one relay, safety numbers with verify/clear, rename, the two themes.
+- Device secret: Windows Credential Manager; Android/Linux a 0600 file in the app's private directory (INV-REST-2 is partial there).
+
+Cut, and listed as future work: attachments, voice notes, disappearing messages, calls (Phase 6), backup, panic wipe, notifications, camera QR scanning, mailbox rotation, multi-relay, Android Keystore, a key-change warning UI, Linux/macOS packages. Unused invites keep their delivery token registered at the relay until the mailbox is gone.
+
 ## 7. Distribution (recorded owner request)
 
 The final step, after all phases pass the code-reviewer gate, is a GitHub Actions workflow that builds the Android **APK** and publishes it to this repository's **GitHub Releases**. Details:
 - Signing keystore lives only in encrypted GitHub secrets.
 - A SHA-256 checksum file and the exact source tag are attached to each release, which also satisfies AGPL.
-- Desktop artifacts (Linux AppImage/deb) are built the same way. Windows/macOS jobs are added if the owner wants them.
+- Implemented in `.github/workflows/release.yml`: an arm64 APK and a Windows NSIS installer, published as a pre-release on a `v*` tag with `SHA256SUMS.txt`. The owner asked for Windows; Linux/macOS packages are not built yet.
+- Without the keystore secrets the APK is signed with a throwaway key made in that run, and the release notes say so. The Windows installer is not code-signed.
