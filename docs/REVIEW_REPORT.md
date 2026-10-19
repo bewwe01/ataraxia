@@ -1805,3 +1805,292 @@ None.
 
 ---
 Housekeeping: the working tree is clean (`git status --short` is empty) and nothing was committed or pushed. The temporary probe test, the bench DBs, the TURN credential file, the test UDP container, the compose stack and its volume, `deploy/.env`, `deploy/secrets` and the `inet veil_turn` table have all been removed. The scratch bench crate now has extra modes (`idlefill`, `idlesweep`, `uploadtok`, `tokrows`), at `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/bench/src/main.rs`. The mangle-priority rule I tested is at `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/veil-turn-mangle.nft`.
+
+---
+
+## Phase 3 review, round 3 (2026-10-19)
+
+**Reviewer:** code-reviewer agent (Agent tool, `subagent_type: "code-reviewer"`, model override `opus`), adversarial brief. Scope: round-2 fixes in `73a8688`, CI fixes in `0d9f412`, plus `git diff 0958b70^..HEAD`. Report follows verbatim.
+
+# Phase 3 review: round 3
+
+## Verdict: PASS WITH CONDITIONS
+All nine round-2 findings are addressed, and the core fixes hold up when tested adversarially.
+- **Counters:** a randomized probe of 30 000 operations checked the `STATS` counters and the `EXPIRY` index after every operation. They always matched the real row counts exactly.
+- **Firewall:** the Docker-published UDP service is blocked by the `priority mangle` rule (5/5 packets lost). The round-2 rule at `priority filter` lets 5/5 through.
+- **Mutation checks:** 11 of 13 mutants were killed by the intended tests.
+- **Tooling:** fmt, clippy (`-D warnings`), tests, deny, vet and gitleaks all pass.
+
+There are no Critical or High findings, but the fixes introduced four Medium problems:
+- The new relay-wide token caps turn the old disk-fill into a relay-wide lockout. For token rows, **one** host can reach it in about 32 h; the docs say this needs "many sources" (P3R3-1).
+- The new per-source limits cannot be configured. Behind Docker's userland proxy, which in the shipped compose covers IPv6 clients, every client shares one source's creation, upload-token and response-budget allowance. I reproduced this (P3R3-2).
+- One host can keep the single DB writer busy with no-op commits. A victim's deposit latency went from 3.4 ms to 62 ms (P3R3-3).
+- "Never by IP" is now false in five places, and IP-derived limiter keys stay in memory for the life of the process (P3R3-4).
+
+**Conditions for PASS:**
+1. P3R3-1: either give every mailbox a floor that the global cap cannot take away, or size the caps so they are never the binding limit. In both cases, correct README and THREAT_MODEL to state how many sources each cap needs.
+2. P3R3-2: make the per-source limits configurable, or derive them from `VEIL_MAX_CONN_PER_SOURCE`, and correct the README advice.
+3. P3R3-3: skip commits for writes that change nothing, and rate-limit `UpdateTokens` and `Ack`, or document the risk with numbers.
+4. P3R3-4: correct the five "never by IP" texts, and prune full buckets in the sweep loop.
+
+The Lows can follow later.
+
+## Round-2 findings: status
+| ID | Status | Evidence |
+|---|---|---|
+| P3R2-1 | **Fixed** (disk fill). New lockout: P3R3-1 | **Counters exact on every path.** Probe `r3_counters_stay_exact`: a temporary `#[cfg(test)]` module appended to `store.rs`, then reverted. It ran 30 000 random operations with tiny quotas: create, touch, delete, `update_tokens` with duplicate and FF-prefixed hashes, deposit, ack, invite put/take, upload tokens with frequent id collisions (2 261 successes), chunks, sweep and clock ticks. After every operation it asserted that each of these matches the actual rows:<br>• `STAT_{MAILBOXES,TOKEN_ROWS,UPLOAD_TOKENS,INVITES,ENVELOPE_BYTES,BLOB_BYTES}`;<br>• `EXPIRY` = mailboxes + envelopes + invites + upload tokens + blobs (no stale entries);<br>• each mailbox's `tokens` and `count` field.<br>It passed.<br>**Mutants killed:** M1–M5 (cap off, completion not freeing, expiry not freeing, row cap off, delete not freeing).<br>**Not done:** the round-2 request for a *per-mailbox outstanding* upload-token cap was not implemented. |
+| P3R2-2 | **Fixed** (residual risk documented qualitatively) | The 8 MiB share works; M7 is killed. A full fetch reserves 2 050 KiB, so one source holds 3 reservations. **11 sources** fill the 64 MiB budget for full-size fetches. README and THREAT_MODEL say "many addresses" without a number. |
+| P3R2-3 | **Fixed** | The per-source bucket (M8 killed) and the 24 h lifetime of never-authenticated mailboxes (M11 killed) both work. `touch_mailbox` writes when `!authed`, even within the same minute.<br>**Residual:** draining the relay-wide creation bucket continuously takes about 60 sources at 1/min each. One host that re-authenticates its mailboxes reaches `max_mailboxes` (100 000) in about 69 days. |
+| P3R2-4 | **Fixed** | The test is not vacuous: the canary from `spawn_blocking` must appear, and any other line fails it. M12 (`tracing::warn!(m = ?id)` in `Store::deposit`) is killed at `logs.rs:167`. `tracing-subscriber` is built without `tracing-log`, so `main.rs`'s `.init()` installs nothing the test lacks. |
+| P3R2-5 | **Fixed** (unit issues: P3R3-5) | Deployed stack with the committed rule:<br>• Docker-published echo on 40001/udp: lost 5/5; the nft counter went to 1;<br>• the same rule at `priority filter`: lost 0/5;<br>• no rule at all: lost 0/5.<br>So the CI step does fail with the old rule. Client↔client relay lost 0, and the private peer got 403. `systemd-analyze verify` is clean, with no ordering cycle: the unit's dependencies mirror Debian's `nftables.service`. |
+| P3R2-6 | **Fixed** | M9 (no key filter in `notify`) fails `pushes_follow_the_current_mailbox_key`. Delete drops all subscribers, and a failed re-check unsubscribes. |
+| P3R2-7 | **Partially fixed** → P3R3-2 | Only the connection cap is configurable. Reproduced: through `docker-proxy`, clients from 127.0.0.3 and 127.0.0.4 share 127.0.0.1's creation bucket. |
+| P3R2-8 | **Fixed** | README, ADR-0010, `.env.example`, INV-ROB-1 and the `Store::sweep` doc are corrected. |
+| P3R2-9 | **Fixed** (edge case: P3R3-7) | M10 is killed. An unversioned database holding only upload tokens or token rows is stamped as v2 (reproduced). |
+
+## Commands I ran and their results
+```text
+$ cargo fmt --all --check                                         → fmt exit 0
+$ cargo clippy --workspace --all-targets --locked -- -D warnings  → clippy exit 0
+$ cargo test --workspace --locked                                 → test exit 0
+  veil_core 74 | secrets 3 | session 22 (+1 ignored) | veil_relay lib 18 | logs 1 | relay 18 | smoke 0 (+2 ignored) | veil_wire 5
+$ cargo deny --locked check → advisories ok, bans ok, licenses ok, sources ok (exit 0)
+$ cargo vet --locked        → Vetting Succeeded (43 fully audited, 5 partially audited, 207 exempted)
+$ /tmp/claude-0/gl/gitleaks git --redact --exit-code 1 .   (8.30.1) → 43 commits, no leaks found, exit 0
+  with only the default rules (no allowlist): exit 1, generic-api-key in Cargo.lock, crates/core/fuzz/Cargo.lock, spikes/libsignal/Cargo.lock
+  negative test, a scratch repo with the repo's .gitleaks.toml:
+    sub/Cargo.lock with api_key="8f3a…0a" (40 lowercase hex) and heroku_api_key="5a4c3e2f-…" → NOT reported
+    the same content in sub/notlock.toml → reported (generic-api-key, heroku-api-key)
+```
+Mutation checks. Each mutant was an exact single-match replace, the named test was run, and the file was then restored with `git checkout`.
+```text
+R3-M1  add_upload_token: `if false && live >= max`        → upload_tokens_are_capped_and_released FAILED (store.rs:1298)
+R3-M2  completion does not decrement STAT_UPLOAD_TOKENS   → upload_tokens_are_capped_and_released FAILED (1303)
+R3-M3  expiry does not decrement STAT_UPLOAD_TOKENS       → upload_tokens_are_capped_and_released FAILED (1306)
+R3-M4  token-row cap check removed                        → token_rows_are_capped_relay_wide FAILED (1327)
+R3-M5  remove_mailbox does not subtract token rows        → token_rows_are_capped_relay_wide FAILED (1337)
+R3-M6  shrink exemption removed (`rows > max` only)       → token_rows_are_capped_relay_wide ok   (SURVIVES)
+R3-M7  reserve: no per-source share                       → one_source_cannot_hold_the_response_budget FAILED
+R3-M8  no per-source create check                         → mailbox_creation_is_limited_per_source FAILED
+R3-M9  notify: no key filter                              → pushes_follow_the_current_mailbox_key FAILED
+R3-M10 schema: any version accepted                       → foreign_schema_is_refused FAILED
+R3-M11 touch does not set authed                          → never_authenticated_mailboxes_expire_early FAILED
+R3-M12 tracing::warn!(m = ?id) in Store::deposit          → relay_logs_nothing_about_clients FAILED (logs.rs:167)
+R3-M13 per-source upload-token limiter removed            → whole veil-relay suite passes (SURVIVES)
+```
+Temporary probes. These were `crates/relay/tests/r3_probe.rs`, `r3_proxy_probe.rs` and two appended `#[cfg(test)]` modules in `store.rs`, all deleted or reverted afterwards.
+```text
+R3 counters probe: 30000 ops, successes {ack 977, chunk 440, create 1314, delete 1004, deposit 470, invite 1369,
+   sweep 2333, take 416, tick 2327, tokens 973, touch 1005, uptok 2261}: every invariant held after every op
+R3 schema probe: unversioned DB holding 1 upload token + 1 orphan token row → Ok (stamped v2);
+   rows after sweep(u64::MAX-1): [("tokens", 1), ("upload_tokens", 1)]
+R3 PROBE token rows (max_token_rows lowered to 5 120): one source registered 5120 rows in 705 ms;
+   victim from 127.0.0.2 adds 1 token → Err(QuotaExceeded)
+R3 PROBE no-op writes, default Config, debug build: one source, 31 conns, 4 s → 1932 accepted UpdateTokens{} (483/s),
+   each a committed write transaction
+R3 PROBE victim deposit latency (p50, max): idle (3.40 ms, 5.32 ms), during no-op spam (61.8 ms, 79.8 ms)
+```
+Deployment. Setup followed deploy/README: `.env` with `TURN_EXTERNAL_IP=192.0.2.2`, `secrets/turn_secret` 0644 inside a 0700 directory, `gen-cert`, `nft -f firewall/veil-turn.nft`, `up -d`, with the existing `veil-relay:local` image (created 18:25:05Z).
+```text
+smoke deployed_relay_round_trip (VEIL_SMOKE_ADDR=127.0.0.1:8443) ... ok
+  (with VEIL_SMOKE_ADDR=192.0.2.2:8443 the test client hung at connect, although openssl s_client connected; see "could not verify")
+uc -y -c -n 20                               → Total lost packets 0 (0.000000%)
+uc -c -e 10.0.0.1                            → 403 (Forbidden IP)
+docker run -d --name udp-svc -p 40001:3480/udp … turnutils_peer
+uc -c -e 192.0.2.2 -r 40001, committed rule  → Total lost packets 5 (100.000000%); counter packets 1 … drop
+same, rule switched to `priority filter`     → Total lost packets 0 (0.000000%)
+same, no rule                                → Total lost packets 0 (0.000000%)
+docker-proxy probe (via 127.0.0.1:8443, after smoke used 1 creation):
+  conn0-2 from 127.0.0.1: 9 × Ok; conn3 from 127.0.0.3: Ok, RateLimited, RateLimited; conn4 from 127.0.0.4: 3 × RateLimited
+relay log: 1 line (startup); coturn log: 1 line "udp send: Operation not permitted" (firewall drop, no address)
+docker stats: relay 2.8 MiB / 512 MiB, coturn 7.2 MiB
+docker compose stop relay → 446 ms, ExitCode=0 OOMKilled=false, "veil-relay stopped"
+systemd-analyze verify veil-turn-firewall.service → no output, exit 0
+/lib/systemd/system/nftables.service: ExecStart/ExecReload=nft -f /etc/nftables.conf, ExecStop=nft flush ruleset;
+/etc/nftables.conf line 3: "flush ruleset"
+```
+Cleanup:
+- Ran `docker rm -f udp-svc`, `docker compose down -v` (volume `veil_relay-data` removed), `rm -rf deploy/.env deploy/secrets` and `nft delete table inet veil_turn`.
+- Removed the probe files, the TURN credential file, and the 16 `/tmp/veil-*` store dirs left by my panicking mutant runs.
+- `git status --short` is empty. HEAD is still 0d9f412. Nothing was committed or pushed.
+
+## New findings
+### Critical
+None.
+
+### High
+None.
+
+### Medium
+**P3R3-1: The relay-wide token caps are a lockout that one host (token rows) or about 7 hosts (upload tokens) can trigger. The docs say it takes "many sources".** [HIGH confidence]
+- **Where:**
+  - `crates/relay/src/store.rs:506-511` (`update_tokens` global row check);
+  - `store.rs:679-682` (`add_upload_token`);
+  - defaults at `server.rs:174-176` (`max_tokens_per_mailbox: 512`, `max_token_rows: 1_000_000`, `max_upload_tokens: 20_000`) and `server.rs:104-111` (per-source rates);
+  - `deploy/README.md` "Denial of service by many sources" bullet;
+  - `docs/THREAT_MODEL.md:79`.
+- **What is wrong:** the caps bound disk use, but nothing reserves any share of them for anyone, and `UpdateTokens` has no rate limit.
+  - **Token rows:** 1 000 000 / 512 = 1 954 mailboxes are enough. At the per-source creation rate (10, then 1/min) one IPv4 host has them in (1 954 − 10) min ≈ **32.4 h**.
+    - Each mailbox needs one authentication and 8 `UpdateTokens` of 64 tokens.
+    - The mailboxes then live 60 days per authentication, so one re-authentication every 59 days keeps the lockout going indefinitely.
+    - After that, **every** `UpdateTokens` that adds a token fails with `QuotaExceeded` relay-wide.
+  - **Upload tokens:** one source gets 30 + 86 400/30 = 2 910 per 24 h, so 7 sources keep all 20 000 live permanently. Every attachment upload relay-wide is refused.
+  - Round 2's required fix also asked for "a small per-mailbox cap on outstanding upload tokens". That was not implemented.
+- **Exploit:** reproduced at reduced scale, with `max_token_rows` = 5 120.
+  1. One source registered 5 120 rows in 705 ms.
+  2. A different source's first `UpdateTokens` → `QuotaExceeded`.
+  3. At default scale, PROTOCOL §2 says pairing registers a delivery token and every 7-day rotation registers new tokens. So after about 32 h of one host's effort, new contacts and rotation fail for every user. [MEDIUM confidence on how the Phase 4 client reacts]
+- **Required fix:**
+  - Guarantee each mailbox a floor that the global cap cannot take away. For example, the global row cap applies only to tokens above the first 64 per mailbox. Or make the cap non-binding: lower `max_tokens_per_mailbox` (for example to 64, which still fits contacts padded to multiples of 8) and set `max_token_rows ≥ max_mailboxes × max_tokens_per_mailbox`, with the resulting size (6.4 M rows ≈ 1.05 GB) in the README disk sizing.
+  - For upload tokens, add an in-memory per-mailbox outstanding count. Then the cap needs about 20 000 / k mailboxes' worth of attackers, and that number should be documented.
+  - In README and THREAT_MODEL, state how many sources each cap takes: rows 1 host in about 32 h, upload tokens 7 hosts, response budget 11, creation about 60.
+- **How to test:**
+  - A store test: with the global row cap full, a fresh mailbox can still register its floor.
+  - An integration test: an attacker source exhausts its share, and a victim from 127.0.0.2 can still `UpdateTokens` and get an upload token.
+  - Mutant: "global check without the floor" must fail the test.
+
+**P3R3-2: Only the connection cap can be configured. The new per-source limits collapse onto a single source behind Docker's userland proxy (all IPv6 clients in the shipped compose) or any reverse proxy.** [HIGH confidence on the mechanism (reproduced); MEDIUM for IPv6 specifically, because this sandbox has no IPv6]
+- **Where:**
+  - `server.rs:104-111` (`create_mailbox_per_source`, `upload_token_per_source`) and `server.rs:202` (`response_budget_per_source`), all hard-coded;
+  - `main.rs:85-104` (`limits_from_env` reads only `VEIL_MAX_CONN_PER_SOURCE`);
+  - `deploy/README.md` "raise `VEIL_MAX_CONN_PER_SOURCE` then";
+  - `deploy/.env.example:22-25`.
+- **What is wrong:** behind `docker-proxy` every client has the bridge gateway as its peer address, so one source key covers them all. That key's limits then apply to everyone together:
+  - 10 creations, then 1/min;
+  - 30 upload tokens, then 1/30 s;
+  - an 8 MiB response share, i.e. 3 concurrent full fetches;
+  - 32 connections (the only one that can be raised).
+
+  The README tells the operator that raising `VEIL_MAX_CONN_PER_SOURCE` is the remedy, but that does not lift the other three.
+- **Reproduced:** through `127.0.0.1:8443`, which goes through `docker-proxy`, connections bound to 127.0.0.3 and 127.0.0.4 were rate-limited by the creations already made from 127.0.0.1. The in-process tests treat 127.0.0.2 as a separate source.
+- **Scenario:** on a dual-stack VPS, one IPv6 client holds 4 non-reading fetches, or 32 connections. Every IPv6 user's fetches, or all their connections, are then refused. Even without an attacker, more than 3 IPv6 users syncing at once get `RateLimited`.
+- **Required fix (any one of these):**
+  - expose `VEIL_PER_SOURCE_CREATE`, `…_UPLOAD` and `…_BUDGET_MB`;
+  - scale them with `VEIL_MAX_CONN_PER_SOURCE`;
+  - enable IPv6 on the compose network, or `userland-proxy: false`, so real addresses arrive;
+  - in any case, correct the README and `.env.example` text.
+- **How to test:** a unit test of `limits_from_env` for the new variables, and an integration test where `per_source` is raised and 20 creations from one source succeed.
+
+**P3R3-3: One source can keep the single redb writer busy with write transactions that change nothing.** [HIGH confidence on the mechanism; MEDIUM on the SD-card impact, which was not measured]
+- **Where:**
+  - `store.rs:482-516`: `update_tokens` with empty `add` and `remove` still inserts into `STATS` and `MAILBOXES` and commits;
+  - `store.rs:590-615`: `ack` commits even when nothing is removed;
+  - `server.rs:776-835`: no rate limit on `UpdateTokens` or `Ack`, only the frame limit of 50/s per connection × 32 connections.
+- **Exploit (measured):**
+  1. One source authenticates one mailbox on 31 connections.
+  2. It loops `UpdateTokens{}`: 483 commits/s accepted (debug build; the writer was the bottleneck).
+  3. A victim's deposit latency from another source went from p50 3.4 ms to 61.8 ms, max 79.8 ms. That is on this fast disk.
+
+  On a Raspberry Pi SD card, where each fsync costs milliseconds to tens of milliseconds, the same load serialises every deposit, auth touch and creation behind about 30 queued commits. This degrades the service for every user without filling anything. It is not documented.
+- **Required fix:**
+  - Return early without committing when an `update_tokens` or `ack` changes nothing.
+  - Add per-mailbox token buckets for `UpdateTokens` and `Ack` (for example burst 20, then 1/s).
+  - Document the residual multi-source write load.
+- **How to test:** a store unit test showing that an empty `update_tokens` or `ack` leaves the database unchanged (or that a commit counter does not move). An integration test: `UpdateTokens` beyond the burst → `RateLimited`.
+
+**P3R3-4: "Never by IP" is now false in five places, and IP-derived keys stay in memory for the life of the process.** [HIGH confidence]
+- **Where:**
+  - `docs/PROTOCOL.md:214` ("**Never by IP.**");
+  - `docs/THREAT_MODEL.md:78` ("Rate limits are never keyed by IP");
+  - `docs/ARCHITECTURE.md:196` ("No IP-keyed rate limits or records"), which directly contradicts the next bullet;
+  - `crates/relay/src/limits.rs:2`;
+  - `server.rs:10`;
+  - mechanism: `server.rs:255-256` (`KeyedLimiter` keyed by `limiter_key(source)`, the full IPv4 address) and `limits.rs:84-108` (eviction only when 100 000 keys are tracked).
+- **What is wrong:**
+  - Mailbox creation and upload tokens are now rate-limited by source address.
+  - The per-source buckets are never pruned on a time basis. On a personal relay, which never reaches 100 000 keys, the full IPv4 address of every client that created a mailbox or requested an upload token since startup stays in memory.
+  - Mailbox rotation happens every 7 days, so that list covers effectively every user.
+  - The docs promise the opposite, and only for connection counts and budget shares does the code forget at zero.
+- **Scenario:** a memory image of a running relay (host compromise, seizure, or a core dump) yields the IP addresses of all users since the last restart. The README and THREAT_MODEL tell operators that IPs are never retained.
+- **Required fix:**
+  - Correct the five texts: rate limits are also keyed by an in-memory source key, here is how long it lives, and here is why.
+  - In `sweep_loop`, drop buckets that have refilled to burst; they are indistinguishable from fresh buckets, as `evict` already notes. Retention is then bounded to about 10 min for creation and 15 min for upload.
+  - Or key the buckets by a keyed hash with a per-process random key, rotated daily.
+- **How to test:** a `KeyedLimiter` unit test: after a refill interval, `prune(now)` leaves 0 keys. Mutant: no prune → fails.
+
+### Low
+**P3R3-5: The systemd unit stops Docker on removal or restart, and does not survive nftables.service.** [HIGH confidence from systemd.unit(5) and the Ubuntu unit files; not run, since this sandbox has no systemd]
+- **Where:** `deploy/firewall/veil-turn-firewall.service:15-17`, and the "Remove" line at `veil-turn.nft:16`.
+- **What is wrong:**
+  - `RequiredBy=docker.service` puts this unit in docker's `Requires=`. When a required unit is explicitly stopped or restarted, the requiring unit is stopped or restarted too. So the documented `systemctl disable --now veil-turn-firewall` stops Docker and every container on the host, a Pi-hole included. A `systemctl restart` after editing the port range restarts all of them.
+  - There is no ordering against `nftables.service`. Its start, reload (`nft -f /etc/nftables.conf`, which begins with `flush ruleset` on Debian and Ubuntu) and stop (`nft flush ruleset`) silently delete `inet veil_turn`, while this oneshot unit still reports active and coturn keeps running.
+- **Fix:**
+  - Replace `RequiredBy` with a docker drop-in `ExecStartPre=/usr/sbin/nft list table inet veil_turn`, which refuses to start Docker without the rule but does not propagate stop.
+  - Add `After=nftables.service`, `PartOf=nftables.service`, `ReloadPropagatedFrom=nftables.service` and `ExecReload=/usr/sbin/nft -f /etc/veil-turn.nft`.
+  - Or document adding `include "/etc/veil-turn.nft"` to `/etc/nftables.conf`.
+- **Test:** in CI (the runners have systemd), install the unit and enable it, then `systemctl restart nftables` → `nft list table inet veil_turn` still succeeds; and `systemctl stop veil-turn-firewall` → `systemctl is-active docker` is still active.
+
+**P3R3-6: The gitleaks allowlist is global and wider than "crate names".** [HIGH confidence, reproduced]
+- **Where:** `.gitleaks.toml:9-13`.
+- **What is wrong:** the allowlist applies to every rule and matches any secret made only of `[a-z0-9_-]`. In any `Cargo.lock` it hides lowercase-hex API keys and Heroku keys; both were reproduced as not reported. The commit message's "real-looking keys in a Cargo.lock are still reported" is only partly true.
+- **Fix:**
+  ```toml
+  [[allowlists]]
+  targetRules = ["generic-api-key"]
+  condition = "AND"
+  paths = ['''(^|/)Cargo\.lock$''']
+  regexTarget = "line"
+  regexes = ['''^\s*"[a-z0-9][a-z0-9_-]*",?\s*$''']
+  ```
+- **Test:** the three current findings stay suppressed, and the two negative-test values in a `Cargo.lock` are reported.
+
+**P3R3-7: The schema check treats a database holding only upload tokens, token rows, chunks or envelopes as "empty".** [HIGH confidence, reproduced]
+- **Where:** `store.rs:384-396` checks only `MAILBOXES`, `INVITES` and `BLOBS`.
+- **What is wrong:** reproduced with an unversioned database holding 1 upload token, 1 orphan token row and no index entries.
+  - It is stamped as v2.
+  - Both rows survive `sweep(u64::MAX-1)`, and `STAT_UPLOAD_TOKENS` undercounts.
+  - Orphan FF-prefixed token rows are exactly what the pre-P3-2 image left behind.
+- **Fix:** require all record tables to be empty, including `TOKENS`, `UPLOAD_TOKENS`, `ENVELOPES`, `BLOB_CHUNKS` and `EXPIRY`, and all `STATS` counters to be zero.
+- **Test:** extend `foreign_schema_is_refused` with a database containing only an upload token, and one containing only a token row.
+
+**P3R3-8: Security claims with no test, and stale doc rows.**
+- **Untested claims:**
+  - R3-M13 survives the whole suite. The per-source upload-token limit, claimed in the TEST_REPORT P3R2-1 row, PROTOCOL §6.3 and README, has no test.
+  - R3-M6 survives. The "Shrinking is always allowed" comment in `token_rows_are_capped_relay_wide` never runs in an over-cap state.
+- **Stale docs:**
+  - PROTOCOL §14 does not list the new limits: token rows, upload tokens, the per-source creation, upload and budget limits, and the 24 h lifetime of never-authenticated mailboxes.
+  - The INV-LOG-1 row still cites only M3 and M4.
+- **Fix:** add `upload_tokens_are_limited_per_source` (31st token from one source → `RateLimited`, another source → Ok), and update §14 and INV-LOG-1. CLAUDE.md rule 9 applies.
+
+**P3R3-9: When the relay-wide creation bucket is empty, a legitimate creation still spends its per-source token.**
+- **Where:** `server.rs:717-722`.
+- **What is wrong:** during a multi-source drain, each retry by a victim burns their own 10-token burst. They then stay locked out for minutes after the attack stops.
+- **Fix:** check the relay-wide bucket without consuming it first, or refund the per-source token on refusal.
+- **Test:** with the global bucket exhausted, 11 refused attempts, then one global token appears, and the source can create.
+
+## Claims I checked and found accurate
+- TEST_REPORT round-2 test counts (74 / 3 / 22+1 / 18 / 1 / 18 / 0+2 / 5), and fmt, clippy, deny and vet (43/5/207).
+- Every mutant named in the TEST_REPORT round-2 table that I re-ran fails its test:
+  - P3R2-1 (cap and freeing);
+  - P3R2-2 (share);
+  - P3R2-3 (per-source check, touch marking);
+  - P3R2-4 (M8 style);
+  - P3R2-6 (key filter);
+  - P3R2-9 (version).
+- "Counted in `STATS` in the same transaction, released on completion, expiry, removal, delete and idle expiry": verified exact by the 30 000-operation probe, including upload-token id collisions and FF-prefixed token hashes.
+- The `EXPIRY` index stays exactly one entry per live record; no stale entries accumulate.
+- P3R2-5: `priority mangle` blocks a Docker-published service, and the round-2 `priority filter` rule does not. So the CI step's claim "fails with the old rule" holds, and calls still relay with 0 loss.
+- "relay log lines after smoke + probes: 1"; coturn logs only its address-free drop line; clean SIGTERM stop (446 ms here vs 299 ms reported; same order).
+- README record sizes: about 165 MB for 1 000 000 token rows and about 3 MB for 20 000 upload tokens, consistent with round 2's measured 164 and 159 B per row.
+- `.env.example` and README now describe the apparent 3.4× vs allocated about 2× file size correctly. `Store::sweep` documents what it counts.
+- The CI `relay-deploy` job has actions pinned by SHA, `persist-credentials: false` and `permissions: contents: read`, and it installs protoc.
+
+## Claims I could not verify
+- The systemd unit on a real systemd host (no PID-1 systemd here); P3R3-5 is from the man page and unit files.
+- IPv6 clients behind `docker-proxy` (this sandbox has no IPv6). I demonstrated the collapse with proxied IPv4 loopback clients.
+- The SD-card or Raspberry Pi impact of P3R3-3; measured only on this disk, in a debug build.
+- Why the smoke client hung connecting to `192.0.2.2:8443` (the DNAT path) while `openssl s_client` connected. Through `127.0.0.1` (docker-proxy) it passed. This is probably a sandbox networking quirk, but I did not prove it.
+- The ADR-0010 container figures (71 MB peak, 0.77 s at 36 MB) and a fresh 1.1 GB soak; I did not repeat a soak, because only 3 GB of disk was free.
+- How the Phase 4 client reacts when `UpdateTokens` fails during pairing or rotation (P3R3-1 impact).
+- The `relay-deploy` job as actually run on GitHub.
+
+---
+Housekeeping: the working tree is clean (`git status --short` is empty, HEAD 0d9f412) and nothing was committed or pushed. These are all gone:
+- the compose stack and its volume;
+- `udp-svc`;
+- `deploy/.env` and `deploy/secrets`;
+- `inet veil_turn`;
+- the probe tests and the TURN credential file;
+- my `/tmp/veil-*` dirs (7 older ones that predate this review were left in place).
+
+Copies of the probe code are in `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r3/` (`r3_probe.rs`, `counters_probe.rs`, `mut.py`).
