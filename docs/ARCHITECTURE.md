@@ -211,10 +211,11 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
 ### ADR-0011: Phase 4 scope cut (owner request, 2026-10-19). **Accepted.**
 The owner asked to finish the mandatory parts and ship installers within a limited budget. Phase 4 therefore ships:
 - `crates/client`: SQLCipher store (vendored OpenSSL, the only OpenSSL in the tree, enforced by `deny.toml`), pinned TLS 1.3 relay link, a single-threaded actor around `Account` (which is `!Send`).
-- `app/`: onboarding with the vault, unlock, auto-lock after 5 minutes idle, invites by link (QR shows the link; there is no camera scanner), 1:1 text chat over one relay, safety numbers with verify/clear, rename, the two themes.
-- Device secret: Windows Credential Manager; Android/Linux a 0600 file in the app's private directory (INV-REST-2 is partial there).
+- `app/`: onboarding with the vault, unlock, auto-lock after 5 minutes without user input (incoming messages do not postpone it; a lock pre-empts relay I/O), start over (reset), invites by link (QR shows the link; there is no camera scanner), 1:1 text chat over one relay, safety numbers with verify/clear, rename, the two themes.
+- Device secret: Windows Credential Manager; Android/Linux a 0600 file in the app's private directory (INV-REST-2 is partial there). The APK excludes all app data from backup and device transfer and sets FLAG_SECURE.
+- Release builds: signing happens only for a version tag, in a separate job in the `release` environment that runs no project code.
 
-Cut, and listed as future work: attachments, voice notes, disappearing messages, calls (Phase 6), backup, panic wipe, notifications, camera QR scanning, mailbox rotation, multi-relay, Android Keystore, a key-change warning UI, Linux/macOS packages. Unused invites keep their delivery token registered at the relay until the mailbox is gone.
+Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in v1 the relay can link sender and recipient mailboxes; THREAT_MODEL updated), attachments, voice notes, disappearing messages, calls (Phase 6), backup, panic wipe, notifications, camera QR scanning, multi-relay, Android Keystore, a key-change warning UI, Linux/macOS packages. Unused invites keep their delivery token registered at the relay until the mailbox is gone.
 
 ## 7. Distribution (recorded owner request)
 

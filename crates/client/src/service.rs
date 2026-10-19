@@ -3,10 +3,16 @@
 //! display data only.
 //!
 //! Lifecycle: `New` → setup → `Unlocked` ⇄ `Locked`. Locking drops the account and the open
-//! database; it also happens after [`AUTO_LOCK`] without any command.
+//! database; it also happens after [`AUTO_LOCK`] without user activity. Only commands the user
+//! causes count as activity; refreshes triggered by incoming events do not (review P4-2).
+//!
+//! The relay can delay or flood us, so every relay round trip is cancelled by a lock request or
+//! by the auto-lock deadline, and each sync is bounded (review P4-1).
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::Signer as _;
@@ -27,8 +33,13 @@ use crate::db::{Db, SqlBackend};
 use crate::relay::{Relay, split_host_port};
 use crate::{ClientError, Result, keystore, now_ms, now_secs, qr};
 
-/// Lock after this long without a command.
+/// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
+/// At most this many fetch batches per sync; the rest waits for the next push or tick.
+const MAX_BATCHES: usize = 16;
+const FETCH_LIMIT: u32 = 8;
+/// Give up re-sending a message after this many failed deposits.
+const MAX_ATTEMPTS: i64 = 20;
 const TICK: Duration = Duration::from_secs(5);
 const INVITE_TTL_SECS: u64 = 24 * 3600;
 const MIN_PASSPHRASE: usize = 12;
@@ -155,12 +166,22 @@ enum Cmd {
     Safety(i64, Reply<SafetyView>),
     SetVerified(i64, bool, Reply<()>),
     Rename(i64, String, Reply<()>),
+    Touch(Reply<()>),
+    Reset(Reply<()>),
+}
+
+/// Lets a lock request pre-empt relay I/O that is in progress in the actor.
+#[derive(Default)]
+struct Interrupt {
+    pending: AtomicBool,
+    notify: tokio::sync::Notify,
 }
 
 /// Handle to the client actor. Cheap to clone; `Send + Sync`.
 #[derive(Clone)]
 pub struct Client {
     tx: mpsc::Sender<Cmd>,
+    interrupt: Arc<Interrupt>,
 }
 
 impl core::fmt::Debug for Client {
@@ -180,7 +201,19 @@ macro_rules! ask {
 impl Client {
     /// Starts the actor on its own thread. `dir` is the app's private data directory.
     pub fn start(dir: PathBuf, kdf: KdfParams, notify: Notify) -> Result<Self> {
+        Self::start_with_auto_lock(dir, kdf, notify, AUTO_LOCK)
+    }
+
+    /// [`Client::start`] with a different auto-lock delay (tests).
+    pub fn start_with_auto_lock(
+        dir: PathBuf,
+        kdf: KdfParams,
+        notify: Notify,
+        auto_lock: Duration,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(32);
+        let interrupt = Arc::new(Interrupt::default());
+        let actor_interrupt = Arc::clone(&interrupt);
         std::thread::Builder::new()
             .name("veil-client".into())
             .spawn(move || {
@@ -188,10 +221,13 @@ impl Client {
                     return;
                 };
                 let local = tokio::task::LocalSet::new();
-                local.block_on(&rt, Actor::new(dir, kdf, notify).run(rx));
+                local.block_on(
+                    &rt,
+                    Actor::new(dir, kdf, notify, actor_interrupt, auto_lock).run(rx),
+                );
             })
             .map_err(|_| ClientError::Storage)?;
-        Ok(Self { tx })
+        Ok(Self { tx, interrupt })
     }
 
     pub async fn state(&self) -> Result<AppState> {
@@ -203,8 +239,22 @@ impl Client {
     pub async fn unlock(&self, passphrase: Zeroizing<String>) -> Result<()> {
         ask!(self, Unlock, passphrase)
     }
+    /// Locks now: relay I/O in progress is cancelled first, so the relay cannot delay this.
     pub async fn lock(&self) -> Result<()> {
+        self.interrupt.pending.store(true, Ordering::SeqCst);
+        self.interrupt.notify.notify_waiters();
         ask!(self, Lock)
+    }
+    /// The user did something (typed, tapped): postpones auto-lock.
+    pub async fn touch(&self) -> Result<()> {
+        ask!(self, Touch)
+    }
+    /// Deletes this device's identity, contacts and messages, and the device secret. Used to
+    /// start over after a forgotten passphrase. Cannot be undone.
+    pub async fn reset(&self) -> Result<()> {
+        self.interrupt.pending.store(true, Ordering::SeqCst);
+        self.interrupt.notify.notify_waiters();
+        ask!(self, Reset)
     }
     pub async fn me(&self) -> Result<MeView> {
         ask!(self, Me)
@@ -252,6 +302,8 @@ struct Session {
     pushes: Option<mpsc::Receiver<ServerFrame>>,
     next_attempt: Instant,
     backoff: Duration,
+    /// The last sync stopped early; continue on the next tick.
+    more: bool,
 }
 
 struct Actor {
@@ -260,13 +312,24 @@ struct Actor {
     notify: Notify,
     session: Option<Box<Session>>,
     last_activity: Instant,
+    interrupt: Arc<Interrupt>,
+    auto_lock: Duration,
 }
 
-/// Normalises a display name from the network or the user: trimmed, no control characters,
-/// at most [`MAX_NAME`] characters.
+/// Characters that are invisible or reorder text, so a name could imitate another (P4-11).
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}'
+        | '\u{FFF0}'..='\u{FFFB}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// Normalises a display name from the network or the user: trimmed, no control, invisible or
+/// bidi-override characters, at most [`MAX_NAME`] characters.
 fn clean_name(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible(*c))
         .take(MAX_NAME)
         .collect::<String>()
         .trim()
@@ -297,6 +360,23 @@ fn token_hash(token: &[u8; 32]) -> Vec<u8> {
 
 fn arr32(v: &[u8]) -> Result<[u8; 32]> {
     v.try_into().map_err(|_| ClientError::Storage)
+}
+
+/// Writes `name` in `dir` so that a crash leaves either the old file or the complete new one.
+fn write_atomic(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut f = std::fs::File::create(&tmp).map_err(|_| ClientError::Storage)?;
+    f.write_all(bytes).map_err(|_| ClientError::Storage)?;
+    f.sync_all().map_err(|_| ClientError::Storage)?;
+    drop(f);
+    std::fs::rename(&tmp, dir.join(name)).map_err(|_| ClientError::Storage)?;
+    // Persist the rename itself (not possible on Windows, where rename is already durable).
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|_| ClientError::Storage)?;
+    Ok(())
 }
 
 fn initials(name: &str) -> String {
@@ -339,14 +419,56 @@ async fn authenticate(
 }
 
 impl Actor {
-    fn new(dir: PathBuf, kdf: KdfParams, notify: Notify) -> Self {
+    fn new(
+        dir: PathBuf,
+        kdf: KdfParams,
+        notify: Notify,
+        interrupt: Arc<Interrupt>,
+        auto_lock: Duration,
+    ) -> Self {
         Self {
             dir,
             kdf,
             notify,
             session: None,
             last_activity: Instant::now(),
+            interrupt,
+            auto_lock,
         }
+    }
+
+    fn lock_now(&mut self) {
+        let was_open = self.session.take().is_some();
+        self.interrupt.pending.store(false, Ordering::SeqCst);
+        if was_open {
+            self.emit(ChangeKind::Locked, None);
+        }
+    }
+
+    fn idle_expired(&self) -> bool {
+        self.last_activity.elapsed() >= self.auto_lock
+    }
+
+    /// Runs relay I/O so that a lock request or the auto-lock deadline cancels it (P4-1).
+    async fn interruptible<T>(&self, fut: impl Future<Output = Result<T>>) -> Result<T> {
+        let notified = self.interrupt.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.interrupt.pending.load(Ordering::SeqCst) {
+            return Err(ClientError::Locked);
+        }
+        let left = self.auto_lock.saturating_sub(self.last_activity.elapsed());
+        tokio::select! {
+            r = fut => r,
+            () = &mut notified => Err(ClientError::Locked),
+            () = tokio::time::sleep(left) => Err(ClientError::Locked),
+        }
+    }
+
+    /// One relay round trip on the live connection; see [`Self::interruptible`].
+    async fn call(&self, req: Request) -> Result<Response> {
+        let relay = self.relay()?;
+        self.interruptible(relay.call(req)).await
     }
 
     fn emit(&self, kind: ChangeKind, contact: Option<i64>) {
@@ -364,7 +486,10 @@ impl Actor {
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
-        let mut tick = tokio::time::interval(TICK);
+        let mut tick = tokio::time::interval(
+            TICK.min(self.auto_lock.checked_div(4).unwrap_or(TICK))
+                .max(Duration::from_millis(50)),
+        );
         loop {
             tokio::select! {
                 cmd = rx.recv() => {
@@ -388,17 +513,15 @@ impl Actor {
     }
 
     async fn on_tick(&mut self) {
-        if self.session.is_some() && self.last_activity.elapsed() >= AUTO_LOCK {
-            self.session = None;
-            self.emit(ChangeKind::Locked, None);
+        if self.session.is_some() && self.idle_expired() {
+            self.lock_now();
             return;
         }
-        let due = self
-            .session
-            .as_ref()
-            .is_some_and(|s| s.relay.is_none() && Instant::now() >= s.next_attempt);
-        if due {
+        let Some(s) = self.session.as_ref() else { return };
+        if s.relay.is_none() && Instant::now() >= s.next_attempt {
             self.connect().await;
+        } else if s.relay.as_ref().is_some_and(Relay::is_open) && s.more {
+            self.sync().await;
         }
     }
 
@@ -412,13 +535,17 @@ impl Actor {
     }
 
     async fn connect(&mut self) {
+        let Some(s) = self.session.as_ref() else { return };
+        let (addr, pin, mailbox, key) = (s.relay_addr.clone(), s.pin, s.mailbox, s.mbox_key.clone());
+        let attempt = self
+            .interruptible(Box::pin(async {
+                let (relay, pushes) = Relay::connect(&addr, pin).await?;
+                authenticate(&relay, &pin, &mailbox, &key).await?;
+                Ok::<_, ClientError>((relay, pushes))
+            }))
+            .await;
         let Some(s) = self.session.as_mut() else { return };
-        let attempt = async {
-            let (relay, pushes) = Relay::connect(&s.relay_addr, s.pin).await?;
-            authenticate(&relay, &s.pin, &s.mailbox, &s.mbox_key).await?;
-            Ok::<_, ClientError>((relay, pushes))
-        };
-        if let Ok((relay, pushes)) = attempt.await {
+        if let Ok((relay, pushes)) = attempt {
             s.relay = Some(relay);
             s.pushes = Some(pushes);
             s.backoff = Duration::from_secs(2);
@@ -432,7 +559,19 @@ impl Actor {
     }
 
     async fn handle(&mut self, cmd: Cmd) {
-        if !matches!(cmd, Cmd::State(_)) {
+        // Only what the user does keeps Veil unlocked; UI refreshes caused by incoming
+        // messages or connection changes must not (P4-2).
+        if matches!(
+            cmd,
+            Cmd::Setup(..)
+                | Cmd::Unlock(..)
+                | Cmd::Touch(_)
+                | Cmd::Send(..)
+                | Cmd::CreateInvite(_)
+                | Cmd::AcceptInvite(..)
+                | Cmd::SetVerified(..)
+                | Cmd::Rename(..)
+        ) {
             self.last_activity = Instant::now();
         }
         match cmd {
@@ -448,8 +587,15 @@ impl Actor {
                 let _ = r.send(res);
             }
             Cmd::Lock(r) => {
-                self.session = None;
+                self.lock_now();
                 let _ = r.send(Ok(()));
+            }
+            Cmd::Touch(r) => {
+                let _ = r.send(self.s().map(|_| ()));
+            }
+            Cmd::Reset(r) => {
+                self.lock_now();
+                let _ = r.send(self.wipe());
             }
             Cmd::Me(r) => {
                 let _ = r.send(self.me());
@@ -487,6 +633,23 @@ impl Actor {
         }
     }
 
+    /// Removes the vault header, the database and the device secret.
+    fn wipe(&self) -> Result<()> {
+        for f in [
+            HEADER_FILE,
+            DB_FILE,
+            "veil.db-journal",
+            "veil.db-wal",
+            "veil.db-shm",
+        ] {
+            match std::fs::remove_file(self.dir.join(f)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(ClientError::Storage),
+                _ => {}
+            }
+        }
+        keystore::remove(&self.dir)
+    }
+
     fn s(&self) -> Result<&Session> {
         self.session.as_deref().ok_or(ClientError::Locked)
     }
@@ -517,8 +680,11 @@ impl Actor {
             .await?;
         authenticate(&relay, &pin, &mailbox, &mbox_key).await?;
 
-        // 2. The vault: device secret + passphrase wrap the database key.
+        // 2. The vault: device secret + passphrase wrap the database key. Without a header no
+        //    setup ever completed, so anything else here is debris from an interrupted setup or
+        //    an earlier install, and is replaced (P4-3).
         std::fs::create_dir_all(&self.dir).map_err(|_| ClientError::Storage)?;
+        self.wipe()?;
         let mut device = Zeroizing::new([0u8; 32]);
         rand::Rng::fill(&mut rng(), &mut device[..]);
         keystore::store(&self.dir, &device)?;
@@ -531,7 +697,7 @@ impl Actor {
         db.set_setting("mailbox", &mailbox)?;
         db.set_setting("mailbox_key", mbox_key.as_bytes())?;
         // The header is written last: its presence is what marks setup as complete.
-        std::fs::write(self.dir.join(HEADER_FILE), header.encode()).map_err(|_| ClientError::Storage)?;
+        write_atomic(&self.dir, HEADER_FILE, &header.encode())?;
 
         self.session = Some(Box::new(Session {
             account,
@@ -545,6 +711,7 @@ impl Actor {
             pushes: Some(pushes),
             next_attempt: Instant::now(),
             backoff: Duration::from_secs(2),
+            more: true,
         }));
         self.emit(ChangeKind::Connection, None);
         Ok(())
@@ -578,6 +745,7 @@ impl Actor {
             pushes: None,
             next_attempt: Instant::now(),
             backoff: Duration::from_secs(2),
+            more: true,
         }));
         self.connect().await;
         Ok(())
@@ -744,13 +912,12 @@ impl Actor {
                 .chunks_exact(32)
                 .map(|t| token_hash(&arr32(t).unwrap_or_default()))
                 .collect();
-            self.relay()?
-                .call(Request::UpdateTokens(veil_wire::UpdateTokens {
-                    mailbox_id: s.mailbox.to_vec(),
-                    add,
-                    remove: vec![],
-                }))
-                .await?;
+            self.call(Request::UpdateTokens(veil_wire::UpdateTokens {
+                mailbox_id: s.mailbox.to_vec(),
+                add,
+                remove: vec![],
+            }))
+            .await?;
             spare = batch;
         }
         let token = arr32(spare.get(..32).ok_or(ClientError::Storage)?)?;
@@ -776,14 +943,13 @@ impl Actor {
             )
             .await?;
         let expires = now.saturating_add(INVITE_TTL_SECS);
-        self.relay()?
-            .call(Request::PutInvite(veil_wire::PutInvite {
-                mailbox_id: s.mailbox.to_vec(),
-                invite_id: created.invite.id.to_vec(),
-                sealed: created.sealed_package.clone(),
-                expires_at: expires,
-            }))
-            .await?;
+        self.call(Request::PutInvite(veil_wire::PutInvite {
+            mailbox_id: s.mailbox.to_vec(),
+            invite_id: created.invite.id.to_vec(),
+            sealed: created.sealed_package.clone(),
+            expires_at: expires,
+        }))
+        .await?;
         s.db.conn().execute(
             "INSERT INTO invites (id, token, expires) VALUES (?1, ?2, ?3)",
             params![
@@ -814,8 +980,9 @@ impl Actor {
         if invite.is_expired(now) {
             return Err(ClientError::InviteInvalid);
         }
+        // The token first: once the relay hands out the invite it is gone (P4-10).
+        let my_token = self.take_token().await?;
         let Response::Invite(pkg) = self
-            .relay()?
             .call(Request::TakeInvite(veil_wire::TakeInvite {
                 invite_id: invite.id.to_vec(),
             }))
@@ -827,7 +994,6 @@ impl Actor {
         else {
             return Err(ClientError::Relay);
         };
-        let my_token = self.take_token().await?;
         let s = self.s()?;
         let fields = IntroFields {
             mailbox_id: s.mailbox,
@@ -835,33 +1001,85 @@ impl Actor {
             display_name: (!s.name.is_empty()).then(|| s.name.clone()),
             rekey: None,
         };
-        let red = s
-            .account
-            .redeem_invite(&mut rng(), &invite, &pkg.sealed, fields, now)
+        // The core's session state and our contact row are committed together (P4-6). The
+        // introduction is stored with the contact and delivered (and retried) from there.
+        let id = self
+            .atomically(async {
+                let red = s
+                    .account
+                    .redeem_invite(&mut rng(), &invite, &pkg.sealed, fields, now)
+                    .await?;
+                let name = format!(
+                    "Contact {}",
+                    veil_core::identity::display_fingerprint(&red.contact_identity)
+                        .chars()
+                        .take(4)
+                        .collect::<String>()
+                );
+                let id = self.upsert_contact(
+                    red.contact.as_str(),
+                    &name,
+                    &red.contact_mailbox_id,
+                    &red.contact_delivery_token,
+                    &my_token,
+                )?;
+                s.db.conn().execute(
+                    "UPDATE contacts SET intro = ?2 WHERE id = ?1",
+                    params![id, red.envelope],
+                )?;
+                Ok(id)
+            })
             .await?;
-        self.relay()?
-            .call(Request::Deposit(veil_wire::Deposit {
-                mailbox_id: red.contact_mailbox_id.to_vec(),
-                token: red.contact_delivery_token.to_vec(),
-                envelope: red.envelope,
-            }))
-            .await?;
-        let name = format!(
-            "Contact {}",
-            veil_core::identity::display_fingerprint(&red.contact_identity)
-                .chars()
-                .take(4)
-                .collect::<String>()
-        );
-        let id = self.upsert_contact(
-            red.contact.as_str(),
-            &name,
-            &red.contact_mailbox_id,
-            &red.contact_delivery_token,
-            &my_token,
-        )?;
+        self.deliver_intro(id).await;
         self.emit(ChangeKind::Contacts, Some(id));
         Self::contact_view(&self.s()?.db, id)
+    }
+
+    /// Runs `fut` inside one `SQLite` savepoint: everything it writes, including the core's
+    /// store, is committed together or not at all.
+    async fn atomically<T>(&self, fut: impl Future<Output = Result<T>>) -> Result<T> {
+        let db = self.s()?.db.clone();
+        db.conn().execute_batch("SAVEPOINT veil_op")?;
+        let r = fut.await;
+        let end = if r.is_ok() {
+            "RELEASE veil_op"
+        } else {
+            "ROLLBACK TO veil_op; RELEASE veil_op"
+        };
+        db.conn().execute_batch(end)?;
+        r
+    }
+
+    /// Deposits a contact's pending introduction, if any.
+    async fn deliver_intro(&self, contact: i64) -> bool {
+        let Ok(s) = self.s() else { return false };
+        let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> =
+            s.db.conn()
+                .query_row(
+                    "SELECT mailbox, token, intro FROM contacts WHERE id = ?1 AND intro IS NOT NULL",
+                    [contact],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+        let Some((mailbox, token, envelope)) = row else {
+            return false;
+        };
+        let ok = self
+            .call(Request::Deposit(veil_wire::Deposit {
+                mailbox_id: mailbox,
+                token,
+                envelope,
+            }))
+            .await
+            .is_ok();
+        if ok {
+            let _ =
+                s.db.conn()
+                    .execute("UPDATE contacts SET intro = NULL WHERE id = ?1", [contact]);
+        }
+        ok
     }
 
     fn upsert_contact(
@@ -942,13 +1160,7 @@ impl Actor {
         let Some((mailbox, token, envelope)) = row else {
             return false;
         };
-        let Ok(relay) = self.relay() else {
-            let _ =
-                s.db.conn()
-                    .execute("UPDATE messages SET status = 'failed' WHERE id = ?1", [message]);
-            return false;
-        };
-        let ok = relay
+        let ok = self
             .call(Request::Deposit(veil_wire::Deposit {
                 mailbox_id: mailbox,
                 token,
@@ -959,7 +1171,7 @@ impl Actor {
         let sql = if ok {
             "UPDATE messages SET status = 'sent', envelope = NULL WHERE id = ?1"
         } else {
-            "UPDATE messages SET status = 'failed' WHERE id = ?1"
+            "UPDATE messages SET status = 'failed', attempts = attempts + 1 WHERE id = ?1"
         };
         let _ = s.db.conn().execute(sql, [message]);
         ok
@@ -967,14 +1179,30 @@ impl Actor {
 
     async fn retry_failed(&mut self) {
         let Ok(s) = self.s() else { return };
-        let ids: Vec<i64> = s
-            .db
-            .conn()
-            .prepare("SELECT id FROM messages WHERE status IN ('failed', 'sending') AND envelope IS NOT NULL ORDER BY id")
-            .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
-            .unwrap_or_default();
+        let ids: Vec<i64> =
+            s.db.conn()
+                .prepare(
+                    "SELECT id FROM messages WHERE status IN ('failed', 'sending') AND envelope IS NOT NULL
+                 AND attempts < ?1 ORDER BY id",
+                )
+                .and_then(|mut st| st.query_map([MAX_ATTEMPTS], |r| r.get(0))?.collect())
+                .unwrap_or_default();
+        let intros: Vec<i64> =
+            s.db.conn()
+                .prepare("SELECT id FROM contacts WHERE intro IS NOT NULL ORDER BY id")
+                .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
+                .unwrap_or_default();
+        for id in intros {
+            if self.interrupt.pending.load(Ordering::SeqCst) || self.idle_expired() {
+                return;
+            }
+            self.deliver_intro(id).await;
+        }
         let mut any = false;
         for id in ids {
+            if self.interrupt.pending.load(Ordering::SeqCst) || self.idle_expired() {
+                break;
+            }
             any |= self.deliver(id).await;
         }
         if any {
@@ -984,9 +1212,17 @@ impl Actor {
 
     // ---- receiving ----
 
-    /// Fetches, opens and acknowledges everything waiting in our mailbox.
+    /// Fetches, opens and acknowledges what is waiting in our mailbox, at most
+    /// [`MAX_BATCHES`] batches at a time. A relay that replays old sequence numbers or never
+    /// runs dry cannot keep the actor busy (P4-1).
     async fn sync(&mut self) {
-        loop {
+        if let Some(s) = self.session.as_mut() {
+            s.more = false;
+        }
+        for _ in 0..MAX_BATCHES {
+            if self.idle_expired() {
+                return;
+            }
             let Ok(s) = self.s() else { return };
             let after =
                 s.db.setting("last_seq")
@@ -994,49 +1230,69 @@ impl Actor {
                     .flatten()
                     .and_then(|v| v.as_slice().try_into().ok().map(u64::from_be_bytes))
                     .unwrap_or(0);
-            let Ok(relay) = self.relay() else { return };
-            let Ok(Response::Envelopes(batch)) = relay
+            let mailbox = s.mailbox.to_vec();
+            let Ok(Response::Envelopes(batch)) = self
                 .call(Request::Fetch(veil_wire::Fetch {
-                    mailbox_id: s.mailbox.to_vec(),
+                    mailbox_id: mailbox.clone(),
                     after_seq: after,
-                    limit: 8,
+                    limit: FETCH_LIMIT,
                 }))
                 .await
             else {
                 return;
             };
-            if batch.items.is_empty() {
-                return;
-            }
+            let full = batch.items.len() >= usize::try_from(FETCH_LIMIT).unwrap_or(usize::MAX);
             let mut last = after;
+            let mut stalled = false;
             for item in batch.items {
+                // Only strictly newer items count; replays and reordering are skipped.
+                if item.seq <= last {
+                    continue;
+                }
                 if !ENVELOPE_BUCKETS.contains(&item.envelope.len()) {
-                    last = last.max(item.seq);
+                    last = item.seq;
                     continue;
                 }
                 match self.process(&item.envelope).await {
-                    // Storage failures are transient: stop without acking, retry next sync.
-                    Err(ClientError::Storage) => return,
+                    // Storage failures are transient and were rolled back: stop without
+                    // acking, retry on the next sync.
+                    Err(ClientError::Storage) => {
+                        stalled = true;
+                        break;
+                    }
                     // Anything else is either done or permanently invalid: acknowledge it.
-                    _ => last = last.max(item.seq),
+                    _ => last = item.seq,
                 }
+            }
+            if last == after {
+                return;
             }
             let Ok(s) = self.s() else { return };
             if s.db.set_setting("last_seq", &last.to_be_bytes()).is_err() {
                 return;
             }
-            if let Ok(relay) = self.relay() {
-                let _ = relay
-                    .call(Request::Ack(veil_wire::Ack {
-                        mailbox_id: s.mailbox.to_vec(),
-                        up_to_seq: last,
-                    }))
-                    .await;
+            let _ = self
+                .call(Request::Ack(veil_wire::Ack {
+                    mailbox_id: mailbox,
+                    up_to_seq: last,
+                }))
+                .await;
+            if stalled || !full {
+                return;
             }
+        }
+        if let Some(s) = self.session.as_mut() {
+            s.more = true;
         }
     }
 
+    /// Opens one envelope and stores the result. The core's ratchet update and our rows are
+    /// committed together, so a crash or a storage error cannot lose the message (P4-6).
     async fn process(&mut self, envelope: &[u8]) -> Result<()> {
+        self.atomically(self.process_inner(envelope)).await
+    }
+
+    async fn process_inner(&self, envelope: &[u8]) -> Result<()> {
         let s = self.s()?;
         let opened = s
             .account

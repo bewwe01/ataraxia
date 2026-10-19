@@ -977,13 +977,22 @@ impl Conn {
                 // Peek both buckets first, so one refusal does not spend the other; give both
                 // back if the relay-wide cap refuses (review P3R4-10).
                 let source = limiter_key(self.source);
-                if !lock(&sh.upload_tokens).would_allow(&m)
-                    || !lock(&sh.upload_tokens_per_source).would_allow(&source)
                 {
-                    return Err(ErrorCode::RateLimited);
+                    // Check and take both under both locks, so concurrent requests cannot
+                    // overspend (review P4-15). Lock order: per-mailbox, then per-source.
+                    let mut per_mailbox = lock(&sh.upload_tokens);
+                    let mut per_source = lock(&sh.upload_tokens_per_source);
+                    if !per_mailbox.would_allow(&m) || !per_source.would_allow(&source) {
+                        return Err(ErrorCode::RateLimited);
+                    }
+                    if !per_mailbox.allow(&m) {
+                        return Err(ErrorCode::RateLimited);
+                    }
+                    if !per_source.allow(&source) {
+                        per_mailbox.refund(&m);
+                        return Err(ErrorCode::RateLimited);
+                    }
                 }
-                lock(&sh.upload_tokens).allow(&m);
-                lock(&sh.upload_tokens_per_source).allow(&source);
                 let mut token = [0u8; 32];
                 rand::rng().fill(&mut token);
                 let h = upload_hash(&token);

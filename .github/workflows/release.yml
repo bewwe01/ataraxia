@@ -1,11 +1,15 @@
 # Release builds: Android APK (arm64) and Windows installer (NSIS), published to a GitHub
 # pre-release with SHA-256 checksums when a version tag is pushed.
 #
+# Build jobs never see a signing secret (review P4-5). Branch pushes only build: the APK stays
+# unsigned. On a version tag, a separate job in the protected `release` environment downloads
+# the unsigned APK and signs it without running any project code.
+#
 # Signing, stated plainly:
-# - Android: signed with the release keystore from repository secrets when they are set
-#   (ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS). Otherwise with a
-#   throwaway key generated in this run: such an APK installs, but the next build cannot
-#   update it in place (uninstall first, which deletes local data).
+# - Android: signed with the release keystore from the `release` environment's secrets when
+#   they are set (ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS).
+#   Otherwise with a throwaway key generated in that run: such an APK installs, but the next
+#   release cannot update it in place (uninstall first, which deletes local data).
 # - Windows: not code-signed. SmartScreen will warn; check the SHA-256 instead.
 name: release
 
@@ -23,6 +27,7 @@ on:
       - "app/**"
       - "crates/**"
       - "Cargo.lock"
+      - "deny.toml"
       - ".github/workflows/release.yml"
 
 permissions:
@@ -49,13 +54,37 @@ jobs:
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: "10.28.0"
-      - name: Typecheck, lint, build
+      - name: Typecheck, lint, build, audit
         working-directory: app
         run: |
           pnpm install --frozen-lockfile
           pnpm typecheck
           pnpm lint
           pnpm build
+          pnpm audit --prod
+
+  # The app's own Cargo workspace (Tauri and the webview bindings) gets the same deny and
+  # audit gates as the root workspace (review P4-7).
+  app-supply-chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install tools (built from source, exact versions)
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal && rustup default 1.97.0
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo deny --manifest-path app/src-tauri/Cargo.toml --config deny.toml --locked check
+      # Ignored, with reasons: RUSTSEC-2024-0370 and RUSTSEC-2026-0173 are "unmaintained"
+      # notices for proc-macro-error(2), build-time macro crates of Tauri's GTK stack;
+      # RUSTSEC-2024-0429 is an unsoundness in glib's VariantStrIter, and glib is only built
+      # for Linux, which this workflow does not ship (Windows and Android only).
+      - run: >
+          cargo audit --file app/src-tauri/Cargo.lock --deny warnings
+          --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2026-0173 --ignore RUSTSEC-2024-0429
 
   android:
     needs: frontend
@@ -99,43 +128,23 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm tauri android init --ci
           pnpm tauri icon app-icon.png
-          pnpm tauri android build --target aarch64 --apk --ci
-          find src-tauri/gen/android -name '*.apk' -print
+          # No backups of the vault, FLAG_SECURE (review P4-4, P4-8).
+          python3 android/harden.py src-tauri/gen/android
+          pnpm tauri android build --target aarch64 --apk --ci -- --locked
+          mkdir -p ../out
+          cp "$(find src-tauri/gen/android -name '*-release-unsigned.apk' | head -1)" ../out/Veil-android-arm64-unsigned.apk
 
-      - name: Sign APK
-        env:
-          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
-          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      - name: Check the hardening reached the APK
         run: |
-          set -euo pipefail
           BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
-          IN=$(find app/src-tauri/gen/android -name '*-release-unsigned.apk' | head -1)
-          test -n "$IN"
-          KS="$RUNNER_TEMP/release.jks"
-          if [ -n "$KEYSTORE_B64" ]; then
-            echo "$KEYSTORE_B64" | base64 -d > "$KS"
-            echo "SIGNING=release key from repository secrets" >> "$GITHUB_ENV"
-          else
-            export KEYSTORE_PASSWORD KEY_ALIAS
-            KEYSTORE_PASSWORD=$(openssl rand -hex 24)
-            KEY_ALIAS=veil-ephemeral
-            keytool -genkeypair -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" \
-              -alias "$KEY_ALIAS" -keyalg EC -groupname secp256r1 -validity 3650 -dname "CN=Veil ephemeral CI key"
-            echo "SIGNING=throwaway key generated in this CI run (not updatable in place)" >> "$GITHUB_ENV"
-          fi
-          mkdir -p out
-          "$BT/zipalign" -P 16 -f 4 "$IN" "$RUNNER_TEMP/aligned.apk"
-          # The password reaches apksigner through the environment, never argv.
-          "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" --ks-pass "env:KEYSTORE_PASSWORD" \
-            --out out/Veil-android-arm64.apk "$RUNNER_TEMP/aligned.apk"
-          "$BT/apksigner" verify --print-certs out/Veil-android-arm64.apk | grep -E "Signer #1 certificate (DN|SHA-256)"
-          rm -f "$KS"
-          echo "$SIGNING" > out/android-signing.txt
+          M=$("$BT/aapt2" dump xmltree --file AndroidManifest.xml out/Veil-android-arm64-unsigned.apk)
+          echo "$M" | grep -E 'allowBackup|dataExtractionRules|fullBackupContent'
+          echo "$M" | grep -E 'allowBackup.*=false'
+          echo "$M" | grep -q dataExtractionRules
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: android
+          name: android-unsigned
           path: out/
           if-no-files-found: error
           retention-days: 7
@@ -156,7 +165,7 @@ jobs:
           version: "10.28.0"
 
       - name: Rust toolchain, protoc
-        shell: bash
+        shell: pwsh
         run: |
           rustup toolchain install 1.97.0 --profile minimal
           rustup default 1.97.0
@@ -165,12 +174,17 @@ jobs:
 
       - name: Build NSIS installer
         working-directory: app
-        shell: bash
+        shell: pwsh
+        env:
+          # OpenSSL's Configure needs a full Perl; Git for Windows' Perl lacks modules.
+          OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
         run: |
           pnpm install --frozen-lockfile
-          pnpm tauri build --bundles nsis
-          mkdir -p ../out
-          cp src-tauri/target/release/bundle/nsis/*-setup.exe ../out/Veil-windows-x64-setup.exe
+          pnpm tauri build --bundles nsis -- --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force ../out | Out-Null
+          $exe = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          Copy-Item $exe.FullName ../out/Veil-windows-x64-setup.exe
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -179,8 +193,56 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Runs only for a release, in the protected environment, on the unsigned APK alone: no
+  # checkout, no project code, nothing that could read or replace the key.
+  sign-android:
+    needs: android
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: android-unsigned
+          path: in
+      - name: Align and sign
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$KS"
+            SIGNING="release key"
+          else
+            export KEYSTORE_PASSWORD KEY_ALIAS
+            KEYSTORE_PASSWORD=$(openssl rand -hex 24)
+            KEY_ALIAS=veil-ephemeral
+            keytool -genkeypair -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" \
+              -alias "$KEY_ALIAS" -keyalg EC -groupname secp256r1 -validity 3650 -dname "CN=Veil ephemeral CI key"
+            SIGNING="throwaway key generated in this CI run (cannot be updated in place)"
+          fi
+          mkdir -p out
+          "$BT/zipalign" -f 4 in/Veil-android-arm64-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+          # The password reaches apksigner through the environment, never argv.
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD \
+            --out out/Veil-android-arm64.apk "$RUNNER_TEMP/aligned.apk"
+          rm -f "$KS"
+          "$BT/apksigner" verify --verbose --print-certs out/Veil-android-arm64.apk
+          echo "$SIGNING" > out/android-signing.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
-    needs: [android, windows]
+    needs: [sign-android, windows, app-supply-chain]
     if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -189,6 +251,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: "{android,windows}"
           path: dist
           merge-multiple: true
       - name: Checksums and release
@@ -199,6 +262,8 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # The tag becomes a CLI argument: allow version-like names only.
+          [[ "$TAG" =~ ^v[0-9][0-9A-Za-z.-]*$ ]] || { echo "bad tag"; exit 1; }
           cd dist
           SIGNING=$(cat android-signing.txt)
           rm android-signing.txt

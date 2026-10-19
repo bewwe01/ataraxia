@@ -25,12 +25,32 @@ export function App() {
 
   useEffect(refreshState, [refreshState]);
 
+  // Auto-lock counts only real user input (review P4-2): report it, at most every 20 s.
+  useEffect(() => {
+    if (state !== "unlocked") return;
+    let last = 0;
+    const onInput = () => {
+      const now = Date.now();
+      if (now - last < 20_000) return;
+      last = now;
+      void ipc.touch().catch(() => undefined);
+    };
+    const events = ["pointerdown", "keydown", "wheel", "touchstart"] as const;
+    for (const e of events) window.addEventListener(e, onInput, { passive: true });
+    return () => {
+      for (const e of events) window.removeEventListener(e, onInput);
+    };
+  }, [state]);
+
   useEffect(() => {
     if (state !== "unlocked") return;
     refresh();
     let off: (() => void) | undefined;
     void onChange((kind) => {
       if (kind === "locked") {
+        // Drop everything shown while unlocked, previews included.
+        setContacts([]);
+        setMe(null);
         setRoute({ screen: "chats" });
         refreshState();
         return;
@@ -61,7 +81,7 @@ export function App() {
     case "add":
       return <AddContact nav={(to) => { refresh(); setRoute(to); }} />;
     case "settings":
-      return <Settings me={me} nav={setRoute} onLocked={refreshState} />;
+      return <Settings me={me} nav={setRoute} onLocked={() => { setContacts([]); setMe(null); refreshState(); }} />;
     case "chats":
       return <ChatList contacts={contacts} me={me} nav={setRoute} />;
   }

@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   mailbox BLOB NOT NULL,
   token BLOB NOT NULL,
   my_token BLOB NOT NULL,
+  intro BLOB,
   unread INTEGER NOT NULL DEFAULT 0,
   added_ms INTEGER NOT NULL
 );
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS messages (
   body TEXT NOT NULL,
   at_ms INTEGER NOT NULL,
   status TEXT NOT NULL,
-  envelope BLOB
+  envelope BLOB,
+  attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS messages_by_contact ON messages(contact, id);
 CREATE TABLE IF NOT EXISTS invites (id BLOB PRIMARY KEY, token BLOB NOT NULL, expires INTEGER NOT NULL) WITHOUT ROWID;
@@ -128,23 +130,30 @@ impl KvBackend for SqlBackend {
             .map_err(|_| veil_core::CoreError::Storage)
     }
 
+    /// A savepoint rather than a transaction, so the batch nests inside an outer savepoint
+    /// when the client commits the core's state together with its own rows (review P4-6).
     fn apply(&mut self, batch: &[Write]) -> veil_core::Result<()> {
-        let tx = self
-            .0
-            .conn()
-            .unchecked_transaction()
+        let conn = self.0.conn();
+        conn.execute_batch("SAVEPOINT kv_apply")
             .map_err(|_| veil_core::CoreError::Storage)?;
-        for (k, v) in batch {
-            let r = match v {
-                Some(v) => tx.execute(
+        let r = batch.iter().try_for_each(|(k, v)| {
+            match v {
+                Some(v) => conn.execute(
                     "INSERT OR REPLACE INTO kv (k, v) VALUES (?1, ?2)",
                     params![k, v.as_slice()],
                 ),
-                None => tx.execute("DELETE FROM kv WHERE k = ?1", [k]),
-            };
-            r.map_err(|_| veil_core::CoreError::Storage)?;
-        }
-        tx.commit().map_err(|_| veil_core::CoreError::Storage)
+                None => conn.execute("DELETE FROM kv WHERE k = ?1", [k]),
+            }
+            .map(|_| ())
+        });
+        let end = if r.is_ok() {
+            "RELEASE kv_apply"
+        } else {
+            "ROLLBACK TO kv_apply; RELEASE kv_apply"
+        };
+        conn.execute_batch(end)
+            .map_err(|_| veil_core::CoreError::Storage)?;
+        r.map_err(|_| veil_core::CoreError::Storage)
     }
 }
 

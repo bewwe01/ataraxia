@@ -42,7 +42,7 @@ export function Setup({ onDone }: { onDone: () => void }) {
             <h2 className="protect-h yes"><Icon name="shield-check" className="icon-sm" />Protected</h2>
             <ul className="protect-list yes">
               <li>What you write: end-to-end encrypted, also against quantum attacks (PQXDH + SPQR).</li>
-              <li>Who you talk to: the relay sees random mailbox ids, not names or keys.</li>
+              <li>Names and keys: the relay never sees them, only random mailbox ids.</li>
               <li>Everything stored on this device: encrypted with your passphrase.</li>
             </ul>
           </section>
@@ -50,6 +50,7 @@ export function Setup({ onDone }: { onDone: () => void }) {
             <h2 className="protect-h no"><Icon name="alert-triangle" className="icon-sm" />Not protected</h2>
             <ul className="protect-list no">
               <li>The relay sees your IP address while you are connected, and message timing and sizes.</li>
+              <li>Who talks to whom: the relay can link your mailbox to the mailboxes you send to. This version does not rotate mailboxes.</li>
               <li>A contact can screenshot or copy what you send.</li>
               <li>A device that is unlocked and compromised can read your messages.</li>
               <li>Veil has not had an independent security audit.</li>
@@ -126,6 +127,20 @@ export function Unlock({ onDone }: { onDone: () => void }) {
   const [pass, setPass] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  async function reset() {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.reset();
+      onDone();
+    } catch (err) {
+      setError(err instanceof IpcError ? err.message : "Could not delete the data");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -161,7 +176,16 @@ export function Unlock({ onDone }: { onDone: () => void }) {
         </div>
         <details className="err-details forgot">
           <summary>Forgot your passphrase?</summary>
-          <p className="hint">It can't be reset or recovered, by anyone. Without it, start over with a new identity.</p>
+          <p className="hint">It can't be reset or recovered, by anyone. Without it, start over with a new identity. This deletes all contacts and messages on this device.</p>
+          {confirmReset ? (
+            <div className="stack-sm">
+              <p className="hint"><strong>Delete everything on this device and start over?</strong> This cannot be undone.</p>
+              <button className="btn btn-danger btn-block" type="button" disabled={busy} onClick={() => void reset()}>Yes, delete and start over</button>
+              <button className="btn btn-secondary btn-block" type="button" onClick={() => setConfirmReset(false)}>Cancel</button>
+            </div>
+          ) : (
+            <button className="btn btn-secondary btn-block" type="button" onClick={() => setConfirmReset(true)}>Start over…</button>
+          )}
         </details>
       </form>
     </div>

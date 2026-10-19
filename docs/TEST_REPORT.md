@@ -2,6 +2,39 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 4: client, app, release (2026-10-19), after final gate round 1
+
+Final gate round 1 returned **FAIL** (5 High). All five Highs, the Mediums and the Lows are addressed. Each new behavioural test was checked against a mutant that reverts its fix.
+
+| Finding | Fix | Evidence |
+|---|---|---|
+| P4-1 relay can stall the actor | Every relay round trip runs through `Actor::interruptible`: a lock request (`Client::lock` sets a flag and wakes the actor) or the auto-lock deadline cancels it. `sync` skips `seq <= last`, stops when nothing advances, and does at most 16 batches, then continues on the next tick | `lock_preempts_a_stalled_relay`: a tarpit relay holds `unlock` in connect; `lock()` must finish within 3 s (mutant without the interrupt: fails, "lock waited for the relay"). Stale-`seq` replay: code argument, no fake-relay test |
+| P4-2 background events postponed auto-lock | Only user-caused commands count as activity (setup, unlock, send, invite, verify, rename, and a new `touch` that the UI sends on pointer/key input, at most every 20 s). Refreshes, `mark_read`, `me` do not | `incoming_traffic_does_not_postpone_auto_lock` (auto-lock 3 s, a message every 200 ms plus UI refreshes; must lock; `touch` keeps it open). Mutant counting every command: fails |
+| P4-3 setup not crash-safe | Without a header, setup first wipes debris (DB, journal/WAL, device secret, keyring entry); the device secret and header are written via temp file + fsync + rename. New `reset` command and "Start over" on the unlock screen, with confirmation | `setup_recovers_from_debris_and_reset_starts_over` |
+| P4-4 Android backups | `app/android/harden.py` sets `allowBackup=false` and backup/transfer rules excluding every domain; CI checks the built APK's manifest with `aapt2` | CI `android` job step "Check the hardening reached the APK" (first run pending at time of writing) |
+| P4-5 signing key exposure | Build jobs have no secrets and produce an unsigned APK. Signing runs only for a `v*` tag / tagged dispatch, in `environment: release`, with no checkout and no project code | workflow review |
+| P4-6 message loss between commits | `SqlBackend::apply` uses a savepoint; `process` and pairing wrap the core's commit and the app rows in one savepoint. The introduction envelope is stored with the contact and retried | existing E2E test; crash-injection test not written |
+| P4-7 app tree outside gates | `release.yml` job `app-supply-chain` (deny + audit on `app/src-tauri`), `pnpm audit --prod`, `--locked` builds | CI (first run pending) |
+| P4-8 screenshots | FLAG_SECURE via `harden.py` | script tested on a template-shaped project; not checked on a device |
+| P4-9 docs | THREAT_MODEL "who you talk to" corrected; onboarding text; ADR-0011; INVARIANTS rows | docs |
+| P4-10 to P4-14 | token before `TakeInvite`; invisible/bidi characters stripped from names; IPv6 URLs bracketed and unbalanced brackets refused; UI clears state on lock, send guard, rejection handlers; tag validated; deposit retries capped at 20 | `host_port_parsing` extended |
+| P4-15 relay bucket race | Both upload-token buckets checked and taken under both locks; `allow` results acted on | relay tests pass |
+
+```text
+$ cargo fmt --all --check                                             # FMT_OK
+$ cargo clippy --workspace --all-targets --locked -- -D warnings      # exit 0
+$ cargo test --workspace --locked
+  veil_client unit 4 | lock_and_setup 3 | pair_and_message 1
+  veil_core 74 | secrets 3 | session 22 (+1 ignored)
+  veil_relay lib 25 | logs 1 | relay 24 | smoke 0 (+2 ignored) | veil_wire 5
+$ cargo deny check                    # advisories ok, bans ok, licenses ok, sources ok
+$ cargo vet --locked                  # Vetting Succeeded (48 fully audited, 16 partially audited, 217 exempted)
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build     # lint: 9 files clean; built
+$ (app/src-tauri) cargo clippy --all-targets --locked -- -D warnings   # exit 0
+```
+
+Not verified here: the app has not been run on a real Android phone or Windows machine by me; the CI builds produce the binaries. There is no frontend test suite.
+
 ## Phase 3: after review round 4 conditions (2026-10-19)
 
 Review round 4 returned **PASS WITH CONDITIONS** (no Critical or High). All five conditions and the Lows are addressed. Each new test was mutation-checked.

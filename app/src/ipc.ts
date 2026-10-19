@@ -1,5 +1,5 @@
 // The only module that talks to the Rust side (CLAUDE.md: "All IPC goes through one typed
-// module"). It mirrors `app/src-tauri/src/commands.rs`. Everything that crosses this boundary is
+// module"). It mirrors `app/src-tauri/src/lib.rs`. Everything that crosses this boundary is
 // display data: no key material, no ciphertext, no file paths.
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -73,6 +73,10 @@ export const ipc = {
   setup: (input: SetupInput) => call<void>("setup", { input }),
   unlock: (passphrase: string) => call<void>("unlock", { passphrase }),
   lock: () => call<void>("lock"),
+  /** The user did something; postpones auto-lock. Event-driven refreshes must not call it. */
+  touch: () => call<void>("touch"),
+  /** Deletes the identity, contacts, messages and device secret. Cannot be undone. */
+  reset: () => call<void>("reset"),
   me: () => call<Me>("me"),
   contacts: () => call<ContactView[]>("contacts"),
   messages: (contact: number) => call<MessageView[]>("messages", { contact }),

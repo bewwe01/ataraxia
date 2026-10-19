@@ -56,6 +56,16 @@ async fn lock(c: State<'_, Client>) -> Res<()> {
 }
 
 #[tauri::command]
+async fn touch(c: State<'_, Client>) -> Res<()> {
+    c.touch().await.map_err(err)
+}
+
+#[tauri::command]
+async fn reset(c: State<'_, Client>) -> Res<()> {
+    c.reset().await.map_err(err)
+}
+
+#[tauri::command]
 async fn me(c: State<'_, Client>) -> Res<MeView> {
     c.me().await.map_err(err)
 }
@@ -124,6 +134,8 @@ pub fn run() {
             setup,
             unlock,
             lock,
+            touch,
+            reset,
             me,
             contacts,
             messages,

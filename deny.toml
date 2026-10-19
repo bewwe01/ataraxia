@@ -12,6 +12,10 @@ ignore = [
     # hax-lib-macros <- libcrux-intrinsics <- libcrux-ml-kem <- libsignal/spqr. No runtime code.
     # Removing it requires changes upstream in libcrux/libsignal. Review: 2027-01-15.
     { id = "RUSTSEC-2026-0173", reason = "build-time proc-macro via libcrux (libsignal); unmaintained, not vulnerable" },
+    # The two below occur only in the app workspace (app/src-tauri, checked with this same file
+    # by release.yml), through Tauri's Linux GTK stack. Review: 2027-01-15.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: build-time macro of gtk-rs; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2024-0429", reason = "glib VariantStrIter unsoundness; glib is built only for Linux, which is not shipped" },
 ]
 
 [licenses]

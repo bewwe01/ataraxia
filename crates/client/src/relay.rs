@@ -138,10 +138,14 @@ fn tls_config(pin: [u8; 32]) -> Result<rustls::ClientConfig, ClientError> {
         .with_no_client_auth())
 }
 
-/// Splits `host:port`, accepting `[v6]:port`.
+/// Splits `host:port`, accepting `[v6]:port`. An IPv6 host must be bracketed.
 pub(crate) fn split_host_port(addr: &str) -> Result<(String, u16), ClientError> {
     let (host, port) = addr.rsplit_once(':').ok_or(ClientError::BadInput)?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = match host.strip_prefix('[') {
+        Some(inner) => inner.strip_suffix(']').ok_or(ClientError::BadInput)?,
+        None if host.contains([':', '[', ']']) => return Err(ClientError::BadInput),
+        None => host,
+    };
     let port: u16 = port.parse().map_err(|_| ClientError::BadInput)?;
     if host.is_empty() || host.len() > 253 || port == 0 {
         return Err(ClientError::BadInput);
@@ -193,7 +197,15 @@ impl Relay {
             .max_frame_size(Some(veil_wire::MAX_FRAME));
         let (ws, _) = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            tokio_tungstenite::client_async_with_config(format!("wss://{host}/"), tls, Some(cfg)),
+            tokio_tungstenite::client_async_with_config(
+                if host.contains(':') {
+                    format!("wss://[{host}]/")
+                } else {
+                    format!("wss://{host}/")
+                },
+                tls,
+                Some(cfg),
+            ),
         )
         .await
         .map_err(|_| ClientError::Unreachable)?
@@ -291,7 +303,17 @@ mod tests {
             ("relay.example.org".into(), 8443)
         );
         assert_eq!(split_host_port("[::1]:8443").unwrap(), ("::1".into(), 8443));
-        for bad in ["relay", ":8443", "relay:0", "relay:99999", "relay:x"] {
+        for bad in [
+            "relay",
+            ":8443",
+            "relay:0",
+            "relay:99999",
+            "relay:x",
+            "[::1:8443",
+            "::1]:8443",
+            "::1:8443",
+            "[]:8443",
+        ] {
             assert!(split_host_port(bad).is_err(), "{bad}");
         }
     }

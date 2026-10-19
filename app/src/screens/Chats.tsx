@@ -82,14 +82,20 @@ export function Chat({ contact, me, nav, version }: { contact: ContactView; me: 
   const [messages, setMessages] = useState<MessageView[]>([]);
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
   const end = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let live = true;
-    void ipc.messages(contact.id).then((m) => {
-      if (live) setMessages(m);
-    });
-    void ipc.markRead(contact.id);
+    ipc.messages(contact.id).then(
+      (m) => {
+        if (live) setMessages(m);
+      },
+      () => {
+        if (live) setError("Could not load messages");
+      },
+    );
+    void ipc.markRead(contact.id).catch(() => undefined);
     return () => {
       live = false;
     };
@@ -102,7 +108,8 @@ export function Chat({ contact, me, nav, version }: { contact: ContactView; me: 
   async function send(e?: FormEvent) {
     e?.preventDefault();
     const body = text.trim();
-    if (!body) return;
+    if (!body || sending) return;
+    setSending(true);
     setError(null);
     try {
       const m = await ipc.send(contact.id, body);
@@ -110,6 +117,8 @@ export function Chat({ contact, me, nav, version }: { contact: ContactView; me: 
       setMessages((prev) => [...prev, m]);
     } catch (err) {
       setError(err instanceof IpcError ? err.message : "Not sent");
+    } finally {
+      setSending(false);
     }
   }
 
@@ -164,7 +173,7 @@ export function Chat({ contact, me, nav, version }: { contact: ContactView; me: 
           <label className="sr-only" htmlFor="composer">Message {contact.name}</label>
           <textarea id="composer" rows={1} placeholder="Message" spellCheck value={text} maxLength={62464} onChange={(e) => setText(e.target.value)} onKeyDown={onKey} />
         </div>
-        <button className="icon-btn accent send-btn" type="submit" aria-label="Send"><Icon name="send" /></button>
+        <button className="icon-btn accent send-btn" type="submit" aria-label="Send" disabled={sending}><Icon name="send" /></button>
       </form>
     </div>
   );

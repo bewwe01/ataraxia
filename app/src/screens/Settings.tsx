@@ -48,10 +48,10 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
         </section>
         <section className="card stack-sm">
           <h2>Security</h2>
-          <button className="btn btn-secondary btn-block" type="button" onClick={() => void ipc.lock().then(onLocked)}>
+          <button className="btn btn-secondary btn-block" type="button" onClick={() => void ipc.lock().then(onLocked, onLocked)}>
             <Icon name="lock" />Lock now
           </button>
-          <p className="hint">Veil also locks itself after 5 minutes without use.</p>
+          <p className="hint">Veil also locks itself after 5 minutes without you touching it. New messages arriving do not keep it unlocked.</p>
         </section>
         <section className="card stack-sm">
           <h2>About</h2>
