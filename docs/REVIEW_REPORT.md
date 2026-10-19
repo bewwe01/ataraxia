@@ -2363,3 +2363,160 @@ None.
 - **Left behind:**
   - incremental build artifacts in the git-ignored `target/` (the free disk went from about 2.5 GB to 2.1 GB);
   - probe sources in `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r4/`.
+
+## Final gate, round 1: Phase 4 client, app, release workflow (2026-10-19)
+
+**Reviewer:** independent code-reviewer agent (adversarial gate). Scope: `crates/client`, `app/`, `.github/workflows/release.yml`, `deny.toml`, spot-check of d158de3, docs honesty. HEAD = `0b0d8c6` + docs commit.
+
+## Veil final review gate: Phase 4 (client, app, release) and spot-check of the Phase 3 round-4 fixes
+
+VERDICT: FAIL
+
+**Scope read in full:** `crates/client/src/{relay,db,keystore,service,qr,lib}.rs`, `crates/client/tests/pair_and_message.rs`, `app/src/**`, `app/scripts/lint.mjs`, `app/index.html`, `app/src-tauri/{src/lib.rs,tauri.conf.json,capabilities/default.json,Cargo.toml}`, `.github/workflows/release.yml`, `deny.toml`, the d158de3 diff, the relevant sections of ARCHITECTURE, INVARIANTS and TEST_REPORT, and the `Account::open` path in core.
+
+**Commands run (read-only):**
+- `cargo test -p veil-client`: 4 unit tests and 1 integration test, all pass.
+- `cargo clippy -p veil-client --all-targets -D warnings`: clean.
+- `pnpm typecheck` and `pnpm lint`: clean.
+- The four new round-4 relay tests: pass.
+
+The result is FAIL because of five High findings. Two of them let the relay or contacts beat the lock, one makes setup permanently unusable, one sends both vault factors to cloud backup by default, and one exposes the release signing key and release-signed builds of unreviewed branches. The pin verifier, the CSP and the shape of the IPC surface are sound (see "Verified good" at the end).
+
+---
+
+### High
+
+**P4-1 (High): a hostile relay can freeze the client actor forever, so Lock, auto-lock and unlock never complete.** `crates/client/src/service.rs:988-1037`
+- **What happens:** `sync()` loops for as long as `Fetch` returns a non-empty batch. It never checks that `seq > after`, and there is no limit on batches per sync.
+- **Scenario 1:** the relay returns the same items with `seq <= last_seq`. `last` stays equal to `after`, so the loop repeats forever. Each round also does a DB write and an `Ack`.
+- **Scenario 2:** the relay hands out an endless stream of junk items with increasing `seq`. The loop never ends either.
+- **Why this matters:** the actor runs commands and ticks only between `sync()` calls (`run`, L366-388). While it loops:
+  - `Cmd::Lock` waits in the queue and the "Lock now" button hangs;
+  - `on_tick` never runs, so auto-lock never fires;
+  - `unlock()` never returns, because it awaits `connect()`, then `sync()`.
+
+  The account, the open SQLCipher handle and the mailbox key stay in memory for as long as the relay wants.
+- **Fix:**
+  - In the batch loop, ignore any item with `item.seq <= after` and stop when `last == after`.
+  - Allow at most N batches per sync (e.g. 16), then return and let the next push or tick continue.
+  - Check the auto-lock deadline inside `sync`, `retry_failed` and `connect`.
+  - Better: make Lock pre-emptive. Run relay I/O as a cancellable future in the `select!` alongside `rx.recv()`, so a Lock or tick can drop it.
+  - Add a test with a fake relay that replays stale `seq` values.
+
+**P4-2 (High): background events count as user activity, so a contact or the relay can keep the vault unlocked indefinitely.** `app/src/App.tsx:127-134`, `app/src/screens/Chats.tsx:87-96`, `service.rs:435-437`
+- **What happens:** every `veil://changed` event makes the UI call `ipc.contacts()` and `ipc.me()`. A `messages` event with the chat open also triggers `ipc.messages()` and `ipc.markRead()`. All of these reset `last_activity`; only `Cmd::State` is exempt.
+- **What emits those events:**
+  - every incoming message (`process`, L1069);
+  - every successful reconnect (`connect`, L425);
+  - every dropped connection (`disconnected`, L411).
+- **Scenario:** a contact sends one message every 4 minutes, or the relay accepts the connection and drops it every 4 minutes. The device then never locks.
+- **Docs that overclaim:** ADR-0011 ("auto-lock after 5 minutes idle") and Settings ("locks itself after 5 minutes without use").
+- **Fix:**
+  - Count only user-initiated commands as activity. Add an explicit `touch` command fired from real UI input (pointer, key or focus events), or an `activity: bool` flag on commands that UI refreshes set to false.
+  - Add a test: with no user commands, a stream of incoming messages still locks the vault after `AUTO_LOCK`. Use a test-configurable `AUTO_LOCK`.
+
+**P4-3 (High): setup is not crash-safe, and after a partial setup or a reinstall the app can never be set up again.** `service.rs:521-534`, `keystore.rs:211-235`
+- **What happens:** `keystore::store` runs before the Argon2 `vault::create` (seconds on mobile), `Db::open`, `Account::create` and the settings writes. "Setup complete" is defined only by the presence of `vault.hdr`.
+- **Failure 1, any later step fails or the app is killed mid-setup:**
+  - on Android and Linux, `device.secret` already exists and the next setup fails at `create_new` with `Storage`;
+  - on Windows, `store` returns `AlreadySetUp`;
+  - a leftover `veil.db` under the old key makes `Db::open` report "Wrong passphrase" during setup.
+
+  The state stays `New` forever, and no reset command exists.
+- **Failure 2, Windows reinstall:** the NSIS uninstall, or the user deleting `%APPDATA%`, leaves the Credential Manager entry behind. Every setup after that fails with "Veil is already set up". This is the path the Unlock screen recommends ("start over with a new identity"), and it cannot work.
+- **Smaller issue:** `vault.hdr` is written with `std::fs::write`, with no temp file, rename or fsync. A torn write leaves the state `Locked` with an undecodable header.
+- **Fix:**
+  - In setup, when no header exists, treat any existing device secret and DB as debris: overwrite the keyring entry, delete `device.secret`, `veil.db` and its `-journal`.
+  - Write the header with temp file, fsync, rename, then fsync the directory.
+  - Add a `reset` command behind an explicit confirmation, so "start over" actually works.
+  - Test: inject a failure after `keystore::store`, then confirm a second setup succeeds.
+
+**P4-4 (High): Android backs up both vault factors off the device by default.** Generated manifest (no `gen/android` committed; `release.yml:100` runs `tauri android init --ci`)
+- **What happens:** the Tauri 2.12 template manifest (checked in the CLI binary strings) has no `android:allowBackup="false"` and no `dataExtractionRules`. `app_data_dir` on Android is `activity.dataDir` (`tauri-2.12.4/.../PathPlugin.kt:57`), which is in Auto Backup's default scope. So `device.secret`, `vault.hdr` and `veil.db` all go to Google Drive backup, and on Android 12+ to device-to-device transfer.
+- **Effect:** for anyone with access to the backup, the vault comes down to the passphrase alone, contrary to INV-REST-2 and the keystore.rs comment ("protected by the OS app sandbox"). INVARIANTS calls Android "partial" but never mentions backups.
+- **Fix:**
+  - Commit `gen/android`, or patch the manifest in CI, with `android:allowBackup="false"` and `android:dataExtractionRules` / `fullBackupContent` excluding everything in the `root`, `file` and `database` domains for both cloud backup and device transfer.
+  - Alternatively, put `device.secret` under `noBackupFilesDir`.
+  - State this in INV-REST-2.
+
+**P4-5 (High): the release signing key is exposed to every branch push and to all build-time third-party code, and unreviewed branches produce release-signed APKs.** `.github/workflows/release.yml:18-26, 96-141`
+- **Branch pushes get the key:** `push: branches: ["**"]` runs the android job, and the Sign step gets `ANDROID_KEYSTORE_*` from repo-level secrets.
+  - Anyone with push access can change `release.yml` on a branch and dump the keystore.
+  - Every branch build uploads a production-signed APK as an artifact, downloadable by any GitHub user for 7 days on a public repo. Those APKs update real installs in place.
+- **Signing happens next to untrusted code:** signing runs in the same job, right after `pnpm install` plus `tauri android build`, i.e. npm scripts, cargo build scripts and Gradle plugins. That code can append to `$GITHUB_PATH` or `$GITHUB_ENV` to shadow `base64` or `apksigner` in the Sign step, and read the keystore.
+- **Fix:**
+  - Run signing only on `refs/tags/v*`, in a separate job with `environment: release` (protected, required reviewers, secrets scoped to the environment).
+  - That job should download the unsigned APK artifact and run no project code.
+  - Branch builds should upload unsigned APKs, or ones signed with a throwaway key.
+
+---
+
+### Medium
+
+**P4-6 (Medium): message and contact loss when storage fails or the app crashes between the core commit and the app-table write.** `service.rs:1017-1022, 1039-1094, 830-862`
+- **Messages:** `Account::open` commits the ratchet in its own transaction (core `account.rs:659-670`) before `INSERT INTO messages`. If the insert fails (disk full) or the app crashes, `sync` treats it as transient (`Err(Storage)`, no ack). The retry then fails as a duplicate, gets mapped to `Protocol`, and is acked. The message is gone, which contradicts the comment at L1018.
+- **NewContact:** the same applies: core creates the contact and deletes its invite, but the `contacts` row may be missing. All later messages from that contact are then dropped silently at L1062.
+- **Pairing:** in `accept_invite`, a crash after `redeem_invite` and before `upsert_contact` has the same effect.
+- **Fix:**
+  - Do the core commit and the app-table writes in one SQLite transaction (SAVEPOINT on the shared connection, with `SqlBackend::apply` nested inside).
+  - Or, in `process`, create the missing `contacts` row on demand whenever core reports a known contact.
+- **Also due:** the backend-conformance test for SqlBackend that the Phase 2 review (H2) asked for is not shipped.
+
+**P4-7 (Medium): the shipped app's dependency tree is outside every supply-chain gate.** `app/src-tauri/Cargo.toml:231` (its own `[workspace]`), `release.yml:102,171`
+- `cargo deny`, `cargo audit`, `cargo vet` and clippy in `ci.yml` cover only the root workspace. The Tauri tree (`app/src-tauri/Cargo.lock`, several hundred crates) is never checked.
+- `pnpm audit` is not run anywhere, although INV-SUP-2 lists it.
+- Release builds call `tauri build` without `--locked`, so lock drift is silently resolved in CI (against INV-SUP-1).
+- ADR-0011's "the only OpenSSL in the tree, enforced by `deny.toml`" holds only for the root workspace.
+- **Fix:**
+  - Run deny, audit and vet with `--manifest-path app/src-tauri/Cargo.toml`, plus `pnpm audit --prod`, in CI.
+  - Build with `pnpm tauri build -- --locked` and `pnpm tauri android build ... -- --locked`.
+
+**P4-8 (Medium): Android saves plaintext screenshots outside the vault.** `MainActivity` has no `FLAG_SECURE`, so the recents snapshot of an open chat is written to disk by the OS (non-negotiable 6). Screenshot blocking was not among the features cut in ADR-0011. **Fix:** set `WindowManager.LayoutParams.FLAG_SECURE` in the generated `MainActivity` (same commit-`gen/android` change as P4-4).
+
+**P4-9 (Medium): docs overclaim or are missing.**
+- **No Phase 4 test report:** `docs/TEST_REPORT.md` has no Phase 4 section with real command output (CLAUDE.md process).
+- **THREAT_MODEL L69 overclaims:** it says the relay learns who you talk to "Not directly… unlinkable tokens; timing correlation possible". The v1 client deposits on its own authenticated connection (`service.rs:842, 951`), and mailbox rotation is cut. The relay therefore sees exact pairs of static mailboxes plus IPs. Onboarding's "Who you talk to: the relay sees random mailbox ids" is misleading for the same reason.
+- **Auto-lock claims:** ADR-0011 and Settings claim an auto-lock that P4-1 and P4-2 defeat.
+- **INV-UI-1:** cites an "ESLint rule" and `pnpm -C app test`/`e2e`. No ESLint is present, `package.json` has no test script, and the app has zero tests.
+- **Fix:** add the Phase 4 TEST_REPORT section, and correct THREAT_MODEL, the onboarding text and the INVARIANTS rows to match the code.
+
+---
+
+### Low
+
+**P4-10 (Low): an invite can be burned by a failure.** `service.rs:817-848`: `TakeInvite` deletes the invite at the relay before `take_token`, `redeem_invite` and `Deposit`. Any failure after that point (for example a relay timeout) burns the invite. **Fix:** obtain the token before `TakeInvite`, and show a specific "ask for a new invite" error.
+
+**P4-11 (Low): contact names can be spoofed.** `clean_name` (L267) filters only `is_control()` (category Cc). Bidi overrides and zero-width characters (Cf) pass. An attacker-chosen `display_name` from NewContact can therefore imitate an existing contact's name. **Fix:** also strip `Cf`, and the U+202A–202E and U+2066–2069 ranges.
+
+**P4-12 (Low): IPv6 relay addresses fail.** `relay.rs:196` builds `wss://{host}/` with the brackets removed, so `[::1]:8443` gives the invalid URL `wss://::1/`. Also, `split_host_port` accepts unbalanced brackets. **Fix:** keep the brackets for IPv6 hosts in the URL, and require them to be balanced.
+
+**P4-13 (Low): webview hygiene.**
+- After a lock, `App` keeps `contacts` (120-character plaintext previews) in React state. **Fix:** clear them on `locked`.
+- `Chat.send` has no in-flight guard, so pressing Enter twice sends twice. **Fix:** add `isPending`.
+- `ipc.messages(...).then` and `ipc.lock().then` have no rejection handlers.
+- The `ipc.ts` header refers to a `commands.rs` that does not exist.
+
+**P4-14 (Low): workflow nits.**
+- `inputs.tag` is not validated; a value starting with `-` is parsed by `gh release create` as a flag. **Fix:** check against `^v[0-9][0-9A-Za-z.\-]*$`.
+- `choco install protoc` has no checksum.
+- Failed deposits that are permanently rejected (for example `Unauthorized`) are retried on every reconnect forever (`retry_failed`, L968). **Fix:** cap the retries.
+
+**P4-15 (Low): Phase 3 round-4 spot-check.**
+- **Real, and the four tests pass:** P3R4-4 (the factor is clamped to ≥ 1), P3R4-5 (put counter at byte 41, `MAX_EXTRA_PUTS`, schema v4), P3R4-7 (M7/M8 tests).
+- **Residual race in P3R4-10:** `would_allow` and `allow` take separate locks, and the result of `allow` is ignored (`server.rs:980-986`), so concurrent requests can exceed the bucket. **Fix:** do the check-and-take for both buckets under one lock, and act on the result of `allow`.
+- **Wording:** TEST_REPORT says "Docker loads the rule when it starts". The drop-in only checks (`ExecStartPre=nft list table`); `Wants=` starts the unit, but does not reload the table if the unit is still active.
+- **Not yet verified:** the `firewall-unit` CI job is still "first run pending".
+
+---
+
+### Verified good
+- **Pin verifier:** TLS 1.3 only (`with_protocol_versions(&[TLS13])`), no CA fallback, constant-time pin compare. CertificateVerify is checked by webpki over the same cert, so a parser differential cannot pick a different SPKI from any cert webpki accepts.
+- **Relay framing:** frames are size-limited and strictly decoded, the push queue is bounded, pending calls time out, and every response is type-checked by its caller.
+- **IPC surface:** only view types. No paths, keys or ciphertext cross. Errors are content-free strings.
+- **CSP:** strict, with no inline or remote sources, `freezePrototype` on, no Tauri plugins, and capabilities limited to `core:event:default`.
+- **No HTML injection in the webview:** all text is rendered as React text nodes, and the QR code is drawn as SVG rectangles.
+- **Encryption at rest:** SQLCipher with `temp_store=MEMORY` and log level `NONE`, and a plaintext-canary test over the data directory.
+- **RNG wiring:** every core call receives `OsRng` (the item the Phase 2 review asked to check).
+- **Identity changes:** addresses are key hashes, so a changed key becomes a new, unverified contact and is never auto-accepted.
+- **Invite single use:** enforced at the relay, in core (invite record deleted) and in the app's `invites` table.
+- **Locking drops all session state:** the account, the DB `Rc` and the mailbox key.
