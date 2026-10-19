@@ -18,7 +18,7 @@ tauri-build = { version = "=2.7.3", features = [] }
 [dependencies]
 # No Tauri plugins at all: no shell, fs, http, clipboard or updater (CLAUDE.md rules 2, 6, 8).
 tauri = { version = "=2.12.4", features = [] }
-veil-client = { path = "../../crates/client" }
+veil-client = { path = "../../crates/client", version = "=0.1.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 zeroize = { version = "=1.9.1", features = ["serde"] }
 
