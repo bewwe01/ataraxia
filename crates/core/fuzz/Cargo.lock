@@ -1725,6 +1725,7 @@ version = "0.0.0"
 dependencies = [
  "futures-executor",
  "libfuzzer-sys",
+ "prost",
  "rand 0.9.5",
  "veil-core",
 ]

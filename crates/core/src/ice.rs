@@ -105,7 +105,7 @@ pub fn filter_candidate(line: &str, mode: Mode) -> Option<String> {
     while let Some(name) = ext.next() {
         let name = name.to_ascii_lowercase();
         let Some(value) = ext.next() else { break };
-        // Each extension at most once (the first wins).
+        // Each extension at most once: the first *valid* occurrence wins.
         if seen.contains(&name) {
             continue;
         }
@@ -484,6 +484,17 @@ mod tests {
         assert_eq!(
             kept,
             "a=candidate:1 1 udp 1 8.8.4.4 9 typ relay raddr 0.0.0.0 rport 0 generation 0"
+        );
+        // Review round 4, R4-2: numbers are re-emitted canonically (component, priority, port,
+        // extension values), and each extension is kept once: the first *valid* occurrence wins.
+        let kept = filter_candidate(
+            "a=candidate:1 +1 udp +7 8.8.4.4 0009 typ relay generation x generation +5 generation 9 network-cost 010",
+            Mode::RelayOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            "a=candidate:1 1 udp 7 8.8.4.4 9 typ relay raddr 0.0.0.0 rport 0 generation 5 network-cost 10"
         );
     }
 

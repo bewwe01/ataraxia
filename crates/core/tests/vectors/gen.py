@@ -2,7 +2,8 @@
 
 Uses only Python stdlib + argon2-cffi + pyca/cryptography. Implements HChaCha20 and the
 STREAM (BE32) nonce layout directly from their specifications, so these vectors do not
-depend on any Rust code under test. Run:  python3 gen.py > vectors.rs
+depend on any Rust code under test. Regenerate (the same steps as the CI `vectors` job):
+    python3 -I gen.py > vectors.rs && rustfmt --edition 2024 --config-path ../../../../rustfmt.toml vectors.rs
 """
 import hashlib, struct
 from argon2.low_level import hash_secret_raw, Type
@@ -32,7 +33,8 @@ def rs_bytes(name, b):
 out = ["//! Known-answer vectors, computed independently by `tests/vectors/gen.py` (Python stdlib +",
        "//! argon2-cffi + pyca/cryptography, with HChaCha20/STREAM implemented from the specs), NOT by",
        "//! this crate, so tests compare against an outside oracle.",
-       "//! Regenerate: `cd crates/core/tests/vectors && python3 gen.py > vectors.rs`.", ""]
+       "//! Regenerate: `cd crates/core/tests/vectors && python3 -I gen.py > vectors.rs &&",
+       "//! rustfmt --edition 2024 --config-path ../../../../rustfmt.toml vectors.rs` (CI job `vectors`).", ""]
 
 # Address / fingerprint
 raw = bytes([5]) + bytes([1]) * 32

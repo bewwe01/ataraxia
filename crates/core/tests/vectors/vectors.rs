@@ -1,7 +1,8 @@
 //! Known-answer vectors, computed independently by `tests/vectors/gen.py` (Python stdlib +
 //! argon2-cffi + pyca/cryptography, with HChaCha20/STREAM implemented from the specs), NOT by
 //! this crate, so tests compare against an outside oracle.
-//! Regenerate: `cd crates/core/tests/vectors && python3 gen.py > vectors.rs`.
+//! Regenerate: `cd crates/core/tests/vectors && python3 -I gen.py > vectors.rs &&
+//! rustfmt --edition 2024 --config-path ../../../../rustfmt.toml vectors.rs` (CI job `vectors`).
 
 /// `Address::of(0x05 || 0x01 * 32)`
 pub const ADDR_OF_05_01X32: &str = "v1:eab28c3f15575401c12c958fab4b3049d34c8c4c";

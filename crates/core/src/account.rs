@@ -286,7 +286,14 @@ impl<B: KvBackend> Account<B> {
         let signed_sig = private
             .calculate_signature(&signed.public_key.serialize(), rng)
             .map_err(|_| CoreError::Protocol)?;
-        let kyber = KyberPreKeyRecord::generate(kem::KeyType::Kyber1024, kyber_id.into(), &private)?;
+        // Generated from the caller's CSPRNG (not libsignal's internal OsRng), so every key in an
+        // invite comes from one injected source; this also lets tests and fuzzers pair
+        // deterministically (review round 4, R4-1).
+        let kyber_pair = kem::KeyPair::generate(kem::KeyType::Kyber1024, rng);
+        let kyber_sig_bytes = private
+            .calculate_signature(&kyber_pair.public_key.serialize(), rng)
+            .map_err(|_| CoreError::Protocol)?;
+        let kyber = KyberPreKeyRecord::new(kyber_id.into(), timestamp(now), &kyber_pair, &kyber_sig_bytes);
         let kyber_pub = kyber.public_key()?;
         let kyber_sig = kyber.signature()?;
 
@@ -843,6 +850,18 @@ impl<B: KvBackend> Account<B> {
         };
         let sealed = self.seal_to_bucket(rng, &remote, ty, inner, &cert).await?;
         envelope::frame(&sealed)
+    }
+
+    /// Unseals one of our envelopes back to `(type byte, inner message)` in the
+    /// `contact_inner` input format, for writing genuine seeds.
+    pub async fn fuzz_inner_of(&self, env: &[u8]) -> Result<(u8, Vec<u8>)> {
+        let usmc = sealed_sender_decrypt_to_usmc(envelope::unframe(env)?, &self.handle()).await?;
+        let ty = match usmc.msg_type()? {
+            CiphertextMessageType::Whisper => 0,
+            CiphertextMessageType::PreKey => 3,
+            _ => 6,
+        };
+        Ok((ty, usmc.contents()?.to_vec()))
     }
 
     /// Encrypts fuzz input over the real session, skipping content validation. The first

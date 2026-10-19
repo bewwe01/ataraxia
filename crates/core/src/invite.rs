@@ -286,6 +286,13 @@ impl Invite {
     }
 
     /// Exposes the proof key so the inviter can verify redemptions without keeping the secret.
+    /// Fuzz-only access to [`Invite::proof`], so seeds can carry a valid re-key proof.
+    #[cfg(fuzzing)]
+    #[doc(hidden)]
+    pub fn fuzz_proof(&self, redeemer: &IdentityKey) -> Result<[u8; 32]> {
+        self.proof(redeemer)
+    }
+
     pub(crate) fn proof_key_bytes(&self) -> Result<Zeroizing<[u8; 32]>> {
         self.proof_key()
     }

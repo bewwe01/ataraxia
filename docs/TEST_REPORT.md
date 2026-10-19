@@ -2,18 +2,39 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 2: after review round 4 conditions (2026-10-19)
+
+Review round 4 returned **PASS WITH CONDITIONS**: nothing Critical, High or Medium, and three Lows (R4-1 to R4-3). Two of the three were mistakes in my round-3 report: the deferral reasons were wrong, and a test I reported as added never landed.
+
+| Finding | Outcome |
+|---|---|
+| R4-1 the R3-1/R3-2 deferral reasons were false | **Corrected, and R3-1/R3-2 are now fixed, not deferred.** (a) The Kyber prekey of an invite is now generated from the caller's CSPRNG (`kem::KeyPair::generate` plus `KyberPreKeyRecord::new`) instead of libsignal's internal OsRng, so every invite key comes from one injected source. (b) The fuzz fixture (`fuzz_targets/pairing.rs`) pairs from a fixed-seed `StdRng`; `assert_deterministic` checks that two pairings give byte-identical state. (c) Seeds are written by the targets themselves (`VEIL_WRITE_SEEDS=…`), and each is replayed on a fresh fixture before it is written: all 5 genuine `contact_inner` seeds open (4 Whisper, plus 1 PreKey that redeems Bob's live re-key invite through PQXDH and the Kyber step); the `contact_plaintext` re-key seeds take their branches (valid proof → accepted and consumed, bad proof → `AuthFailed`, unknown id → ignored). (d) Both targets return on empty input *before* touching the fixture, so setup coverage is in the INITED baseline. |
+| R4-2 canonicalisation/dedupe untested | **Fixed.** Assertion added to `candidate_case_and_extensions_canonicalised`. The script now asserts that its edit applied. Mutation check: reverting component canonicalisation, extension-number canonicalisation or dedupe each fails the test. The comment now says "first *valid* occurrence wins". |
+| R4-3 `gen.py` docstring | **Fixed.** `gen.py` and the generated header now give the exact regenerate command, including `rustfmt`. Regenerated: only the header lines changed. |
+
+Fuzzing (scratch corpus copies, 0 crashes):
+
+| Target | Duration | Runs | INITED cov → end | Notes |
+|---|---|---|---|---|
+| contact_inner, before / with the genuine seeds (`-runs=0`) | n/a | n/a | 3429 → **6028** | The genuine seeds alone add ~2 600 edges |
+| contact_inner | 150 s | 46 432 | 9877 → 9910 | Baseline includes setup and the seeds |
+| contact_plaintext, before / with the re-key seeds (`-runs=0`) | n/a | n/a | 6068 → 6246 | |
+| contact_plaintext | 150 s | 14 152 | 10 803 → 10 952 | **No jump** across seven re-pairs (an intermediate version still jumped at #2003 because the fixture was built during the discarded empty run) |
+
+`cargo test --workspace --locked`: 73 (+1 ignored) / 3 / 22 (+1 ignored) / 0, all pass. Clippy is clean, including `--cfg fuzzing`.
+
 ## Phase 2: after review round 3 conditions (2026-10-19)
 
 Review round 3 returned **PASS WITH CONDITIONS**: nothing Critical, High or Medium open, no regressions, and five new Lows (R3-1 to R3-5).
 
 | Finding | Outcome |
 |---|---|
-| R3-1 `contact_plaintext` coverage inflated; invite-proof branches unreachable | **Claim corrected; deeper reach deferred to Phase 8.** Re-measured over 300 s on a scratch corpus: `INITED cov 6275` → `6282` just before the re-pair at input #2001 → jump to `10171` (setup code that libFuzzer credits to that input) → `10356` at the end. **The gain driven by fuzz input is small; the earlier "4325 → 10 057" was mostly setup.** Pairing twice at start-up was tried and did *not* move the jump, so the change was reverted, not kept. The invite-proof branches need a live random invite id and proof, which no committed corpus can hold; they are covered by the mutation-checked unit test `known_contact_rekey_invite_paths`. |
-| R3-2 `contact_inner` seeds come from another pairing | **Deferred to Phase 8.** A deterministic pairing is impossible from the harness: libsignal's `KyberPreKeyRecord::generate` draws from its own OS RNG. Documented in the target. |
+| R3-1 `contact_plaintext` coverage inflated; invite-proof branches unreachable | *Superseded in round 4: the reasons given here were wrong (R4-1), and the item is now fixed, not deferred.* **Claim corrected; deeper reach deferred to Phase 8.** Re-measured over 300 s on a scratch corpus: `INITED cov 6275` → `6282` just before the re-pair at input #2001 → jump to `10171` (setup code that libFuzzer credits to that input) → `10356` at the end. **The gain driven by fuzz input is small; the earlier "4325 → 10 057" was mostly setup.** Pairing twice at start-up was tried and did *not* move the jump, so the change was reverted, not kept. The invite-proof branches need a live random invite id and proof, which no committed corpus can hold; they are covered by the mutation-checked unit test `known_contact_rekey_invite_paths`. |
+| R3-2 `contact_inner` seeds come from another pairing | *Superseded in round 4: the reason given here was wrong (R4-1), and the item is now fixed.* **Deferred to Phase 8.** A deterministic pairing is impossible from the harness: libsignal's `KyberPreKeyRecord::generate` draws from its own OS RNG. Documented in the target. |
 | R3-3 the `::` rule was not pinned by a test | **Fixed.** `a=mid:x::` added. Mutation check: allowing unspecified addresses again fails `addresses_outside_candidates_removed` on that input. |
 | R3-4 STUN caveat missing in PROTOCOL §8 | **Fixed in the docs; the end-to-end check is Phase 6.** PROTOCOL §8 and INV-NET-1 now say the SDP filter cannot stop the WebRTC stack's own STUN checks; only `iceTransportPolicy: relay` (and the `webrtc-rs` configuration on Linux) can. |
 | R3-5 vectors job tied to Python 3.12 | **Fixed.** `requirements.txt` now also pins the CPython 3.13 `cffi` wheel. Verified: a fresh 3.13 venv installs with `--require-hashes` and regenerates byte-identical vectors. |
-| Round-2 nits | **Fixed.** Candidate numbers are re-emitted canonically (`+1` → `1`), each candidate extension is kept at most once (test added), and PROTOCOL §6 now states that a bucket with fewer than 2 bytes of slack is skipped. |
+| Round-2 nits | Candidate numbers are re-emitted canonically (`+1` → `1`), each candidate extension is kept at most once, and PROTOCOL §6 now states that a bucket with fewer than 2 bytes of slack is skipped. *Correction (review round 4, R4-2): this row originally said "test added". That was false: the scripted edit adding the assertion silently failed to apply. The test was added in round 4; see below.* |
 
 ```
 $ cargo clippy --workspace --all-targets -- -D warnings   # clean

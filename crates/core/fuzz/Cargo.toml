@@ -13,6 +13,7 @@ libfuzzer-sys = "=0.4.10"
 veil-core = { path = ".." }
 futures-executor = "=0.3.34"
 rand = "=0.9.5"
+prost = "=0.14.4"
 
 [workspace]
 
