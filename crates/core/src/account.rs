@@ -149,8 +149,8 @@ impl<B: KvBackend> Account<B> {
     /// Creates a new account with a fresh identity and stores it in `backend`.
     ///
     /// `rng` must be an OS-seeded CSPRNG (`OsRng.unwrap_err()` or `rand::rng()`): it supplies
-    /// every secret created here, including (for invites) the ML-KEM prekey. Seeded RNGs are
-    /// for tests and fuzzing only (review round 5, R5-4).
+    /// the identity key pair and registration id. Seeded RNGs are for tests and fuzzing only
+    /// (review round 5, R5-4; wording per round 6, R6-N2).
     pub fn create<R: Rng + CryptoRng>(mut backend: B, rng: &mut R) -> Result<Self> {
         if backend.get(keys::IDENTITY)?.is_some() {
             return Err(CoreError::Storage);
@@ -258,8 +258,8 @@ impl<B: KvBackend> Account<B> {
     /// Creates a single-use invite with its own one-time prekeys (PROTOCOL §4.2).
     ///
     /// `rng` must be an OS-seeded CSPRNG (`OsRng.unwrap_err()` or `rand::rng()`): it supplies
-    /// every secret created here, including (for invites) the ML-KEM prekey. Seeded RNGs are
-    /// for tests and fuzzing only (review round 5, R5-4).
+    /// every secret of the invite, including the ML-KEM prekey. Seeded RNGs are for tests and
+    /// fuzzing only (review round 5, R5-4).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_invite<R: Rng + CryptoRng>(
         &self,
@@ -362,8 +362,9 @@ impl<B: KvBackend> Account<B> {
     /// Redeems someone else's invite (PROTOCOL §4.3).
     ///
     /// `rng` must be an OS-seeded CSPRNG (`OsRng.unwrap_err()` or `rand::rng()`): it supplies
-    /// every secret created here, including (for invites) the ML-KEM prekey. Seeded RNGs are
-    /// for tests and fuzzing only (review round 5, R5-4).
+    /// the EC base key and the ML-KEM encapsulation randomness of the new session, so a weak RNG
+    /// here also weakens the post-quantum layer. Seeded RNGs are for tests and fuzzing only
+    /// (review round 5, R5-4; wording per round 6, R6-N2).
     pub async fn redeem_invite<R: Rng + CryptoRng>(
         &self,
         rng: &mut R,

@@ -20,9 +20,9 @@ Reproducible figures (committed build; scratch corpus copies under the session s
 | Measurement | contact_inner | contact_plaintext |
 |---|---|---|
 | `-runs=0`, committed corpus minus the `seed-*` files | INITED 9378 | INITED 10 828 |
-| `-runs=0`, committed corpus | INITED 9750 (**the genuine seeds add ~370 edges**) | INITED 10 896 (**the re-key seeds add ~70**) |
+| `-runs=0`, committed corpus | INITED 9750, which reviewer round 6 showed is the **low mode** of a bimodal figure: 9886–9920 in 30 of 35 runs, 9744–9798 in 5 (R6-N1). **The genuine seeds add ~370–540 edges.** | INITED 10 896 (**the re-key seeds add ~70**) |
 | `-max_total_time=180` | 49 300 runs, 9795 → 9952 | 15 931 runs, 10 897 → 10 954 |
-| Steps of ≥ 15 edges | **+119 at run 765, not attributed:** a re-run with `-runs=3000 -print_pcs=1` started at INITED 9912 and showed no such step. The new PCs there are libsignal's skipped-message-key handling, i.e. real fuzz progress | +16 at run 4396; no step at any re-pair |
+| Steps of ≥ 15 edges | **+119 at run 765:** per reviewer round 6 (R6-N1), this is a low-mode INITED (9795) catching up to the usual ~9912. Earlier note, kept: a re-run with `-runs=3000 -print_pcs=1` started at INITED 9912 and showed no such step. The new PCs there are libsignal's skipped-message-key handling, i.e. real fuzz progress | +16 at run 4396; no step at any re-pair |
 
 `cargo test --workspace --locked`: 74 / 3 / 22 (+1 ignored: the `seed-body-*` writer) / 0, all pass. The unit count went from 73 (+1 ignored) to 74 (+0): one new test, and the stale ignored writer was deleted. Clippy is clean, normal and `--cfg fuzzing`.
 
