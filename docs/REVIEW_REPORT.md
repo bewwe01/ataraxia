@@ -500,3 +500,180 @@ All other **tested** and **partial** statuses are backed by tests that exist and
 3. Address N4 to N9 in docs or code, or defer each with a named phase, before the Phase 3 gate.
 
 VERDICT: PASS WITH CONDITIONS
+
+## Phase 2 review, round 3 (2026-10-19)
+
+**Reviewer:** independent code-reviewer agent (adversarial gate), round 3.
+**Scope:** `git diff 4f242cb..HEAD` (HEAD = `8fe1c75`, "Address review round 2 conditions (N1-N9)"): `crates/core/src/{account,content,ice}.rs`, `crates/core/tests/session.rs`, the fuzz targets `contact_plaintext`, `contact_inner` and `ice_sdp`, `.github/workflows/ci.yml`, `crates/core/tests/vectors/requirements.txt`, `supply-chain/`, and `docs/{PROTOCOL,ARCHITECTURE,INVARIANTS,TEST_REPORT}.md`. Binary corpus files (≈ 700) were skipped, apart from the statistics below.
+**libsignal consulted:** `~/.cargo/git/checkouts/libsignal-2a193a9867decbc4/4beb029/rust/protocol/src/session.rs` (`process_prekey`: identity trust check at `:59`, Kyber prekey lookup at `:139`).
+
+**Verdict: PASS WITH CONDITIONS.** No Critical, High or Medium findings are open. N2, N3, N5, N6, N7 and N9 are fixed, and I mutation-verified N2, N3, N7 and the new `v=`/`t=`/`b=` validation. N1, N4 and N8 are only partially fixed. The main goal of N1 is met: `contact_plaintext` now reaches strict decoding, validation and the post-decrypt rollback. However, the headline coverage figure is inflated by the fixture rebuild, and the invite-proof branches cannot be reached by construction. There are 5 new Low findings and no regressions. Real Chrome and Firefox offers still pass the tightened ICE filter.
+
+### 1. Evidence re-run (real output, 2026-10-19)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | no output, exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | `Finished 'dev' profile`, exit 0, no warnings |
+| `RUSTFLAGS="--cfg fuzzing" CARGO_TARGET_DIR=target/fuzzing-lint cargo clippy -p veil-core --lib --locked -- -D warnings` | `Checking veil-core v0.1.0 … Finished`, exit 0 |
+| `cargo test --workspace --locked` | unit `73 passed; 1 ignored`; `tests/secrets.rs` `3 passed`; `tests/session.rs` `22 passed; 1 ignored`; doctests `0`. **Matches TEST_REPORT.** |
+| `cargo deny --locked check` | `advisories ok, bans ok, licenses ok, sources ok`, exit 0 (only `unmatched license allowance` notes) |
+| `cargo audit --deny warnings` | `Loaded 1338 security advisories`, `Scanning Cargo.lock … (203 crate dependencies)`, exit 0 |
+| `cargo vet --locked` | `Vetting Succeeded (36 fully audited, 2 partially audited, 159 exempted)`, exit 0. **Matches INV-SUP-3 and TEST_REPORT.** |
+
+**Vectors (the new CI `vectors` job, reproduced exactly).**
+- I created a fresh `/usr/bin/python3.12` (3.12.3, as on `ubuntu-24.04`) venv and ran `pip install --require-hashes --only-binary=:all: -r requirements.txt`: exit 0.
+- Then `python3 -I gen.py`, `rustfmt +1.97.0 --edition 2024 --config-path rustfmt.toml`, and `diff -u vectors.rs`: **byte-identical**. The reviewer venv from round 2 gives the same result.
+- The same install under Python 3.13 **fails**: `Expected sha256 c1453022… Got a931079…` (see R3-5).
+
+**Fuzzing.** I ran `cargo +nightly-2026-10-01 fuzz run -O <t> <scratch copy> -- -max_total_time=120 -max_len=70000 -rss_limit_mb=2048`, with corpora copied to the scratchpad and the artifact prefix pointed there. The three targets ran in parallel on 4 cores.
+
+| Target | Runs / 121 s | INITED cov → final cov | `lim` | Crashes |
+|---|---|---|---|---|
+| contact_plaintext | 10,934 | 6275 → **10,218** (of which **+3,890 at exec #2001**, the fixture rebuild; see R3-1) | 347 | 0 |
+| contact_inner | 35,114 | 8797 → 8797 (ft 12,652 → 12,677) | 2254 | 0 |
+| ice_sdp | 2,528,898 | 593 → 1057 | 6217 | 0 |
+
+`git status` was clean after every run, and after the mutation runs and probes.
+
+**Mutation runs** (on a `git archive HEAD` copy in the scratchpad, separate target dir):
+
+```
+[N2]  remove `if ik != invite.identity` (account.rs:556)        -> package_with_swapped_identity_or_signature_refused FAILED
+[N3a] skip expiry check in consume_invite_if_proven              -> known_contact_rekey_invite_paths FAILED
+[N3b] ignore verify_proof result there                           -> known_contact_rekey_invite_paths FAILED
+[N3c] do not delete invite/prekeys on valid proof                -> known_contact_rekey_invite_paths FAILED
+[N3d] transact() commits instead of rolling back on error        -> known_contact_rekey_invite_paths FAILED
+[N7]  MAX_BODY_LEN back to 64*1024-2048                           -> largest_valid_content_always_seals FAILED
+[M3]  drop the certificate device-id check (account.rs:609)      -> certificate_key_must_match_sealing_key FAILED
+[ICE] `v=`/`t=`/`b=` passed through again                        -> ice::tests::addresses_outside_candidates_removed FAILED
+[ICE] re-exempt unspecified IPs (`::`) in contains_ip_literal    -> all 12 ice tests PASS  (R3-3)
+[ICE] skip the IP scan on kept t=/b= lines                       -> all pass (equivalent mutant: both are digits-only after validation)
+[N5]  stop zeroizing Attachment.key in Drop                      -> all pass (expected; INV-REST-4 documents that wiping is unobservable)
+```
+
+**Probes** (a scratch crate with a path dependency on an unmodified HEAD copy):
+
+```
+# Real browser SDPs, relay-only (ice.rs at HEAD)
+Chrome audio+video+datachannel offer (106 lines: b=AS/b=TIAS, 16 extmap URLs incl. AV1 DD
+  and video-layers-allocation00, UUID msid, base64 cname with + and /, rid q/h/f,
+  a=simulcast:send q;h;f, red 111/111, H265/AV1/VP9 fmtp, IPv6 relay candidate) -> OK, 103 kept
+  (dropped: 2 x a=rtcp, 1 host candidate; the relay candidate is re-serialised with raddr 0.0.0.0)
+Same as answer with a=setup:active                                               -> OK
+Firefox 128 audio+video offer (82 lines: rid a/b/c, a=simulcast:send a;b;c, b=TIAS,
+  {uuid} msid and cname, ssrc-group FID, AV1 fmtp, IPv4 and ULA host candidates)  -> OK, 80 kept
+b=CT:1000, b=X-YZ:5, b=RR:0, b=as:30, t=3034423619 3042462419, a=ptime/maxptime -> ok
+a=ssrc:1 cname:dead:beef                                                          -> ok (not an IP)
+a=ssrc:1 cname:a::b / a=mid:x:: / cname:aa:bb:cc:dd:ee:ff:00:11                   -> Malformed (fail closed)
+
+# N7: true PreKey-phase capacity, measured through fuzz_seal_plaintext (skips validation),
+# Text with reply_to, max timer and sent_at = u64::MAX, 40 binary searches
+largest Text body that seals >= 63,171 B; MAX_BODY_LEN 62,464 -> margin 707 B
+200 consecutive max-size PreKey-phase seals: 0 failed; 200 ping-pong (SPQR epochs) seals: 0 failed
+```
+
+### 2. Status of the round-2 findings
+
+| # | Status | Evidence |
+|---|---|---|
+| **N1** `contact_plaintext` stuck at unpadding | **PARTIALLY FIXED** | **Fixed:**<br>• An even first byte → `pad_block(rest)`; an odd first byte → raw.<br>• 406 of the 464 committed corpus files are in pad mode.<br>• The seeds are `encode()` of every body variant, so valid content now opens and `decode_strict`, `validate` and the post-decrypt rollback are exercised.<br>• Input-driven coverage went from 4302 (round 2) to about 6283 before the first re-pair in my run.<br>• Re-pairing every 2,000 inputs fixes the ratchet-drift concern.<br>**Not as claimed** (R3-1):<br>• The "4325 → 10 057" figure is mostly the fixture rebuild.<br>• `consume_invite_if_proven` is entered, but its expiry, proof and delete branches are unreachable: the fixture has no live invite, and invite ids are random per run.<br>• Those branches are now pinned deterministically by N3's unit test, which mitigates this. |
+| **N2** INV-PAIR-1 test | **FIXED** | Mallory re-signs both prekeys, so only Veil's identity check can refuse the package. Mutation-verified. |
+| **N3** re-key path untested | **FIXED** | `known_contact_rekey_invite_paths` covers bad proof, foreign-bound proof, expired, unknown id and valid proof.<br>• Every refusal asserts a byte-identical backend (`open_checked`).<br>• The final success proves the invite stayed usable after the refusals.<br>• Four independent mutations all fail the test. |
+| **N4** docs | **PARTIALLY FIXED** | PROTOCOL §8 now describes the allowlist and matches the code. I checked:<br>• the kept candidate extensions (`ice.rs:105-110`);<br>• the `v=`/`t=`/`b=` rules;<br>• fail-closed on IP literals;<br>• the public-relay rule.<br>mDNS is documented as dropped in every mode, in `ice.rs:14-15` and §8. ADR-0009 matches `seal_to_bucket` (`groupId` filler, `contentHint` toggle, `0x11`). **Still missing, for the third round:** the sentence that no SDP filter can stop the webview's own STUN checks from host candidates, and that only `iceTransportPolicy` can (R3-4). |
+| **N5** content secrets | **FIXED** | `Drop` + `zeroize` on `Attachment`, `ContactIntro`, `RekeyInvite` and `MailboxUpdate`. `InviteRecordPb` has no `Clone`/`PartialEq`. `Opened`'s `Debug` prints only the variant, and the test asserts the address is absent.<br>**No soundness concern:** no `unsafe`; prost's derived `merge` and `clear` work through `&mut` field access, and oneof replacement drops the old value once; derived `Clone` copies are each wiped on drop.<br>The residuals (freed prost buffers; wiping cannot be observed) are disclosed in INV-REST-4. |
+| **N6** vet audit | **FIXED** | The audit entry was removed. `inout 0.2.4` is an exemption whose note says the CBC/PKCS7 path *is* used, and the stale 0.2.3 exemption is gone. `cargo vet --locked` passes. |
+| **N7** max content in PreKey phase | **FIXED** | `MAX_BODY_LEN` = 62,464. Measured margin is 707 B (≈ 2 padding blocks). It held over 200 consecutive PreKey seals and 200 ping-pong seals. The regression test fails with the old limit. Text/Edit are the largest variants: ICE ≤ 33 KB, SDP ≤ 16 KB, re-key ≤ 8.7 KB, which I checked against `validate`. Compatibility: this is pre-release, and receivers now refuse 62,465–63,488-byte bodies, which is intended. |
+| **N8** `contact_inner` | **PARTIALLY FIXED** | The type selector is fixed: 6 of 8 values map to Whisper/PreKey. The "genuine" seeds come from a **different random pairing** (`write_contact_inner_seeds` creates its own accounts), so their identity key never matches the fixture's Alice. libsignal refuses them at the trust check (`session.rs:59`), before any prekey lookup or Kyber decapsulation (`:139`). Coverage did not grow in 121 s (R3-2). |
+| **N9** oracles, numbers | **FIXED** | Done:<br>• the proptest uses an independent `any_ip_in`;<br>• the fuzz oracle exempts only the exact `o=`/`c=` placeholders;<br>• the doc comment is corrected;<br>• INV-SUP-3 and INV-MSG-5 numbers are corrected.<br>This uncovered a real gap (`v=`/`t=`/`b=` passed through verbatim), which is now validated and mutation-verified. One sub-change, "`::` included", has no test that pins it (R3-3). |
+| **M3 remainder** | **FIXED** | A v3 PreKey message gives `UnsupportedVersion`. A self-issued certificate for device 2 gives `AuthFailed`, and the device check is mutation-verified. Without it the error would be `UnknownSender`, and the test asserts the exact error. |
+| **L2 nit** | **FIXED** | `::ffff:0:a.b.c.d` is judged by its IPv4, and a test case was added. |
+| Round-2 nits | open, no action required | Unchanged:<br>• candidate `+1`/`+7` tokens are not canonicalised;<br>• PROTOCOL `:149` "smallest bucket that fits" wording;<br>• the `gen.py` docstring and the generated header still say `python3 gen.py > vectors.rs` without the `rustfmt` step that CI now uses. |
+
+### 3. New findings
+
+| # | Sev | Area | Location | Summary |
+|---|---|---|---|---|
+| R3-1 | Low | Fuzzing claims (INV-MSG-5) | `fuzz_targets/contact_plaintext.rs:27-31`; TEST_REPORT N1 row; INVARIANTS INV-MSG-5 | The coverage headline is inflated by the in-loop fixture rebuild, and the invite-proof branches are unreachable |
+| R3-2 | Low | Fuzz seeds (N8 residual) | `account.rs` `pq_tests::write_contact_inner_seeds`; `fuzz_targets/pairing.rs:17-30` | "Genuine" PreKey/Whisper seeds are from a foreign pairing and stop at libsignal's identity-trust check |
+| R3-3 | Low | Test gap | `ice.rs` `addresses_outside_candidates_removed` (`a=ssrc:1 cname:::`) | The new "`::` included" rule survives mutation: the test input is caught via `e::` by the old rule too |
+| R3-4 | Low | Docs (N4 residual) | `docs/PROTOCOL.md:206-207`, `docs/ARCHITECTURE.md:139` | Still no statement that the SDP filter cannot stop the webview's own host-candidate STUN checks |
+| R3-5 | Low | CI robustness | `.github/workflows/ci.yml` `vectors` job; `tests/vectors/requirements.txt` | The hash pins cover only the CPython 3.12 `cffi` wheel and rely on the runner's system Python |
+
+#### R3-1. `contact_plaintext` coverage is inflated, and invite proofs are out of reach. [HIGH confidence, observed]
+
+- **What I observed:** in my run, coverage sat at 6283 until exec #2000. At exec **#2001**, the input on which the counter hits `REPAIR_EVERY` and `paired()` runs inside the fuzz callback, it jumped to 10,173 (+3,890 edges, ft +7,417). The edges come from account creation, invite creation and redemption, the `NewContact` path and dropping the old pair.
+- **Effect on the numbers and the corpus:**
+  - The arbitrary mutant that happened to run then (`MS: 1 InsertByte`) was added to the corpus as `NEW`. Every re-pair can pollute the corpus in this way.
+  - TEST_REPORT's "cov 4325 → 10 057 edges" therefore mostly measures the fixture. The input-driven gain is about 4302 → 6283.
+- **Invite proofs:**
+  - `paired()` creates one invite, and Bob's `NewContact` consumes it (`delete_invite`). During fuzzing, Bob has no live invite.
+  - Invite ids are random per run, so no seed can name one.
+  - `consume_invite_if_proven` therefore always returns at `account.rs:754` (`let Some(raw) = rec else { return Ok(()) }`). Its expiry, `verify_proof` and `delete_invite` branches are never fuzzed.
+  - The commit message, INV-MSG-5 ("reach … invite proofs and rollback") and TEST_REPORT claim otherwise.
+- **Scenario:** a regression in the proof or expiry branch that panics on an odd `invite_proof` length would not be found by this target. N3's unit test covers only well-formed proofs. (Today `validate` enforces 32 bytes first, so this is not exploitable.)
+- **Fix:**
+  - Make the fixture deterministic: seed a `ChaCha20Rng` from a constant in `pairing.rs` instead of `OsRng`.
+  - In `paired()`, have Bob also create one long-lived re-key invite (`expires_at` = `NOW + 10 years`) with a known id, and write a seed whose `ContactIntro` names that id with a valid proof.
+  - Exclude the fixture's own coverage: call `paired()` twice in the `thread_local` initialiser, so the rebuild and drop paths are covered before the first input. Alternatively, build a small pool up front.
+  - Re-measure, and correct the INV-MSG-5 and TEST_REPORT figures (report coverage after the first re-pair, or the pre-re-pair figure).
+
+#### R3-2. `contact_inner` seeds cannot pass the identity check. [HIGH confidence, from source]
+
+- **Why the seeds stop early:**
+  - `write_contact_inner_seeds` builds its own `bob`/`alice` with `OsRng`, while the fuzz fixture builds fresh random accounts.
+  - A seeded `PreKeySignalMessage` therefore carries an identity key that is not the fixture Alice's.
+  - libsignal's `process_prekey` refuses it at `is_trusted_identity` (`session.rs:59`), before the signed/Kyber prekey lookup and decapsulation (`session.rs:139`).
+  - Seeded Whisper messages fail the MAC under the wrong chain.
+- **Evidence:** in 121 s and 35,114 runs, `cov` stayed flat at 8797. TEST_REPORT's "genuine PreKey (2 030 B, with Kyber)" seeds are genuine only in structure.
+- **Fix:** use the same deterministic fixture as in R3-1 for both the seed writer and `pairing.rs`, so the seeds come from the fixture's own session. Until then, reword TEST_REPORT and INV-MSG-5 ("structurally valid seeds from a separate session").
+
+#### R3-3. The `::` rule is not pinned by a test. [HIGH, mutation-verified]
+
+- **What survives:** reverting `contains_ip_literal` to "any IP except unspecified" leaves all 12 `ice::` tests green.
+- **Why:** the intended test input `a=ssrc:1 cname:::` is rejected anyway, because the hex/colon run `e:::` contains `e::`, a non-unspecified IPv6.
+- **Fix:** use an input whose only IP-like run is `::`, for example `a=mid:x::` or `a=ssrc:1 cname:x::`. Both are rejected at HEAD (I probed them), and they would pass under the reverted rule.
+
+#### R3-4. The STUN caveat is still not documented.
+
+- Round 1 (H3, "Note for Phase 6") and round 2 (N4) both asked for this.
+- PROTOCOL §8 still introduces the Rust filter as "Independently, …". ARCHITECTURE `:139` calls it "defence in depth" without saying what it cannot do.
+- **Scenario:** a Phase 6 implementer reads §8, decides the filter suffices, and relaxes `iceTransportPolicy` for compatibility. The webview then sends STUN connectivity checks from host candidates directly to the peer's addresses, which leaks the user's IP. No SDP rewriting can prevent this.
+- **Fix:** add to §8: "The SDP filter only controls what is *signalled*. It cannot stop the WebRTC stack from gathering host candidates or sending STUN checks from them. Only `iceTransportPolicy: \"relay\"` does that, and Phase 6 must verify it on every platform (packet capture)." Alternatively, defer it explicitly to Phase 6 in INV-NET-1.
+
+#### R3-5. The vectors CI job depends on the runner's Python minor version.
+
+- **The problem:** `requirements.txt` pins one hash per package. For `cffi` 2.1.1 that is the `cp312-cp312-manylinux2014_x86_64` wheel only. The job uses whatever `python3` the `ubuntu-24.04` image ships (3.12.3 today).
+- **What breaks:** on any other CPython, the install fails, as my 3.13 run did (`Expected sha256 c1453022… Got a931079…`). The failure is closed, not silent, but the job will turn red on an image update for reasons that have nothing to do with the vectors.
+- **Fix:** either add `actions/setup-python` (pinned by SHA) with `python-version: "3.12"`, or list the hashes of the cp313 and cp314 `cffi` wheels as well. While there, update `gen.py`'s docstring and the generated header to include the `rustfmt --config-path rustfmt.toml` step.
+
+**What I checked and found sound:**
+- The `v=`/`t=`/`b=` validators accept everything real browsers emit: `b=AS`, `TIAS`, `CT`, `RR`, `X-…`, lower-case types, and NTP `t=` values.
+- No allowlisted attribute in the Chrome or Firefox offers contains `::` or a `hexdigit.digit` pair.
+- The `Drop` impls compile against prost 0.14.4's derives without behaviour change.
+- The `fuzz-hooks-lint` job reproduces locally, and the `vectors` job fails on any diff (`bash -e`, and `diff` exits 1).
+- The `MAX_BODY_LEN` change has no other consumers in the workspace.
+
+### 4. Invariant status corrections required
+
+| ID | Claimed | Should be | Reason |
+|---|---|---|---|
+| INV-MSG-5 | partial, "reach … invite proofs and rollback" | partial; drop "invite proofs" until R3-1 is fixed; describe the `contact_inner` seeds accurately | R3-1, R3-2 |
+
+All other statuses changed in `8fe1c75` are backed by tests that exist and assert what is claimed. I checked INV-CRY-3, INV-MSG-6, INV-PAIR-1, INV-REST-4, INV-STATE-1 and INV-SUP-3; the first four are mutation-verified where cheap, and the vet numbers match.
+
+### 5. What is done well
+
+- **N2 and N3:** both regression tests are tight. Each fails under every mutation I tried, and `open_checked` makes a byte-identical backend after every refusal a reusable assertion.
+- **N9:** the independent oracle immediately found a real pass-through (`v=`/`t=`/`b=`), which was fixed by validation rather than by widening an exemption. Real browser SDPs still survive.
+- **N7:** fixed from a measurement (63 203 B), with a regression test across both phases and all large variants. My independent measurement agrees within the effect of field sizes.
+- **N6:** the AI-read audit was correctly downgraded to an exemption with an accurate note.
+- **Honest residuals:** INV-REST-4 now says plainly that prost's freed buffers and the wiping itself cannot be observed.
+
+### 6. Conditions for PASS
+
+1. Correct the INV-MSG-5 and TEST_REPORT claims for `contact_plaintext` (coverage figure, invite proofs) and `contact_inner` (seed provenance). Then either fix R3-1/R3-2 (deterministic fixture, live re-key invite, fixture coverage at init) or defer them to a named phase.
+2. Fix R3-3 (a one-line test input) and R3-4 (one paragraph in §8, or an explicit Phase 6 deferral under INV-NET-1).
+3. R3-5 and the remaining nits can be fixed or deferred, with a named phase, before the Phase 3 gate.
+
+VERDICT: PASS WITH CONDITIONS
