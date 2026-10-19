@@ -873,3 +873,283 @@ INV-NET-1's new wording is backed by tests that exist, and the `::` rule is muta
 All three are Low, and none blocks starting Phase 3 work. They must be closed or explicitly deferred before the Phase 3 gate.
 
 VERDICT: PASS WITH CONDITIONS
+
+## Phase 2 review, round 5 (2026-10-19)
+
+**Reviewer:** independent code-reviewer agent (adversarial gate), round 5.
+**Scope:** `git diff 8d31010..6f90435` ("Address review round 4 conditions (R4-1 to R4-3)"), 20 files:
+- `crates/core/src/account.rs`: the Kyber prekey change in `create_invite` and the `fuzz_inner_of` hook;
+- `crates/core/src/invite.rs`: `fuzz_proof`;
+- `crates/core/src/ice.rs`: the R4-2 test;
+- `crates/core/fuzz/fuzz_targets/{pairing,contact_inner,contact_plaintext}.rs`, the 8 new `seed-*` corpus files, `fuzz/Cargo.toml` and `fuzz/Cargo.lock`;
+- `crates/core/tests/vectors/{gen.py,vectors.rs}`;
+- `docs/{TEST_REPORT,INVARIANTS}.md`.
+
+I also read `Account::open`, `consume_invite_if_proven`, `delete_invite` and the older seed writers in `account.rs` and `tests/session.rs`. On the libsignal side (`4beb029`) I read `state/kyber_prekey.rs`, `state/signed_prekey.rs` (`GenericSignedPreKey::new`), `kem.rs` and `session.rs` (`process_prekey_impl`).
+
+**Verdict: PASS WITH CONDITIONS.** All three round-4 findings are fixed, and this time the claims hold up:
+- **R4-2:** the new assertion kills all four mutants I tried.
+- **R4-3:** the regeneration command in `gen.py` reproduces `vectors.rs` byte for byte on CPython 3.12 and 3.13.
+- **R4-1:** the fixture is deterministic across processes. I regenerated all 8 committed seeds and every one is byte-identical. Each seed takes its claimed branch on a fresh fixture.
+- **The Kyber change** is equivalent to libsignal's own `KyberPreKeyRecord::generate` in key type, signed bytes and record format. Only the RNG source and the stored timestamp differ. It changes no wire format.
+
+No Critical, High or Medium finding is open. There are five new Lows and one nit:
+- **R5-1:** the Kyber step and the bad-proof branch are reached only once per fixture, or only when the seeds happen to run in the right order, so the fuzzer cannot mutate its way into them.
+- **R5-2:** some of the new TEST_REPORT fuzz figures do not reproduce, and "no jump" is not quite true.
+- **R5-3:** nothing in `cargo test` or CI pins the new deterministic Kyber generation.
+- **R5-4:** the RNG contract of `create_invite` is undocumented, and it now covers the post-quantum key too.
+- **R5-5:** a stale seed writer still writes the same file names from a random pairing.
+
+### 1. Evidence re-run (real output, 2026-10-19, HEAD = `6f90435`)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | no output, exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | `Checking veil-core v0.1.0 … Finished 'dev' profile`, exit 0 |
+| `RUSTFLAGS="--cfg fuzzing" CARGO_TARGET_DIR=target/fuzzing-lint cargo clippy -p veil-core --lib --locked -- -D warnings` | `Finished`, exit 0 |
+| `cargo test --workspace --locked` | unit `73 passed; 1 ignored`; `tests/secrets.rs` `3 passed`; `tests/session.rs` `22 passed; 1 ignored`; doctests `0`; exit 0. This matches TEST_REPORT. The count is unchanged because the R4-2 assertion went into an existing test. |
+| `cargo deny --locked check` | `advisories ok, bans ok, licenses ok, sources ok`, exit 0 |
+| `cargo audit --deny warnings` | `Loaded 1338 security advisories`, `Scanning Cargo.lock … (203 crate dependencies)`, exit 0 |
+| `cargo audit --deny warnings -f crates/core/fuzz/Cargo.lock` | `(194 crate dependencies)`, exit 0. The only lockfile change is `prost` added to `veil-core-fuzz`'s dependency list, at the same `=0.14.4` as the workspace. |
+| `cargo vet --locked` | `Vetting Succeeded (36 fully audited, 2 partially audited, 159 exempted)`, exit 0 |
+
+**Vectors.** I ran the exact command now written in `gen.py:6`:
+
+```
+python3 -I gen.py > vectors.rs && rustfmt --edition 2024 --config-path ../../../../rustfmt.toml vectors.rs
+```
+
+- **Where:** in `crates/core/tests/vectors` of a `git archive HEAD` scratch copy. `rustfmt` 1.97.0 comes from the copy's `rust-toolchain.toml`.
+- **Interpreters:** `python3` was on the PATH from three hash-pinned venvs: the provided 3.13 venv, and the round-4 3.12 and 3.13 venvs.
+- **Result:** exit 0 each time, and `cmp` against the committed `vectors.rs` reports **IDENTICAL** on all three.
+- **Path check:** the relative `--config-path` correctly resolves to the repository root.
+
+**Determinism and seeds (R4-1).**
+- **Cross-process determinism.** On a scratch copy, I deleted the 8 `seed-*` files from copies of both corpora and re-ran `VEIL_WRITE_SEEDS=<dir> cargo +nightly-2026-10-01 fuzz run -O <t> <dir> -- -runs=0`. Both exited 0, so the writers' internal `assert_deterministic` and per-seed self-checks passed. All 5 `seed-genuine-*` and all 3 `seed-rekey-*` files came out **byte-identical** to the committed ones.
+- **Branch probe.** I used a second scratch copy with two added `cfg(fuzzing)` probe hooks:
+  - one reports whether Bob's re-key invite record exists;
+  - one counts Bob's Kyber prekeys.
+
+  The targets logged every seed execution, and I ran `-runs=0` over the seed files alone and over the full corpus four times:
+
+```
+contact_inner (seeds only, and each of 4 full-corpus runs, same result):
+  seed-genuine-0/1/2 (Whisper)  -> Ok(Message)   kyber 1->1
+  seed-genuine-4    (PreKey)    -> Ok(Message)   kyber 1->0   (re-key invite consumed: PQXDH + Kyber ran)
+  seed-genuine-3    (Whisper)   -> Ok(Message)   kyber 0->0   (old-session message still opens after the PreKey)
+contact_plaintext:
+  seeds only : unknownid Ok live 1->1 | valid Ok live 1->0 | badproof Ok   live 0->0   <- not AuthFailed
+  full run 1 : badproof AuthFailed     | unknownid Ok      | valid Ok live 1->0
+  full run 2 : unknownid Ok            | valid Ok live 1->0| badproof Ok  live 0->0   <- not AuthFailed
+  full run 3 : badproof AuthFailed     | unknownid Ok      | valid Ok live 1->0
+  full run 4 : valid Ok live 1->0      | badproof Ok       | unknownid Ok             <- not AuthFailed
+```
+
+  - Every seed takes its claimed branch **on a fresh fixture**, and "valid proof → accepted and consumed" is true.
+  - In real runs, though, `seed-rekey-badproof` reaches `verify_proof`'s failure branch only when libFuzzer happens to run it before `seed-rekey-valid`. The three seeds are the same size (144 bytes), so their order is random. That happened in 2 of 5 runs. Otherwise the invite has already been deleted and the seed takes the unknown-id `return Ok(())`. INITED coverage tracks this exactly: 10 855 when the bad proof is reached, 10 831 when it is not. See R5-1.
+- **contact_inner after a 60 s run** (probe binary, 16 747 runs): exactly one execution moved Bob's Kyber prekeys from 1 to 0, and the store held 0 for all later executions. See R5-1.
+
+**Fuzzing on scratch corpus copies.** Clean HEAD build, `-O`, `-max_len=70000 -rss_limit_mb=2048`. The two targets ran in parallel on 4 cores. No crashes, no artifacts.
+
+| Target | Time | Runs | INITED cov → final | Jumps of ≥ 15 edges |
+|---|---|---|---|---|
+| contact_plaintext | 181 s | 15 702 | 10 779 → 10 947 | **#2003: 10 793 → 10 859 (+66)**; #5628 +17; #11952 +24 |
+| contact_inner | 151 s | 44 572 | 9885 → 9931 | #923 +29 (not a re-pair; this target never re-pairs) |
+
+- **contact_plaintext at the re-pairs:** #4003, #6003, #8002 and #10002 log `NEW` with features only and no edge gain, so the round-4 setup jump (+3872) is gone.
+- **The +66 at the first re-pair:** I repeated it with `-runs=2100 -print_pcs=1` and got `#1719 cov 10808` → `#2003 cov 10874`, with `NEW_FUNC … drop_glue::<veil_core::store::MemoryBackend>` and `NEW_FUNC … drop_glue::<contact_plaintext::pairing::Fixture>`. The new PCs are zeroizing `write_volatile`s plus `contact_plaintext.rs:86` (the re-pair line itself). That code is the teardown of the old fixture, which first runs at the first re-pair. See R5-2.
+- **Against TEST_REPORT's 150 s rows:** contact_inner 9877 → 9910 and contact_plaintext 10 803 → 10 952 reproduce within run-to-run noise.
+
+**INITED with `-runs=0`** (TEST_REPORT's "before / with the seeds" rows):
+
+| Corpus | contact_inner | contact_plaintext |
+|---|---|---|
+| committed corpus minus `seed-*` | 9310, 9310 | 10 752, 10 752 |
+| committed corpus | 9847, 9764 | 10 779, 10 779 |
+| `seed-*` only | 9431 | 9354 |
+| empty dir | 8780 | 9025 |
+| **TEST_REPORT** | **3429 → 6028** ("~2 600 edges") | **6068 → 6246** |
+
+None of my configurations comes near TEST_REPORT's figures. See R5-2.
+
+**Mutation runs** on a `git archive HEAD` scratch copy, with a separate target dir:
+
+```
+cargo test -p veil-core --lib -- ice::
+baseline                                                    -> 12 passed
+[R4-2] emit the raw component token                         -> candidate_case_and_extensions_canonicalised FAILED
+[R4-2] emit raw generation/network-id/network-cost values   -> candidate_case_and_extensions_canonicalised FAILED
+[R4-2] remove the `seen` dedupe check                       -> candidate_case_and_extensions_canonicalised FAILED
+[R4-2] first occurrence wins even if invalid (seen.push
+       before validation)                                    -> candidate_case_and_extensions_canonicalised FAILED
+
+cargo test -p veil-core   (create_invite, Kyber prekey)
+sign the signed-prekey bytes instead of the Kyber public key -> 6 lib tests FAILED   (signature is pinned)
+store Timestamp 0 instead of timestamp(now)                  -> all pass (expected: libsignal never reads it)
+revert to KyberPreKeyRecord::generate (internal OsRng)       -> all pass (73/3/22)   (R5-3)
+```
+
+`git status` was clean after every run. All copies, corpora, probes and target dirs were under the scratchpad.
+
+### 2. The Kyber change compared with libsignal's `generate`
+
+The libsignal side is `kyber_prekey.rs:53-74` at `4beb029`. Veil's replacement is `account.rs:289-296`.
+
+| Aspect | libsignal `generate` | Veil `create_invite` | Same? |
+|---|---|---|---|
+| Key type | caller-given (`Kyber1024` was passed) | `kem::KeyType::Kyber1024` | yes |
+| Key pair | `kem::KeyPair::generate(type, &mut OsRng.unwrap_err())` | `kem::KeyPair::generate(type, rng)` (caller's `Rng + CryptoRng`) | API yes; RNG source differs |
+| Signed bytes | `key_pair.public_key.serialize()` (with key-type byte) | the same | yes |
+| Signing key | the identity `PrivateKey` | the same (`private`) | yes |
+| Record | `KyberPreKeyRecord::new(id, ts, &kp, &sig)` (`GenericSignedPreKey::new`) | the same | yes, same `SignedPreKeyRecordStructure` |
+| Timestamp | wall clock in ms, with two `expect`s | `timestamp(now)` = caller's `now × 1000`, the same as the signed prekey at `:337` | value differs. libsignal never reads a Kyber prekey's timestamp (its only `timestamp()` uses are unacknowledged-session ages), and `PackagePb` does not carry it. Two potential panics are removed. |
+
+What goes on the wire is unchanged: `PackagePb` holds the same public key, id and signature bytes. The redeemer's `process_prekey_bundle` still verifies the signature, as the `sign wrong key` mutant shows. No new primitive or composition is introduced; this uses libsignal's own public API in the same steps, so no ADR is needed.
+
+On whether a weak RNG can reach this in production:
+- **Today:** `crates/core` is the only crate, and nothing outside it calls `create_invite`.
+- **Existing callers:** the tests pass `OsRng.unwrap_err()`. The only seeded caller is the fuzz harness, which is outside the library.
+- **The bound does not help:** `CryptoRng` is only a marker trait, and `StdRng::seed_from_u64` satisfies it.
+- **The post-quantum secret now depends on the caller's RNG:** before this change it was the one invite secret that stayed independent of it. See R5-4.
+
+### 3. Status of the round-4 findings
+
+| # | Status | Evidence |
+|---|---|---|
+| **R4-1** false deferral reasons for R3-1/R3-2 | **FIXED.** R3-1 and R3-2 are now fixed rather than deferred, apart from the reach limits in R5-1. | The false "impossible" and "cannot" wording is gone. The round-3 TEST_REPORT rows are annotated as superseded, not rewritten.<br>The fixture is deterministic within one process (`assert_deterministic`) and across processes (seeds regenerated byte-identical).<br>**R3-2:** the genuine seeds match the fixture. All 5 open in real runs, and the PreKey seed goes through PQXDH and the Kyber step (Kyber prekey 1 → 0).<br>**R3-1:** the valid-proof seed reaches `verify_proof` and `delete_invite`.<br>**Coverage jump:** the empty-input early return removed the setup jump. A residual +66 at the first re-pair comes from fixture teardown (R5-2). |
+| **R4-2** canonicalisation and dedupe untested; false "test added" | **FIXED** | The assertion is at `ice.rs:488-499`. All four mutants are killed. The comment now says "first *valid* occurrence wins". TEST_REPORT `:37` carries an explicit correction of the false claim. |
+| **R4-3** `gen.py` docstring | **FIXED** | `gen.py:5-6` and `:36-37`, and `vectors.rs:4-5`, give the full command. It reproduces the vectors byte for byte on 3.12 and 3.13. |
+
+### 4. New findings
+
+| # | Sev | Area | Location | Summary |
+|---|---|---|---|---|
+| R5-1 | Low | Fuzz reach | `fuzz_targets/contact_inner.rs:19-26, 71-87`; `contact_plaintext.rs:38-73, 85-87`; `docs/INVARIANTS.md:25` | The Kyber step and the bad-proof branch are one-shot or order-dependent per process, so mutated inputs cannot explore them |
+| R5-2 | Low | Docs accuracy | `docs/TEST_REPORT.md:19, 21, 22` | The `-runs=0` figures do not reproduce, and "no jump" is not quite true (+66 from fixture teardown) |
+| R5-3 | Low | Test gap | `account.rs:289-296`; `fuzz_targets/pairing.rs:66-70` | Reverting to `KyberPreKeyRecord::generate` passes every test and CI, and would silently invalidate every genuine seed |
+| R5-4 | Low | Security docs (defence in depth) | `account.rs:254-256`; `docs/PROTOCOL.md` §4.2 | The RNG contract of `create_invite` is undocumented, and it now covers the ML-KEM secret |
+| R5-5 | Low | Stale tooling | `account.rs:919-985` (`write_contact_inner_seeds`) | The old seed writer produces the same `seed-genuine-0..4` names from a random pairing |
+| N1 | Nit | Docs | `invite.rs:288-296` | `fuzz_proof` was inserted under `proof_key_bytes`'s doc comment |
+
+#### R5-1. The Kyber step and the bad-proof branch are one-shot or order-dependent. [HIGH, verified by probe and in libsignal source]
+
+**contact_inner.**
+- **What happens:** the fixture is built once and never rebuilt. The first time `seed-genuine-4` runs, Bob consumes the re-key invite: `consume_invite_if_proven` calls `delete_invite`, which deletes the Kyber, signed and one-time prekeys.
+- **What then fails:** `process_prekey_impl` (`session.rs:97-142`) either returns early on a known base key (`promote_matching_session`) or fails at `get_signed_pre_key` / `get_kyber_pre_key` before any decapsulation.
+- **Effect:** for the rest of the process, no input reaches PQXDH or ML-KEM decapsulation. The probe shows `kyber 1->0` once, then `0->0` for 16 747 runs. The Kyber step is executed by exactly one input, the unmutated seed, and the fuzzer never mutates the ciphertext into it.
+
+**contact_plaintext.**
+- **What happens:** `seed-rekey-valid` deletes the invite. For the rest of that 2000-input fixture, `seed-rekey-badproof` and any mutated proof take the unknown-id `return Ok(())`, not `verify_proof`.
+- **Effect:** whether INITED covers the bad-proof branch depends on libFuzzer's random ordering of three same-size files. In my runs it was 2 of 5 (24 edges).
+- **A further gap:** the writer's self-check (`:69-70`) accepts `Ok(Message)` for both "valid" and "unknownid". It therefore never checks that the valid proof was accepted and the invite consumed. That is true (my probe), but unverified by the harness.
+
+**Why it matters:**
+- INV-MSG-5 and the target doc comments say the targets "reach … PQXDH and the Kyber step" and "the invite-proof branches". That is literally true, but a reader will take it to mean those branches are fuzzed, and they are not.
+- This is a fuzz-depth gap, not a product bug: the branches are unit-tested, and libsignal's own decapsulation has its own tests.
+
+**Fix:**
+1. Add a `cfg(fuzzing)` hook `Account::fuzz_has_invite(&self, id: &[u8]) -> bool`.
+2. In both targets, rebuild the fixture right after any input that leaves `!f.bob.fuzz_has_invite(&f.rekey.id)`. For `contact_inner` this means keeping the whole `Fixture` in `PAIR` and adding the same re-pair logic as `contact_plaintext`.
+3. In `contact_plaintext::write_seeds`, assert `!g.bob.fuzz_has_invite(&g.rekey.id)` after "valid" and `g.bob.fuzz_has_invite(...)` after "unknownid".
+4. Either fix the ordering (re-pairing after consumption makes it irrelevant), or state the limit in INV-MSG-5: "reached once per fixture".
+
+#### R5-2. Some TEST_REPORT fuzz figures do not reproduce. [HIGH for the measurements; MEDIUM for the cause of the author's numbers]
+
+**What does not reproduce:**
+- **The `-runs=0` rows (`TEST_REPORT.md:19, 21`):** "contact_inner 3429 → **6028**, the genuine seeds alone add ~2 600 edges" and "contact_plaintext 6068 → 6246" match no configuration I measured (table in §1).
+  - The genuine seeds add about **450–540** edges (9310 → 9764/9847), not about 2600.
+  - The re-key seeds add about **27** (10 752 → 10 779).
+  - The figures also contradict the same report's 150 s rows (`INITED 9877` and `10 803`), which come from the same build and corpus and do reproduce.
+  - I could not find how 3429 or 6068 arose. They may come from an earlier harness version.
+- **"No jump across seven re-pairs" (`:22`):** the first re-pair still adds **+66 edges** (10 808 → 10 874 and 10 793 → 10 859 in two runs). `-print_pcs` attributes them to `drop_glue::<Fixture>` and `drop_glue::<MemoryBackend>` (zeroize) and to the re-pair line. That is far smaller than round 4's +3872, and its cause differs from the parenthetical's explanation.
+
+**Why it matters:** this is the third round in which a coverage figure in TEST_REPORT does not reproduce. CLAUDE.md requires "real command output".
+
+**Fix:**
+- Replace rows 19 and 21 with real output, including the exact corpus and build used, or delete them.
+- Change "No jump" to "+66 at the first re-pair (teardown of the old fixture); no setup jump".
+- Optionally, run `drop(paired());` once in each target's `thread_local!` initialiser, so that teardown is part of the baseline as well.
+
+#### R5-3. Nothing pins the deterministic Kyber generation. [HIGH, mutation-verified]
+
+**What survives:** replacing `account.rs:289-296` with the old `KyberPreKeyRecord::generate(…)` passes `cargo test --workspace` (73/3/22) and clippy.
+- **Why the fuzz smoke job would not catch it either:** `assert_deterministic` runs only when `VEIL_WRITE_SEEDS` is set.
+- **What breaks silently:** the fixture's PQXDH shared secret would become random per run, so every committed genuine seed (all 5) would stop opening. The R3-2 fix would quietly undo itself.
+- **What is affected:** the commit message and TEST_REPORT present "every invite key comes from one injected source" as a property, and nothing tests it.
+
+**Fix (either is enough):**
+- **A unit test** in `account.rs`. Create the same account twice from `StdRng::seed_from_u64(1)`, call `create_invite` on each with a fresh `StdRng::seed_from_u64(2)`, and assert `a.sealed_package == b.sealed_package`.
+- **An unconditional check in the fuzz init:** call `pairing::assert_deterministic()` in both targets' initialisers, so the CI smoke run fails on regression. It costs two extra pairings once per process.
+
+#### R5-4. `create_invite`'s RNG contract is undocumented, and it now covers the ML-KEM secret. [MEDIUM: design judgement; no production caller yet]
+
+**The trade-off:**
+- **Before this change:** the invite's ML-KEM secret came from libsignal's `OsRng`. If a caller passed a weak or seeded RNG, the EC prekeys would be predictable, but PQXDH's KEM shared secret would still be secret. A passive attacker could still not derive the session key, since the inviter's EC privates alone do not give `SS`.
+- **Now:** every invite secret depends on the caller's RNG. This is a reasonable choice: one injected source, testability, and two fewer `expect`s. It removes one layer of independence, though.
+- **The guard is weak:** `R: Rng + CryptoRng` is only a marker, and seeded `StdRng` satisfies it. No document states what callers must pass.
+
+**Scenario:** the Phase 4 client wires `create_invite` to a convenience RNG, for example a `StdRng` seeded once from the clock. Before this change the post-quantum layer would still have protected the session. Now it does not.
+
+**Fix (docs only):** add to the doc comment at `account.rs:254`, and to PROTOCOL §4.2 or INV-ID:
+
+```rust
+/// `rng` must be an OS-seeded CSPRNG (`OsRng.unwrap_err()` or `rand::rng()`); it supplies
+/// every secret of the invite, including the ML-KEM prekey. Seeded RNGs are for tests and
+/// fuzzing only.
+```
+
+Add the same note to `Account::create` and `redeem_invite`. Phase 4 should list this as a review item for the client wiring.
+
+#### R5-5. A stale seed writer still writes `seed-genuine-0..4` from a random pairing. [HIGH, read]
+
+**What it does:** `account.rs:919-985`, `write_contact_inner_seeds` (round 2, `#[ignore]`):
+- builds a pairing from `OsRng`;
+- writes `seed-genuine-0` through `seed-genuine-4`, exactly the names the new deterministic writer uses.
+
+**Why it is harmful:** its doc comment still says `Run with VEIL_SEED_DIR=crates/core/fuzz/corpus/contact_inner …`. Following it overwrites the five committed deterministic seeds with foreign-pairing ones, which reintroduces R3-2 silently. Nothing would fail.
+
+**Not affected:** `tests/session.rs:1137-1167` (`write_contact_plaintext_seeds`) writes `seed-body-*` and does not collide.
+
+**Fix:** delete `write_contact_inner_seeds`, which the harness writer supersedes, or rename its output and change its doc comment to point to `VEIL_WRITE_SEEDS`.
+
+#### N1. `fuzz_proof` sits under the wrong doc comment.
+
+`invite.rs:288-289`: the new function was inserted between `proof_key_bytes` and its doc comment. As a result, `fuzz_proof`'s rustdoc starts with "Exposes the proof key so the inviter can verify redemptions…", and `proof_key_bytes` has no doc.
+
+**Fix:** move line 288 below `fuzz_proof`, directly above `pub(crate) fn proof_key_bytes`.
+
+**What I checked and found sound:**
+- **`fuzz_inner_of` and `fuzz_proof`** are compiled only under `cfg(fuzzing)`: the impl block at `account.rs:830`, and `invite.rs:290`. Neither exposes the invite secret or proof key, only a proof for a given redeemer. Clippy is clean with `--cfg fuzzing`.
+- **The harness's fixed seed** lives only in the fuzz crate, not in the library.
+- **Fuzz inputs** are still sealed with `OsRng`, as documented.
+- **`seed-genuine-3`** (an old-session Whisper message) still opens after the PreKey seed has promoted the new session, because libsignal tries previous states. So corpus order does not hurt the Whisper seeds.
+- **The `prost` dependency** added to the fuzz crate is pinned exactly and matches the workspace version.
+- **INV-MSG-5 status** stays **partial**, which is correct (no nightly run recorded yet).
+
+### 5. Invariant status corrections required
+
+| ID | Claimed | Should be | Reason |
+|---|---|---|---|
+| INV-MSG-5 | partial; the targets "reach … PQXDH and the Kyber step … the invite-proof branches" | partial (unchanged). Add: "reached once per fixture; `contact_inner` never re-pairs, so mutated PreKey inputs do not reach decapsulation" (or fix R5-1) | R5-1 |
+
+No other invariant changed in `6f90435`.
+
+### 6. What is done well
+
+- **The Kyber change** is the minimal, correct one. It reuses libsignal's public API in libsignal's own order, keeps the signature semantics, stores the same timestamp convention as the signed prekey, and removes two latent panics (`expect("Time should move forward")` and `expect("Timestamp too large")`).
+- **Determinism is real and self-checking.** The seeds regenerate byte-identically in a separate process. The writers replay every seed on a fresh fixture before writing it, a good guard against the "test added but never applied" class of error from round 4.
+- **The R4-2 test** covers all three behaviours with one input, and its "first *valid* occurrence" case kills a mutant (`seen.push` before validation) that I had not asked for.
+- **The empty-input fix** removed the +3872 setup jump. Round-3 claims were annotated as superseded rather than silently rewritten, and the false "test added" claim is explicitly retracted.
+
+### 7. Conditions for PASS
+
+1. **R5-1:** re-pair after the invite is consumed in both targets, and check consumption in the writer. Alternatively, state the "once per fixture" limit in INV-MSG-5 and the target doc comments, and defer the fix to a named phase.
+2. **R5-2:** replace TEST_REPORT rows 19 and 21 with reproducible output, and correct "No jump".
+3. **R5-3:** add the determinism unit test, or call `assert_deterministic` unconditionally.
+4. **R5-4:** document the RNG contract on `create_invite`, `Account::create` and `redeem_invite`, and in PROTOCOL §4.2.
+5. **R5-5:** delete or retarget `write_contact_inner_seeds`.
+6. **N1** is optional.
+
+All are Low, and none blocks Phase 3 work. Each must be fixed, or explicitly deferred to a named phase with an accurate reason, before the Phase 3 gate.
+
+VERDICT: PASS WITH CONDITIONS
