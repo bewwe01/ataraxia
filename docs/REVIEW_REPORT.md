@@ -1153,3 +1153,162 @@ No other invariant changed in `6f90435`.
 All are Low, and none blocks Phase 3 work. Each must be fixed, or explicitly deferred to a named phase with an accurate reason, before the Phase 3 gate.
 
 VERDICT: PASS WITH CONDITIONS
+
+## Phase 2 review, round 6 (2026-10-19)
+
+**Scope.** `104928f..75b6dcd` (7 files, +122/−83):
+- `crates/core/src/account.rs`: the `fuzz_has_invite` hook, the RNG doc comments, the deletion of `write_contact_inner_seeds`, and the new test `invite_keys_come_only_from_the_callers_rng`;
+- `crates/core/src/invite.rs` (N1);
+- `crates/core/fuzz/fuzz_targets/{contact_inner,contact_plaintext}.rs`;
+- `docs/{PROTOCOL,TEST_REPORT,INVARIANTS}.md`.
+
+I re-read CLAUDE.md and rounds 1–5. I verified every claim myself and did not rely on the author's descriptions. All probes, mutants, corpora and target dirs were scratch copies under the session scratchpad (`…/scratchpad/r6`, with target dirs under `…/scratchpad/r5/target-*`). `git status` was clean after every step.
+
+### 1. Evidence
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+| `RUSTFLAGS='--cfg fuzzing' cargo clippy -p veil-core --lib --all-targets --locked -- -D warnings` | exit 0 |
+| `cargo test --workspace --locked` | **74 / 3 / 22 (+1 ignored) / 0 doc**, all pass. Matches TEST_REPORT: one test added, and the ignored lib writer is gone. |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok |
+| `cargo audit` | exit 0 (1338 advisories, 203 crates) |
+| `cargo vet` | Vetting Succeeded (36 fully audited, 2 partially audited, 159 exempted) |
+| Vectors: `python3 -I gen.py > vectors.rs && rustfmt …` on a `git archive HEAD` copy, with the argon2 venv | exit 0; `cmp` reports **IDENTICAL** |
+| `cargo +nightly-2026-10-01 fuzz build -O` of both contact targets | no warnings |
+
+### 2. Status of the round-5 findings
+
+| # | Status | Evidence |
+|---|---|---|
+| **R5-1** Kyber / bad-proof reach was one-shot | **FIXED** | See 2.1. |
+| **R5-2** TEST_REPORT figures did not reproduce | **FIXED.** One residual imprecision is listed as optional nit R6-N1. | See 2.2. |
+| **R5-3** nothing pinned the injected-RNG Kyber generation | **FIXED** | The round-5 mutant (`KyberPreKeyRecord::generate(kem::KeyType::Kyber1024, kyber_id.into(), &private)?`, applied by the round-5 `mutk.py` on a scratch copy) now gives `invite_keys_come_only_from_the_callers_rng ... FAILED` at `account.rs:1488` (the `sealed_package` equality), 73 passed / 1 failed. The test compares the whole sealed package, so it also catches any other invite secret drawn from a different RNG (prekey ids, EC keys, nonce). |
+| **R5-4** RNG contract undocumented | **FIXED.** Wording nit R6-N2. | See 2.3. |
+| **R5-5** stale seed writer collided | **FIXED** | See 2.4. |
+| **N1** misplaced doc comment | **FIXED** | `invite.rs:288-298`: `fuzz_proof` has its own doc, and "Exposes the proof key…" sits directly above `proof_key_bytes`. |
+
+#### 2.1 R5-1: Kyber and bad-proof reach
+
+I instrumented a scratch copy, which was never committed:
+- `store.rs` `get_kyber_pre_key` increments a counter after it loads a record. libsignal does this only once it has passed the session, version and signed-prekey checks; ML-KEM decapsulation follows.
+- `consume_invite_if_proven` counts `verify_proof` Ok and Err.
+- The targets log consumption, re-pairs (with timing) and which seed was run.
+
+**Run:** clean `-O` build, 90 s, corpus copies.
+
+**contact_inner** (23 298 runs):
+- `SEED4 kyber_get=1 consumed=true` → re-pair (13.5 ms). This happens once, during INITED.
+- After that, **30 mutated (non-seed) inputs** loaded Bob's Kyber prekey (`kind=other len=2030 kyber_get=1 consumed=false`), spread over the whole run (#5383 … #22123).
+- In round 5, the Kyber store held 0 entries for every input after the first.
+- No mutated input consumed the invite, so the seed caused the only re-pair.
+
+**contact_plaintext**, with two libFuzzer seeds so the INITED order differs:
+- `-seed=1`: `SEED-badproof bad=1` runs **before** `SEED-valid ok=1` → `repair consumed=true`. Mutated inputs later reach `verify_proof` Err (`kind=other bad=1`) after periodic re-pairs.
+- `-seed=7`: `SEED-valid ok=1` → `repair consumed=true` → `SEED-badproof bad=1`. The bad-proof branch is reached even though the valid seed ran first.
+- So the bad-proof branch is reached in both orders. The re-pair check runs **before** each input, which makes the order irrelevant.
+
+**Pathological loops and starvation:** none.
+- Consumption re-pairs happened once per run in all three runs. A re-pair costs 13–23 ms.
+- Throughput is unchanged from round 5 on clean builds: contact_inner 279 exec/s vs 295, contact_plaintext 86 vs 86.
+- The RSS growth (contact_plaintext about 240 → 785 MB in 180 s) is the same as in round 5, so it is not new.
+
+**Writer self-check:** `contact_plaintext.rs:69-84` now asserts the invite's fate per case: valid → consumed; badproof → `AuthFailed` and live; unknownid → `Ok` and live. That closes the round-5 gap where "valid" and "unknownid" could not be told apart.
+
+**Hook scope:**
+- `fuzz_has_invite` (`account.rs:869`) is inside the `#[cfg(fuzzing)] #[doc(hidden)] impl` block (`:842-908`) and is referenced nowhere else.
+- It returns only a bool for an id the caller already holds. It exposes no secret.
+- It maps a store error to "not live". That only causes an extra re-pair in the harness, which is harmless.
+
+**INVARIANTS (INV-MSG-5):** the new wording ("rebuilt whenever an input consumes the re-key invite, so the Kyber step and both proof branches stay reachable for mutated inputs") is accurate, and the status stays **partial** (no nightly run recorded), which is correct.
+
+#### 2.2 R5-2: coverage figures
+
+All measurements used a clean HEAD build and scratch corpus copies. I used both the bare binary and the exact `cargo +nightly-2026-10-01 fuzz run -O <t> <copy> -- -runs=0` command.
+
+| Measurement | TEST_REPORT | Reproduced |
+|---|---|---|
+| contact_inner, `-runs=0`, no `seed-*` | 9378 | **9378** (4 of 4 runs) |
+| contact_inner, `-runs=0`, committed corpus | 9750 ("seeds add ~370") | **Bimodal over 35 runs:** 30 runs at 9886–9920, 5 at 9744–9798. 9750 is a real low-mode value; the typical gain is about 510–540. See R6-N1. |
+| contact_plaintext, `-runs=0`, no `seed-*` | 10 828 | **10 828** (2 of 2) |
+| contact_plaintext, `-runs=0`, committed corpus | 10 896 | **10 896 / 10 897** |
+| contact_inner, 180 s | 49 300 runs, 9795 → 9952 | 50 618 runs, 9910 → 9961, no step of ≥ 15 edges |
+| contact_plaintext, 180 s | 15 931 runs, 10 897 → 10 954 | 15 649 runs, 10 893 → 10 972. One +16 step at #7556, not at a re-pair. Around the periodic re-pairs (#2001–2049, #4001–4049, …) only `pulse`/`REDUCE`/`NEW` with ≤ 2 edges. |
+
+**Teardown jump is gone:**
+- I repeated the round-5 attribution run (`contact_plaintext -runs=2600 -print_pcs=1`, which crosses the first periodic re-pair): 10 897 → 10 904, only **7** `NEW_PC`s after INITED.
+- There is no `drop_glue::<Fixture>`, `drop_glue::<MemoryBackend>`, zeroize or `paired` PC. The only `drop_glue` is `drop_glue<veil_core::content::CallKind>`, which is content decoding.
+- The round-5 +66 at #2003 is absent. The `drop(paired())` in both initialisers works as claimed.
+
+**History handling:** the withdrawn round-4 rows are struck through with a reason rather than silently rewritten, and the "no jump" correction is explicit. That is the right handling.
+
+#### 2.3 R5-4: RNG contract
+
+**PROTOCOL §4.2 "Randomness" is accurate.** I traced `create_invite` (`account.rs:264-355`) and `Invite::generate` / `seal_package` (`invite.rs:123-134, 221-227`). The id, secret, prekey ids, EC one-time and signed prekeys, both signatures, the Kyber key pair and the package nonce all draw from `rng`.
+
+**The doc comments** on `create` (`:150-153`), `create_invite` (`:259-262`) and `redeem_invite` (`:363-366`) state the contract: "must be an OS-seeded CSPRNG… Seeded RNGs are for tests and fuzzing only". That is the substance asked for. The text was copied verbatim, though, so two of the three are slightly off; see R6-N2.
+
+#### 2.4 R5-5: seed writers
+
+`write_contact_inner_seeds` is deleted.
+
+`grep` for `seed-` / `VEIL_SEED_DIR` / `VEIL_WRITE_SEEDS` finds three writers:
+- the two harness writers (`seed-genuine-N`, `seed-rekey-{valid,badproof,unknownid}`), both deterministic and self-checking;
+- `tests/session.rs:1139-1166`, which writes `seed-body-NN`. This name collides with nothing, and the seeds are fixture-independent plaintext inputs.
+
+No name collisions remain.
+
+### 3. New findings
+
+No Critical, High, Medium or Low findings. Two optional nits:
+
+| # | Sev | Location | Summary |
+|---|---|---|---|
+| R6-N1 | Nit | `docs/TEST_REPORT.md:23-25` | contact_inner's INITED with the full corpus is bimodal; the report's 9750/9795 are the low mode |
+| R6-N2 | Nit | `crates/core/src/account.rs:152, :365` | The RNG doc comment was copied onto `create` and `redeem_invite` with invite-specific wording |
+
+#### R6-N1. contact_inner's INITED is bimodal; the report shows the low mode. [HIGH: 35 runs]
+
+**What I measured:** with the committed corpus, `-runs=0` gives 9886–9920 in 30 of 35 runs and 9744–9798 in 5 of 35. Before the seeds are added the figure is a stable 9378.
+
+**What the report shows:**
+- TEST_REPORT's 9750 ("the genuine seeds add ~370") and its 180 s INITED of 9795 are both low-mode values. They are real output, but not typical.
+- The report's own "unattributed +119 at run 765" is that low-mode run catching up to the usual level, about 9912. The report notes that a re-run started at INITED 9912.
+- I did not pin down the cause. Removing `seed-genuine-4` alone gives 9577 or 9804, so it depends on whether INITED's single pass happens to hit some of the PQXDH/session paths.
+- This is not introduced by the diff: round 5 also saw 9764 vs 9847.
+
+**Optional fix:** change the cell to "INITED 9886–9920 in 30 of 35 runs, 9744–9798 in 5 (low mode); the genuine seeds add ~370–540". Change the +119 note to "low-mode INITED catching up".
+
+#### R6-N2. The RNG doc comment was copied with invite-specific wording. [HIGH: read, and checked against libsignal]
+
+**Where it is wrong:**
+- **`Account::create` (`:152`)** says "including (for invites) the ML-KEM prekey". `create` makes no invite or Kyber key; it makes the identity key and registration id.
+- **`redeem_invite` (`:365`)** says the same. The redeemer creates no prekey. Its `rng` reaches `process_prekey_bundle` (`:439-447`), so it supplies the EC base key and the **ML-KEM encapsulation randomness** (`kem.rs:350` `encapsulate<R: CryptoRng>`). That randomness is just as important for the post-quantum layer, but the comment names the wrong secret.
+
+**Why it is only a nit:** the contract itself, OS-seeded CSPRNG only, is correct on all three.
+
+**Optional fix:**
+- `create`: "…it supplies the identity key pair and registration id."
+- `redeem_invite`: "…it supplies the EC base key and the ML-KEM encapsulation randomness of the new session, so a weak RNG here also weakens the post-quantum layer."
+
+**Considered and not a finding:**
+- **`fuzz_has_invite` keys on the invite record, not the Kyber prekey.** A known contact's PreKey message whose content is not a proven intro would delete the Kyber prekey (libsignal's `mark_kyber_pre_key_used`) and leave the invite live, so the harness would not re-pair. It is unreachable here: the fuzzer cannot forge a decryptable PreKey message, the only genuine one (`seed-genuine-4`) carries a valid proof, and the probe saw no such case. The product semantics of that path are pre-existing and outside this diff.
+- **Re-pair loops:** see §2.1. One consumption re-pair per run, about 15 ms, no change in throughput.
+
+### 4. Invariant status
+
+No changes needed. INV-MSG-5 stays **partial**, and its new wording matches the probe.
+
+### 5. What is done well
+
+- **The R5-1 fix is minimal and correct.** It is one fuzz-only predicate, checked before each input in `contact_plaintext`, which removes the order dependence entirely. The writer now distinguishes all three proof outcomes by the invite's fate rather than by the return value alone.
+- **The R5-3 test is a strong oracle.** It compares the whole sealed package as well as the Kyber key, so it pins every invite secret to the injected RNG, and it kills the exact mutant from round 5.
+- **R5-2 was handled honestly.** Non-reproducible rows are withdrawn and struck through with a reason, a step the author could not attribute is reported as such instead of explained away, and the new contact_plaintext and no-seed figures reproduce exactly.
+- **The teardown-baseline change** (`drop(paired())`) removed the residual +66, as `-print_pcs` confirms.
+
+### 6. Conditions
+
+None. R6-N1 and R6-N2 are optional nits and can go in with any later docs change.
+
+VERDICT: PASS
