@@ -1559,3 +1559,249 @@ None.
 
 ---
 Housekeeping: the working tree is clean (`git status --short` is empty). I ran `docker compose down -v` and removed `deploy/.env` and `deploy/secrets`. I removed the new fuzz corpus files and my scratch DB in `/dev/shm`. I stopped the dockerd I had started; a defunct `dockerd` process entry remains. A container `eager_chatterjee` (coturn, created 17:07, before this review) was left untouched. The scratch benchmark crate is at `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/bench`. Nothing was committed or pushed.
+
+---
+
+## Phase 3 review, round 2 (2026-10-19)
+
+**Reviewer:** code-reviewer agent (Agent tool, `subagent_type: "code-reviewer"`, model override `opus`), adversarial brief. Scope: round-1 fixes in `af98aa9` plus `git diff 0958b70^..HEAD`. Report follows verbatim.
+
+# Phase 3 review: round 2
+
+## Verdict: FAIL
+The two round-1 High findings are fixed, and the fixes hold up.
+- **P3-1:** the expiry index is kept consistent on every insert and remove path. Stale index entries are harmless, because each one is re-checked against the record's due time. The worst case, a sweep batch of idle mailboxes, freed 563 MiB in one transaction in 407 ms with a 70 MB peak.
+- **P3-2:** `prefix_end` covers every key length in every table.
+- fmt, clippy (`-D warnings`) and the full test suite pass. `cargo deny` and `cargo vet` pass. 11 mutants of round-1 regression tests were all killed by the intended tests.
+
+The gate still fails on one new High finding, P3R2-1. Upload tokens have no count limit at all, and delivery-token rows are limited only by 512 per mailbox × 100 000 mailboxes. A single anonymous host can therefore fill the disk with tens of GB that sit outside every byte cap. That contradicts the README's "these caps are what keep a stranger from filling the disk", which is the same class of problem as round-1 P3-2.
+
+Five of the round-1 fixes are only partial. I reproduced each gap:
+- **P3-3 / P3-4:** 31 non-reading connections from one source hold the whole 64 MiB response budget. Every other client's `Fetch` is refused (10/10).
+- **P3-5:** one host drains the relay-wide creation budget by reconnecting: 20 creations in 78 ms, then the victim gets `RateLimited`.
+- **P3-8:** the "required" nft rule does not stop TURN from reaching a UDP service that Docker publishes on the host. 5/5 packets were echoed, which covers the README's own example of a Pi-hole in Docker.
+- **P3-6:** the log test does not notice a `?id` (Debug) log of the mailbox id, or a log of the stored size.
+- **P3-11:** a connection whose authentication was revoked still receives `NewEnvelopes` pushes for the re-created mailbox.
+
+## Round-1 findings: status
+| ID | Status | Evidence |
+|---|---|---|
+| P3-1 | **Fixed** | Bounded cache in `open_with_cache`. The sweep reads only due `EXPIRY` keys, 256 per transaction. Every insert and remove path pairs `index_put` with `index_del`, and `expire_one` re-checks the due time, so stale entries are only dropped. I found no full scans: fetch's skip of expired rows is bounded by the 5 000-envelope mailbox cap. `EXPIRY` holds one entry per live record, so it grows only as fast as the records themselves (see P3R2-1). Bench, real disk, worst case of 2 idle mailboxes holding 9 000 × 64 KiB of live envelopes: one batch removed everything in 407 ms, VmHWM 70 148 kB. Mutant R2-M2 (batches never continue) is killed. Container: 300 MiB soak, `docker stats` 90.46 MiB / 512 MiB. |
+| P3-2 | **Fixed** | `prefix ‖ FF×33` is above every key `prefix ‖ s` with \|s\| ≤ 32. That covers TOKENS (32-byte suffix), ENVELOPES (8), BLOB_CHUNKS (4), the fetch range `id‖seq+1 .. id‖FF×33`, and the full-ack range. EXPIRY's `due_keys` uses an exclusive `kind‖now+1` bound, plus a separate `now == u64::MAX` branch. Mutant R2-M1 (`FF×16`) is killed: "delete: rows left behind". |
+| P3-3 | **Partially fixed** | The write timeout works: mutant R2-M10 (no timeout on replies) fails `a_client_that_stops_reading_is_dropped` after 16.3 s. But the response budget can be held entirely by one source (P3R2-2). |
+| P3-4 | **Fixed** (with residual risks P3R2-2, P3R2-7) | The per-source cap holds: mutant R2-M4 is killed. The pre-auth deadline holds: mutant R2-M11 (Ping sets `established`) is killed. A connection sending only Pings, either WebSocket or application-level, really does close. IPv4-mapped IPv6 addresses fold to the IPv4 key. `established` can be earned cheaply by authenticating any mailbox the attacker owns; this is documented. |
+| P3-5 | **Partially fixed** | Bad requests no longer spend the relay-wide budget, and the test passes. But the per-connection limiter resets on every reconnect, so one host drains the budget with valid requests (P3R2-3). |
+| P3-6 | **Partially fixed** | The global subscriber and its positive control work, and M4 (R2-M7, hex in `Store::deposit`) is killed. Debug-formatted ids and sizes survive (R2-M8, R2-M9) → P3R2-4. |
+| P3-7 | **Fixed** | Mutant R2-M6 (server offers TLS 1.3 + 1.2) fails with "TLS 1.2 must be refused by the relay". |
+| P3-8 | **Partially fixed** | A plain host listener on 192.0.2.2:40000 received 0 packets, and the nft counter counted 1 drop. A UDP port published by Docker is reached 5/5, because Docker's `nat OUTPUT` DNAT runs before the filter hook (P3R2-5). The rule handles IPv6, since it is in the `inet` family. TCP is out of scope because of `no-tcp-relay`. "Required" is enforced only in CI, and persistence across reboots is optional in the README. Dropping the private `allowed-peer-ip` is **not** a regression: with `external-ip=198.51.100.7/192.0.2.2`, the `-y` client↔client relay lost 0 packets, because coturn maps its own public address internally. |
+| P3-9 | **Fixed** | `docker compose stop relay`: 310 ms, ExitCode=0, "veil-relay stopped" logged. |
+| P3-10 | **Fixed** | Mutant R2-M5 (incomplete blob gets `blob_ttl`) fails `abandoned_uploads_expire_with_their_token`. |
+| P3-11 | **Partially fixed** | `require_auth` re-checks the key: mutant R2-M3 is killed. Push subscriptions are not revoked (P3R2-6). |
+| P3-12 | **Fixed** | `main.rs`: `std::fs::read(&path).map(Zeroizing::new)`, and the trimmed copy is `Zeroizing` too. |
+| P3-13 | **Partially fixed** | The round-1 claims are corrected. The new text contains several claims that are false (P3R2-3, P3R2-4, P3R2-5, P3R2-8). |
+
+## Commands I ran and their results
+```text
+$ cargo fmt --all --check                                         → fmt exit 0
+$ cargo clippy --workspace --all-targets --locked -- -D warnings  → clippy exit 0
+$ cargo test --workspace --locked                                 → test exit 0
+  veil_core 74 | secrets 3 | session 22 (+1 ignored) | veil_relay lib 14 | logs.rs 1 | relay.rs 15 | smoke 0 (2 ignored) | veil_wire 5
+$ cargo deny --locked check → advisories ok, bans ok, licenses ok, sources ok
+$ cargo vet --locked        → Vetting Succeeded (43 fully audited, 5 partially audited, 207 exempted)
+```
+Mutation checks. Each mutant was applied with an exact-match replace, the named test was run, and the file was then restored with `git checkout`.
+```text
+R2-M1  prefix_end FF×16                         → ff_prefixed_tokens_are_deleted_with_their_mailbox FAILED ("delete: rows left behind")
+R2-M2  sweep: more = false                      → sweep_touches_only_due_records FAILED
+R2-M3  require_auth accepts any current key     → deleting_a_mailbox_revokes_other_connections FAILED
+R2-M4  per-source cap u32::MAX                  → connections_are_capped_per_source_and_must_authenticate FAILED
+R2-M5  incomplete blob expires = now+blob_ttl   → abandoned_uploads_expire_with_their_token FAILED ("the abandoned blob")
+R2-M6  server offers TLS13+TLS12                → tls_is_1_3_only_and_pinned FAILED
+R2-M7  tracing::warn!(m = %hex(id)) in Store::deposit → relay_logs_nothing_about_clients FAILED
+R2-M8  tracing::warn!(m = ?id) in Store::deposit      → relay_logs_nothing_about_clients ... ok   (SURVIVES)
+R2-M9  tracing::info!(bytes = value.len()) in Store::deposit → relay_logs_nothing_about_clients ... ok (SURVIVES)
+R2-M10 reply send without write timeout         → a_client_that_stops_reading_is_dropped FAILED (16.30 s)
+R2-M11 Request::Ping sets established           → connections_are_capped_per_source_and_must_authenticate FAILED
+```
+Temporary probe tests, written as `crates/relay/tests/r2_probe.rs` and deleted afterwards, using the default `Config`:
+```text
+PROBE budget: victim fetch(limit 32) refused 10/10 over 5.03s by 31 non-reading connections from one source
+              (with 30 connections: 0/10, since 30 × 2 050 KiB leaves room for one more reservation)
+PROBE push:   revoked connection received NewEnvelopes last_seq=[1, 2]
+PROBE create: one host created 20 mailboxes in 78.2ms over sequential connections; victim got Err(RateLimited)
+```
+Store bench, using the scratch crate with the real `veil_relay::store::Store` on real disk. The DBs were deleted afterwards.
+```text
+idlefill 9000 (mailboxes created at T, deposits at T+59d) → idle-filled 9000 in 10.07s (2 mailboxes), VmHWM 70716 kB
+  file: apparent 2155876352 B, allocated (du) 1154588 KiB
+idlesweep (T+60d+120 s)  → idle sweep removed 2 (records counted) in 406.97ms, VmHWM 70148 kB
+uploadtok 100000         → 100000 upload tokens in 36.22s (2 760 commits/s); file 15 863 808 B (≈159 B per token)
+tokrows 102400           → 102400 delivery-token rows in 200 mailboxes; file 16 846 848 B (≈164 B per row)
+```
+Deployment, following deploy/README:
+- Setup: `.env` with `TURN_EXTERNAL_IP=192.0.2.2`, `secrets/turn_secret` 0644 in a 0700 directory, `gen-cert`, `nft -f firewall/veil-turn.nft`, `up -d`, using the existing `veil-relay:local` image without a rebuild.
+```text
+smoke deployed_relay_round_trip ... ok
+uc -y -c -n 20                                   → Total lost packets 0 (0.000000%)
+host listener 192.0.2.2:40000, uc -e 192.0.2.2 -r 40000 → host listener: udp packets received = 0; nft counter packets 1 … drop
+docker run -p 40001:3480/udp … turnutils_peer;  uc -c -e 192.0.2.2 -r 40001
+   → tot_send_msgs=5, tot_recv_msgs=5, Total lost packets 0 (0.000000%)
+   → nft veil_turn counter unchanged (1); ip nat DOCKER: "udp dport 40001 counter packets 1 … dnat to 172.17.0.2:3480"
+same rule at `priority mangle`: same probe → Total lost packets 5 (100%); uc -y client↔client → lost 0
+TURN_EXTERNAL_IP=198.51.100.7/192.0.2.2: uc -y → lost 0;  uc -e 198.51.100.7 -r 40001 → lost 0 (Docker service reached)
+soak VEIL_SOAK_MB=300 → deposited 4800 × 64 KiB in 8.17s; docker stats 90.46MiB / 512MiB
+relay log: exactly 1 line (startup) after smoke + soak; coturn log: empty
+docker compose stop relay → 310 ms, ExitCode=0 OOMKilled=false, "veil-relay stopped"
+```
+Cleanup:
+- I ran `docker rm -f r2-udp-svc`, `docker compose down -v`, `rm -rf deploy/.env deploy/secrets` and `nft delete table inet veil_turn`.
+- I removed the probe file and the bench DBs.
+- `git status --short` is empty. Nothing was committed or pushed.
+
+## New findings
+### Critical
+None.
+
+### High
+**P3R2-1: Upload tokens and delivery-token rows are outside every storage cap, so one anonymous host can fill the relay's disk.**
+- **Where:**
+  - `crates/relay/src/store.rs:612` (`add_upload_token` has no quota of any kind);
+  - `store.rs:428` (`update_tokens` is limited only per mailbox);
+  - `server.rs:771` (`BlobUploadToken` is limited only by the per-mailbox rate, burst 20 then 0.1/s);
+  - the `Quotas` defaults in `server.rs`.
+- **What is wrong:**
+  - Each upload token costs about 159 B on disk (measured), including its `EXPIRY` row, and lives 24 h.
+  - Nothing counts or caps the number of upload tokens, so their total is rate × 24 h.
+  - The rate grows linearly with the number of mailboxes the attacker owns. Mailboxes are free to create, at about 1/s from one host (P3R2-3).
+  - Delivery-token rows (about 164 B each, measured) are capped at 512 per mailbox × 100 000 mailboxes = 51.2 M rows, or about 8.4 GB. They live until idle expiry, which is 60 days.
+  - Neither kind counts toward `max_envelope_bytes_total` or `max_blob_bytes_total`.
+- **Exploit, one IPv4 host:**
+  1. Create mailboxes at about 1/s by reconnecting.
+  2. After about 10 h (36 000 mailboxes), each mailbox's 0.1/s token rate adds up to 3 600 tokens/s. One source's 32 connections × 50 frames/s caps this at about 1 600/s.
+  3. 1 600/s × 86 400 s × 159 B ≈ 22 GB of live upload tokens, refilled continuously.
+  4. Add up to 8.4 GB of token rows. This is far beyond the "~18 GB" the README sizes for the caps.
+  5. When the disk is full, every redb write fails: deposits, auth touches and creations.
+  6. Each token is also one fsync'd commit (2 760/s on this disk). On an SD card the attacker saturates the single writer, which stalls every legitimate write before the disk even fills.
+- **Required fix:**
+  - Add a relay-wide cap on live upload tokens, tracked in `STATS` and released on completion and expiry. Add a small per-mailbox cap on outstanding upload tokens.
+  - Either cap total token rows relay-wide or charge them to a byte budget. Alternatively, reduce `max_tokens_per_mailbox × max_mailboxes` to a product the docs size for.
+  - Add the resulting worst case to README disk sizing.
+- **Test:**
+  - A store unit test showing that `add_upload_token` past the cap returns `Quota`, and that expiry or completion frees a slot.
+  - A test of the relay-wide token-row cap.
+  - The mutant "skip the count check" must fail them.
+
+### Medium
+**P3R2-2: One source holds the entire relay-wide response budget, so every other client's `Fetch` is refused.**
+- **Where:** `server.rs:706` (`reserve(limit × (MAX_ENVELOPE+64))`), with the defaults `response_budget_bytes: 64 MiB` (`server.rs:181`) and `max_connections_per_source: 32` (`server.rs:176`).
+- **What is wrong:**
+  - A `limit=32` fetch reserves 2 050 KiB, so 31 reservations exhaust the 64 MiB budget.
+  - A single source is allowed 32 connections, so it can hold every reservation itself.
+- **Exploit:** reproduced as PROBE budget, 10/10 refusals.
+  1. Deposit 32 × 64 KiB into your own mailbox.
+  2. From 31 connections, authenticate and pipeline `Fetch{limit:32}` without reading.
+  3. Each connection holds 2 MiB of budget for `write_timeout` (30 s). Reconnect and repeat.
+  4. Every legitimate client receives `RateLimited` on full-size fetches relay-wide.
+
+  This contradicts README:205-206 ("slow or non-reading clients cannot hold memory or connection slots" implies no lasting effect on others).
+- **Required fix:**
+  - Give each source a share of the budget, for example at most budget/8, keyed by the existing `SourceSlot` key and held in memory only.
+  - And/or reserve the actual encoded size after the DB read rather than `limit × max`.
+  - Document the remaining multi-source risk.
+- **Test:** an integration test with the defaults: 31 non-reading connections from 127.0.0.1, then a fresh client's `fetch(limit 32)` must succeed. The mutant "no per-source share" must fail it.
+
+**P3R2-3: One host drains the relay-wide mailbox-creation budget and fills `max_mailboxes`. The docs say it takes a distributed attacker.**
+- **Where:**
+  - `server.rs:523` (the per-connection `create_mailbox` limiter is new for every connection);
+  - `deploy/README.md:226-228`;
+  - `docs/THREAT_MODEL.md:79`.
+- **What is wrong:**
+  - The per-connection limit (burst 4) resets on reconnect.
+  - Reproduced: one host created 20 mailboxes in 78 ms over 6 sequential connections, and the victim then got `RateLimited`.
+  - Sustained at 1/s, one host also reaches `max_mailboxes` (100 000) in about 28 h. Those mailboxes idle-expire only after 60 days, so onboarding and the mandatory 7-day rotation fail for every user for weeks.
+  - The docs ("an attacker with many addresses", "a distributed attacker") understate this.
+- **Required fix:**
+  - Key creation by source as well, using the in-memory `SourceSlot` key with the same lifetime rules, and/or add a proof of work or an operator registration secret.
+  - Expire never-authenticated mailboxes much sooner than 60 days.
+  - Correct README and THREAT_MODEL.
+- **Test:** one host creates over many sequential connections; after N creations it gets `RateLimited` while a different source key still succeeds. The idle-expiry test should cover the shorter never-authenticated TTL.
+
+**P3R2-4: The log test cannot see the most natural way to leak a mailbox id or a size.**
+- **Where:** `crates/relay/tests/logs.rs:161-175`.
+- **What is wrong:**
+  - The needles are hex prefixes and specific decimal sizes.
+  - `tracing::warn!(m = ?id)` prints `[12, 200, …]`, and logging the stored record length prints `4112`, not `4096`. Both survive (R2-M8, R2-M9).
+  - INV-META-2 and INV-LOG-1 say the test "finds no mailbox id … or size".
+- **Required fix:** the relay is meant to log nothing during a session, so assert that. After the canary, the captured output must be empty, or match an explicit allowlist of event names with no fields. Keep the needle search as a second check.
+- **Test:** R2-M8 and R2-M9 must fail it.
+
+**P3R2-5: The "required" TURN firewall rule misses UDP services that Docker publishes on the host, such as Pi-hole or wg-easy in Docker.**
+- **Where:** `deploy/firewall/veil-turn.nft:22` (`hook output priority filter`).
+- **What is wrong:**
+  - For locally generated packets, Docker's `ip nat OUTPUT` chain (`fib daddr type local … jump DOCKER`, priority dstnat −100) rewrites `daddr` to the container address before this filter chain (priority 0) runs.
+  - `fib daddr type local` is then false, so the packet is accepted.
+  - Reproduced: a container publishing 40001/udp echoed 5/5 relayed packets, the nft drop counter did not move, and the Docker DNAT counter did. The same happened with the option-B `public/private` external IP.
+  - README:194 names Pi-hole as protected. On a Raspberry Pi, Pi-hole usually runs in Docker.
+- **Required fix:**
+  - Hook before NAT, at `priority mangle` (−150) or `raw`. Verified: at mangle the probe lost 5/5 and client↔client relaying still lost 0.
+  - Alternatively, match `ct original ip daddr` / `ip6 daddr`.
+  - Make persistence a required step, because after a reboot `restart: unless-stopped` brings coturn back without the rule.
+  - Correct the README claim.
+- **Test:** extend the CI P3-8 step with `docker run -d -p 40001:3480/udp … turnutils_peer` and assert `uc -e $TURN_IP -r 40001` reports `Total lost packets 5 (100`. With the rule at priority filter, the step must fail.
+
+### Low
+**P3R2-6: A revoked connection keeps receiving pushes for the re-created mailbox.**
+- **Where:** `server.rs:669` (subscribe), `server.rs:576` and `server.rs:735` (`authed.remove` without unsubscribing). Subscriptions are only cleared by `unsubscribe_all` at disconnect.
+- **What is wrong:** after `DeleteMailbox` and re-creation under a new key, the old connection got `NewEnvelopes last_seq=[1, 2]` (PROBE push). So the holder of a revoked key keeps learning deposit timing and counts for as long as it pings. PROTOCOL §6.3 says deleting "revokes all connections".
+- **Fix:**
+  - Unsubscribe `(m, conn)` wherever `authed.remove(&m)` happens.
+  - In `notify`, or at delete, drop subscribers whose key no longer matches. Simplest: store the auth key in the subscriber entry and remove entries on `delete_mailbox`.
+- **Test:** extend `deleting_a_mailbox_revokes_other_connections` with a deposit to the new mailbox, and assert the stale connection receives no push.
+
+**P3R2-7: All IPv6 clients may share one source key under the shipped Docker setup [MEDIUM confidence, not reproduced here].**
+- **Where:** `deploy/docker-compose.yml` (`ports: "8443:8443/tcp"` on the default bridge, without IPv6), `server.rs:290`.
+- **What is wrong:** Docker serves IPv6 connections to an IPv4-only container through `docker-proxy`. The relay then sees the bridge gateway as the peer for every IPv6 client, and the same goes for any TCP proxy or load balancer in front of it. The 32-per-source cap becomes 32 in total for those clients, and one of them can lock out the rest.
+- **Fix:** document it, or enable IPv6 on the compose network / set `userland-proxy: false`. Consider making the per-source cap configurable (`VEIL_MAX_CONN_PER_SOURCE`).
+- **Test:** a deploy check that connects over `[::1]` and from IPv4, and shows separate counts. Or a README note.
+
+**P3R2-8: Documentation figures and test claims that do not reproduce or do not test what they claim.**
+- **"3.4× the payload" (ADR-0010, README, `.env.example`):** this is the file's *apparent* size, a redb growth step. 9 000 and 9 600 envelopes both give exactly 2 155 876 352 B, while the allocated size for 563 MiB was 1.15 GB (about 2×). The disk sizing is conservative but described wrongly.
+- **INV-ROB-1 / TEST_REPORT "soak … then two sweep intervals under 512 MiB":** the soak's envelopes have a 14-day TTL, so those sweeps have nothing due. The soak tests filling, not expiry, under the memory limit. Expiry is covered only by the unit test and the bench.
+- **`Store::sweep` doc (`store.rs:767`) "Returns the number of envelopes … removed":** envelopes removed together with an idle mailbox are not counted. The bench reported "removed 2" for 9 000 envelopes.
+- **Fix:** correct the text.
+
+**P3R2-9: No database schema version and no migration of the expiry index.**
+- **Where:** `store.rs` `open_with_cache`.
+- **What is wrong:** a database created by the round-1 image (`80043a9`, publicly documented deploy) opens without error with an empty `EXPIRY` table. None of its records ever expire.
+- **Fix:** store a schema version in `STATS`. On mismatch, refuse to start or rebuild the index.
+- **Test:** open a DB without a version row and assert a refusal or a rebuilt index.
+
+## Claims I checked and found accurate
+- TEST_REPORT test counts (74/3/22+1/14/1/15/0+2/5), and fmt, clippy, deny and vet (43/5/207).
+- Every row of the TEST_REPORT finding→fix→test→mutant table that I re-ran (P3-1, 2, 3 (timeout part), 4, 6 (M4), 7, 10, 11 (auth part)): each mutant fails its test.
+- PROTOCOL §6.3 limits match the code:
+  - 1 024 connections and 32 per source;
+  - 30 s pre-authentication, 5 min idle, 30 s write;
+  - 64 MiB budget;
+  - 1 GiB and 4 GiB caps;
+  - incomplete blobs expire with their token;
+  - rate-limit refusals echo the request id (`frame_rate_limit_echoes_the_request_id`).
+- `source_key` folds IPv4-mapped IPv6 and keeps IPv6 keys apart from IPv4 keys. The source entry is removed at zero, and the peer address is not stored or logged: one relay log line after smoke and soak.
+- Decoding before the frame limit is not a CPU amplifier: input is capped at about 66 KiB by the WebSocket limits, and decoding is linear, the same order as the TLS and WebSocket work already done.
+- The budget is dropped only after the send completes or times out, so there is no race between the budget and the send. The error paths drop it at once.
+- Memory: 90.46 MiB with 300 MiB stored, consistent with README's 92 MiB at 600 MiB. Idle-mailbox expiry of 563 MiB in a single batch: 407 ms, VmHWM 70 MB.
+- SIGTERM: clean stop in 310 ms with exit 0 (TEST_REPORT says 533 ms).
+- The coturn deny list, `no-tcp-relay`, the 403 for private peers, and the wrong-password refusal behave as described. Client↔client relaying lost 0 packets with the rule loaded.
+- Dropping the private `allowed-peer-ip` does not break the `public/private` configuration: coturn relayed both legs via its own public address without needing hairpin NAT.
+- The CI P3-8 probe can fail for a host-bound listener. It does not cover Docker-published services (P3R2-5).
+
+## Claims I could not verify
+- arm64 / Raspberry Pi, SD-card commit and sweep timings, and an actual home router (option B) with hairpin NAT. I tested only the coturn side of the mapping.
+- The CI `relay-deploy` job as actually run on GitHub, including the 1.1 GB soak and `memory.peak`.
+- The TEST_REPORT figures "71 MB peak while filling 630 MB in a 512 MiB container" and "expire 9 600 in 0.77 s at 36 MB". I measured comparable numbers natively, not in a container, and used 300 MiB in the deployed container.
+- P3R2-7 (IPv6 clients sharing the Docker gateway source) is based on Docker's documented `docker-proxy` behaviour. This sandbox has no external IPv6.
+- Whether kernel socket send buffers, which are outside the response budget, can push a 512 MiB container into OOM with about 1 000 non-reading connections. I did not test this.
+- Image reproducibility: I did not rebuild `veil-relay:local`.
+
+---
+Housekeeping: the working tree is clean (`git status --short` is empty) and nothing was committed or pushed. The temporary probe test, the bench DBs, the TURN credential file, the test UDP container, the compose stack and its volume, `deploy/.env`, `deploy/secrets` and the `inet veil_turn` table have all been removed. The scratch bench crate now has extra modes (`idlefill`, `idlesweep`, `uploadtok`, `tokrows`), at `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/bench/src/main.rs`. The mangle-priority rule I tested is at `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/veil-turn-mangle.nft`.
