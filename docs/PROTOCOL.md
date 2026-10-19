@@ -87,6 +87,8 @@ sealed     = nonce (24, random) || XChaCha20-Poly1305(k_package, nonce, aad = "v
 
 `sealed` is exactly **4136 bytes**. The relay stores it under `id` with **TTL = expires_at** and **deletes it on first successful fetch** (single use, INV-PAIR-2). It never sees `secret`, so it can read neither the bundle nor the identity key. The inviter stores only `k_proof`, the prekey ids, the expiry and the mode, not the secret.
 
+**Randomness.** Every secret of an invite comes from the RNG passed to `create_invite`: the invite secret and id, the one-time EC prekey, the signed prekey, the **ML-KEM (Kyber1024) prekey**, and the nonce. Veil generates the Kyber key with `kem::KeyPair::generate(…, rng)` and signs it with the identity key, following the same steps as libsignal's `KyberPreKeyRecord::generate`, which would use its own OsRng. Callers MUST pass an OS-seeded CSPRNG (`OsRng` / `rand::rng()`). Seeded RNGs are for tests and fuzzing only. A weak RNG here would now also weaken the post-quantum layer (review round 5, R5-4; pinned by `pairing_tests::invite_keys_come_only_from_the_callers_rng`).
+
 ### 4.3 Redeeming
 
 1. Parse the link. Fetch `sealed` by `id` from the pinned relay and open it with `k_package`. Any failure means "invalid or expired"; show a generic error.

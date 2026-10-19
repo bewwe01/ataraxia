@@ -2,6 +2,30 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 2: after review round 5 conditions (2026-10-19)
+
+Review round 5 returned **PASS WITH CONDITIONS**: it verified the round-4 fixes (including byte-identical seed regeneration, and that the Kyber change is equivalent to libsignal's own `generate`), with nothing Critical, High or Medium open. It raised five Lows and a nit.
+
+| Finding | Outcome |
+|---|---|
+| R5-1 Kyber step / bad-proof branch reached only once per fixture | **Fixed.** New `cfg(fuzzing)` hook `fuzz_has_invite`. Both targets rebuild the fixture as soon as an input has consumed Bob's re-key invite, so the Kyber step and both proof branches stay reachable for later inputs. The `contact_plaintext` seed writer now checks the invite's fate: a valid proof consumes it, a bad proof and an unknown id leave it. Temporary probe (reverted): in 60 s, `contact_inner` rebuilt once after consumption; `contact_plaintext` rebuilt twice after consumption and twice periodically. |
+| R5-2 coverage figures did not reproduce | **Fixed.** The round-4 `-runs=0` rows are struck through and "no jump" is corrected (see above). A throwaway fixture is now built and dropped at start-up, so setup *and* teardown are in the baseline. New figures, with commands: |
+| R5-3 nothing pinned the injected-RNG Kyber key | **Fixed.** `pairing_tests::invite_keys_come_only_from_the_callers_rng`: same seeds give a byte-identical sealed package and Kyber key. Mutation check: reverting to `KyberPreKeyRecord::generate` fails it. |
+| R5-4 RNG contract undocumented | **Fixed.** Doc comments on `Account::create`, `create_invite` and `redeem_invite`, plus PROTOCOL §4.2 "Randomness": callers must pass an OS-seeded CSPRNG, which now also supplies the ML-KEM prekey. |
+| R5-5 stale seed writer | **Fixed.** `write_contact_inner_seeds` (round 2) deleted. Only the harness writer remains. |
+| N1 misplaced doc comment | **Fixed.** |
+
+Reproducible figures (committed build; scratch corpus copies under the session scratchpad; `cargo +nightly-2026-10-01 fuzz run -O <t> <copy> -- …`; 0 crashes):
+
+| Measurement | contact_inner | contact_plaintext |
+|---|---|---|
+| `-runs=0`, committed corpus minus the `seed-*` files | INITED 9378 | INITED 10 828 |
+| `-runs=0`, committed corpus | INITED 9750 (**the genuine seeds add ~370 edges**) | INITED 10 896 (**the re-key seeds add ~70**) |
+| `-max_total_time=180` | 49 300 runs, 9795 → 9952 | 15 931 runs, 10 897 → 10 954 |
+| Steps of ≥ 15 edges | **+119 at run 765, not attributed:** a re-run with `-runs=3000 -print_pcs=1` started at INITED 9912 and showed no such step. The new PCs there are libsignal's skipped-message-key handling, i.e. real fuzz progress | +16 at run 4396; no step at any re-pair |
+
+`cargo test --workspace --locked`: 74 / 3 / 22 (+1 ignored: the `seed-body-*` writer) / 0, all pass. The unit count went from 73 (+1 ignored) to 74 (+0): one new test, and the stale ignored writer was deleted. Clippy is clean, normal and `--cfg fuzzing`.
+
 ## Phase 2: after review round 4 conditions (2026-10-19)
 
 Review round 4 returned **PASS WITH CONDITIONS**: nothing Critical, High or Medium, and three Lows (R4-1 to R4-3). Two of the three were mistakes in my round-3 report: the deferral reasons were wrong, and a test I reported as added never landed.
@@ -16,10 +40,10 @@ Fuzzing (scratch corpus copies, 0 crashes):
 
 | Target | Duration | Runs | INITED cov → end | Notes |
 |---|---|---|---|---|
-| contact_inner, before / with the genuine seeds (`-runs=0`) | n/a | n/a | 3429 → **6028** | The genuine seeds alone add ~2 600 edges |
+| ~~contact_inner, before / with the genuine seeds (`-runs=0`)~~ | n/a | n/a | ~~3429 → 6028~~ | *Withdrawn (review round 5, R5-2): measured on an intermediate harness build that built the fixture during libFuzzer's discarded empty run. Does not reproduce on the committed build; see the round-5 section.* |
 | contact_inner | 150 s | 46 432 | 9877 → 9910 | Baseline includes setup and the seeds |
-| contact_plaintext, before / with the re-key seeds (`-runs=0`) | n/a | n/a | 6068 → 6246 | |
-| contact_plaintext | 150 s | 14 152 | 10 803 → 10 952 | **No jump** across seven re-pairs (an intermediate version still jumped at #2003 because the fixture was built during the discarded empty run) |
+| ~~contact_plaintext, before / with the re-key seeds (`-runs=0`)~~ | n/a | n/a | ~~6068 → 6246~~ | *Withdrawn (R5-2), same reason.* |
+| contact_plaintext | 150 s | 14 152 | 10 803 → 10 952 | No *setup* jump across seven re-pairs. *Correction (R5-2): "no jump" was not quite true; the reviewer measured +66 edges at the first re-pair, from tearing down the old fixture. Fixed in round 5 by dropping a throwaway fixture at start-up.* |
 
 `cargo test --workspace --locked`: 73 (+1 ignored) / 3 / 22 (+1 ignored) / 0, all pass. Clippy is clean, including `--cfg fuzzing`.
 

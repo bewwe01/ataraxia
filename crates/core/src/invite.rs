@@ -285,7 +285,6 @@ impl Invite {
         Ok(mac)
     }
 
-    /// Exposes the proof key so the inviter can verify redemptions without keeping the secret.
     /// Fuzz-only access to [`Invite::proof`], so seeds can carry a valid re-key proof.
     #[cfg(fuzzing)]
     #[doc(hidden)]
@@ -293,6 +292,7 @@ impl Invite {
         self.proof(redeemer)
     }
 
+    /// Exposes the proof key so the inviter can verify redemptions without keeping the secret.
     pub(crate) fn proof_key_bytes(&self) -> Result<Zeroizing<[u8; 32]>> {
         self.proof_key()
     }

@@ -7,22 +7,25 @@
 //!
 //! The fixture is deterministic (`pairing.rs`), so the committed genuine seeds match it
 //! (review round 4, R4-1): Whisper messages from Alice, and a PreKey message redeeming
-//! Bob's live re-key invite. Write them with
+//! Bob's live re-key invite. The fixture is rebuilt whenever an input consumes that invite,
+//! so the Kyber step stays reachable for every later input (review round 5, R5-1). Write them with
 //! `VEIL_WRITE_SEEDS=corpus/contact_inner cargo fuzz run contact_inner -- -runs=0`.
 mod pairing;
 use std::cell::RefCell;
 
-use pairing::{Acc, Fixture, NOW, paired, rng};
+use pairing::{Fixture, NOW, paired, rng};
 use veil_core::account::{IntroFields, Opened};
 use veil_core::content::{Body, Content, Text};
 
 thread_local! {
-    static PAIR: RefCell<(Acc, Acc)> = RefCell::new({
+    static PAIR: RefCell<Fixture> = RefCell::new({
         if let Ok(dir) = std::env::var("VEIL_WRITE_SEEDS") {
             write_seeds(&dir);
         }
-        let Fixture { alice, bob, .. } = paired();
-        (alice, bob)
+        // Build and drop one throwaway fixture first, so setup *and* teardown code are part of
+        // the INITED baseline instead of being credited to a later re-pair (review R5-2).
+        drop(paired());
+        paired()
     });
 }
 
@@ -73,14 +76,20 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     // is built on the first real input and its setup code is part of the INITED baseline.
     let Some((&ty, inner)) = data.split_first() else { return };
     PAIR.with(|cell| {
-        let (alice, bob) = &*cell.borrow();
+        let mut f = cell.borrow_mut();
         futures_executor::block_on(async {
-            let to = bob.identity().address();
-            if let Ok(env) = alice.fuzz_seal_inner(&mut rng(), &to, ty, inner, NOW).await {
-                if let Ok(Opened::Message { content, .. }) = bob.open(&mut rng(), &env, NOW).await {
+            let to = f.bob.identity().address();
+            if let Ok(env) = f.alice.fuzz_seal_inner(&mut rng(), &to, ty, inner, NOW).await {
+                if let Ok(Opened::Message { content, .. }) = f.bob.open(&mut rng(), &env, NOW).await {
                     assert!(content.validate().is_ok(), "invalid content accepted");
                 }
             }
         });
+        // Once an input has consumed Bob's re-key invite (and with it the Kyber prekey), later
+        // PreKey inputs could no longer reach PQXDH/ML-KEM decapsulation: rebuild the fixture
+        // (review round 5, R5-1).
+        if !f.bob.fuzz_has_invite(&f.rekey.id) {
+            *f = paired();
+        }
     });
 });

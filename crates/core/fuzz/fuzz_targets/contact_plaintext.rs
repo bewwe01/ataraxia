@@ -30,6 +30,7 @@ thread_local! {
         if let Ok(dir) = std::env::var("VEIL_WRITE_SEEDS") {
             write_seeds(&dir);
         }
+        drop(paired()); // setup and teardown code into the INITED baseline (review R5-2)
         (paired(), 0)
     });
 }
@@ -65,9 +66,21 @@ fn write_seeds(dir: &str) {
             let env = g.alice.fuzz_seal_plaintext(&mut rng(), &g.bob.identity().address(), &seed, NOW).await?;
             g.bob.open(&mut rng(), &env, NOW).await
         });
+        // The outcome *and* the invite's fate tell the three branches apart (review R5-1).
+        let live = g.bob.fuzz_has_invite(&g.rekey.id);
         match name {
-            "badproof" => assert_eq!(r.err(), Some(veil_core::CoreError::AuthFailed), "{name}"),
-            _ => assert!(matches!(r, Ok(Opened::Message { .. })), "{name}"),
+            "badproof" => {
+                assert_eq!(r.err(), Some(veil_core::CoreError::AuthFailed), "{name}");
+                assert!(live, "a bad proof must not consume the invite");
+            }
+            "valid" => {
+                assert!(matches!(r, Ok(Opened::Message { .. })), "{name}");
+                assert!(!live, "a valid proof must consume the invite");
+            }
+            _ => {
+                assert!(matches!(r, Ok(Opened::Message { .. })), "{name}");
+                assert!(live, "an unknown id must leave the invite alone");
+            }
         }
         std::fs::write(format!("{dir}/seed-rekey-{name}"), seed).expect("write seed");
     }
@@ -82,7 +95,9 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     }
     STATE.with(|cell| {
         let mut state = cell.borrow_mut();
-        if state.1 >= REPAIR_EVERY {
+        // Rebuild every REPAIR_EVERY inputs, and as soon as an input has consumed Bob's re-key
+        // invite, so the invite-proof branches (valid and bad) stay reachable (review R5-1).
+        if state.1 >= REPAIR_EVERY || !state.0.bob.fuzz_has_invite(&state.0.rekey.id) {
             *state = (paired(), 0);
         }
         state.1 += 1;

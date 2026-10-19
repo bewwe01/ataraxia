@@ -147,6 +147,10 @@ fn arr32(v: &[u8]) -> Result<[u8; 32]> {
 
 impl<B: KvBackend> Account<B> {
     /// Creates a new account with a fresh identity and stores it in `backend`.
+    ///
+    /// `rng` must be an OS-seeded CSPRNG (`OsRng.unwrap_err()` or `rand::rng()`): it supplies
+    /// every secret created here, including (for invites) the ML-KEM prekey. Seeded RNGs are
+    /// for tests and fuzzing only (review round 5, R5-4).
     pub fn create<R: Rng + CryptoRng>(mut backend: B, rng: &mut R) -> Result<Self> {
         if backend.get(keys::IDENTITY)?.is_some() {
             return Err(CoreError::Storage);
@@ -252,6 +256,10 @@ impl<B: KvBackend> Account<B> {
     }
 
     /// Creates a single-use invite with its own one-time prekeys (PROTOCOL §4.2).
+    ///
+    /// `rng` must be an OS-seeded CSPRNG (`OsRng.unwrap_err()` or `rand::rng()`): it supplies
+    /// every secret created here, including (for invites) the ML-KEM prekey. Seeded RNGs are
+    /// for tests and fuzzing only (review round 5, R5-4).
     #[allow(clippy::too_many_arguments)]
     pub async fn create_invite<R: Rng + CryptoRng>(
         &self,
@@ -352,6 +360,10 @@ impl<B: KvBackend> Account<B> {
     }
 
     /// Redeems someone else's invite (PROTOCOL §4.3).
+    ///
+    /// `rng` must be an OS-seeded CSPRNG (`OsRng.unwrap_err()` or `rand::rng()`): it supplies
+    /// every secret created here, including (for invites) the ML-KEM prekey. Seeded RNGs are
+    /// for tests and fuzzing only (review round 5, R5-4).
     pub async fn redeem_invite<R: Rng + CryptoRng>(
         &self,
         rng: &mut R,
@@ -852,6 +864,13 @@ impl<B: KvBackend> Account<B> {
         envelope::frame(&sealed)
     }
 
+    /// Whether the invite `id` is still live (its record exists). Lets the fuzz targets
+    /// rebuild their fixture once a re-key invite has been consumed (review round 5, R5-1).
+    pub fn fuzz_has_invite(&self, id: &[u8]) -> bool {
+        self.with_store(|s| s.get(&keys::with(keys::INVITE, id)))
+            .is_ok_and(|v| v.is_some())
+    }
+
     /// Unseals one of our envelopes back to `(type byte, inner message)` in the
     /// `contact_inner` input format, for writing genuine seeds.
     pub async fn fuzz_inner_of(&self, env: &[u8]) -> Result<(u8, Vec<u8>)> {
@@ -914,72 +933,6 @@ mod pq_tests {
             }
             _ => panic!("unexpected type"),
         }
-    }
-
-    /// Writes genuine inner messages as `contact_inner` fuzz seeds (review round 2, N8):
-    /// `PreKey` messages (type byte 3) and `Whisper` messages (type byte 0), in the target's
-    /// `type || inner` format. Run with `VEIL_SEED_DIR=crates/core/fuzz/corpus/contact_inner
-    /// cargo test -p veil-core --lib write_contact_inner_seeds -- --ignored`.
-    #[test]
-    #[ignore = "generates fuzz seeds on demand"]
-    fn write_contact_inner_seeds() {
-        let dir = std::env::var("VEIL_SEED_DIR").unwrap();
-        block_on(async {
-            let mut rng = OsRng.unwrap_err();
-            let bob = Account::create(MemoryBackend::new(), &mut rng).unwrap();
-            let alice = Account::create(MemoryBackend::new(), &mut rng).unwrap();
-            let created = bob
-                .create_invite(
-                    &mut rng,
-                    InviteMode::Remote,
-                    "wss://r",
-                    [3; 32],
-                    [1; 32],
-                    [2; 32],
-                    NOW,
-                    600,
-                )
-                .await
-                .unwrap();
-            let fields = IntroFields {
-                mailbox_id: [4; 32],
-                delivery_token: [5; 32],
-                display_name: None,
-                rekey: None,
-            };
-            let red = alice
-                .redeem_invite(&mut rng, &created.invite, &created.sealed_package, fields, NOW)
-                .await
-                .unwrap();
-            let mut seeds = vec![(3u8, inner(&bob, &red.envelope).await.serialize().to_vec())];
-            bob.open(&mut rng, &red.envelope, NOW).await.unwrap();
-            let text = |s: &str| Content {
-                id: random_id(&mut OsRng.unwrap_err()).clone(),
-                sent_at_ms: 1,
-                body: Some(Body::Text(Text {
-                    body: s.into(),
-                    ..Default::default()
-                })),
-            };
-            let env = bob
-                .seal(&mut rng, &alice.identity.address(), &text("reply"), NOW)
-                .await
-                .unwrap();
-            seeds.push((0, inner(&alice, &env).await.serialize().to_vec()));
-            alice.open(&mut rng, &env, NOW).await.unwrap();
-            for n in [0, 200, 2000] {
-                let env = alice
-                    .seal(&mut rng, &bob.identity.address(), &text(&"m".repeat(n)), NOW)
-                    .await
-                    .unwrap();
-                seeds.push((0, inner(&bob, &env).await.serialize().to_vec()));
-            }
-            for (i, (ty, bytes)) in seeds.into_iter().enumerate() {
-                let mut seed = vec![ty];
-                seed.extend_from_slice(&bytes);
-                std::fs::write(format!("{dir}/seed-genuine-{i}"), seed).unwrap();
-            }
-        });
     }
 
     #[test]
@@ -1507,5 +1460,41 @@ mod pairing_tests {
         let (bob, r) = open_checked(bob, &env, NOW);
         assert!(matches!(r, Ok(Opened::Message { .. })));
         assert_eq!(prekeys_present(&bob, &rekey), [false; 4]);
+    }
+
+    /// Review round 5, R5-3: every secret of an invite, the ML-KEM prekey included, comes from
+    /// the caller's RNG (not libsignal's internal `OsRng`). Same seed → byte-identical package.
+    /// Reverting to `KyberPreKeyRecord::generate` breaks this, and with it the fuzz seeds.
+    #[test]
+    fn invite_keys_come_only_from_the_callers_rng() {
+        use rand::SeedableRng as _;
+        use rand::rngs::StdRng;
+        let make = || {
+            let bob = Account::create(MemoryBackend::new(), &mut StdRng::seed_from_u64(1)).unwrap();
+            block_on(bob.create_invite(
+                &mut StdRng::seed_from_u64(2),
+                InviteMode::Remote,
+                "wss://r",
+                [3; 32],
+                [1; 32],
+                [2; 32],
+                NOW,
+                600,
+            ))
+            .unwrap()
+        };
+        let (a, b) = (make(), make());
+        assert_eq!(a.sealed_package, b.sealed_package);
+        let pa = a.invite.open_package(&a.sealed_package).unwrap();
+        let pb = b.invite.open_package(&b.sealed_package).unwrap();
+        assert_eq!(
+            pa.kyber_prekey_pub, pb.kyber_prekey_pub,
+            "ML-KEM key must come from the caller's RNG"
+        );
+        assert_eq!(
+            pa.kyber_prekey_pub.len(),
+            1569,
+            "Kyber1024 public key (with type byte)"
+        );
     }
 }
