@@ -16,14 +16,20 @@ audit.
 ## What you need
 
 * A Raspberry Pi 4 or 5 running a **64-bit** OS (Raspberry Pi OS Lite 64-bit or Ubuntu Server), or
-  any small Linux VPS. 1 GB RAM is plenty.
+  any small Linux VPS with 1 GB RAM. The relay's memory is bounded by its database cache
+  (`VEIL_DB_CACHE_MB`, default 64). Measured with 600 MiB of queued messages: 92 MiB in use, under a
+  container limit of 512 MiB.
 * Docker Engine with the compose plugin: `curl -fsSL https://get.docker.com | sh` or your distro's
   packages.
-* About 2 GB of disk for the build, plus space for queued messages and attachments. These are
-  capped at 4 GiB and 20 GiB by default; set `VEIL_QUOTA_ENVELOPES_MB` and `VEIL_QUOTA_BLOBS_MB` in
-  `.env` to fit your disk. Anyone who can reach the relay can create a mailbox, so the caps are what
-  keep a stranger from filling the disk. When a cap is reached, new deposits are refused until old
-  data expires (see *Known limits*).
+* About 2 GB of disk for the build, plus room for the database.
+  * Queued messages and attachments are capped at 1 GiB and 4 GiB by default (`VEIL_QUOTA_ENVELOPES_MB`,
+    `VEIL_QUOTA_BLOBS_MB` in `.env`).
+  * The database file can grow to about **3.5× the caps** (measured: 2.16 GB on disk for 630 MB of
+    queued messages), so the defaults need about 18 GB free. Lower the caps on a small SD card.
+  * Anyone who can reach the relay can create a mailbox, so these caps are what keep a stranger from
+    filling the disk. When a cap is reached, new deposits are refused until old data expires (see
+    *Known limits*).
+* `nftables` on the host (standard on Raspberry Pi OS, Debian and Ubuntu) for the TURN firewall rule.
 
 The image builds for `amd64` and `arm64` from the same Dockerfile (base images are pinned by
 multi-arch digest). It has been built and tested on amd64 only. The first build on a Pi compiles
@@ -106,6 +112,16 @@ again any time:
 docker compose run --rm relay pin /data/tls/cert.pem /data/tls/key.pem
 ```
 
+Install the TURN firewall rule (**required**, see *Hardening* for why):
+
+```sh
+sudo nft -f firewall/veil-turn.nft
+```
+
+It only stops coturn's relay sockets from reaching other services on this host; nothing else changes.
+To keep it across reboots, add `include "/full/path/to/deploy/firewall/veil-turn.nft"` to
+`/etc/nftables.conf` and run `sudo systemctl enable nftables`.
+
 Start everything:
 
 ```sh
@@ -114,8 +130,10 @@ docker compose ps        # both services "running"
 docker compose logs relay
 ```
 
-The relay logs one startup line (listen address, pin, whether TURN is on) and nothing about clients.
-coturn is configured to log nothing at all, because its logs would contain client IP addresses.
+The relay logs one startup line (listen address, pin, whether TURN is on), one line on shutdown,
+and nothing about clients. coturn's logging is switched off, because its logs would contain client
+IP addresses. Its only output is the address-free line `udp send: Operation not permitted`,
+printed when the firewall rule blocks a relay packet.
 
 ### Check it from another machine (optional)
 
@@ -128,6 +146,10 @@ VEIL_SMOKE_ADDR=<relay ip>:8443 VEIL_SMOKE_PIN=<pin> \
 
 This connects with a wrong pin (must be refused), then with the right one. It creates a mailbox,
 deposits and fetches a test envelope, asks for TURN credentials and deletes the mailbox.
+
+`deployed_relay_soak` (same variables plus `VEIL_SOAK_MB=600`) loads that many megabytes of
+messages, to check memory on your hardware. It only uses space up to the caps, and the messages
+expire after 14 days. Run it only on a relay you are about to reset.
 
 ## Running it
 
@@ -160,13 +182,29 @@ deposits and fetches a test envelope, asks for TURN credentials and deletes the 
   * The secret is written to a tmpfs config file (mode 0600) by a shell builtin, so it never
     appears in a process's arguments or environment.
 * **TURN:**
-  * Only clients holding relay-minted credentials (HMAC, 1 h lifetime, authenticated mailboxes only)
-    can allocate.
-  * No CLI and no TCP relay endpoints. Quotas per user and in total, plus a bandwidth cap.
+  * Allocations need relay-minted credentials (HMAC, 1 h lifetime), which the relay gives to any
+    authenticated mailbox. Mailbox creation is open, so in practice **anyone can use your TURN
+    server**, like any public TURN service. Per-user and total quotas, a bandwidth cap, no CLI and
+    no TCP relay endpoints limit what they can do.
   * Peers in private, loopback, link-local, CGNAT/Tailscale, documentation and multicast ranges are
     refused (tested: `403 Forbidden IP`), so nobody can use your TURN server to reach your LAN or
     tailnet.
-  * The only exception is the server's own `TURN_EXTERNAL_IP`, which relayed calls need.
+  * The one exception is the server's own `TURN_EXTERNAL_IP`, because both legs of a call are
+    relayed through it. Without the firewall rule, that exception would let anyone send UDP to
+    *every* service listening on that address (DNS, Pi-hole, WireGuard, ...). `firewall/veil-turn.nft`
+    restricts coturn's relay sockets, towards this host's own addresses, to the relay port range
+    (tested: a host UDP service on port 40000 received 0 of 5 relayed packets with the rule and 5 of
+    5 without it; calls still relay with 0 loss).
+  * Not verified: home deployments behind NAT (option B), where relayed packets to the public
+    address depend on the router's hairpin NAT. If calls fail there, report it rather than widening
+    `allowed-peer-ip`.
+* **Relay connections:**
+  * At most 32 concurrent connections per source (IPv4 address or IPv6 /64), counted in memory
+    only while connected.
+  * A connection must authenticate a mailbox, or deliver, fetch or upload something, within 30 s.
+  * Every write to a client has a 30 s timeout, and large responses share a 64 MiB budget, so slow
+    or non-reading clients cannot hold memory or connection slots.
+  * `docker stop` shuts the relay down cleanly (SIGTERM).
 
 ## Known limits
 
@@ -182,5 +220,10 @@ deposits and fetches a test envelope, asks for TURN credentials and deletes the 
   anywhere.
 * **Open mailbox creation.** The relay doesn't know who its users are, by design, so anyone can
   create mailboxes and use up the storage caps. That stops new messages and uploads, but it can't
-  read or delete anything already stored. Rate limits slow this down without preventing it.
+  read or delete anything already stored. Rate limits don't really slow it down: with many tokens per
+  mailbox, an attacker can fill the caps as fast as their uplink allows.
+* **Connection exhaustion.** The relay has 1 024 connection slots. One host can take only 32 of them,
+  but an attacker with many addresses (a botnet, or many IPv6 /64s) can still take all of them.
+  Mailbox creation also has a relay-wide budget (20, then 1 per second), which a distributed attacker
+  can drain. Both are denials of service, not data exposure.
 * **Not audited.** Treat this as a carefully built but independently unverified system.

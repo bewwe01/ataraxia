@@ -169,6 +169,7 @@ jobs:
           {
             echo "TURN_EXTERNAL_IP=$ip"
             echo "VEIL_TURN_URLS=turn:$ip:3478?transport=udp,turn:$ip:3478?transport=tcp"
+            echo "VEIL_QUOTA_ENVELOPES_MB=2048"   # room for the 1.1 GB soak below
           } > .env
           mkdir -m 0700 secrets
           openssl rand -hex 32 > secrets/turn_secret
@@ -188,24 +189,69 @@ jobs:
           VEIL_SMOKE_ADDR: 127.0.0.1:8443
           VEIL_SMOKE_TURN_OUT: ${{ runner.temp }}/turn
         run: VEIL_SMOKE_PIN="$PIN" cargo test --locked -p veil-relay --test smoke -- --ignored
-      - name: coturn accepts relay-minted credentials and refuses private peers
+      - name: Install the TURN host firewall rule (deploy/README.md)
+        run: sudo nft -f deploy/firewall/veil-turn.nft
+      - name: coturn accepts relay-minted credentials and refuses private peers and host ports
         run: |
           cred() { sed -n "$1p" "$RUNNER_TEMP/turn"; }
           uc() { docker run --rm --network host --entrypoint turnutils_uclient \
             docker.io/coturn/coturn:4.7.0@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93 "$@" 2>&1; }
-          uc -y -c -n 20 -m 1 -l 170 -u "$(cred 1)" -w "$(cred 2)" -r veil "$TURN_IP" | tee ok.txt
+          uc -y -c -n 20 -m 1 -l 170 -u "$(cred 1)" -w "$(cred 2)" "$TURN_IP" | tee ok.txt
           grep -q "Total lost packets 0 " ok.txt
-          uc -c -e 10.0.0.1 -n 5 -m 1 -u "$(cred 3)" -w "$(cred 4)" -r veil "$TURN_IP" | tee denied.txt
+          uc -c -e 10.0.0.1 -n 5 -m 1 -u "$(cred 3)" -w "$(cred 4)" "$TURN_IP" | tee denied.txt
           grep -q "403 (Forbidden IP)" denied.txt
-          uc -y -c -n 5 -m 1 -u "$(cred 5)" -w "wrong$(cred 6)" -r veil "$TURN_IP" | tee bad.txt
+          uc -y -c -n 5 -m 1 -u "$(cred 5)" -w "wrong$(cred 6)" "$TURN_IP" | tee bad.txt
           grep -q "Cannot complete Allocation" bad.txt
+          # A host UDP service outside the relay range must not be reachable through TURN (P3-8).
+          python3 -I -c '
+          import socket, time
+          s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("'"$TURN_IP"'", 40000)); s.settimeout(0.5)
+          n, end = 0, time.time() + 10
+          while time.time() < end:
+              try: s.recv(65536); n += 1
+              except socket.timeout: pass
+          print("udp packets received =", n)
+          ' > host.txt &
+          sleep 1
+          uc -c -e "$TURN_IP" -r 40000 -n 5 -m 1 -u "$(cred 7)" -w "$(cred 8)" "$TURN_IP" | tee host-probe.txt
+          wait
+          cat host.txt
+          grep -q "udp packets received = 0" host.txt
+          sudo nft list table inet veil_turn | grep -E "counter packets [1-9]"
       - name: Nothing about clients in either container's logs
         working-directory: deploy
         run: |
           docker compose logs relay | tee relay.log
           test "$(wc -l < relay.log)" = 1
           grep -q "veil-relay started" relay.log
-          test "$(docker compose logs coturn | wc -l)" = 0
+          # coturn's logging is off. The only output allowed is the address-free stderr line it
+          # prints when the host firewall drops a relay packet (the P3-8 probe).
+          docker compose logs --no-log-prefix coturn | tee coturn.log
+          test "$(grep -cv '^udp send: Operation not permitted$' coturn.log)" = 0
+      - name: Soak (review P3-1) - 1.1 GB of envelopes, then two sweep intervals, under mem_limit 512m
+        working-directory: deploy
+        env:
+          VEIL_SMOKE_ADDR: 127.0.0.1:8443
+          VEIL_SOAK_MB: "1100"
+        run: |
+          VEIL_SMOKE_PIN="$PIN" cargo test --locked -p veil-relay --test smoke deployed_relay_soak -- --ignored --nocapture
+          sleep 130
+          id=$(docker compose ps -q relay)
+          docker inspect -f 'OOMKilled={{.State.OOMKilled}} Restarts={{.RestartCount}} Running={{.State.Running}}' "$id" | tee state.txt
+          grep -q "OOMKilled=false Restarts=0 Running=true" state.txt
+          peak=$(cat /sys/fs/cgroup/system.slice/docker-"$id".scope/memory.peak 2>/dev/null || echo unknown)
+          echo "relay memory.peak bytes: $peak"
+          VEIL_SMOKE_PIN="$PIN" cargo test --locked -p veil-relay --test smoke deployed_relay_round_trip -- --ignored
+      - name: docker stop is a clean SIGTERM shutdown (review P3-9)
+        working-directory: deploy
+        run: |
+          start=$(date +%s)
+          docker compose stop relay
+          elapsed=$(( $(date +%s) - start ))
+          echo "stopped in ${elapsed}s"
+          test "$elapsed" -le 5
+          test "$(docker inspect -f '{{.State.ExitCode}}' "$(docker compose ps -aq relay)")" = 0
+          docker compose logs relay | grep -q "veil-relay stopped"
       - if: always()
         working-directory: deploy
         run: docker compose down -v

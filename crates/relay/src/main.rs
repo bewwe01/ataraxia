@@ -12,8 +12,9 @@
 //! * `VEIL_RELAY_CERT`, `VEIL_RELAY_KEY` (default `<data>/tls/cert.pem`, `<data>/tls/key.pem`)
 //! * `VEIL_TURN_SECRET_FILE`: file holding coturn's `static-auth-secret` (enables TURN)
 //! * `VEIL_TURN_URLS`: comma-separated `turn:`/`turns:` URLs handed to clients
-//! * `VEIL_QUOTA_ENVELOPES_MB` (default 4096), `VEIL_QUOTA_BLOBS_MB` (default 20480): disk caps for
+//! * `VEIL_QUOTA_ENVELOPES_MB` (default 1024), `VEIL_QUOTA_BLOBS_MB` (default 4096): disk caps for
 //!   queued envelopes and attachment blobs
+//! * `VEIL_DB_CACHE_MB` (default 64): database page cache, the main part of the relay's memory
 //! * `VEIL_LOG` (default `info`): `error`, `warn`, `info` or `debug`
 #![forbid(unsafe_code)]
 
@@ -113,10 +114,11 @@ fn serve() -> ExitCode {
         }
     }
     if let Some(path) = env("VEIL_TURN_SECRET_FILE") {
-        let Ok(secret) = std::fs::read(&path) else {
+        let Ok(raw) = std::fs::read(&path).map(Zeroizing::new) else {
             return fail("cannot read VEIL_TURN_SECRET_FILE");
         };
-        let secret = Zeroizing::new(secret.trim_ascii().to_vec());
+        let secret = Zeroizing::new(raw.trim_ascii().to_vec());
+        drop(raw);
         if secret.len() < 32 {
             return fail("the TURN secret must be at least 32 bytes");
         }
@@ -140,7 +142,16 @@ fn serve() -> ExitCode {
             ttl_secs: 3600,
         });
     }
-    let store = match Store::open(&data.join("relay.redb"), cfg.quotas) {
+    let cache_mb = match env("VEIL_DB_CACHE_MB").map(|v| v.parse::<usize>()) {
+        None => 64,
+        Some(Ok(mb)) if (8..=4096).contains(&mb) => mb,
+        Some(_) => return fail("VEIL_DB_CACHE_MB must be between 8 and 4096"),
+    };
+    let store = match Store::open_with_cache(
+        &data.join("relay.redb"),
+        cfg.quotas,
+        cache_mb.saturating_mul(1024 * 1024),
+    ) {
         Ok(s) => s,
         Err(e) => return fail(&format!("database: {e}")),
     };
@@ -156,8 +167,15 @@ fn serve() -> ExitCode {
         };
         // Operator-facing startup facts only: no client data is ever logged.
         tracing::info!(listen = %listen, pin = %tls::hex(&pin), turn = turn_enabled, "veil-relay started");
-        let shutdown = async {
-            let _ = tokio::signal::ctrl_c().await;
+        // SIGTERM is what `docker stop` sends; as PID 1 it is otherwise ignored (P3-9).
+        let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) else {
+            return fail("cannot install the SIGTERM handler");
+        };
+        let shutdown = async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
         };
         server::serve(listener, tls_config, shared, shutdown).await;
         tracing::info!("veil-relay stopped");

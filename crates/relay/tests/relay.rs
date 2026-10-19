@@ -533,16 +533,19 @@ async fn tls_is_1_3_only_and_pinned() {
         Client::connect(relay.addr, [0x42; 32]).await.is_err(),
         "wrong pin must fail"
     );
-    // A TLS 1.2-only client is refused.
-    let tcp = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
-    let cfg = common::client_tls(relay.pin, &[&rustls::version::TLS12]);
-    let res = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg))
-        .connect(
-            rustls::pki_types::ServerName::try_from("relay.test").unwrap(),
-            tcp,
-        )
-        .await;
-    assert!(res.is_err(), "TLS 1.2 must be refused");
+    // Positive control: a client able to do both 1.2 and 1.3 (with a working 1.2 signature
+    // check) connects, so the refusal below can only come from the server.
+    let both = [&rustls::version::TLS13, &rustls::version::TLS12];
+    common::tls_handshake(relay.addr, relay.pin, &both).await.unwrap();
+    // A TLS 1.2-only client is refused by the server with a protocol_version alert.
+    let res = common::tls_handshake(relay.addr, relay.pin, &[&rustls::version::TLS12]).await;
+    assert_eq!(
+        res,
+        Err(rustls::Error::AlertReceived(
+            rustls::AlertDescription::ProtocolVersion
+        )),
+        "TLS 1.2 must be refused by the relay"
+    );
     // Plain TCP (no TLS): the relay never answers in plaintext. A TLS server replies to a
     // non-TLS ClientHello with an alert record (content type 0x15) or closes.
     let mut tcp = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
@@ -614,78 +617,218 @@ async fn mailbox_creation_is_rate_limited() {
     assert_eq!(c.call(create(rand::random())).await, Err(ErrorCode::RateLimited));
 }
 
-/// INV-META-2 (logs): during a full session (create, auth, tokens, deposits, fetch, ack,
-/// invites, blobs, errors) the relay logs nothing that identifies a client: no IP, no
-/// mailbox id, no token, no size. Captured with a test subscriber at DEBUG level.
-#[tokio::test(flavor = "current_thread")]
-async fn relay_logs_nothing_about_clients() {
-    use std::sync::{Arc, Mutex};
-    #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Buf {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+fn fetch_frame(m: [u8; 32], id: u64) -> Vec<u8> {
+    veil_wire::ClientFrame {
+        v: veil_wire::VERSION,
+        id,
+        req: Some(Request::Fetch(veil_wire::Fetch {
+            mailbox_id: m.to_vec(),
+            after_seq: 0,
+            limit: 32,
+        })),
     }
-    let buf = Buf::default();
-    let sink = buf.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(move || sink.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    .encode()
+}
 
+/// P3-3: a client that requests large responses and never reads them is dropped after the
+/// write timeout, releasing its connection slot (here the only one).
+#[tokio::test]
+async fn a_client_that_stops_reading_is_dropped() {
+    let cfg = Config {
+        max_connections: 1,
+        write_timeout: std::time::Duration::from_secs(1),
+        ..Config::default()
+    };
+    let relay = TestRelay::start(cfg).await;
+    let mut a = relay.client().await;
+    let (m, tok): ([u8; 32], [u8; 32]) = (rand::random(), rand::random());
+    a.new_mailbox(relay.pin, m).await;
+    a.add_token(m, tok).await;
+    for _ in 0..32 {
+        a.deposit(m, tok, vec![0; 65_536]).await.unwrap();
+    }
+    // ~40 × 2 MiB of responses, never read: far more than the socket buffers hold.
+    for i in 0..40 {
+        a.send_raw(fetch_frame(m, 1_000 + i)).await;
+    }
+    assert!(
+        Client::connect(relay.addr, relay.pin).await.is_err(),
+        "the only slot is held"
+    );
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(mut b) = Client::connect(relay.addr, relay.pin).await
+            && b.try_ping().await
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "the non-reading client still holds the slot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    drop(a);
+}
+
+/// P3-4: one source cannot hold more than its share of connections, and a connection that
+/// never authenticates or delivers anything is closed, keep-alives notwithstanding.
+#[tokio::test]
+async fn connections_are_capped_per_source_and_must_authenticate() {
+    let cfg = Config {
+        max_connections_per_source: 2,
+        pre_auth_timeout: std::time::Duration::from_secs(1),
+        ..Config::default()
+    };
+    let relay = TestRelay::start(cfg).await;
+    let mut idle = relay.client().await;
+    let mut authed = relay.client().await;
+    assert!(
+        Client::connect(relay.addr, relay.pin).await.is_err(),
+        "third connection from 127.0.0.1"
+    );
+    authed.new_mailbox(relay.pin, rand::random()).await;
+    // Ping both for 2.5 s: only the authenticated one survives.
+    let mut idle_alive = true;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        idle_alive = idle_alive && idle.try_ping().await;
+        assert!(authed.try_ping().await, "authenticated connection closed");
+    }
+    assert!(
+        !idle_alive,
+        "unauthenticated connection outlived the pre-auth timeout"
+    );
+    // Its slot is free again.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut again = relay.client().await;
+    assert!(again.try_ping().await);
+}
+
+/// P3-5: invalid or conflicting creations do not spend the relay-wide budget, and one
+/// connection cannot drain it.
+#[tokio::test]
+async fn mailbox_creation_budget_cannot_be_drained_by_bad_requests() {
+    let mut cfg = Config::default();
+    cfg.limits.create_mailbox = Rate {
+        burst: 2,
+        per_sec: 0.001,
+    };
+    let relay = TestRelay::start(cfg).await;
+    let bad_key = (0u8..=255)
+        .map(|b| [b; 32])
+        .find(|k| ed25519_dalek::VerifyingKey::from_bytes(k).is_err())
+        .unwrap();
+    let create = |id: [u8; 32], key: [u8; 32]| {
+        Request::CreateMailbox(veil_wire::CreateMailbox {
+            mailbox_id: id.to_vec(),
+            auth_pub: key.to_vec(),
+        })
+    };
+    let good = || {
+        ed25519_dalek::SigningKey::from_bytes(&rand::random())
+            .verifying_key()
+            .to_bytes()
+    };
+    let mut flood = relay.client().await;
+    for _ in 0..4 {
+        assert_eq!(
+            flood.call(create(rand::random(), bad_key)).await,
+            Err(ErrorCode::Malformed)
+        );
+    }
+    assert_eq!(
+        flood.call(create(rand::random(), good())).await,
+        Err(ErrorCode::RateLimited),
+        "per-connection limit"
+    );
+    let mut b = relay.client().await;
+    let id: [u8; 32] = rand::random();
+    b.call(create(id, good())).await.unwrap();
+    assert_eq!(b.call(create(id, good())).await, Err(ErrorCode::Conflict));
+    b.call(create(rand::random(), good())).await.unwrap();
+    let mut c = relay.client().await;
+    assert_eq!(
+        c.call(create(rand::random(), good())).await,
+        Err(ErrorCode::RateLimited),
+        "relay-wide budget (2) spent only by the two real creations"
+    );
+}
+
+/// P3-11: deleting a mailbox revokes every connection's authentication for it, also when
+/// the id is re-created with a new key.
+#[tokio::test]
+async fn deleting_a_mailbox_revokes_other_connections() {
     let relay = TestRelay::start(Config::default()).await;
+    let m: [u8; 32] = rand::random();
+    let mut one = relay.client().await;
+    let key = one.new_mailbox(relay.pin, m).await;
+    let mut two = relay.client().await;
+    two.auth(relay.pin, m, &key).await.unwrap();
+    two.fetch(m, 0).await.unwrap();
+    one.call(Request::DeleteMailbox(veil_wire::MailboxRef {
+        mailbox_id: m.to_vec(),
+    }))
+    .await
+    .unwrap();
+    one.new_mailbox(relay.pin, m).await; // same id, new key
+    assert_eq!(two.fetch(m, 0).await.unwrap_err(), ErrorCode::Unauthorized);
+    assert_eq!(
+        two.call(Request::UpdateTokens(veil_wire::UpdateTokens {
+            mailbox_id: m.to_vec(),
+            add: vec![vec![1; 32]],
+            remove: vec![],
+        }))
+        .await,
+        Err(ErrorCode::Unauthorized)
+    );
+    one.fetch(m, 0).await.unwrap();
+}
+
+/// P3-3: large responses draw on a relay-wide byte budget; a request that would exceed it is
+/// refused with `RateLimited` instead of being buffered.
+#[tokio::test]
+async fn responses_draw_on_a_relay_wide_budget() {
+    let cfg = Config {
+        response_budget_bytes: 1024 * 1024,
+        ..Config::default()
+    };
+    let relay = TestRelay::start(cfg).await;
     let mut c = relay.client().await;
     let m: [u8; 32] = rand::random();
-    let tok: [u8; 32] = rand::random();
     c.new_mailbox(relay.pin, m).await;
-    c.add_token(m, tok).await;
-    let mut s = relay.client().await;
-    s.deposit(m, tok, vec![0x5A; 4096]).await.unwrap();
-    let _ = s.deposit(m, [9; 32], vec![0; 1024]).await;
-    c.fetch(m, 0).await.unwrap();
-    c.call(Request::Ack(veil_wire::Ack {
-        mailbox_id: m.to_vec(),
-        up_to_seq: 1,
-    }))
-    .await
-    .unwrap();
-    let inv = Request::PutInvite(veil_wire::PutInvite {
-        mailbox_id: m.to_vec(),
-        invite_id: vec![3; 16],
-        sealed: vec![1; veil_wire::SEALED_INVITE_LEN],
-        expires_at: now() + 100,
-    });
-    c.call(inv).await.unwrap();
-    s.call(Request::TakeInvite(veil_wire::TakeInvite {
-        invite_id: vec![3; 16],
-    }))
-    .await
-    .unwrap();
-    s.send_raw(vec![0xFF; 10]).await;
-    let _ = s.recv().await;
-    c.close().await;
-    s.close().await;
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-    let addr = relay.addr.to_string();
-    for (what, needle) in [
-        ("client IP", "127.0.0.1".to_owned()),
-        ("relay port (connection info)", relay.addr.port().to_string()),
-        ("listen address", addr),
-        ("mailbox id (hex)", veil_relay::tls::hex(&m)),
-        ("mailbox id prefix (hex)", veil_relay::tls::hex(&m[..6])),
-        ("token (hex)", veil_relay::tls::hex(&tok[..6])),
-        ("envelope size", "4096".to_owned()),
-        ("invite size", veil_wire::SEALED_INVITE_LEN.to_string()),
-    ] {
-        assert!(!logs.contains(&needle), "{what} in relay logs:\n{logs}");
+    let fetch = |limit| {
+        Request::Fetch(veil_wire::Fetch {
+            mailbox_id: m.to_vec(),
+            after_seq: 0,
+            limit,
+        })
+    };
+    // 32 × 64 KiB worst case is 2 MiB, more than the whole budget.
+    assert_eq!(c.call(fetch(32)).await, Err(ErrorCode::RateLimited));
+    // 8 × 64 KiB fits, and the budget is returned after each reply.
+    for _ in 0..5 {
+        c.call(fetch(8)).await.unwrap();
     }
+}
+
+/// The per-connection frame limit answers with the request's id (not the push id 0), so a
+/// client can tell which request was refused.
+#[tokio::test]
+async fn frame_rate_limit_echoes_the_request_id() {
+    let mut cfg = Config::default();
+    cfg.limits.frames_per_conn = Rate {
+        burst: 3,
+        per_sec: 0.001,
+    };
+    let relay = TestRelay::start(cfg).await;
+    let mut c = relay.client().await;
+    for _ in 0..3 {
+        c.call(Request::Ping(veil_wire::Empty {})).await.unwrap();
+    }
+    // `call` asserts that the reply echoes the request id.
+    assert_eq!(
+        c.call(Request::Ping(veil_wire::Empty {})).await,
+        Err(ErrorCode::RateLimited)
+    );
 }

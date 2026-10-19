@@ -193,9 +193,9 @@ Defined in `crates/wire` (shared by client and relay).
 
 | Request | Auth | Effect |
 |---|---|---|
-| `CreateMailbox { mailbox_id, auth_pub }` | none (relay-wide rate limit) | registers the mailbox's Ed25519 key |
+| `CreateMailbox { mailbox_id, auth_pub }` | none (per-connection limit, then relay-wide limit spent only by requests that would succeed) | registers the mailbox's Ed25519 key |
 | `Challenge { mailbox_id }` → `Challenge { nonce }` | none | single-use 32-byte nonce, bound to this connection and mailbox (≤ 64 outstanding) |
-| `Authenticate { mailbox_id, unix_secs, signature }` | signs §2 message | marks the mailbox authenticated **on this connection** (≤ 64 per connection) and subscribes it to pushes |
+| `Authenticate { mailbox_id, unix_secs, signature }` | signs §2 message | marks the mailbox authenticated **on this connection** (≤ 64 per connection) and subscribes it to pushes. Every later use re-checks that the mailbox still has the key it was authenticated with, so deleting a mailbox revokes all connections |
 | `UpdateTokens { mailbox_id, add[], remove[] }` | mailbox | registers/removes `SHA-256("veil/v1/tok" ‖ token)` (≤ 512 per mailbox) |
 | `Deposit { mailbox_id, token, envelope }` | delivery token | stores the envelope, pushes `NewEnvelopes` to subscribed connections |
 | `Fetch { mailbox_id, after_seq, limit ≤ 32 }` → `Envelopes { items[], last_seq }` | mailbox | `items` = `{ seq, received_minute, envelope }`, oldest first |
@@ -209,9 +209,15 @@ Defined in `crates/wire` (shared by client and relay).
 | `TurnCredentials { mailbox_id }` → `Turn` | mailbox | §8 |
 | `Ping` → `Ok` | none | keep-alive |
 
-**Storage.** For an envelope the relay stores `{ mailbox_id, seq, received_minute, envelope }` with a TTL (default 14 days); a full mailbox (5 000 envelopes) or a full relay (byte cap, default 4 GiB) refuses new deposits with `QuotaExceeded`. It never drops queued envelopes to make room. Mailboxes not authenticated for 60 days expire. **No sender, no IP, no User-Agent, no connection record** is stored or logged (INV-META-2, INV-LOG-1).
+**Storage.** For an envelope the relay stores `{ mailbox_id, seq, received_minute, envelope }` with a TTL (default 14 days); a full mailbox (5 000 envelopes) or a full relay (byte cap, default 1 GiB) refuses new deposits with `QuotaExceeded`. It never drops queued envelopes to make room. Mailboxes not authenticated for 60 days expire. Incomplete blobs expire with their upload token (24 h), complete ones 30 days after completion. Expiry runs from an index of due times, in short batches. **No sender, no IP, no User-Agent, no connection record** is stored or logged (INV-META-2, INV-LOG-1).
 
-**Rate limits** are token buckets keyed by delivery token, mailbox or connection, plus a relay-wide one for mailbox creation. **Never by IP**: the relay drops the peer address right after accept.
+**Rate limits** are token buckets keyed by delivery token, mailbox or connection, plus a relay-wide one for mailbox creation. **Never by IP.** Rate-limit refusals echo the request id.
+
+**Connections.**
+- At most 1 024 concurrent connections, and at most 32 per source (IPv4 address or IPv6 /64). The per-source count is the only use of the peer address: it is held in memory while the connection is open, then forgotten, and never stored or logged.
+- A connection that has not authenticated a mailbox, deposited, taken an invite or transferred a blob chunk within 30 s is closed, whatever it sends meanwhile.
+- Idle timeout: 5 min.
+- Every write has a 30 s timeout. `Fetch` and `BlobGet` responses reserve their worst-case size from a relay-wide 64 MiB budget until sent; when the budget is exhausted they are refused with `RateLimited`.
 
 ## 7. Content messages (inside the envelope)
 
@@ -336,8 +342,10 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 | Text body | 62 464 bytes (61 KiB, so a maximal `Text` or `Edit` still fits the 64 KiB bucket) |
 | Attachment | 100 MiB (v1), 64 KiB chunks |
 | Envelopes per mailbox held by relay | 5 000; further deposits refused (`QuotaExceeded`), never oldest-dropped |
-| Envelope bytes per relay | 4 GiB default (`VEIL_QUOTA_ENVELOPES_MB`); blobs 20 GiB (`VEIL_QUOTA_BLOBS_MB`) |
+| Envelope bytes per relay | 1 GiB default (`VEIL_QUOTA_ENVELOPES_MB`); blobs 4 GiB (`VEIL_QUOTA_BLOBS_MB`) |
 | Deposits per token | burst 60, then 1/s |
-| WebSocket message | client → relay ≤ 64 KiB + 1 040 bytes (one blob chunk + framing); relay → client ≤ 32 envelopes; idle timeout 5 min (clients ping); TLS+WS handshake timeout 10 s each |
+| WebSocket message | client → relay ≤ 64 KiB + 1 040 bytes (one blob chunk + framing); relay → client ≤ 32 envelopes |
+| Timeouts | TLS and WebSocket handshakes 10 s each; pre-authentication 30 s; idle 5 min (clients ping); each write 30 s |
+| Connections | 1 024 per relay; 32 per source (IPv4 address / IPv6 /64), in memory only |
 | Invite TTL | ≤ 7 days (default 24 h) |
 | Clock skew accepted | ±120 s for auth; message timestamps never security-relevant |

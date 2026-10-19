@@ -4,13 +4,21 @@
 //! defend itself against hostile clients:
 //! * sizes are limited before parsing (WebSocket frame and message limits, then
 //!   [`ClientFrame::decode_strict`]);
-//! * handshake and idle timeouts, a connection cap, and per-connection frame rate limits;
+//! * handshake, idle, pre-authentication and write timeouts, a connection cap, and
+//!   per-connection frame rate limits;
+//! * a relay-wide budget for response bytes in flight, so slow readers cannot exhaust memory;
 //! * rate limits keyed by delivery token, mailbox or connection, **never by IP**.
+//!
+//! The one use of the peer address is an in-memory count of *concurrent* connections per
+//! source (IPv4 address or IPv6 /64), so one host cannot take every connection slot
+//! (review P3-4). The count exists only while a connection is open; it is never logged or
+//! stored, and an entry is removed when it reaches zero.
 //!
 //! Nothing about a connection is logged: no address, no mailbox id, no size (INV-META-2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -19,13 +27,14 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use rand::Rng as _;
 use sha2::{Digest as _, Sha256};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use veil_wire::{
     ChallengeResponse, ClientFrame, Envelopes, ErrorCode, InviteResponse, MAX_BLOB_CHUNK, MAX_CLIENT_FRAME,
-    NewEnvelopes, Request, Response, ServerFrame, StoredEnvelope, TurnResponse, UploadTokenResponse, VERSION,
+    MAX_ENVELOPE, MAX_FRAME, NewEnvelopes, Request, Response, ServerFrame, StoredEnvelope, TurnResponse,
+    UploadTokenResponse, VERSION,
 };
 
 use crate::limits::{KeyedLimiter, Limiter, Rate};
@@ -50,6 +59,8 @@ pub struct Limits {
     pub frames_per_conn: Rate,
     /// Mailbox creations, relay-wide.
     pub create_mailbox: Rate,
+    /// Mailbox creations per connection (so one connection cannot drain the relay-wide bucket).
+    pub create_mailbox_per_conn: Rate,
     /// Deposits per delivery token.
     pub deposit_per_token: Rate,
     /// Invite uploads per authenticated mailbox.
@@ -78,6 +89,10 @@ impl Default for Limits {
             create_mailbox: Rate {
                 burst: 20,
                 per_sec: 1.0,
+            },
+            create_mailbox_per_conn: Rate {
+                burst: 4,
+                per_sec: 1.0 / 60.0,
             },
             deposit_per_token: Rate {
                 burst: 60,
@@ -111,8 +126,17 @@ pub struct Config {
     pub limits: Limits,
     pub turn: Option<TurnConfig>,
     pub max_connections: usize,
+    /// Concurrent connections from one source (IPv4 address or IPv6 /64).
+    pub max_connections_per_source: u32,
     pub handshake_timeout: Duration,
     pub idle_timeout: Duration,
+    /// A connection that has not authenticated a mailbox or completed a deposit, invite take
+    /// or blob transfer within this time is closed, whatever keep-alives it sends.
+    pub pre_auth_timeout: Duration,
+    /// Longest a single write to a client may take; a client that stops reading is dropped.
+    pub write_timeout: Duration,
+    /// Response bytes (fetches, blob chunks) that may be in flight relay-wide.
+    pub response_budget_bytes: usize,
     pub sweep_interval: Duration,
 }
 
@@ -129,10 +153,10 @@ impl Default for Quotas {
         Self {
             max_mailboxes: 100_000,
             max_envelopes_per_mailbox: 5_000,
-            max_envelope_bytes_total: 4 * 1024 * 1024 * 1024,
+            max_envelope_bytes_total: 1024 * 1024 * 1024,
             max_tokens_per_mailbox: 512,
             max_invites: 50_000,
-            max_blob_bytes_total: 20 * 1024 * 1024 * 1024,
+            max_blob_bytes_total: 4 * 1024 * 1024 * 1024,
             envelope_ttl_secs: 14 * 24 * 3600,
             invite_max_ttl_secs: 7 * 24 * 3600,
             blob_ttl_secs: 30 * 24 * 3600,
@@ -149,8 +173,12 @@ impl Default for Config {
             limits: Limits::default(),
             turn: None,
             max_connections: 1024,
+            max_connections_per_source: 32,
             handshake_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_mins(5),
+            pre_auth_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
+            response_budget_bytes: 64 * 1024 * 1024,
             sweep_interval: Duration::from_mins(1),
         }
     }
@@ -171,6 +199,8 @@ pub struct Shared {
     turn: Mutex<KeyedLimiter>,
     subscribers: Mutex<Subscribers>,
     next_conn: AtomicU64,
+    /// Response bytes in flight, in KiB units.
+    response_budget: Arc<Semaphore>,
 }
 
 impl core::fmt::Debug for Shared {
@@ -199,6 +229,9 @@ impl Shared {
             turn: Mutex::new(KeyedLimiter::new(l.turn_per_mailbox, LIMITER_KEYS)),
             subscribers: Mutex::new(HashMap::new()),
             next_conn: AtomicU64::new(1),
+            response_budget: Arc::new(Semaphore::new(
+                (cfg.response_budget_bytes / 1024).min(Semaphore::MAX_PERMITS),
+            )),
             cfg,
         })
     }
@@ -253,6 +286,72 @@ impl Shared {
     }
 }
 
+/// Connection source for the concurrency cap: the IPv4 address, or the IPv6 /64.
+fn source_key(ip: IpAddr) -> [u8; 8] {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mut k = [0u8; 8];
+            if let Some(dst) = k.get_mut(4..) {
+                dst.copy_from_slice(&v4.octets());
+            }
+            k
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return source_key(IpAddr::V4(v4));
+            }
+            let o = v6.octets();
+            let mut k = [0u8; 8];
+            if let (Some(dst), Some(src)) = (k.get_mut(..), o.get(..8)) {
+                dst.copy_from_slice(src);
+            }
+            // Never equal to an IPv4 key, whose first four bytes are zero.
+            if let Some(first) = k.first_mut() {
+                *first |= 0x80;
+            }
+            k
+        }
+    }
+}
+
+type Sources = Arc<Mutex<HashMap<[u8; 8], u32>>>;
+
+/// Holds one source slot; releases it (and forgets the source at zero) on drop.
+struct SourceSlot {
+    sources: Sources,
+    key: [u8; 8],
+}
+
+impl SourceSlot {
+    fn take(sources: &Sources, key: [u8; 8], max: u32) -> Option<Self> {
+        let mut map = lock(sources);
+        let n = map.entry(key).or_insert(0);
+        if *n >= max {
+            if *n == 0 {
+                map.remove(&key);
+            }
+            return None;
+        }
+        *n = n.saturating_add(1);
+        Some(Self {
+            sources: Arc::clone(sources),
+            key,
+        })
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let mut map = lock(&self.sources);
+        if let Some(n) = map.get_mut(&self.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Accepts connections until `shutdown` resolves. TLS is mandatory: there is no plaintext mode.
 pub async fn serve(
     listener: TcpListener,
@@ -262,14 +361,21 @@ pub async fn serve(
 ) {
     let acceptor = TlsAcceptor::from(tls);
     let slots = Arc::new(Semaphore::new(shared.cfg.max_connections));
+    let sources: Sources = Arc::new(Mutex::new(HashMap::new()));
     let sweeper = tokio::spawn(sweep_loop(Arc::clone(&shared)));
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
             () = &mut shutdown => break,
             accepted = listener.accept() => {
-                let Ok((stream, _addr)) = accepted else { continue };
-                // `_addr` is dropped here: the relay never stores or logs client addresses.
+                let Ok((stream, addr)) = accepted else { continue };
+                // Only a truncated source key survives, in memory, for the concurrency cap;
+                // the address itself is dropped here and never stored or logged.
+                let key = source_key(addr.ip());
+                let Some(source) = SourceSlot::take(&sources, key, shared.cfg.max_connections_per_source) else {
+                    drop(stream); // this source already holds its share of connections
+                    continue;
+                };
                 let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
                     drop(stream); // over the connection cap
                     continue;
@@ -279,6 +385,7 @@ pub async fn serve(
                 tokio::spawn(async move {
                     connection(stream, acceptor, shared).await;
                     drop(permit);
+                    drop(source);
                 });
             }
         }
@@ -301,6 +408,8 @@ fn ws_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(MAX_CLIENT_FRAME))
         .max_frame_size(Some(MAX_CLIENT_FRAME))
+        // One largest response plus slack; writes beyond that fail instead of buffering.
+        .max_write_buffer_size(MAX_FRAME.saturating_add(256 * 1024))
 }
 
 async fn connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared>) {
@@ -319,29 +428,40 @@ async fn connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared
     let (mut sink, mut source) = ws.split();
     let (push_tx, mut push_rx) = mpsc::channel::<ServerFrame>(64);
     let mut conn = Conn::new(Arc::clone(&shared), push_tx);
-    let idle = shared.cfg.idle_timeout;
+    let (idle, write) = (shared.cfg.idle_timeout, shared.cfg.write_timeout);
+    let start = tokio::time::Instant::now();
+    let pre_auth_deadline = start.checked_add(shared.cfg.pre_auth_timeout).unwrap_or(start);
     loop {
+        // Until the connection does something useful, keep-alives do not keep it open.
+        let wait = if conn.established {
+            idle
+        } else {
+            pre_auth_deadline.saturating_duration_since(tokio::time::Instant::now())
+        };
         tokio::select! {
-            incoming = tokio::time::timeout(idle, source.next()) => {
-                let reply = match incoming {
+            incoming = tokio::time::timeout(wait, source.next()) => {
+                let (reply, budget) = match incoming {
                     Ok(Some(Ok(Message::Binary(bytes)))) => conn.handle(&bytes).await,
                     Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
-                    // Text frames, close, errors, end of stream or idle timeout: hang up.
+                    // Text frames, close, errors, end of stream or timeout: hang up.
                     _ => break,
                 };
-                if sink.send(Message::Binary(reply.encode().into())).await.is_err() {
+                let sent = tokio::time::timeout(write, sink.send(Message::Binary(reply.encode().into()))).await;
+                drop(budget); // the response bytes have left (or the connection is going)
+                if !matches!(sent, Ok(Ok(()))) {
                     break;
                 }
             }
             Some(push) = push_rx.recv() => {
-                if sink.send(Message::Binary(push.encode().into())).await.is_err() {
+                let sent = tokio::time::timeout(write, sink.send(Message::Binary(push.encode().into()))).await;
+                if !matches!(sent, Ok(Ok(()))) {
                     break;
                 }
             }
         }
     }
     shared.unsubscribe_all(conn.id);
-    let _ = sink.close().await;
+    let _ = tokio::time::timeout(write, sink.close()).await;
 }
 
 fn arr32(b: &[u8]) -> Option<[u8; 32]> {
@@ -383,9 +503,13 @@ struct Conn {
     push: mpsc::Sender<ServerFrame>,
     frames: Limiter,
     take_invite: Limiter,
+    create_mailbox: Limiter,
     /// Mailbox → (nonce, issued at).
     challenges: HashMap<[u8; 32], ([u8; 32], u64)>,
-    authed: HashSet<[u8; 32]>,
+    /// Mailbox → the auth key it was authenticated with (re-checked on use, P3-11).
+    authed: HashMap<[u8; 32], [u8; 32]>,
+    /// Set by the first authentication, deposit, invite take or blob transfer.
+    established: bool,
 }
 
 impl Conn {
@@ -396,48 +520,80 @@ impl Conn {
             push,
             frames: Limiter::new(l.frames_per_conn),
             take_invite: Limiter::new(l.take_invite_per_conn),
+            create_mailbox: Limiter::new(l.create_mailbox_per_conn),
             challenges: HashMap::new(),
-            authed: HashSet::new(),
+            authed: HashMap::new(),
+            established: false,
             shared,
         }
     }
 
-    async fn handle(&mut self, bytes: &[u8]) -> ServerFrame {
-        if !self.frames.allow() {
-            return ServerFrame::error(0, ErrorCode::RateLimited);
-        }
+    /// One request → one reply, plus the response-budget share the reply holds until sent.
+    async fn handle(&mut self, bytes: &[u8]) -> (ServerFrame, Option<OwnedSemaphorePermit>) {
+        // Every frame counts, decodable or not. Decoding first (the size is already capped by
+        // the WebSocket limits) lets a refusal echo the request id, so clients can match it.
+        let allowed = self.frames.allow();
         let frame = match ClientFrame::decode_strict(bytes) {
             Ok(f) => f,
+            Err(_) if !allowed => return (ServerFrame::error(0, ErrorCode::RateLimited), None),
             Err(veil_wire::WireError::UnsupportedVersion) => {
-                return ServerFrame::error(0, ErrorCode::Unsupported);
+                return (ServerFrame::error(0, ErrorCode::Unsupported), None);
             }
-            Err(_) => return ServerFrame::error(0, ErrorCode::Malformed),
+            Err(_) => return (ServerFrame::error(0, ErrorCode::Malformed), None),
         };
         let id = frame.id;
+        if !allowed {
+            return (ServerFrame::error(id, ErrorCode::RateLimited), None);
+        }
         let Some(req) = frame.req else {
-            return ServerFrame::error(id, ErrorCode::Malformed);
+            return (ServerFrame::error(id, ErrorCode::Malformed), None);
         };
-        match self.dispatch(req).await {
-            Ok(resp) => ServerFrame {
-                v: VERSION,
-                id,
-                resp: Some(resp),
-            },
-            Err(code) => ServerFrame::error(id, code),
+        let mut budget = None;
+        match self.dispatch(req, &mut budget).await {
+            Ok(resp) => (
+                ServerFrame {
+                    v: VERSION,
+                    id,
+                    resp: Some(resp),
+                },
+                budget,
+            ),
+            Err(code) => (ServerFrame::error(id, code), None),
         }
     }
 
-    fn require_auth(&self, mailbox: &[u8]) -> Result<[u8; 32], ErrorCode> {
+    /// The mailbox must be authenticated on this connection *and* still carry the key it
+    /// was authenticated with: a deleted and re-created mailbox needs a new authentication
+    /// (P3-11).
+    async fn require_auth(&mut self, mailbox: &[u8]) -> Result<[u8; 32], ErrorCode> {
         let m = arr32(mailbox).ok_or(ErrorCode::Malformed)?;
-        if self.authed.contains(&m) {
-            Ok(m)
-        } else {
-            Err(ErrorCode::Unauthorized)
+        let Some(&key) = self.authed.get(&m) else {
+            return Err(ErrorCode::Unauthorized);
+        };
+        match self.shared.db(move |s| s.mailbox_auth_key(&m)).await {
+            Ok(current) if current == key => Ok(m),
+            Ok(_) | Err(StoreError::NotFound) => {
+                self.authed.remove(&m);
+                Err(ErrorCode::Unauthorized)
+            }
+            Err(e) => Err(code(e)),
         }
+    }
+
+    /// Reserves `bytes` of the relay-wide response budget, or refuses with `RateLimited`.
+    fn reserve(&self, bytes: usize) -> Result<OwnedSemaphorePermit, ErrorCode> {
+        let kib = u32::try_from(bytes.div_ceil(1024)).map_err(|_| ErrorCode::Internal)?;
+        Arc::clone(&self.shared.response_budget)
+            .try_acquire_many_owned(kib)
+            .map_err(|_| ErrorCode::RateLimited)
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn dispatch(&mut self, req: Request) -> Result<Response, ErrorCode> {
+    async fn dispatch(
+        &mut self,
+        req: Request,
+        budget: &mut Option<OwnedSemaphorePermit>,
+    ) -> Result<Response, ErrorCode> {
         let sh = Arc::clone(&self.shared);
         let now = sh.now();
         let ok = || Response::Ok(veil_wire::Empty {});
@@ -445,7 +601,7 @@ impl Conn {
             Request::Ping(_) => Ok(ok()),
 
             Request::CreateMailbox(c) => {
-                if !lock(&sh.create_mailbox).allow() {
+                if !self.create_mailbox.allow() {
                     return Err(ErrorCode::RateLimited);
                 }
                 let (m, k) = (
@@ -454,6 +610,13 @@ impl Conn {
                 );
                 // Reject keys that are not valid Ed25519 points now rather than at every auth.
                 ed25519_dalek::VerifyingKey::from_bytes(&k).map_err(|_| ErrorCode::Malformed)?;
+                // Only requests that would succeed spend the relay-wide budget (P3-5).
+                if sh.db(move |s| s.mailbox_exists(&m)).await.map_err(code)? {
+                    return Err(ErrorCode::Conflict);
+                }
+                if !lock(&sh.create_mailbox).allow() {
+                    return Err(ErrorCode::RateLimited);
+                }
                 sh.db(move |s| s.create_mailbox(&m, &k, now))
                     .await
                     .map_err(code)?;
@@ -484,7 +647,7 @@ impl Conn {
                 if now.abs_diff(a.unix_secs) > skew || now.saturating_sub(issued) > skew {
                     return Err(ErrorCode::Unauthorized);
                 }
-                if !self.authed.contains(&m) && self.authed.len() >= sh.cfg.limits.max_auth_per_conn {
+                if !self.authed.contains_key(&m) && self.authed.len() >= sh.cfg.limits.max_auth_per_conn {
                     return Err(ErrorCode::RateLimited);
                 }
                 let key = match sh.db(move |s| s.mailbox_auth_key(&m)).await {
@@ -501,13 +664,14 @@ impl Conn {
                 vk.verify_strict(&msg, &sig)
                     .map_err(|_| ErrorCode::Unauthorized)?;
                 sh.db(move |s| s.touch_mailbox(&m, now)).await.map_err(code)?;
-                self.authed.insert(m);
+                self.authed.insert(m, key);
+                self.established = true;
                 sh.subscribe(m, self.id, self.push.clone());
                 Ok(ok())
             }
 
             Request::UpdateTokens(u) => {
-                let m = self.require_auth(&u.mailbox_id)?;
+                let m = self.require_auth(&u.mailbox_id).await?;
                 let to32 = |v: &[Vec<u8>]| {
                     v.iter()
                         .map(|t| arr32(t).ok_or(ErrorCode::Malformed))
@@ -532,12 +696,14 @@ impl Conn {
                     .await
                     .map_err(code)?;
                 sh.notify(m, seq);
+                self.established = true;
                 Ok(ok())
             }
 
             Request::Fetch(f) => {
-                let m = self.require_auth(&f.mailbox_id)?;
+                let m = self.require_auth(&f.mailbox_id).await?;
                 let limit = usize::try_from(f.limit).map_err(|_| ErrorCode::Malformed)?;
+                *budget = Some(self.reserve(limit.saturating_mul(MAX_ENVELOPE + 64))?);
                 let after = f.after_seq;
                 let (items, last_seq) = sh
                     .db(move |s| s.fetch(&m, after, limit, now))
@@ -557,21 +723,21 @@ impl Conn {
             }
 
             Request::Ack(a) => {
-                let m = self.require_auth(&a.mailbox_id)?;
+                let m = self.require_auth(&a.mailbox_id).await?;
                 let up_to = a.up_to_seq;
                 sh.db(move |s| s.ack(&m, up_to)).await.map_err(code)?;
                 Ok(ok())
             }
 
             Request::DeleteMailbox(d) => {
-                let m = self.require_auth(&d.mailbox_id)?;
+                let m = self.require_auth(&d.mailbox_id).await?;
                 sh.db(move |s| s.delete_mailbox(&m)).await.map_err(code)?;
                 self.authed.remove(&m);
                 Ok(ok())
             }
 
             Request::PutInvite(p) => {
-                let m = self.require_auth(&p.mailbox_id)?;
+                let m = self.require_auth(&p.mailbox_id).await?;
                 if !lock(&sh.put_invite).allow(&m) {
                     return Err(ErrorCode::RateLimited);
                 }
@@ -598,11 +764,12 @@ impl Conn {
                     .try_into()
                     .map_err(|_| ErrorCode::Malformed)?;
                 let sealed = sh.db(move |s| s.take_invite(&id, now)).await.map_err(code)?;
+                self.established = true;
                 Ok(Response::Invite(InviteResponse { sealed }))
             }
 
             Request::BlobUploadToken(b) => {
-                let m = self.require_auth(&b.mailbox_id)?;
+                let m = self.require_auth(&b.mailbox_id).await?;
                 if !lock(&sh.upload_tokens).allow(&m) {
                     return Err(ErrorCode::RateLimited);
                 }
@@ -622,19 +789,22 @@ impl Conn {
                 sh.db(move |s| s.put_chunk(&h, &blob, idx, total, &data, MAX_BLOB_CHUNK, now))
                     .await
                     .map_err(code)?;
+                self.established = true;
                 Ok(ok())
             }
 
             Request::BlobGet(b) => {
                 let blob = arr32(&b.blob_id).ok_or(ErrorCode::Malformed)?;
                 let idx = b.chunk_index;
+                *budget = Some(self.reserve(MAX_BLOB_CHUNK + 64)?);
                 let (total_chunks, data) =
                     sh.db(move |s| s.get_chunk(&blob, idx, now)).await.map_err(code)?;
+                self.established = true;
                 Ok(Response::BlobChunk(veil_wire::BlobChunk { total_chunks, data }))
             }
 
             Request::TurnCredentials(t) => {
-                let m = self.require_auth(&t.mailbox_id)?;
+                let m = self.require_auth(&t.mailbox_id).await?;
                 let cfg = sh.cfg.turn.as_ref().ok_or(ErrorCode::Unsupported)?;
                 if !lock(&sh.turn).allow(&m) {
                     return Err(ErrorCode::RateLimited);

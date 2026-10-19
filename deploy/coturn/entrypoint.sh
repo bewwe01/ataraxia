@@ -14,7 +14,6 @@ if [ "${#secret}" -lt 32 ]; then
 fi
 
 public=${TURN_EXTERNAL_IP%%/*}
-private=${TURN_EXTERNAL_IP#*/}
 
 umask 077
 conf=/run/coturn/turnserver.conf
@@ -22,12 +21,11 @@ cat /etc/coturn/veil.conf > "$conf"
 # printf is a shell builtin: the secret is not passed to any process's argv.
 printf 'static-auth-secret=%s\n' "$secret" >> "$conf"
 printf 'external-ip=%s\n' "$TURN_EXTERNAL_IP" >> "$conf"
-# Both call legs are relayed through this server, so peers must reach its own address even when it
-# lies inside a denied range (LAN or Tailscale deployments).
+# Both call legs are relayed through this server, so peers must reach the address it advertises
+# even when that lies inside a denied range (LAN or Tailscale deployments). This also lets anyone
+# with TURN credentials send UDP to *any* port on that address, so deploy/firewall/veil-turn.nft
+# is required: it limits coturn's relay sockets to the relay port range on this host (P3-8).
 printf 'allowed-peer-ip=%s\n' "$public" >> "$conf"
-if [ "$private" != "$TURN_EXTERNAL_IP" ]; then
-  printf 'allowed-peer-ip=%s\n' "$private" >> "$conf"
-fi
 unset secret
 
 exec turnserver -c "$conf"

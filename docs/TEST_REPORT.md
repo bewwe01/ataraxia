@@ -2,6 +2,84 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 3: after review round 1 fixes (2026-10-19)
+
+Review round 1 returned **FAIL**: 2 High, 6 Medium, 5 Low (`docs/REVIEW_REPORT.md`). Every finding was addressed. Each new test was mutation-checked: the fix was reverted or broken by hand, the test failed, the fix was restored.
+
+| Finding | Fix | Test (mutant that fails it) |
+|---|---|---|
+| **P3-1 (High)** OOM: redb 1 GiB cache + full-table sweep | Explicit page cache (64 MiB, `VEIL_DB_CACHE_MB`). Expiry index table `kind ‖ due ‖ id`; sweep reads only due keys, 256 per write transaction. | `store::tests::sweep_touches_only_due_records` (nothing due → 0 records read; 300 due → 300 read in 2 batches). Container soak in CI (`deployed_relay_soak` + inspect). |
+| **P3-2 (High)** `FF…` token rows escape deletion | `prefix_end = prefix ‖ FF×33` covers every suffix ≤ 32 bytes | `ff_prefixed_tokens_are_deleted_with_their_mailbox` (delete and idle paths). Restoring the `FF×16` bound fails it. `nothing_is_left_behind` (no row in any table, index included) |
+| P3-3 no write timeout | 30 s timeout on every write; `max_write_buffer_size`; relay-wide 64 MiB response budget for `Fetch`/`BlobGet` | `a_client_that_stops_reading_is_dropped` (removing the timeout fails it after 15 s); `responses_draw_on_a_relay_wide_budget` |
+| P3-4 one host takes every slot | In-memory per-source cap (32; IPv4 address or IPv6 /64), forgotten at zero; 30 s pre-authentication timeout | `connections_are_capped_per_source_and_must_authenticate` (disabling the cap fails it; disabling the pre-auth timeout fails it) |
+| P3-5 creation budget drained by bad requests | Per-connection creation limit; validate key and id before spending the relay-wide budget | `mailbox_creation_budget_cannot_be_drained_by_bad_requests` (spending the global budget first fails it) |
+| P3-6 log test blind to blocking threads | Own test binary with a **global** subscriber; positive control from `spawn_blocking`; session adds blobs, TURN and delete | `tests/logs.rs`: M3 (log in handler) and M4 (log in `Store::deposit`) both fail it |
+| P3-7 TLS 1.2 test vacuous | Probe verifier does real TLS 1.2 signature checks; asserts the server's `protocol_version` alert; positive control | Server offering TLS 1.2 too (M5) fails `tls_is_1_3_only_and_pinned` |
+| P3-8 coturn relays to every host port | Required host rule `deploy/firewall/veil-turn.nft`: coturn relay sockets → this host's addresses only to the relay port range. Private-address `allowed-peer-ip` dropped. README and THREAT_MODEL corrected (TURN is open to anyone) | CI probe: host UDP listener on port 40000 must receive 0; without the rule the same script fails (5 received, exit 1) |
+| P3-9 SIGTERM ignored | SIGTERM handled alongside SIGINT | CI: `docker compose stop relay` ≤ 5 s, exit 0, "veil-relay stopped" logged |
+| P3-10 abandoned uploads hold quota 30 days | Incomplete blob expires with its upload token; complete blob gets the TTL from completion | `abandoned_uploads_expire_with_their_token` |
+| P3-11 delete leaves other connections authed | Connections remember the auth key; every use re-checks it | `deleting_a_mailbox_revokes_other_connections` (dropping the re-check fails it) |
+| P3-12 raw TURN secret not zeroized | `std::fs::read(..).map(Zeroizing::new)` | code review |
+| P3-13 inaccurate docs | README, THREAT_MODEL §5, PROTOCOL §6.3/§14, ADR-0010 and INVARIANTS corrected | — |
+
+Found while fixing:
+- Frame-rate refusals replied with id 0, the push id, so clients could not match them. They now echo the request id (`frame_rate_limit_echoes_the_request_id`).
+- The on-disk size measurement below led to lower default caps (envelopes 1 GiB, blobs 4 GiB; were 4 and 20).
+- My earlier `turnutils_uclient -r veil` was a wrong flag (`-r` is the peer port, not the realm). It did not change any earlier result: `-y` ignores it, and the 403 checks fail on the address first. It is removed.
+
+### Format, lint, tests
+
+```text
+$ cargo fmt --all --check                                         # exit 0
+$ cargo clippy --workspace --all-targets --locked -- -D warnings  # exit 0
+$ cargo test --workspace --locked                                 # exit 0 (condensed as before)
+     Running unittests src/lib.rs (veil_core)       test result: ok. 74 passed; 0 failed
+     Running tests/secrets.rs                       test result: ok. 3 passed; 0 failed
+     Running tests/session.rs                       test result: ok. 22 passed; 0 failed; 1 ignored
+     Running unittests src/lib.rs (veil_relay)      test result: ok. 14 passed; 0 failed
+     Running tests/logs.rs                          test result: ok. 1 passed; 0 failed
+     Running tests/relay.rs                         test result: ok. 15 passed; 0 failed
+     Running tests/smoke.rs                         test result: ok. 0 passed; 0 failed; 2 ignored
+     Running unittests src/lib.rs (veil_wire)       test result: ok. 5 passed; 0 failed
+```
+
+### Memory and expiry (the reviewer's benchmark crate, real `veil_relay::store::Store`)
+
+Run in `docker run --memory=512m --memory-swap=512m` (distroless), with the DB on disk. A first attempt with the DB on tmpfs was OOM-killed during the fill, because tmpfs pages count against the writing container's memory; that run is discarded.
+
+```text
+fill 9600 × 64 KiB:   filled 9600 in 10.252428829s     VmHWM:   70880 kB   exit=0   (before: VmHWM 1086124 kB)
+db.redb size:          2155876352 bytes  (≈ 3.4× the 630 MiB payload)
+sweep, nothing due:    sweep removed 0 in 1.538018ms; second sweep 1.379357ms   VmHWM: 3608 kB   (before: 980 ms, 1053444 kB, OOMKilled under 512m)
+expire all:            expire removed 9600 in 767.80085ms   VmHWM: 36340 kB   exit=0
+```
+
+### Deployed stack (`deploy/`, rebuilt image, run as the CI job runs it)
+
+```text
+SPKI SHA-256 pin: caa4da4a…; 2 running
+smoke deployed_relay_round_trip ... ok
+coturn, firewall rule loaded:
+  -y -c (client↔client)         Total lost packets 0 (0.000000%)
+  -c -e 10.0.0.1                channel bind: error 403 (Forbidden IP)
+  wrong password                ERROR: Cannot complete Allocation
+  -c -e <host IP> -r 40000      host listener: udp packets received = 0     nft counter: packets 1 … drop
+  same probe, rule removed      udp packets received = 5   → CI step exit=1
+relay logs: 1 line (startup); coturn logs: only "udp send: Operation not permitted" (the firewall drop; no address)
+soak: deposited 9600 × 64 KiB (600 MiB) into 2 mailboxes in 20.192327591s
+  +103 s: OOMKilled=false Restarts=0 Running=true; docker stats 91.57MiB / 512MiB; smoke round trip ok
+docker compose stop relay: stopped in 533 ms, ExitCode=0, log "veil-relay stopped"   (before: 10.3 s, exit 137)
+restart on the 600 MiB database: smoke ok; 2.715MiB in use; volume 1.2G
+```
+
+Locally the soak used 600 MiB because the disk here had only about 4 GB free. CI soaks 1.1 GB (with `VEIL_QUOTA_ENVELOPES_MB=2048`).
+
+**Still not verified:**
+- arm64 / Raspberry Pi;
+- a home NAT deployment (hairpin) with the narrowed `allowed-peer-ip`;
+- soak runs longer than a few minutes;
+- the `relay-deploy` job on GitHub's runners with these changes (pending the push).
+
 ## Phase 3: relay, wire protocol, deployment (2026-10-19), before review
 
 Local, Ubuntu 24.04 container, rustc 1.97.0, Docker 29.8.2.
@@ -124,7 +202,7 @@ The Phase 3 relay dependencies are exempted, not reviewed by us (`supply-chain/R
 
 - **Relay TLS is not post-quantum** (*ring* has no ML-KEM; ADR-0010). Message content is PQ end to end; relay-visible metadata is exposed to harvest-now-decrypt-later.
 - **Open mailbox creation:** anyone can exhaust the storage caps, which denies new deposits (THREAT_MODEL §5). The caps bound disk use.
-- **No load or soak test** of the relay; the sweeper scans all envelopes once a minute (fine at Pi scale, untested at large scale).
+- ~~**No load or soak test** of the relay; the sweeper scans all envelopes once a minute (fine at Pi scale, untested at large scale).~~ *Wrong: review round 1 (P3-1) showed the full scan plus redb's 1 GiB default cache OOM-kills the relay at about 600 MB stored. Fixed; see the next section up.*
 - **Plain `turn:`** by default; `turns:` needs a publicly trusted certificate.
 - **arm64 image not built or tested** here.
 - The ≥ 1 h nightly fuzz runs still have no recorded run.

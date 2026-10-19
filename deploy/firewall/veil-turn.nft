@@ -1,0 +1,25 @@
+#!/usr/sbin/nft -f
+# Veil: keep coturn from relaying into this host's own services (review P3-8).
+#
+# Anyone can obtain TURN credentials (mailbox creation is open), and calls need coturn to
+# relay to its own address, so coturn's `allowed-peer-ip` for that address cannot be avoided.
+# This rule limits what that allows: traffic leaving coturn's relay sockets (UDP source
+# ports 49160-49259) towards any address of *this host* may only go to the same relay port
+# range, i.e. to other call legs. Everything else (DNS, Pi-hole, SNMP, WireGuard, ...) is
+# dropped. coturn runs as uid 65534 (`nobody`), which this rule matches.
+#
+# Install:  sudo nft -f deploy/firewall/veil-turn.nft
+# Persist:  add `include "/path/to/veil-turn.nft"` to /etc/nftables.conf (Debian/Raspberry
+#           Pi OS) and `sudo systemctl enable nftables`.
+# Remove:   sudo nft delete table inet veil_turn
+# Keep the port range in sync with min-port/max-port in coturn/turnserver.conf.
+
+table inet veil_turn
+delete table inet veil_turn
+
+table inet veil_turn {
+    chain output {
+        type filter hook output priority filter; policy accept;
+        meta skuid 65534 udp sport 49160-49259 fib daddr type local udp dport != 49160-49259 counter drop
+    }
+}

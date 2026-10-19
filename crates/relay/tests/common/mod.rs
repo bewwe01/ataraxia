@@ -148,15 +148,20 @@ impl ServerCertVerifier for PinVerifier {
         }
     }
 
+    /// A real TLS 1.2 check, so a TLS 1.2 probe fails only if the *server* refuses 1.2
+    /// (review P3-7: refusing here made the "TLS 1.3 only" test pass vacuously).
     fn verify_tls12_signature(
         &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::Tls12NotOffered,
-        ))
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -194,6 +199,26 @@ pub fn client_tls(
 }
 
 // ---- client ------------------------------------------------------------------------------
+
+/// TLS handshake against the relay with the given versions; the rustls error if it fails.
+pub async fn tls_handshake(
+    addr: SocketAddr,
+    pin: [u8; 32],
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> Result<(), rustls::Error> {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let res = tokio_rustls::TlsConnector::from(Arc::new(client_tls(pin, versions)))
+        .connect(ServerName::try_from("relay.test").unwrap(), tcp)
+        .await;
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e
+            .get_ref()
+            .and_then(|i| i.downcast_ref::<rustls::Error>())
+            .cloned()
+            .unwrap_or(rustls::Error::General(e.to_string()))),
+    }
+}
 
 pub struct Client {
     ws: WebSocketStream<TlsStream<TcpStream>>,
@@ -340,6 +365,24 @@ impl Client {
             Response::Envelopes(e) => Ok(e),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// Sends an application-level `Ping`; false if the relay has hung up.
+    pub async fn try_ping(&mut self) -> bool {
+        let frame = ClientFrame {
+            v: VERSION,
+            id: 99_999,
+            req: Some(Request::Ping(veil_wire::Empty {})),
+        };
+        if self
+            .ws
+            .send(Message::Binary(frame.encode().into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        matches!(self.recv().await, Some(f) if f.id == 99_999)
     }
 
     pub async fn close(mut self) {

@@ -193,7 +193,14 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
   - Pure Rust, transactional (ACID, copy-on-write), single file, no `unsafe` in our code paths.
   - Every multi-record change (deposit + counters, take-invite + delete, blob chunk + quota) is one write transaction.
   - Records are fixed-layout byte strings with checked decoding, so a corrupt record yields `Corrupt`, never a panic.
-- **No IP-keyed anything.** The peer address from `accept()` is dropped immediately. Abuse control is by token, mailbox, connection and relay-wide limits, plus storage caps. The trade-off, that anyone can create mailboxes up to the caps, is documented in `deploy/README.md` and THREAT_MODEL §5.
+- **No IP-keyed rate limits or records.** Abuse control is by token, mailbox, connection and relay-wide limits, plus storage caps. The trade-off, that anyone can create mailboxes up to the caps, is documented in `deploy/README.md` and THREAT_MODEL §5.
+- **The one use of the peer address (review P3-4):** a count of concurrent connections per source (IPv4 address or IPv6 /64), capped at 32. It is held in memory while the connection is open and removed at zero; it is never logged or stored. Without it, one host could take every connection slot.
+- **Bounded memory (review P3-1).**
+  - redb's page cache is set explicitly (64 MiB by default, `VEIL_DB_CACHE_MB`); redb's own default of 1 GiB let the process outgrow its container limit.
+  - Expiry uses an index table (`kind ‖ due ‖ id`), so a sweep reads only due entries, in batches of 256, each its own write transaction.
+  - Writes to clients time out, and large responses share a relay-wide byte budget.
+  - Measured in a 512 MiB container: 71 MB peak while filling 630 MB of envelopes; a sweep with nothing due takes 1.5 ms; expiring 9 600 envelopes takes 0.77 s at 36 MB.
+  - The cost: redb's file reached about 3.4× the stored payload in that test, so disk is sized from the caps (`deploy/README.md`).
 
 ## 7. Distribution (recorded owner request)
 
