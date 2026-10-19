@@ -190,7 +190,7 @@ jobs:
         env:
           VEIL_SMOKE_ADDR: 127.0.0.1:8443
           VEIL_SMOKE_TURN_OUT: ${{ runner.temp }}/turn
-        run: VEIL_SMOKE_PIN="$PIN" cargo test --locked -p veil-relay --test smoke -- --ignored
+        run: VEIL_SMOKE_PIN="$PIN" cargo test --locked -p veil-relay --test smoke deployed_relay_round_trip -- --ignored
       - name: Install the TURN host firewall rule (deploy/README.md)
         run: sudo nft -f deploy/firewall/veil-turn.nft
       - name: coturn accepts relay-minted credentials and refuses private peers and host ports
