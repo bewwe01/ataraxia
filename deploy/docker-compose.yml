@@ -28,6 +28,8 @@ services:
       VEIL_TURN_SECRET_FILE: /run/secrets/turn_secret
       VEIL_TURN_URLS: ${VEIL_TURN_URLS:?set VEIL_TURN_URLS in deploy/.env}
       VEIL_LOG: ${VEIL_LOG:-info}
+      VEIL_QUOTA_ENVELOPES_MB: ${VEIL_QUOTA_ENVELOPES_MB:-4096}
+      VEIL_QUOTA_BLOBS_MB: ${VEIL_QUOTA_BLOBS_MB:-20480}
     secrets: [turn_secret]
     logging:
       driver: local

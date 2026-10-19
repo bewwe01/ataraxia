@@ -19,8 +19,11 @@ audit.
   any small Linux VPS. 1 GB RAM is plenty.
 * Docker Engine with the compose plugin: `curl -fsSL https://get.docker.com | sh` or your distro's
   packages.
-* About 2 GB of disk for the build, plus space for queued messages and attachments (capped by the
-  relay's quotas).
+* About 2 GB of disk for the build, plus space for queued messages and attachments. These are
+  capped at 4 GiB and 20 GiB by default; set `VEIL_QUOTA_ENVELOPES_MB` and `VEIL_QUOTA_BLOBS_MB` in
+  `.env` to fit your disk. Anyone who can reach the relay can create a mailbox, so the caps are what
+  keep a stranger from filling the disk. When a cap is reached, new deposits are refused until old
+  data expires (see *Known limits*).
 
 The image builds for `amd64` and `arm64` from the same Dockerfile (base images are pinned by
 multi-arch digest). It has been built and tested on amd64 only. The first build on a Pi compiles
@@ -177,4 +180,7 @@ deposits and fetches a test envelope, asks for TURN credentials and deletes the 
 * **IP addresses in memory.** The relay must hold connected clients' IP addresses in memory while
   they're connected, and coturn must hold them for the length of a call. Neither writes them
   anywhere.
+* **Open mailbox creation.** The relay doesn't know who its users are, by design, so anyone can
+  create mailboxes and use up the storage caps. That stops new messages and uploads, but it can't
+  read or delete anything already stored. Rate limits slow this down without preventing it.
 * **Not audited.** Treat this as a carefully built but independently unverified system.

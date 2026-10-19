@@ -129,6 +129,7 @@ impl Default for Quotas {
         Self {
             max_mailboxes: 100_000,
             max_envelopes_per_mailbox: 5_000,
+            max_envelope_bytes_total: 4 * 1024 * 1024 * 1024,
             max_tokens_per_mailbox: 512,
             max_invites: 50_000,
             max_blob_bytes_total: 20 * 1024 * 1024 * 1024,

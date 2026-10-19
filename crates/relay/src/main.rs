@@ -12,6 +12,8 @@
 //! * `VEIL_RELAY_CERT`, `VEIL_RELAY_KEY` (default `<data>/tls/cert.pem`, `<data>/tls/key.pem`)
 //! * `VEIL_TURN_SECRET_FILE`: file holding coturn's `static-auth-secret` (enables TURN)
 //! * `VEIL_TURN_URLS`: comma-separated `turn:`/`turns:` URLs handed to clients
+//! * `VEIL_QUOTA_ENVELOPES_MB` (default 4096), `VEIL_QUOTA_BLOBS_MB` (default 20480): disk caps for
+//!   queued envelopes and attachment blobs
 //! * `VEIL_LOG` (default `info`): `error`, `warn`, `info` or `debug`
 #![forbid(unsafe_code)]
 
@@ -96,6 +98,20 @@ fn serve() -> ExitCode {
         Err(e) => return fail(&format!("TLS: {e} (run `veil-relay gen-cert` first)")),
     };
     let mut cfg = Config::default();
+    for (name, slot) in [
+        (
+            "VEIL_QUOTA_ENVELOPES_MB",
+            &mut cfg.quotas.max_envelope_bytes_total,
+        ),
+        ("VEIL_QUOTA_BLOBS_MB", &mut cfg.quotas.max_blob_bytes_total),
+    ] {
+        if let Some(v) = env(name) {
+            match v.parse::<u64>().ok().and_then(|mb| mb.checked_mul(1024 * 1024)) {
+                Some(bytes) if bytes > 0 => *slot = bytes,
+                _ => return fail(&format!("{name} must be a positive number of megabytes")),
+            }
+        }
+    }
     if let Some(path) = env("VEIL_TURN_SECRET_FILE") {
         let Ok(secret) = std::fs::read(&path) else {
             return fail("cannot read VEIL_TURN_SECRET_FILE");

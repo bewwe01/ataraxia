@@ -2,6 +2,134 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 3: relay, wire protocol, deployment (2026-10-19), before review
+
+Local, Ubuntu 24.04 container, rustc 1.97.0, Docker 29.8.2.
+
+### Format, lint, tests
+
+```text
+$ cargo fmt --all --check                                         # exit 0
+$ cargo clippy --workspace --all-targets --locked -- -D warnings  # exit 0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s
+$ cargo test --workspace --locked                                 # exit 0 (condensed: each "Running" line joined to its result line; doc-test lines omitted)
+     Running unittests src/lib.rs (veil_core)       test result: ok. 74 passed; 0 failed
+     Running tests/secrets.rs                       test result: ok. 3 passed; 0 failed
+     Running tests/session.rs                       test result: ok. 22 passed; 0 failed; 1 ignored
+     Running unittests src/lib.rs (veil_relay)      test result: ok. 10 passed; 0 failed
+     Running tests/relay.rs                         test result: ok. 10 passed; 0 failed
+     Running tests/smoke.rs                         test result: ok. 0 passed; 0 failed; 1 ignored
+     Running unittests src/lib.rs (veil_wire)       test result: ok. 5 passed; 0 failed
+```
+
+The ignored session test is the Phase 2 timing benchmark. The ignored smoke test needs a running relay; its results against the container are below.
+
+Relay integration tests (`crates/relay/tests/relay.rs`, each against the real TLS + WebSocket server on 127.0.0.1 with a fresh self-signed certificate and a pinning client):
+
+```text
+test pairing_and_messages_through_the_relay_reveal_no_identity ... ok   # INV-META-1, INV-META-2 (DB), INV-PAIR-2, INV-ID-1
+test mailbox_authentication_is_strict ... ok                            # bad sig, replayed nonce, stale time, foreign nonce, no auth
+test deposits_need_a_token_and_trigger_pushes ... ok
+test deposits_are_rate_limited_per_token ... ok
+test blobs_upload_resume_and_download ... ok
+test turn_credentials ... ok
+test tls_is_1_3_only_and_pinned ... ok                                  # INV-NET-2 (relay side)
+test hostile_frames_are_refused_without_harm ... ok                     # INV-ROB-1
+test mailbox_creation_is_rate_limited ... ok
+test relay_logs_nothing_about_clients ... ok                            # INV-META-2 / INV-LOG-1 (logs)
+```
+
+Relay unit tests:
+
+```text
+test limits::tests::bucket_bursts_then_refills ... ok
+test limits::tests::key_count_is_bounded ... ok
+test store::tests::mailbox_tokens_deposit_fetch_ack ... ok
+test store::tests::envelope_bytes_are_capped_and_released ... ok
+test store::tests::invites_are_single_use_and_capped ... ok
+test store::tests::blobs_bind_tokens_and_complete ... ok
+test store::tests::sweep_expires_everything_on_time ... ok
+test tls::tests::generate_load_and_pin ... ok
+test turn::tests::format_and_mac ... ok
+test turn::tests::hmac_sha1_rfc2202 ... ok
+```
+
+Wire unit tests: `roundtrip_and_validation`, `strict_decoding_rejects_unknown_and_trailing_fields`, `server_frames_are_validated_too`, `auth_message_layout`, `arbitrary_bytes_never_panic` (proptest).
+
+**Mutation checks** (each mutant applied by hand, test run, mutant reverted):
+- Logging the mailbox id at debug level in the deposit handler → `relay_logs_nothing_about_clients` fails.
+- Dropping the byte release in the idle-mailbox sweep → `envelope_bytes_are_capped_and_released` fails.
+- Dropping the byte release in `delete_mailbox` → `envelope_bytes_are_capped_and_released` fails.
+
+### Fuzzing (cargo-fuzz 0.13.2, nightly-2026-10-01, `-O`)
+
+New target `wire_frames`. It decodes arbitrary bytes as both client and server frames, and requires every accepted frame to re-encode byte-identically and pass validation again.
+
+```text
+$ cargo +nightly-2026-10-01 fuzz run -O wire_frames corpus/wire_frames -- -max_total_time=180 -max_len=70000 -rss_limit_mb=2048
+#1202	INITED cov: 1814 ft: 5546 corp: 1180/280Kb exec/s: 0 rss: 63Mb
+#6395687	DONE   cov: 1825 ft: 5717 corp: 1238/341Kb lim: 70000 exec/s: 35335 rss: 496Mb
+Done 6395687 runs in 181 second(s)
+$ cargo +nightly-2026-10-01 fuzz cmin -O wire_frames corpus/wire_frames -- -max_len=70000 -rss_limit_mb=2048
+MERGE-OUTER: 1217 new files with 5728 new features added; 1836 new coverage edges
+```
+
+0 crashes. The minimised corpus (1 217 files) is committed. An earlier 180 s run on the first corpus gave 7.6 M runs, also with 0 crashes. `wire_frames` is in the CI smoke matrix (60 s) and in `fuzz-nightly.yml`.
+
+### Container deployment (`deploy/`)
+
+The image was built from `deploy/Dockerfile` (45.2 MB, distroless). This sandbox's egress needs a proxy CA, so the build used a scratch copy that adds only `COPY --from=ca ca-bundle.crt` and `CARGO_HTTP_CAINFO`; the committed Dockerfile is otherwise unchanged. `docker compose` then ran relay + coturn exactly as `deploy/README.md` describes.
+
+```text
+$ docker compose run --rm relay gen-cert /data/tls localhost 127.0.0.1
+SPKI SHA-256 pin: a6e41d74b9038135052bf6551b725d256f8685a03d23dfdc0cc4f57ce53889e3
+$ docker compose run --rm relay gen-cert /data/tls other.name          # exit 1, key kept
+veil-relay: a key already exists there; delete it first to rotate (clients must re-pin)
+$ VEIL_SMOKE_ADDR=127.0.0.1:8443 VEIL_SMOKE_PIN=a6e4… cargo test -p veil-relay --test smoke -- --ignored
+test result: ok. 1 passed; 0 failed      # wrong pin refused; mailbox, token, deposit, fetch, 3 TURN creds, delete
+# coturn with relay-minted credentials (turnutils_uclient from the pinned coturn image), external IP 192.0.2.2:
+-y -c -n 20 -m 1 -l 170 (valid creds, client↔client through two allocations)
+    INFO: Total lost packets 0 (0.000000%), total send dropped 0 (0.000000%)
+-c -e 10.0.0.1 (peer in a denied range)        INFO: channel bind: error 403 (Forbidden IP)
+-c -e 192.168.1.1                               INFO: channel bind: error 403 (Forbidden IP)
+-y with a wrong password                        ERROR: Cannot complete Allocation
+-y with no credentials                          ERROR: Cannot complete Allocation
+$ docker compose logs relay | wc -l   → 1   (startup line: listen, pin, turn=true)
+$ docker compose logs coturn | wc -l  → 0
+```
+
+The gen-cert refusal message shown is from the current build. The first container build printed the older generic "cannot read or write the certificate/key files", which led to the clearer `TlsError::Exists`.
+
+Container checks:
+- relay: uid 65532, read-only root, `CapDrop=[ALL]`, `no-new-privileges`;
+- coturn: uid 65534, read-only root, `CapAdd=[NET_BIND_SERVICE]` and effective capabilities `0000000000000000` at runtime. `NET_BIND_SERVICE` stays only because `/usr/bin/turnserver` carries it as a file capability (`security.capability` xattr, bit 10), without which exec fails with EPERM, as observed;
+- the TURN secret is not in coturn's `/proc/1/cmdline` or `/proc/1/environ` (0 matches).
+
+CI job `relay-deploy` repeats these steps on every push. coturn's per-user quota (4 allocations) is real: the first attempt, which reused one credential for all three checks, hit `486 Allocation Quota Reached`, so the smoke test now mints a fresh credential per check.
+
+**Not verified:** an arm64 (Raspberry Pi) build or run; the image is only built for amd64 here. There is also no load or soak test.
+
+### Supply chain
+
+```text
+$ cargo deny --locked check      → advisories ok, bans ok, licenses ok, sources ok
+$ cargo audit --deny warnings    → Scanning Cargo.lock for vulnerabilities (263 crate dependencies), exit 0
+                                   (the first attempt failed on a crates.io 503 during the yank check; the retry passed)
+$ cargo vet --locked             → Vetting Succeeded (43 fully audited, 5 partially audited, 207 exempted)
+```
+
+The Phase 3 relay dependencies are exempted, not reviewed by us (`supply-chain/README.md`).
+
+### Known limits after Phase 3
+
+- **Relay TLS is not post-quantum** (*ring* has no ML-KEM; ADR-0010). Message content is PQ end to end; relay-visible metadata is exposed to harvest-now-decrypt-later.
+- **Open mailbox creation:** anyone can exhaust the storage caps, which denies new deposits (THREAT_MODEL §5). The caps bound disk use.
+- **No load or soak test** of the relay; the sweeper scans all envelopes once a minute (fine at Pi scale, untested at large scale).
+- **Plain `turn:`** by default; `turns:` needs a publicly trusted certificate.
+- **arm64 image not built or tested** here.
+- The ≥ 1 h nightly fuzz runs still have no recorded run.
+- Client-side halves of INV-NET-2, INV-META-1 (real transport) and INV-LOG-1 come in Phase 4.
+
 ## Phase 2: after review round 5 conditions (2026-10-19)
 
 Review round 5 returned **PASS WITH CONDITIONS**: it verified the round-4 fixes (including byte-identical seed regeneration, and that the Kyber change is equivalent to libsignal's own `generate`), with nothing Critical, High or Medium open. It raised five Lows and a nit.

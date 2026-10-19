@@ -1,6 +1,6 @@
 # Veil: Protocol specification (v1)
 
-Status: **Phase 1 draft, awaiting approval.** Normative words (MUST, MUST NOT, SHOULD) follow RFC 2119. Every MUST that matters for security is tracked as an invariant in [`INVARIANTS.md`](INVARIANTS.md) with the test that proves it. Do not change this document without updating those tests.
+Status: **v1. Phase 1 approved; implemented in `crates/core` (Phase 2) and in `crates/wire` + `crates/relay` (Phase 3).** Normative words (MUST, MUST NOT, SHOULD) follow RFC 2119. Every MUST that matters for security is tracked as an invariant in [`INVARIANTS.md`](INVARIANTS.md) with the test that proves it. Do not change this document without updating those tests.
 
 Veil composes existing, reviewed constructions; **it invents no cryptography**:
 
@@ -169,13 +169,49 @@ Every step runs inside a store transaction that commits only on success, so **re
 5. Known contact (stored key == sender key): decrypt with libsignal, which applies the ratchet, replay and order checks. Unknown sender: only the invite-redemption path of §4.3 step 5 is allowed; anything else is dropped (`UnknownSender`).
 6. Unpad, strict canonical `prost` decode (re-encoding must reproduce the exact bytes), and field validation. Drop on any error; no partial processing.
 
-### 6.3 Wire form to the relay
+### 6.3 Client ↔ relay wire protocol
 
-```
-Deposit { v: 1, mailbox_id: 32 B, token: 32 B, envelope: bytes (exactly one bucket size) }
-```
+Defined in `crates/wire` (shared by client and relay).
 
-The relay stores `{ mailbox_id, server_seq, received_at (rounded to the minute), envelope }` with a TTL (default 14 days). **No sender, no IP, no User-Agent** (INV-META-2).
+**Transport.**
+- WebSocket over **TLS 1.3 only** (rustls; no TLS 1.2, no plaintext mode).
+- The client pins the SHA-256 of the relay's `SubjectPublicKeyInfo` and trusts no CA. A mismatch is a hard failure (INV-NET-2).
+- Binary frames only; a text frame closes the connection.
+
+**Frames.**
+- Each WebSocket message is one protobuf frame:
+  - client → relay: `ClientFrame { v = 1, id, oneof req }`;
+  - relay → client: `ServerFrame { v = 1, id, oneof resp }`, where `id` echoes the request, and `id = 0` marks a push (`NewEnvelopes { mailbox_id, last_seq }`).
+- Decoding is strict on both sides (`decode_strict`):
+  - size is checked first: client frames ≤ `MAX_CLIENT_FRAME` (one blob chunk + 1 KiB), server frames ≤ `MAX_FRAME`;
+  - the bytes must re-encode identically (unknown, duplicate and out-of-order fields, and non-minimal varints, are refused);
+  - `v` must be 1 (otherwise `Unsupported`);
+  - every field is validated: ids exactly 32 or 16 bytes, envelopes exactly a bucket, `limit ≤ 32`, ≤ 64 token changes, chunk sizes, and so on.
+- A request that fails validation gets `Error { Malformed }` and changes nothing.
+
+**Errors.** `Malformed`, `Unauthorized`, `NotFound`, `RateLimited`, `QuotaExceeded`, `Conflict`, `Unsupported`, `Internal`. Unknown mailbox and wrong token both answer `Unauthorized`, so a depositor cannot probe which mailboxes exist.
+
+| Request | Auth | Effect |
+|---|---|---|
+| `CreateMailbox { mailbox_id, auth_pub }` | none (relay-wide rate limit) | registers the mailbox's Ed25519 key |
+| `Challenge { mailbox_id }` → `Challenge { nonce }` | none | single-use 32-byte nonce, bound to this connection and mailbox (≤ 64 outstanding) |
+| `Authenticate { mailbox_id, unix_secs, signature }` | signs §2 message | marks the mailbox authenticated **on this connection** (≤ 64 per connection) and subscribes it to pushes |
+| `UpdateTokens { mailbox_id, add[], remove[] }` | mailbox | registers/removes `SHA-256("veil/v1/tok" ‖ token)` (≤ 512 per mailbox) |
+| `Deposit { mailbox_id, token, envelope }` | delivery token | stores the envelope, pushes `NewEnvelopes` to subscribed connections |
+| `Fetch { mailbox_id, after_seq, limit ≤ 32 }` → `Envelopes { items[], last_seq }` | mailbox | `items` = `{ seq, received_minute, envelope }`, oldest first |
+| `Ack { mailbox_id, up_to_seq }` | mailbox | deletes envelopes with `seq ≤ up_to_seq` |
+| `DeleteMailbox { mailbox_id }` | mailbox | deletes mailbox, tokens and envelopes |
+| `PutInvite { mailbox_id, invite_id, sealed, expires_at }` | mailbox | stores a sealed invite package (§4.2), TTL capped at 7 days |
+| `TakeInvite { invite_id }` → `Invite { sealed }` | none (the id is the capability) | returns **and deletes** it atomically (INV-PAIR-2) |
+| `BlobUploadToken { mailbox_id }` → `UploadToken { token }` | mailbox | one-time 32-byte upload capability (§9), relay stores only `SHA-256("veil/v1/upload" ‖ token)` |
+| `BlobPut { token, blob_id, index, total, data }` | upload token | resumable chunk upload; every chunk but the last is exactly 64 KiB + 16; the token binds to the first `blob_id` it is used with |
+| `BlobGet { blob_id, index }` → `BlobChunk` | none (the random id is the capability) | only for complete blobs |
+| `TurnCredentials { mailbox_id }` → `Turn` | mailbox | §8 |
+| `Ping` → `Ok` | none | keep-alive |
+
+**Storage.** For an envelope the relay stores `{ mailbox_id, seq, received_minute, envelope }` with a TTL (default 14 days); a full mailbox (5 000 envelopes) or a full relay (byte cap, default 4 GiB) refuses new deposits with `QuotaExceeded`. It never drops queued envelopes to make room. Mailboxes not authenticated for 60 days expire. **No sender, no IP, no User-Agent, no connection record** is stored or logged (INV-META-2, INV-LOG-1).
+
+**Rate limits** are token buckets keyed by delivery token, mailbox or connection, plus a relay-wide one for mailbox creation. **Never by IP**: the relay drops the peer address right after accept.
 
 ## 7. Content messages (inside the envelope)
 
@@ -297,10 +333,11 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 | Item | Limit |
 |---|---|
 | Envelope | exactly one of 1 / 4 / 16 / 64 KiB |
-| Text body | 64 KiB |
+| Text body | 62 464 bytes (61 KiB, so a maximal `Text` or `Edit` still fits the 64 KiB bucket) |
 | Attachment | 100 MiB (v1), 64 KiB chunks |
-| Envelopes per mailbox held by relay | 10 000, oldest first dropped (detected via `server_seq`) |
-| Deposits per token | 60/min burst, 600/hour |
-| WebSocket frame | 80 KiB; idle timeout 90 s; handshake timeout 10 s |
+| Envelopes per mailbox held by relay | 5 000; further deposits refused (`QuotaExceeded`), never oldest-dropped |
+| Envelope bytes per relay | 4 GiB default (`VEIL_QUOTA_ENVELOPES_MB`); blobs 20 GiB (`VEIL_QUOTA_BLOBS_MB`) |
+| Deposits per token | burst 60, then 1/s |
+| WebSocket message | client → relay ≤ 64 KiB + 1 040 bytes (one blob chunk + framing); relay → client ≤ 32 envelopes; idle timeout 5 min (clients ping); TLS+WS handshake timeout 10 s each |
 | Invite TTL | ≤ 7 days (default 24 h) |
 | Clock skew accepted | ±120 s for auth; message timestamps never security-relevant |

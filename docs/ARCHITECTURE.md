@@ -34,7 +34,7 @@ Veil is a 1:1 end-to-end encrypted messenger with voice/video calls. There are n
                          ════════════════ untrusted network ═════════════════
                                                  │
  ┌───────────────────────────── Relay (assumed hostile) ───────────────────────────────────┐
- │  crates/relay (axum + tokio + rustls)          coturn (TURN/STUN)                       │
+ │  crates/relay (tokio + tungstenite + rustls)   coturn (TURN/STUN)                       │
  │  • mailboxes: store-and-forward ciphertext     • relays call media for relay-only mode  │
  │  • invite & prekey-bundle storage (opaque)     • ephemeral HMAC credentials minted by   │
  │  • attachment blob store (opaque, padded)        the relay                              │
@@ -97,7 +97,7 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
 | Symmetric crypto outside libsignal | RustCrypto `chacha20poly1305` (XChaCha20-Poly1305), `hkdf`, `sha2`, `argon2`; `ed25519-dalek`, `x25519-dalek` | audited, maintained, no custom constructions |
 | Secrets in memory | `zeroize`, `secrecy`; best-effort `mlock` (see THREAT_MODEL §6) | |
 | At-rest DB | SQLCipher via `rusqlite` (`bundled-sqlcipher-vendored-openssl`) | full-DB encryption incl. indices; see ADR-0005 |
-| Relay | `axum` + `tokio` + `rustls` (TLS 1.3 only) | memory-safe, `forbid(unsafe_code)` in our code |
+| Relay | `tokio` + `tokio-tungstenite` + `tokio-rustls`/`rustls` with *ring* (TLS 1.3 only), `redb` storage | memory-safe, `forbid(unsafe_code)` in our code; see ADR-0010 |
 | TURN | coturn, `use-auth-secret` (REST API credentials) | standard; credentials are ephemeral HMACs |
 | Desktop/mobile shell | **Tauri 2.12.x** (stable; Tauri 3 is alpha) | small attack surface, capability-based IPC ACL |
 | Calls on Linux | **webrtc-rs 0.20** (+ `cpal`/Opus for audio) | the only maintained Rust WebRTC with a TURN client; see ADR-0003 |
@@ -176,6 +176,24 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
   - `relay_learns_only_the_bucket`;
   - reviewer round 2's exhaustive scan of inner lengths 0–65 600, which found no size gap;
   - `largest_valid_content_always_seals`.
+
+### ADR-0010: Relay stack: plain WebSocket over rustls with *ring*, redb storage. **Proposed (Phase 3).**
+- **WebSocket without a web framework.**
+  - The relay has a single endpoint, a binary WebSocket carrying protobuf frames, so `tokio-tungstenite` on a `tokio-rustls` stream replaces the `axum` planned in Phase 1. There is no HTTP routing, no middleware, and fewer dependencies to vet.
+  - Frame and message size caps are set in the WebSocket config, so oversize input is refused before it is buffered.
+- **rustls with the *ring* provider, TLS 1.3 only.**
+  - This avoids `aws-lc-rs`, which needs CMake and a C toolchain for every target, the Pi build included, and brings a large C and assembly crypto library into the audit surface.
+  - **Cost:** *ring* has no ML-KEM, so the relay TLS key exchange is classical (X25519). Message content is post-quantum protected end to end (PQXDH + SPQR) regardless. What a harvest-now-decrypt-later attacker could later recover is only what the relay itself sees: mailbox ids, tokens, sizes and timing (THREAT_MODEL §5).
+  - Revisit when rustls ships a pure-Rust ML-KEM provider, or switch the relay and client together to `aws-lc-rs` with `X25519MLKEM768`.
+- **Trust by pin, not CA.**
+  - `veil-relay gen-cert` creates a self-signed ECDSA P-256 certificate.
+  - Clients pin the SHA-256 of its SPKI, delivered in invites or by manual entry. No domain or CA is needed, and a CA cannot mint a substitute.
+  - At load time the relay checks that the certificate carries the key's SPKI, so the pin it prints is the key it serves.
+- **redb for storage.**
+  - Pure Rust, transactional (ACID, copy-on-write), single file, no `unsafe` in our code paths.
+  - Every multi-record change (deposit + counters, take-invite + delete, blob chunk + quota) is one write transaction.
+  - Records are fixed-layout byte strings with checked decoding, so a corrupt record yields `Corrupt`, never a panic.
+- **No IP-keyed anything.** The peer address from `accept()` is dropped immediately. Abuse control is by token, mailbox, connection and relay-wide limits, plus storage caps. The trade-off, that anyone can create mailboxes up to the caps, is documented in `deploy/README.md` and THREAT_MODEL §5.
 
 ## 7. Distribution (recorded owner request)
 

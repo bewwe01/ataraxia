@@ -70,8 +70,13 @@ Status: **Phase 1 draft, awaiting approval.** Every "protected" claim below poin
 | **Relay** learns message sizes | Bucket only (1/4/16/64 KiB); nothing inside a bucket depends on content length (INV-META-3). A session's first (PreKey) messages never fit 1 KiB, so a short first message shows as 4 KiB. Attachments padded (Padmé) | Media bitrate via TURN | — |
 | **Relay** learns number of contacts | ≈, rounded up to a multiple of 8 (delivery-token count) | — | — |
 | **Relay** learns identity keys / names | **No** (prekey bundles are opaque and only served to token/invite holders; sealed sender) | No | No |
-| **Network observer** | TLS to relay; timing and volume | TLS/DTLS to TURN; timing and bitrate | DTLS between peers: **both IPs visible to the observer** |
+| **Network observer** | TLS 1.3 to relay; timing and volume | Plain `turn:` to the TURN server by default (that you use TURN is visible; the media inside is DTLS-SRTP); timing and bitrate | DTLS between peers: **both IPs visible to the observer** |
 | **Push service** (Google FCM, if push is ever added) | v1 uses no push service; Android keeps a foreground connection or polls | — | — |
+
+Relay-side notes (Phase 3, ADR-0010):
+- **Relay TLS is not post-quantum.** The relay's rustls/*ring* stack has no ML-KEM, so its key exchange is classical. Message content stays post-quantum protected end to end (PQXDH + SPQR). A harvest-now-decrypt-later attacker who records relay traffic could later recover only what the relay itself sees: mailbox ids, tokens, sizes and timing.
+- **Open mailbox creation.** The relay cannot know who its users are, so anyone who can reach it can create mailboxes and fill its storage caps (`deploy/README.md`). When the caps are reached, new deposits and uploads are refused (denial of service). Stored data cannot be read, altered or deleted that way. Rate limits are never keyed by IP, so they slow this down without stopping it.
+- **What the relay keeps.** On disk: mailbox ids, auth public keys, token hashes, queued envelopes with sequence numbers and a minute-rounded receive time, sealed invites, and blob ciphertext. Peer IP addresses are never written to disk or logs (INV-META-2). coturn is configured to log nothing.
 
 ## 6. Specific threat scenarios
 

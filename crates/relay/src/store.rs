@@ -10,6 +10,7 @@
 //! No IP address, no connection data, no sender, no User-Agent (INV-META-2). Every write is a
 //! single redb transaction, so a failed operation changes nothing.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition};
@@ -28,6 +29,7 @@ const STATS: TableDefinition<Bytes, u64> = TableDefinition::new("stats");
 const STAT_MAILBOXES: &[u8] = b"mailboxes";
 const STAT_INVITES: &[u8] = b"invites";
 const STAT_BLOB_BYTES: &[u8] = b"blob_bytes";
+const STAT_ENVELOPE_BYTES: &[u8] = b"envelope_bytes";
 
 /// Storage errors. Messages never include stored or request data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -57,6 +59,8 @@ fn io<E>(_: E) -> StoreError {
 pub struct Quotas {
     pub max_mailboxes: u64,
     pub max_envelopes_per_mailbox: u64,
+    /// Bound on all queued envelopes together, so open mailbox creation cannot fill the disk.
+    pub max_envelope_bytes_total: u64,
     pub max_tokens_per_mailbox: u32,
     pub max_invites: u64,
     pub max_blob_bytes_total: u64,
@@ -166,6 +170,31 @@ impl BlobMeta {
             &self.bytes.to_be_bytes(),
         ])
     }
+}
+
+fn len_u64(b: &[u8]) -> u64 {
+    u64::try_from(b.len()).unwrap_or(u64::MAX)
+}
+
+/// Deletes every envelope in `range`; returns (records, stored bytes) removed.
+fn remove_counted(
+    env: &mut redb::Table<'_, Bytes, Bytes>,
+    range: core::ops::Range<&[u8]>,
+) -> Result<(u64, u64)> {
+    let (mut n, mut bytes) = (0u64, 0u64);
+    env.retain_in(range, |_, v| {
+        n = n.saturating_add(1);
+        bytes = bytes.saturating_add(len_u64(v));
+        false
+    })
+    .map_err(io)?;
+    Ok((n, bytes))
+}
+
+fn sub_stat(stats: &mut redb::Table<'_, Bytes, u64>, key: &[u8], by: u64) -> Result<()> {
+    let v = stats.get(key).map_err(io)?.map_or(0, |g| g.value());
+    stats.insert(key, v.saturating_sub(by)).map_err(io)?;
+    Ok(())
 }
 
 fn minute(now: u64) -> u64 {
@@ -291,10 +320,11 @@ impl Store {
             let mut tokens = txn.open_table(TOKENS).map_err(io)?;
             tokens.retain_in(&id[..]..&end[..], |_, _| false).map_err(io)?;
             let mut env = txn.open_table(ENVELOPES).map_err(io)?;
-            env.retain_in(&id[..]..&end[..], |_, _| false).map_err(io)?;
+            let freed = remove_counted(&mut env, &id[..]..&end[..])?.1;
             let mut stats = txn.open_table(STATS).map_err(io)?;
             let n = stat!(stats, STAT_MAILBOXES);
             stats.insert(STAT_MAILBOXES, n.saturating_sub(1)).map_err(io)?;
+            sub_stat(&mut stats, STAT_ENVELOPE_BYTES, freed)?;
         }
         txn.commit().map_err(io)
     }
@@ -347,14 +377,22 @@ impl Store {
             if rec.count >= self.q.max_envelopes_per_mailbox {
                 return Err(StoreError::Quota);
             }
+            let expires = now.saturating_add(self.q.envelope_ttl_secs);
+            let value = cat(&[&expires.to_be_bytes(), &minute(now).to_be_bytes(), envelope]);
+            let mut stats = txn.open_table(STATS).map_err(io)?;
+            let used = stat!(stats, STAT_ENVELOPE_BYTES)
+                .checked_add(len_u64(&value))
+                .ok_or(StoreError::Quota)?;
+            if used > self.q.max_envelope_bytes_total {
+                return Err(StoreError::Quota);
+            }
             seq = rec.last_seq.checked_add(1).ok_or(StoreError::Quota)?;
             rec.last_seq = seq;
             rec.count = rec.count.saturating_add(1);
-            let expires = now.saturating_add(self.q.envelope_ttl_secs);
-            let value = cat(&[&expires.to_be_bytes(), &minute(now).to_be_bytes(), envelope]);
             let mut env = txn.open_table(ENVELOPES).map_err(io)?;
             env.insert(&env_key(id, seq)[..], &value[..]).map_err(io)?;
             mb.insert(&id[..], &rec.encode()[..]).map_err(io)?;
+            stats.insert(STAT_ENVELOPE_BYTES, used).map_err(io)?;
         }
         txn.commit().map_err(io)?;
         Ok(seq)
@@ -400,15 +438,12 @@ impl Store {
             let mut env = txn.open_table(ENVELOPES).map_err(io)?;
             let start = env_key(id, 0);
             let end = env_key(id, up_to.saturating_add(1).max(1));
-            let mut n = 0u64;
-            env.retain_in(&start[..]..&end[..], |_, _| {
-                n = n.saturating_add(1);
-                false
-            })
-            .map_err(io)?;
+            let (n, freed) = remove_counted(&mut env, &start[..]..&end[..])?;
             removed = n;
             rec.count = rec.count.saturating_sub(n);
             mb.insert(&id[..], &rec.encode()[..]).map_err(io)?;
+            let mut stats = txn.open_table(STATS).map_err(io)?;
+            sub_stat(&mut stats, STAT_ENVELOPE_BYTES, freed)?;
         }
         txn.commit().map_err(io)?;
         Ok(removed)
@@ -607,13 +642,15 @@ impl Store {
         {
             // Envelopes: per-mailbox counts must follow.
             let mut env = txn.open_table(ENVELOPES).map_err(io)?;
-            let mut per_mailbox: Vec<([u8; 32], u64)> = Vec::new();
+            let mut per_mailbox: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+            let mut env_freed = 0u64;
             env.retain(|k, v| {
                 let expired = u64_at(v, 0).is_ok_and(|e| e <= now);
-                if expired && let Ok(m) = take::<32>(k, 0) {
-                    match per_mailbox.iter_mut().find(|(id, _)| *id == m) {
-                        Some((_, n)) => *n = n.saturating_add(1),
-                        None => per_mailbox.push((m, 1)),
+                if expired {
+                    env_freed = env_freed.saturating_add(len_u64(v));
+                    if let Ok(m) = take::<32>(k, 0) {
+                        let n = per_mailbox.entry(m).or_insert(0);
+                        *n = n.saturating_add(1);
                     }
                 }
                 !expired
@@ -647,11 +684,12 @@ impl Store {
                 mb.remove(&id[..]).map_err(io)?;
                 let end = prefix_end(id);
                 tokens.retain_in(&id[..]..&end[..], |_, _| false).map_err(io)?;
-                env.retain_in(&id[..]..&end[..], |_, _| false).map_err(io)?;
+                env_freed = env_freed.saturating_add(remove_counted(&mut env, &id[..]..&end[..])?.1);
                 let n = stat!(stats, STAT_MAILBOXES);
                 stats.insert(STAT_MAILBOXES, n.saturating_sub(1)).map_err(io)?;
                 removed = removed.saturating_add(1);
             }
+            sub_stat(&mut stats, STAT_ENVELOPE_BYTES, env_freed)?;
             // Invites.
             let mut inv = txn.open_table(INVITES).map_err(io)?;
             let mut n_inv = 0u64;
@@ -712,6 +750,7 @@ mod tests {
         Quotas {
             max_mailboxes: 3,
             max_envelopes_per_mailbox: 3,
+            max_envelope_bytes_total: 10_000,
             max_tokens_per_mailbox: 4,
             max_invites: 2,
             max_blob_bytes_total: 300,
@@ -767,6 +806,49 @@ mod tests {
         );
         s.delete_mailbox(&m).unwrap();
         assert_eq!(s.fetch(&m, 0, 10, 1000), Err(StoreError::NotFound));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The global envelope byte quota holds, and every removal path (ack, delete, expiry,
+    /// idle-mailbox expiry) gives the bytes back.
+    #[test]
+    fn envelope_bytes_are_capped_and_released() {
+        let (s, dir) = store();
+        let (a, b, t) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        for m in [&a, &b] {
+            s.create_mailbox(m, &[9; 32], 1000).unwrap();
+            s.update_tokens(m, &[t], &[]).unwrap();
+        }
+        // Each stored record is 16 + 4096 bytes: two fit under 10 000, a third does not.
+        let env = [0u8; 4096];
+        s.deposit(&a, &t, &env, 1000).unwrap();
+        s.deposit(&b, &t, &env, 1000).unwrap();
+        assert_eq!(s.deposit(&a, &t, &env, 1000), Err(StoreError::Quota));
+        // ack frees.
+        s.ack(&a, 1).unwrap();
+        s.deposit(&a, &t, &env, 1000).unwrap();
+        assert_eq!(s.deposit(&a, &t, &env, 1000), Err(StoreError::Quota));
+        // delete frees.
+        s.delete_mailbox(&b).unwrap();
+        s.deposit(&a, &t, &env, 1000).unwrap();
+        assert_eq!(s.deposit(&a, &t, &env, 1000), Err(StoreError::Quota));
+        // expiry frees (ttl 100).
+        s.sweep(1100).unwrap();
+        s.deposit(&a, &t, &env, 1100).unwrap();
+        s.deposit(&a, &t, &env, 1100).unwrap();
+        assert_eq!(s.deposit(&a, &t, &env, 1100), Err(StoreError::Quota));
+        s.sweep(1200).unwrap();
+        // Idle-mailbox expiry frees unexpired envelopes too: at 2050 the 1990 deposits are still
+        // live (ttl 100) but the mailbox has been idle for over 1000 s since its auth at 1000.
+        s.deposit(&a, &t, &env, 1990).unwrap();
+        s.deposit(&a, &t, &env, 1990).unwrap();
+        assert_eq!(s.deposit(&a, &t, &env, 1990), Err(StoreError::Quota));
+        s.sweep(2050).unwrap();
+        assert_eq!(s.mailbox_auth_key(&a), Err(StoreError::NotFound));
+        s.create_mailbox(&b, &[9; 32], 2050).unwrap();
+        s.update_tokens(&b, &[t], &[]).unwrap();
+        s.deposit(&b, &t, &env, 2050).unwrap();
+        s.deposit(&b, &t, &env, 2050).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
