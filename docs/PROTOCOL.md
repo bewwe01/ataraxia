@@ -223,7 +223,7 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 2. Pad the plaintext with **Padmé** (bounded size leakage), then split into 64 KiB chunks.
 3. Encrypt with `EncryptorBE32<XChaCha20Poly1305>`. The last chunk uses `encrypt_last`, so truncation, reordering and chunk swapping are detected (INV-ATT-1/2).
 4. Upload to the relay blob store under a random 32-byte `blob_id`.
-   - Uploads are **resumable** by chunk index.
+   - Uploads are **resumable** by chunk index: the client re-sends the ciphertext it already stored, and never re-encrypts (the chunk encryptor is private, so a changed file cannot reuse a nonce; review round 1, L4).
    - Each upload uses a one-time capability `upload_token` obtained with mailbox auth.
    - Blobs expire (default 30 days).
 5. Send `Content::Attachment` containing the key material. The recipient downloads, checks `SHA-256(ciphertext) == ciphertext_sha256` *before* decrypting, then decrypts chunk by chunk, writing **only to the encrypted attachment store** and never to plaintext temp files (INV-REST-4).
@@ -253,6 +253,7 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 - **Vault header** (unencrypted file, exactly 124 bytes, `crates/core/src/vault.rs`): `"VEILVLT" | v=1 | vault_id (16) | m_kib, t, p (u32 BE each) | salt (16) | nonce (24) | XChaCha20-Poly1305(KEK, nonce, aad = all preceding header bytes, DB key) (48)`.
   - The Argon2 parameters are authenticated, so lowering them in the header only makes unlocking fail.
   - New vaults may not use less than **m = 19 MiB, t = 2** (OWASP's Argon2id minimum); defaults are higher.
+  - No vault may use more than **m = 512 MiB, t = 8, p = 4**. This ceiling applies when opening too, and is checked before Argon2 runs, so a tampered header cannot force a huge allocation or hours of CPU (review round 1, L1).
   - Passphrases are limited to 1–1024 bytes, UTF-8 as entered (the UI normalises to NFC).
 - **Biometric unlock** (optional) releases `dev` plus a passphrase-derived key cached in the keystore. The passphrase is required after every restart (design copy), so biometrics only guard warm unlocks.
 - **Auto-lock** zeroizes the DB key and session caches in memory.

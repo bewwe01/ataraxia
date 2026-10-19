@@ -456,7 +456,9 @@ impl<B: KvBackend> Account<B> {
             rng,
         )
         .await?;
-        let sealed = self.seal_to_bucket(rng, remote, &message, &cert).await?;
+        let sealed = self
+            .seal_to_bucket(rng, remote, message.message_type(), message.serialize(), &cert)
+            .await?;
         envelope::frame(&sealed)
     }
 
@@ -470,11 +472,12 @@ impl<B: KvBackend> Account<B> {
         &self,
         rng: &mut R,
         remote: &ProtocolAddress,
-        message: &CiphertextMessage,
+        ty: CiphertextMessageType,
+        message: &[u8],
         cert: &SenderCertificate,
     ) -> Result<Vec<u8>> {
         let base = self
-            .seal_usmc(rng, remote, message, cert, ContentHint::Default, None)
+            .seal_usmc(rng, remote, ty, message, cert, ContentHint::Default, None)
             .await?
             .len();
         for bucket in crate::padding::ENVELOPE_BUCKETS {
@@ -486,7 +489,7 @@ impl<B: KvBackend> Account<B> {
                 let mut filler = target.saturating_sub(base).saturating_sub(2);
                 for _ in 0..8 {
                     let sealed = self
-                        .seal_usmc(rng, remote, message, cert, hint, Some(filler))
+                        .seal_usmc(rng, remote, ty, message, cert, hint, Some(filler))
                         .await?;
                     if sealed.len() == target {
                         return Ok(sealed);
@@ -506,19 +509,21 @@ impl<B: KvBackend> Account<B> {
         Err(CoreError::TooLarge)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn seal_usmc<R: Rng + CryptoRng>(
         &self,
         rng: &mut R,
         remote: &ProtocolAddress,
-        message: &CiphertextMessage,
+        ty: CiphertextMessageType,
+        message: &[u8],
         cert: &SenderCertificate,
         hint: ContentHint,
         filler: Option<usize>,
     ) -> Result<Vec<u8>> {
         let usmc = UnidentifiedSenderMessageContent::new(
-            message.message_type(),
+            ty,
             cert.clone(),
-            message.serialize().to_vec(),
+            message.to_vec(),
             hint,
             filler.map(|n| vec![0u8; n]),
         )?;
@@ -799,6 +804,48 @@ pub fn random_id<R: Rng + CryptoRng>(rng: &mut R) -> Vec<u8> {
     let mut id = vec![0u8; 16];
     rng.fill(&mut id[..]);
     id
+}
+
+/// Hooks for the `contact_inner` / `contact_plaintext` fuzz targets (review round 1, M5).
+/// They let the fuzzer act as a *legitimate, authenticated contact*, so its input gets past
+/// sealed sender into libsignal, SPQR and content handling. Compiled only under
+/// `cargo fuzz` (`--cfg fuzzing`), never into the library.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+impl<B: KvBackend> Account<B> {
+    /// Seals arbitrary inner-message bytes of the given type, with our valid certificate.
+    pub async fn fuzz_seal_inner<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        to: &Address,
+        ty: u8,
+        inner: &[u8],
+        now: u64,
+    ) -> Result<Vec<u8>> {
+        let remote = ProtocolAddress::new(to.as_str().to_owned(), device()?);
+        let cert = self.sender_certificate(rng, now)?;
+        let ty = match ty % 4 {
+            0 => CiphertextMessageType::Whisper,
+            1 => CiphertextMessageType::PreKey,
+            2 => CiphertextMessageType::SenderKey,
+            _ => CiphertextMessageType::Plaintext,
+        };
+        let sealed = self.seal_to_bucket(rng, &remote, ty, inner, &cert).await?;
+        envelope::frame(&sealed)
+    }
+
+    /// Encrypts arbitrary plaintext over the real session, skipping content validation.
+    pub async fn fuzz_seal_plaintext<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        to: &Address,
+        plaintext: &[u8],
+        now: u64,
+    ) -> Result<Vec<u8>> {
+        let remote = ProtocolAddress::new(to.as_str().to_owned(), device()?);
+        self.transact(self.seal_bytes_in_tx(rng, &remote, plaintext, now))
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -1104,5 +1151,156 @@ mod rollback_tests {
             block_on(bob.open(&mut rng(), &env, NOW)).unwrap(),
             Opened::Message { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    //! White-box pairing checks (review round 1, L7).
+    use super::*;
+    use crate::store::MemoryBackend;
+    use futures_executor::block_on;
+    use rand::TryRngCore as _;
+    use rand::rngs::OsRng;
+
+    const NOW: u64 = 1_800_000_000;
+    type Acc = Account<MemoryBackend>;
+
+    fn rng() -> rand::rand_core::UnwrapErr<OsRng> {
+        OsRng.unwrap_err()
+    }
+
+    fn acc() -> Acc {
+        Account::create(MemoryBackend::new(), &mut rng()).unwrap()
+    }
+
+    fn fields() -> IntroFields {
+        IntroFields {
+            mailbox_id: [4; 32],
+            delivery_token: [5; 32],
+            display_name: None,
+            rekey: None,
+        }
+    }
+
+    fn invite(bob: &Acc, ttl: u64) -> CreatedInvite {
+        block_on(bob.create_invite(
+            &mut rng(),
+            InviteMode::Remote,
+            "wss://r",
+            [3; 32],
+            [1; 32],
+            [2; 32],
+            NOW,
+            ttl,
+        ))
+        .unwrap()
+    }
+
+    /// INV-PAIR-1 for the right reason: a package that *is* sealed under the genuine invite
+    /// secret (so the AEAD passes) but carries another identity key, or a prekey signature
+    /// by another key, is refused. (The integration test only covers a package sealed under
+    /// a different secret, which the AEAD already rejects.)
+    #[test]
+    fn package_with_swapped_identity_or_signature_refused() {
+        let (alice, bob, mallory) = (acc(), acc(), acc());
+        let created = invite(&bob, 600);
+        let genuine = created.invite.open_package(&created.sealed_package).unwrap();
+
+        let mut swapped = genuine.clone();
+        swapped.identity_key = mallory.identity.public().serialize().to_vec();
+        let sealed = created.invite.seal_package(&mut rng(), &swapped).unwrap();
+        assert!(
+            created.invite.open_package(&sealed).is_ok(),
+            "AEAD must pass: we test the identity check"
+        );
+        assert_eq!(
+            block_on(alice.redeem_invite(&mut rng(), &created.invite, &sealed, fields(), NOW)).err(),
+            Some(CoreError::AuthFailed)
+        );
+
+        let other = mallory
+            .identity
+            .key_pair()
+            .private_key()
+            .calculate_signature(&genuine.signed_prekey_pub, &mut rng())
+            .unwrap();
+        for which in ["signed", "kyber"] {
+            let mut forged = genuine.clone();
+            match which {
+                "signed" => forged.signed_prekey_sig = other.to_vec(),
+                _ => forged.kyber_prekey_sig = other.to_vec(),
+            }
+            let sealed = created.invite.seal_package(&mut rng(), &forged).unwrap();
+            assert!(
+                block_on(alice.redeem_invite(&mut rng(), &created.invite, &sealed, fields(), NOW)).is_err(),
+                "{which} prekey signed by another key accepted"
+            );
+            assert!(alice.contact_identity(&bob.identity.address()).unwrap().is_none());
+        }
+        // The genuine package still works.
+        assert!(
+            block_on(alice.redeem_invite(
+                &mut rng(),
+                &created.invite,
+                &created.sealed_package,
+                fields(),
+                NOW
+            ))
+            .is_ok()
+        );
+    }
+
+    fn prekeys_present(acc: &Acc, created: &CreatedInvite) -> [bool; 4] {
+        let pkg = created.invite.open_package(&created.sealed_package).unwrap();
+        acc.with_store(|s| {
+            Ok([
+                s.get(&keys::with(keys::INVITE, &created.invite.id))?.is_some(),
+                s.get(&keys::with(keys::PREKEY, &pkg.prekey_id.to_be_bytes()))?
+                    .is_some(),
+                s.get(&keys::with(
+                    keys::SIGNED_PREKEY,
+                    &pkg.signed_prekey_id.to_be_bytes(),
+                ))?
+                .is_some(),
+                s.get(&keys::with(
+                    keys::KYBER_PREKEY,
+                    &pkg.kyber_prekey_id.to_be_bytes(),
+                ))?
+                .is_some(),
+            ])
+        })
+        .unwrap()
+    }
+
+    /// INV-CRY-4 (local part): the invite record and all three of its one-time prekeys are
+    /// deleted on acceptance, on revocation and on expiry.
+    #[test]
+    fn one_time_prekeys_deleted() {
+        let (alice, bob) = (acc(), acc());
+        let accepted = invite(&bob, 600);
+        let revoked = invite(&bob, 600);
+        let expiring = invite(&bob, 60);
+        for c in [&accepted, &revoked, &expiring] {
+            assert_eq!(prekeys_present(&bob, c), [true; 4]);
+        }
+        let red = block_on(alice.redeem_invite(
+            &mut rng(),
+            &accepted.invite,
+            &accepted.sealed_package,
+            fields(),
+            NOW,
+        ))
+        .unwrap();
+        block_on(bob.open(&mut rng(), &red.envelope, NOW)).unwrap();
+        assert_eq!(prekeys_present(&bob, &accepted), [false; 4], "accepted");
+
+        block_on(bob.revoke_invite(&revoked.invite.id)).unwrap();
+        assert_eq!(prekeys_present(&bob, &revoked), [false; 4], "revoked");
+
+        assert_eq!(block_on(bob.sweep_expired_invites(NOW + 30)).unwrap(), 0);
+        assert_eq!(prekeys_present(&bob, &expiring), [true; 4]);
+        assert_eq!(block_on(bob.sweep_expired_invites(NOW + 61)).unwrap(), 1);
+        assert_eq!(prekeys_present(&bob, &expiring), [false; 4], "expired");
     }
 }

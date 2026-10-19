@@ -36,6 +36,8 @@ futures-executor = "=0.3.34"
 unsafe_code = "forbid"
 missing_debug_implementations = "allow"
 unused_must_use = "deny"
+# `cargo fuzz` builds with `--cfg fuzzing` (fuzz-only hooks in crates/core/src/account.rs).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

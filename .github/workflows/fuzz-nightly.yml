@@ -1,0 +1,53 @@
+# Long fuzzing runs (INV-MSG-5: >= 1 h per target). Actions pinned by commit SHA (ADR-0008).
+name: fuzz-nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NIGHTLY: nightly-2026-10-01
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }} (1 h)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - envelope_unframe
+          - content_decode
+          - invite_link
+          - vault_header
+          - ice_sdp
+          - account_open
+          - contact_inner
+          - contact_plaintext
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Nightly + cargo-fuzz
+        run: |
+          rustup toolchain install "$NIGHTLY" --profile minimal
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+          cargo +"$NIGHTLY" install cargo-fuzz --version 0.13.2 --locked
+          cargo +"$NIGHTLY" metadata --locked --format-version 1 --manifest-path crates/core/fuzz/Cargo.toml > /dev/null
+      - name: Fuzz for one hour
+        working-directory: crates/core/fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo +"$NIGHTLY" fuzz run -O "$TARGET" "corpus/$TARGET" -- \
+            -max_total_time=3600 -max_len=70000 -rss_limit_mb=4096 -print_final_stats=1
+      - name: Print crashing inputs (hex) so they can be reproduced
+        if: failure()
+        working-directory: crates/core/fuzz
+        run: |
+          for f in artifacts/*/*; do [ -f "$f" ] && { echo "== $f"; xxd -p "$f"; }; done || true

@@ -50,6 +50,7 @@ pub mod trust;
 pub mod vault;
 
 #[cfg(test)]
+#[path = "../tests/vectors/vectors.rs"]
 mod test_vectors;
 
 pub use error::{CoreError, Result};

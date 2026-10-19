@@ -57,3 +57,17 @@ path = "fuzz_targets/account_open.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "contact_inner"
+path = "fuzz_targets/contact_inner.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "contact_plaintext"
+path = "fuzz_targets/contact_plaintext.rs"
+test = false
+doc = false
+bench = false

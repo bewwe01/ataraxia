@@ -811,8 +811,12 @@ mod forged {
     }
 
     pub fn v3_message(from: &Acc, to: &Acc) -> SignalMessage {
+        message_v(3, from, to)
+    }
+
+    pub fn message_v(version: u8, from: &Acc, to: &Acc) -> SignalMessage {
         SignalMessage::new(
-            3,
+            version,
             &[7; 32],
             None,
             KeyPair::generate(&mut rng()).public_key,
@@ -824,6 +828,37 @@ mod forged {
             &[],
         )
         .unwrap()
+    }
+
+    /// A well-formed v4 `PreKey` message (with a Kyber payload) that matches none of our invites.
+    pub fn prekey_with_kyber(from: &Acc, to: &Acc) -> Option<PreKeySignalMessage> {
+        let inner = SignalMessage::new(
+            4,
+            &[7; 32],
+            None,
+            KeyPair::generate(&mut rng()).public_key,
+            0,
+            0,
+            &[0x55; 32],
+            &ik(from),
+            &ik(to),
+            &[],
+        )
+        .unwrap();
+        PreKeySignalMessage::new(
+            4,
+            1,
+            Some(12_345.into()),
+            67_890.into(),
+            Some(libsignal_protocol::KyberPayload::new(
+                4_242.into(),
+                vec![0x33; 1569].into_boxed_slice(),
+            )),
+            KeyPair::generate(&mut rng()).public_key,
+            ik(from),
+            inner,
+        )
+        .ok()
     }
 
     pub fn prekey_without_kyber(from: &Acc, to: &Acc) -> Option<PreKeySignalMessage> {
@@ -916,4 +951,133 @@ fn certificate_key_must_match_sealing_key() {
         v4.serialized(),
     );
     forged::refused(bob, &env, Some(CoreError::AuthFailed));
+}
+
+/// INV-MSG-7 (review L7): with a *valid* self-issued certificate and correct sealing, a
+/// stranger is still dropped (both message types), and so is a message sealed to ourselves.
+#[test]
+fn strangers_and_self_addressed_envelopes_dropped() {
+    use libsignal_protocol::CiphertextMessageType;
+    let (alice, bob, _) = paired();
+    let mallory = account();
+    let m = forged::pair_of(&mallory);
+    let v4 = forged::message_v(4, &mallory, &bob);
+    let env = forged::envelope(
+        &m,
+        &bob,
+        &forged::cert(&m, &m),
+        CiphertextMessageType::Whisper,
+        v4.serialized(),
+    );
+    let bob = forged::refused(bob, &env, Some(CoreError::UnknownSender));
+    let pk = forged::prekey_with_kyber(&mallory, &bob).expect("libsignal builds a v4 PreKey message");
+    {
+        let env = forged::envelope(
+            &m,
+            &bob,
+            &forged::cert(&m, &m),
+            CiphertextMessageType::PreKey,
+            pk.serialized(),
+        );
+        forged::refused(bob, &env, Some(CoreError::UnknownSender));
+    }
+    // Alice seals to herself with her own key and certificate.
+    let a = forged::pair_of(&alice);
+    let v = forged::v3_message(&alice, &alice);
+    let env = forged::envelope(
+        &a,
+        &alice,
+        &forged::cert(&a, &a),
+        CiphertextMessageType::Whisper,
+        v.serialized(),
+    );
+    forged::refused(alice, &env, Some(CoreError::AuthFailed));
+}
+
+/// INV-MSG-1 (review L7): every `Body` variant, and every `CallKind`, survives
+/// validate → encode → pad → encrypt → seal → frame → unframe → unseal → decrypt → unpad →
+/// strict decode unchanged.
+#[test]
+fn every_body_variant_roundtrips() {
+    use veil_core::content::{
+        Attachment, Call, CallKind, ContactIntro, Delete, Edit, IceCandidates, MailboxUpdate, Reaction,
+        Receipt, ReceiptKind, SessionReset, TimerUpdate, Typing,
+    };
+    let (alice, bob, _) = paired();
+    let id = || random_id(&mut rng()).clone();
+    let call = |kind| {
+        Body::Call(Call {
+            call_id: id(),
+            kind: Some(kind),
+        })
+    };
+    let bodies = vec![
+        Body::Text(Text {
+            body: "héllo ✓".into(),
+            reply_to: Some(id()),
+            expire_timer_secs: Some(3600),
+        }),
+        Body::Reaction(Reaction {
+            target_id: id(),
+            emoji: "👍🏽".into(),
+            ..Default::default()
+        }),
+        Body::Edit(Edit {
+            target_id: id(),
+            body: "edited".into(),
+        }),
+        Body::Delete(Delete { target_id: id() }),
+        Body::Attachment(Attachment {
+            blob_id: vec![1; 32],
+            key: vec![2; 32],
+            nonce_prefix: vec![3; 19],
+            ciphertext_sha256: vec![4; 32],
+            size: 1000,
+            padded_size: 1024,
+            mime: "audio/ogg".into(),
+            file_name: Some("note.ogg".into()),
+            thumbnail: Some(vec![5; 100]),
+            voice_duration_ms: Some(4200),
+            waveform: Some(vec![6; 64]),
+            expire_timer_secs: Some(60),
+        }),
+        Body::Receipt(Receipt {
+            kind: ReceiptKind::Read.into(),
+            ids: vec![id(), id()],
+        }),
+        Body::Typing(Typing { started: true }),
+        Body::TimerUpdate(TimerUpdate { seconds: 86_400 }),
+        call(CallKind::Offer("v=0\r\n".into())),
+        call(CallKind::Answer("v=0\r\n".into())),
+        call(CallKind::Ice(IceCandidates {
+            candidates: vec!["candidate:1 1 udp 1 8.8.4.4 9 typ relay".into()],
+        })),
+        call(CallKind::Hangup("normal".into())),
+        call(CallKind::Busy(true)),
+        Body::ContactIntro(ContactIntro {
+            mailbox_id: vec![7; 32],
+            delivery_token: vec![8; 32],
+            display_name: Some("Alice".into()),
+            ..Default::default()
+        }),
+        Body::MailboxUpdate(MailboxUpdate {
+            new_mailbox_id: vec![9; 32],
+            new_delivery_token: vec![10; 32],
+            relay_url: Some("wss://relay.example.org".into()),
+        }),
+        Body::SessionReset(SessionReset {}),
+    ];
+    for body in bodies {
+        let sent = Content {
+            id: id(),
+            sent_at_ms: 42,
+            body: Some(body),
+        };
+        sent.validate().unwrap();
+        let env = block_on(alice.seal(&mut rng(), &bob.identity().address(), &sent, NOW)).unwrap();
+        match block_on(bob.open(&mut rng(), &env, NOW)).unwrap() {
+            Opened::Message { content, .. } => assert!(content == sent, "variant did not round-trip"),
+            other @ Opened::NewContact { .. } => panic!("unexpected {other:?}"),
+        }
+    }
 }

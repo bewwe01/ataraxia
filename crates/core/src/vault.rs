@@ -65,8 +65,25 @@ impl KdfParams {
         p: 1,
     };
 
+    /// Highest parameters accepted when creating *or opening* a vault (review L1). The header
+    /// is only authenticated after the KDF has run, so these bounds are what stops a tampered
+    /// header from demanding gigabytes of memory or hours of CPU. `BACKUP` is the largest preset.
+    pub const CEILING: Self = Self {
+        m_kib: 512 * 1024,
+        t: 8,
+        p: 4,
+    };
+
+    fn within_ceiling(self) -> bool {
+        self.m_kib <= Self::CEILING.m_kib && self.t <= Self::CEILING.t && self.p <= Self::CEILING.p
+    }
+
     fn validate_for_create(self) -> Result<()> {
-        let ok = self.m_kib >= Self::FLOOR.m_kib && self.t >= Self::FLOOR.t && self.p >= 1 && self.p <= 8;
+        let floor = self.m_kib >= Self::FLOOR.m_kib && self.t >= Self::FLOOR.t && self.p >= 1;
+        if !self.within_ceiling() {
+            return Err(CoreError::Malformed);
+        }
+        let ok = floor;
         if ok || cfg!(test) {
             Ok(())
         } else {
@@ -76,11 +93,7 @@ impl KdfParams {
 
     /// Bounds accepted when *opening* (prevents absurd values from a corrupted header).
     fn validate_for_open(self) -> Result<()> {
-        let ok = self.m_kib >= 8
-            && self.m_kib <= 4 * 1024 * 1024
-            && self.t >= 1
-            && self.t <= 64
-            && (1..=8).contains(&self.p);
+        let ok = self.m_kib >= 8 && self.t >= 1 && self.p >= 1 && self.within_ceiling();
         if ok { Ok(()) } else { Err(CoreError::Malformed) }
     }
 }
@@ -370,6 +383,54 @@ mod tests {
         assert_eq!(format!("{key:?}"), "DbKey(<redacted>)");
         assert!(VaultHeader::decode(&[0; 3]).is_err());
         assert!(KdfParams::FLOOR.validate_for_open().is_ok());
+    }
+
+    /// Review round 1, L1: a tampered header cannot make opening allocate gigabytes or run
+    /// for hours. The cost fields are refused before Argon2 runs.
+    #[test]
+    fn tampered_cost_parameters_refused_before_kdf() {
+        let mut rng = OsRng.unwrap_err();
+        let (header, _) = create(&mut rng, b"pw", &[0; 32], FAST).unwrap();
+        let good = header.encode();
+        // Layout: magic (7) | version (1) | vault_id (16) | m_kib | t | p (u32 BE each) | ...
+        for (offset, value) in [
+            (24, 4 * 1024 * 1024u32),
+            (24, KdfParams::CEILING.m_kib + 1),
+            (28, 64),
+            (28, 9),
+            (32, 8),
+            (32, 0),
+        ] {
+            let mut bad = good.clone();
+            bad[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+            let started = std::time::Instant::now();
+            assert_eq!(
+                VaultHeader::decode(&bad).err(),
+                Some(CoreError::Malformed),
+                "offset {offset} = {value}"
+            );
+            assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        }
+        assert!(
+            create(
+                &mut rng,
+                b"pw",
+                &[0; 32],
+                KdfParams {
+                    m_kib: KdfParams::CEILING.m_kib * 2,
+                    ..KdfParams::FLOOR
+                }
+            )
+            .is_err()
+        );
+        for preset in [
+            KdfParams::DESKTOP,
+            KdfParams::MOBILE,
+            KdfParams::BACKUP,
+            KdfParams::FLOOR,
+        ] {
+            assert!(preset.validate_for_create().is_ok() && preset.validate_for_open().is_ok());
+        }
     }
 
     /// Known-answer test against an independent Python oracle (argon2-cffi + HKDF + XChaCha20-Poly1305).

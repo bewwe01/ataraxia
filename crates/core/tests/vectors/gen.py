@@ -2,7 +2,7 @@
 
 Uses only Python stdlib + argon2-cffi + pyca/cryptography. Implements HChaCha20 and the
 STREAM (BE32) nonce layout directly from their specifications, so these vectors do not
-depend on any Rust code under test. Run:  python3 gen.py > ../../src/test_vectors.rs
+depend on any Rust code under test. Run:  python3 gen.py > vectors.rs
 """
 import hashlib, struct
 from argon2.low_level import hash_secret_raw, Type
@@ -31,8 +31,8 @@ def rs_bytes(name, b):
 
 out = ["//! Known-answer vectors, computed independently by `tests/vectors/gen.py` (Python stdlib +",
        "//! argon2-cffi + pyca/cryptography, with HChaCha20/STREAM implemented from the specs), NOT by",
-       "//! this crate, so tests compare against an outside oracle. Regenerate: `python3 gen.py`.",
-       "#![cfg(test)]", ""]
+       "//! this crate, so tests compare against an outside oracle.",
+       "//! Regenerate: `cd crates/core/tests/vectors && python3 gen.py > vectors.rs`.", ""]
 
 # Address / fingerprint
 raw = bytes([5]) + bytes([1]) * 32
@@ -73,6 +73,52 @@ out.append(rs_bytes("ATT_KEY", att_key))
 out.append(rs_bytes("ATT_PREFIX", prefix))
 out.append(f"pub const ATT_PLAIN_PADDED: &[u8] = &{list(plain)};")
 out.append(rs_bytes("ATT_CT", ct))
+
+# Attachment, multi-chunk (review L7): 150 000 bytes -> Padme -> 3 STREAM-BE32 chunks.
+def padme(L):
+    if L < 2: return L
+    E = L.bit_length() - 1
+    S = E.bit_length()
+    mask = (1 << (E - S)) - 1
+    return (L + mask) & ~mask
+CHUNK = 64 * 1024
+size = 150_000
+data = bytes((i * 7 + 3) % 256 for i in range(size))
+padded = padme(size + 1)
+plain = (data + b"\x80").ljust(padded, b"\0")
+chunks = [plain[i:i + CHUNK] for i in range(0, len(plain), CHUNK)]
+ct = b"".join(
+    xchacha_encrypt(att_key, prefix + struct.pack('>I', i) + (b"\x01" if i == len(chunks) - 1 else b"\x00"), c, b"veil/v1/attachment")
+    for i, c in enumerate(chunks))
+out.append("/// Multi-chunk attachment: plaintext byte i = (7i + 3) mod 256, same key and prefix as above.")
+out.append(f"pub const ATT2_SIZE: u64 = {size:_};")
+out.append(f"pub const ATT2_PADDED: u64 = {padded:_};")
+out.append(f"pub const ATT2_CHUNKS: u32 = {len(chunks)};")
+out.append(f"pub const ATT2_CT_LEN: u64 = {len(ct):_};")
+out.append(rs_bytes("ATT2_CT_SHA256", hashlib.sha256(ct).digest()))
+
+# Safety numbers (review L7): libsignal numeric fingerprint v2, written from the algorithm:
+# per side h = SHA-512(0x0000 || key || id || key), then 5199 x h = SHA-512(h || key);
+# first 30 bytes -> six 5-byte big-endian numbers mod 100000; smaller string first.
+def fp_half(key, ident, iterations=5200):
+    h = hashlib.sha512(b"\0\0" + key + ident + key).digest()
+    for _ in range(iterations - 1):
+        h = hashlib.sha512(h + key).digest()
+    return h
+def fp_digits(h):
+    return "".join(f"{int.from_bytes(h[i:i + 5], 'big') % 100000:05d}" for i in range(0, 30, 5))
+def safety_number(k1, id1, k2, id2):
+    a, b = fp_digits(fp_half(k1, id1)), fp_digits(fp_half(k2, id2))
+    return a + b if a < b else b + a
+# Self-test against the vector published in libsignal's own test-suite (phone-number ids).
+ka = bytes.fromhex("0506863bc66d02b40d27b8d49ca7c09e9239236f9d7d25d6fcca5ce13c7064d868")
+kb = bytes.fromhex("05f781b6fb32fed9ba1cf2de978d4d5da28dc34046ae814402b5c0dbd96fda907b")
+assert safety_number(ka, b"+14152222222", kb, b"+14153333333") == "300354477692869396892869876765458257569162576843440918079131", "fingerprint self-test"
+addr = lambda k: ("v1:" + hashlib.sha256(b"veil/v1/addr" + k).hexdigest()[:40]).encode()
+out.append("/// Two valid identity keys (from libsignal's test-suite) and their Veil safety number.")
+out.append(rs_bytes("SAFETY_KEY_A", ka))
+out.append(rs_bytes("SAFETY_KEY_B", kb))
+out.append(f'pub const SAFETY_DIGITS: &str = "{safety_number(ka, addr(ka), kb, addr(kb))}";')
 
 # Sanity check of the HChaCha20 implementation against draft-irtf-cfrg-xchacha §2.2.1.
 k = bytes(range(32)); n = bytes.fromhex("000000090000004a0000000031415927")

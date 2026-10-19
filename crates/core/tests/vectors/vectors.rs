@@ -1,7 +1,7 @@
 //! Known-answer vectors, computed independently by `tests/vectors/gen.py` (Python stdlib +
 //! argon2-cffi + pyca/cryptography, with HChaCha20/STREAM implemented from the specs), NOT by
-//! this crate, so tests compare against an outside oracle. Regenerate: `python3 gen.py`.
-#![cfg(test)]
+//! this crate, so tests compare against an outside oracle.
+//! Regenerate: `cd crates/core/tests/vectors && python3 gen.py > vectors.rs`.
 
 /// `Address::of(0x05 || 0x01 * 32)`
 pub const ADDR_OF_05_01X32: &str = "v1:eab28c3f15575401c12c958fab4b3049d34c8c4c";
@@ -41,3 +41,22 @@ pub const ATT_CT: [u8; 33] = [
     226, 43, 207, 196, 128, 45, 37, 243, 65, 127, 173, 31, 220, 62, 187, 165, 243, 4, 235, 167, 233, 20, 206,
     237, 180, 167, 246, 224, 96, 169, 61, 124, 149,
 ];
+/// Multi-chunk attachment: plaintext byte i = (7i + 3) mod 256, same key and prefix as above.
+pub const ATT2_SIZE: u64 = 150_000;
+pub const ATT2_PADDED: u64 = 151_552;
+pub const ATT2_CHUNKS: u32 = 3;
+pub const ATT2_CT_LEN: u64 = 151_600;
+pub const ATT2_CT_SHA256: [u8; 32] = [
+    45, 67, 189, 174, 68, 9, 120, 156, 98, 237, 99, 199, 251, 87, 62, 39, 162, 82, 4, 188, 41, 234, 31, 199,
+    225, 163, 255, 226, 27, 206, 19, 182,
+];
+/// Two valid identity keys (from libsignal's test-suite) and their Veil safety number.
+pub const SAFETY_KEY_A: [u8; 33] = [
+    5, 6, 134, 59, 198, 109, 2, 180, 13, 39, 184, 212, 156, 167, 192, 158, 146, 57, 35, 111, 157, 125, 37,
+    214, 252, 202, 92, 225, 60, 112, 100, 216, 104,
+];
+pub const SAFETY_KEY_B: [u8; 33] = [
+    5, 247, 129, 182, 251, 50, 254, 217, 186, 28, 242, 222, 151, 141, 77, 93, 162, 141, 195, 64, 70, 174,
+    129, 68, 2, 181, 192, 219, 217, 111, 218, 144, 123,
+];
+pub const SAFETY_DIGITS: &str = "238490772717735663483909760218270911544100487253379590271145";

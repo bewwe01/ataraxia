@@ -152,13 +152,11 @@ pub fn encrypt<R: Rng + CryptoRng>(rng: &mut R, plaintext: &[u8]) -> Result<(Att
     ))
 }
 
-/// Encrypts one chunk at a position (for resumable uploads of large files).
-pub fn encrypt_chunk(
-    key: &AttachmentKey,
-    index: u32,
-    is_last: bool,
-    plaintext_chunk: &[u8],
-) -> Result<Vec<u8>> {
+/// Encrypts one chunk at a position. Private on purpose (review L4): re-encrypting *changed*
+/// plaintext at the same index under the same key would reuse an `XChaCha20` nonce. The only
+/// way to produce ciphertext is [`encrypt`], which draws a fresh key and nonce prefix every
+/// time. Uploads resume by re-sending the stored ciphertext, never by re-encrypting.
+fn encrypt_chunk(key: &AttachmentKey, index: u32, is_last: bool, plaintext_chunk: &[u8]) -> Result<Vec<u8>> {
     if plaintext_chunk.is_empty() || plaintext_chunk.len() > CHUNK {
         return Err(CoreError::Malformed);
     }
@@ -254,6 +252,44 @@ mod tests {
         assert_eq!(e.ciphertext.len() as u64, ciphertext_len(e.padded_size).unwrap());
         let out = decrypt(&k, &e.ciphertext, &e.ciphertext_sha256, e.size, e.padded_size).unwrap();
         assert_eq!(&out[..], data);
+    }
+
+    /// Review round 1, L7: multi-chunk known-answer vector (3 chunks, last-chunk flag on the
+    /// third only) from the independent Python oracle.
+    #[test]
+    fn known_answer_multi_chunk() {
+        use crate::test_vectors as v;
+        let k = AttachmentKey::from_parts(&v::ATT_KEY, &v::ATT_PREFIX).unwrap();
+        let data: Vec<u8> = (0..v::ATT2_SIZE)
+            .map(|i| u8::try_from((i * 7 + 3) % 256).unwrap())
+            .collect();
+        assert_eq!(padded_size(v::ATT2_SIZE).unwrap(), v::ATT2_PADDED);
+        assert_eq!(chunk_count(v::ATT2_PADDED).unwrap(), v::ATT2_CHUNKS);
+        let mut padded = data.clone();
+        padded.push(0x80);
+        padded.resize(usize::try_from(v::ATT2_PADDED).unwrap(), 0);
+        let mut ct = Vec::new();
+        for (i, c) in padded.chunks(CHUNK).enumerate() {
+            let i = u32::try_from(i).unwrap();
+            ct.extend_from_slice(&encrypt_chunk(&k, i, i + 1 == v::ATT2_CHUNKS, c).unwrap());
+        }
+        assert_eq!(ct.len() as u64, v::ATT2_CT_LEN);
+        let digest: [u8; 32] = Sha256::digest(&ct).into();
+        assert_eq!(digest, v::ATT2_CT_SHA256);
+        let out = decrypt(&k, &ct, &v::ATT2_CT_SHA256, v::ATT2_SIZE, v::ATT2_PADDED).unwrap();
+        assert_eq!(&out[..], &data[..]);
+    }
+
+    /// Review round 1, L4: encrypting the same file twice never reuses a key or nonce.
+    #[test]
+    fn every_encryption_uses_a_fresh_key() {
+        let mut rng = OsRng.unwrap_err();
+        let data = vec![0x42; 3 * CHUNK + 5];
+        let (k1, e1) = encrypt(&mut rng, &data).unwrap();
+        let (k2, e2) = encrypt(&mut rng, &data).unwrap();
+        assert_ne!(k1.key_bytes(), k2.key_bytes());
+        assert_ne!(k1.nonce_prefix(), k2.nonce_prefix());
+        assert_ne!(e1.ciphertext, e2.ciphertext);
     }
 
     /// INV-CRY-5: one million fresh attachment keys never repeat a key or a STREAM nonce prefix.

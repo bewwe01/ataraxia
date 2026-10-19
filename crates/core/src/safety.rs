@@ -119,4 +119,22 @@ mod tests {
         let (a, b) = pair();
         assert_ne!(sn(&a, &b).matches_scanned(&[0xff; 40]), Ok(true));
     }
+
+    /// Review round 1, L7: known-answer vector from the independent Python oracle
+    /// (`tests/vectors/gen.py`, self-checked against libsignal's published vector).
+    #[test]
+    fn known_answer() {
+        use crate::test_vectors as v;
+        let a = IdentityKey::decode(&v::SAFETY_KEY_A).unwrap();
+        let b = IdentityKey::decode(&v::SAFETY_KEY_B).unwrap();
+        let (aa, ab) = (Address::of(&a), Address::of(&b));
+        assert_eq!(
+            SafetyNumber::new(&aa, &a, &ab, &b).unwrap().digits(),
+            v::SAFETY_DIGITS
+        );
+        assert_eq!(
+            SafetyNumber::new(&ab, &b, &aa, &a).unwrap().digits(),
+            v::SAFETY_DIGITS
+        );
+    }
 }
