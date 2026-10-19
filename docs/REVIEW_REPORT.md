@@ -2094,3 +2094,272 @@ Housekeeping: the working tree is clean (`git status --short` is empty, HEAD 0d9
 - my `/tmp/veil-*` dirs (7 older ones that predate this review were left in place).
 
 Copies of the probe code are in `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r3/` (`r3_probe.rs`, `counters_probe.rs`, `mut.py`).
+
+---
+
+## Phase 3 review, round 4 (2026-10-19)
+
+**Reviewer:** code-reviewer agent (Agent tool, `subagent_type: "code-reviewer"`, model override `opus`), adversarial brief. Scope: round-3 condition fixes in `d12d769`, CI fix `583d14b`, plus `git diff 0958b70^..HEAD`. Report follows verbatim.
+
+# Phase 3 review: round 4
+
+## Verdict: PASS WITH CONDITIONS
+I found no Critical or High issues, and the core of every round-3 condition holds up under test. I replayed the 30 000-operation probe adapted to the floor, with 540 extra floor probes. The `token_rows_over_floor` counter matched the real rows after every operation, no mailbox under its floor was ever refused, and the rows over the floor never went past the cap. The no-op early returns, the per-mailbox limiters, pruning and the creation refund are all mutation-killed. No "never by IP" claim is left. The gitleaks allowlist is narrow, and its negative tests are still reported.
+
+I can't give a plain PASS, for three reasons:
+- **C1 is only partly met.** The README disk sizing still describes the round-2 caps, so it understates the new bound by about 1.4 GB.
+- **The P3R3-5 work has two real problems,** which I reproduced under a real systemd 255 in a throwaway container. The new `firewall-unit` CI job fails as written. And the TURN rule is silently lost when `nftables.service` is started from inactive or stopped, although the README says it is re-applied on start.
+- **Two Medium defects in the round-3 scope.** The C2 scaling made `VEIL_MAX_CONN_PER_SOURCE ≤ 8` break every full `Fetch` (reproduced on the deployed image). `BlobPut` re-sends are an unthrottled write path that costs no quota: about 90 MiB/s of disk writes from one host on the release image, and the docs don't mention it.
+
+All five are small, well-understood fixes, listed as conditions below.
+
+**Conditions:**
+1. **P3R4-1:** correct the README disk sizing for the new bound.
+2. **P3R4-2:** fix the `firewall-unit` CI job, and the README "refuses to start Docker" wording, so the job passes for the right reasons.
+3. **P3R4-3:** make the TURN rule survive `nftables.service` start and stop, or document the gap and give the operator a step that closes it.
+4. **P3R4-4:** don't scale the response share below one full response.
+5. **P3R4-5:** bound `BlobPut` writes per upload token, and name this path in the residual write-load docs.
+
+## Round-3 conditions and findings: status
+| ID | Status | Evidence |
+|---|---|---|
+| C1 / P3R3-1 | **Partially** | **Counters exact:** I appended a temporary `#[cfg(test)]` probe to `store.rs` (reverted since) with floor 2, `max_token_rows` 4 and 30 000 random operations, including FF-prefixed tokens, deletes, idle expiry and sweeps. After every operation `STAT_TOKEN_ROWS` equalled Σ max(0, rows − floor), `rec.tokens` matched the real rows, there were no orphan rows, and the over-floor rows stayed ≤ the cap. <br>**Floor guaranteed:** 540 probes of "a mailbox under its floor adds one new token" were all accepted (0 refused). <br>**Mutation:** the floor-removal mutant is killed. <br>**Source counts in README and THREAT_MODEL are correct:** (1e6/448 − 10) min = 37.05 h; 1e6 / (30 + 1 440) per day = 680; 1 024/32 = 32; 64 MiB / (3 × 2 050 KiB) → 11; creation 60. <br>**Not met:** the README disk sizing (`deploy/README.md:32-33`) still says "1 000 000 rows, about 165 MB" and "20 000 upload tokens, about 3 MB". The actual bound is `max_mailboxes × floor + max_token_rows` = 7.4 M rows (about 1.2 GB) plus 1 M upload tokens (about 160 MB). See P3R4-1. |
+| C2 / P3R3-2 | **Met** (new defect: P3R4-4) | **Scaling:** n=64 doubles the per-source creation and upload allowances and the response share (tested). n=1024 gives creation 320, upload 960, and a share of 256 MiB capped to 64 MiB. Rounding is `ceil` with a minimum of 1. <br>**Small n:** n=1 gives creation burst 1 and upload burst 1, each then 1 per 32 min, and a 256 KiB share. Any n ≤ 8 gives a share below one full fetch, so every `limit: 32` fetch is refused. Reproduced in-process and on the deployed image (P3R4-4). <br>**Mutants:** "response share not scaled" and "upload-per-source not scaled" are both killed. |
+| C3 / P3R3-3 | **Met** (residual docs incomplete: P3R4-5, P3R4-6) | **Mutants killed:** removing the `update_tokens` early return, the `ack` early return, or the per-mailbox UpdateTokens limiter. <br>**Deployed image:** 25 × `UpdateTokens{}` gave 19 ok and 6 RateLimited. <br>**Other commits that change nothing** (my probe compared a full DB snapshot before and after every committed operation): <br>• `update_tokens` with the same token in `add` and `remove` (30 cases); <br>• `put_chunk` re-sends; <br>• `sweep` with nothing due (5 commits per minute, not attacker-driven); <br>• `add_upload_token` on an id collision (a probe artifact, unreachable in production). <br>`touch_mailbox`, deposit errors and a `take_invite` miss do not commit. |
+| C4 / P3R3-4 | **Met** (minor doc gaps: P3R4-8) | **No "never by IP" claim left.** I searched the whole repo. `PROTOCOL.md:39` ("per token, never per IP") is about deposits and is accurate. <br>**Mutants killed:** "prune not called from the sweep" and "prune keeps everything". <br>**Retention:** about 10 min for creation and 30 min for upload, plus up to one sweep interval, as stated. README L9 and L255 still say addresses are held "while connected" (Low). |
+| P3R3-5 | **Partially** → P3R4-2, P3R4-3 | `systemd-analyze verify` is clean. <br>**Real systemd 255 (Ubuntu 24.04 container, a stand-in `docker.service`, the real Ubuntu `nftables.service`):** <br>• restart and reload of nftables re-apply the rule within milliseconds; <br>• stopping the unit leaves Docker active; <br>• Docker fails to start when `/etc/veil-turn.nft` cannot load. <br>**But:** <br>• the CI job fails at step 3, and probably at step 2 (P3R4-2); <br>• `systemctl start nftables` from inactive (the default on Debian and Ubuntu) and `systemctl stop nftables` both leave no rule while Docker runs (P3R4-3). |
+| P3R3-6 | **Met** | `gitleaks git --redact --exit-code 1 .` (8.30.1): "no leaks found", 46 commits, exit 0. <br>**My negative tests** (temporary repo): <br>• 40-hex `api_key`, `secret` and `token` lines in a `Cargo.lock` were reported; <br>• a crate-name pair in `other.txt` was reported; <br>• the crate-name pair in `Cargo.lock` was suppressed. |
+| P3R3-7 | **Met** (one clause untested: P3R4-7) | All 8 tables, plus `STATS`, must be empty before a database is stamped. The lone-token and lone-upload-token cases are tested. The mutant that drops the `STATS` check **survives**. |
+| P3R3-8 | **Met** | **Mutants killed:** R3-M13 (per-source upload check removed) and R3-M6 (shrinking blocked when over the cap). Growing while over the cap (M12) is also killed. <br>**Docs:** §14 lists the new limits; INV-LOG-1 lists M3, M4, M8 and M9. §14 omits the Ack limit (Low). |
+| P3R3-9 | **Met** (same pattern elsewhere: P3R4-10) | Removing both layers is killed. Each layer alone survives, as the author says. The refund-on-race path has no test of its own. |
+
+## Commands I ran and their results
+```text
+$ cargo fmt --all --check                                          # exit 0
+$ cargo clippy --workspace --all-targets --locked -- -D warnings   # exit 0
+$ cargo test --workspace --locked                                  # exit 0
+  veil_core 74 | secrets 3 | session 22 (+1 ignored) | veil_relay lib 23 | logs 1 | relay 23 | smoke 0 (+2 ignored) | veil_wire 5
+$ cargo deny --locked check  → advisories ok, bans ok, licenses ok, sources ok
+$ cargo vet --locked         → Vetting Succeeded (43 fully audited, 5 partially audited, 207 exempted)
+$ gitleaks git --redact --exit-code 1 .  → 46 commits scanned … no leaks found (exit 0)
+$ systemd-analyze verify veil-turn-firewall.service → exit 0, no output
+```
+**Counter probe** (temporary module appended to `store.rs`, reverted):
+```text
+R4 probe: successes {"ack": 884, "chunk": 391, "create": 1179, "delete": 898, "deposit": 403, "floor": 540,
+  "invite": 1217, "sweep": 2128, "take": 371, "tick": 2146, "tokens": 773, "touch": 897, "uptok": 2082}
+ no-op commits {"chunk": 1, "sweep": 1322, "tokens": 30, "uptok": 286}
+ floor probes 540, refused 0
+test store::r4_probe::r4_counters_stay_exact ... ok
+The same probe with mutant M7 (remove_mailbox subtracts all rows):
+  assertion `left == right` failed: token rows over floor  left: 0  right: 1
+```
+**Mutation checks** (`cargo test -p veil-relay`; each file restored afterwards):
+```text
+M1  floor ignored in update_tokens                     KILLED
+M2  update_tokens no-op early return removed           KILLED
+M3  ack no-op early return removed                     KILLED
+M4  prune_limiters not called in sweep loop            KILLED
+M5  would_allow pre-check removed (alone)              SURVIVED (by design; covered by M6)
+M6  refund removed (alone)                             SURVIVED (race path untested)
+M5+M6 both removed                                     KILLED
+M7  remove_mailbox subtracts all rows, not over-floor  SURVIVED  ← P3R4-7
+M8  schema: STATS-emptiness check removed              SURVIVED  ← P3R4-7
+M9  per-mailbox UpdateTokens limiter removed           KILLED
+M10 KeyedLimiter::prune keeps everything               KILLED
+M11 response share not scaled                          KILLED
+M12 over-cap check lets a mailbox grow by 1            KILLED (3 tests)
+M13 per-source upload-token check removed (R3-M13)     KILLED
+M14 shrinking blocked when over the cap (R3-M6)        KILLED
+M15 upload-per-source not scaled                       KILLED
+```
+**In-process probes** (temporary `crates/relay/tests/r4_probe.rs`, debug build, deleted):
+```text
+R4 n=1: share 256 KiB, create burst 1, upload burst 1; one idle fetch(limit 32) -> Err(RateLimited)
+R4 n=8: share 2048 KiB, create burst 3, upload burst 8; one idle fetch(limit 32) -> Err(RateLimited)
+R4 n=9: share 2304 KiB ... -> Ok      R4 n=32: share 8192 KiB ... -> Ok
+R4 net-zero UpdateTokens{add:[X],remove:[X]} x40: ok 19, rate-limited 21   (each ok = a commit with no net change)
+R4 victim deposit latency (p50,max): idle (3.0ms, 3.7ms), during BlobPut re-send (171.4ms, 199.7ms)
+R4 BlobPut re-sends of one 64 KiB chunk, one source, 31 conns, 4 s: 760 accepted, refused 0
+```
+**Docker deploy.** I checked that `veil-relay:local` contains `token_rows_over_floor`, so it is the d12d769 code. Then I followed the README: `.env` with `TURN_EXTERNAL_IP=192.0.2.2`, `secrets/turn_secret`, `gen-cert`, `nft -f firewall/veil-turn.nft`, `docker compose up -d`.
+```text
+relay-1 | INFO veil-relay started listen=0.0.0.0:8443 pin=f346fab9… turn=true
+smoke deployed_relay_round_trip (127.0.0.1:8443) ... ok
+VEIL_MAX_CONN_PER_SOURCE=8 → smoke deployed_relay_round_trip FAILED: smoke.rs:58 owner.fetch(m,0).unwrap() → Err(RateLimited)
+VEIL_MAX_CONN_PER_SOURCE=9 → ok
+Release image, one source, 30 conns, BlobPut re-sending one 64 KiB chunk for 5 s (temporary test, deleted):
+R4D UpdateTokens{} x25: ok 19, rate-limited 6
+R4D victim deposit (p50,max) idle (1.12ms, 1.90ms), during BlobPut re-sends (22.6ms, 46.5ms); 7167 re-sends in 5 s (1433/s, 89.6 MiB/s)
+```
+**systemd 255.** Throwaway `ubuntu:24.04` container (`--privileged`, its own network namespace) with `systemd`, `nftables` and a stand-in `docker.service` running `sleep infinity`. I replayed the CI job's commands:
+```text
+step 1: verify=0; enable --now ok; restart docker ok; table present; docker active
+step 2: flush ruleset in /etc/nftables.conf: yes
+        restart nftables; nft list table → "No such file or directory" (after_restart=1)
+        reload nftables;  nft list table → "No such file or directory" (after_reload=1)
+        5× restart: immediately=1, after 1 s=0;   5× reload: immediately=1, after 1 s=0
+step 3: stop veil-turn-firewall → docker active; table gone
+        systemctl restart docker → SUCCEEDS ("CI WOULD FAIL: Docker started without the rule");
+        veil-turn-firewall active again, table present (pulled in by the drop-in's Wants=)
+nftables inactive, rule loaded → systemctl start nftables (+1 s): table=1 (absent), veil=active
+systemctl stop nftables → table absent, docker=active, veil=inactive
+/etc/veil-turn.nft missing, unit stopped → restart docker: "control process exited with error code", docker=failed
+```
+
+## New findings
+### Critical
+None.
+
+### High
+None.
+
+### Medium
+**P3R4-1: The README disk sizing still gives the round-2 caps and understates the new bound by about 1.4 GB.** [HIGH]
+- **Where:**
+  - `deploy/README.md:31-33`;
+  - the code is `Quotas` defaults at `crates/relay/src/server.rs` (`token_floor_per_mailbox: 64`, `max_upload_tokens: 1_000_000`) and the `store.rs` doc comment ("bounded by `max_mailboxes × floor + max_token_rows`").
+- **What is wrong:**
+  - The README says token rows are at most 1 000 000 (about 165 MB) and upload tokens at most 20 000 (about 3 MB).
+  - Floor rows don't count against the relay-wide cap. So the bound is 100 000 × 64 + 1 000 000 = 7.4 M rows, about 1.2 GB at the measured 164 B per row.
+  - Live upload tokens are now 1 000 000, about 160 MB.
+  - C1 required this to be documented. TEST_REPORT has the 160 MB figure; README, ADR-0010 ("Disk is sized from the caps") and `.env.example` don't.
+- **Scenario:** an operator sizes a Pi SD card from the README.
+  - With 60 or more sources, an attacker creates 100 000 mailboxes (relay-wide 1/s, about 28 h) and registers each one's 64 free tokens.
+  - That is about 1.2 GB of rows the operator didn't plan for, and about 3.4× that in apparent file size.
+- **Fix:** state 7.4 M token rows (about 1.2 GB) and 1 M upload tokens (about 160 MB) in README L31-33. Add them to the "3.5× the caps" total, or lower `max_mailboxes` and the floor.
+- **Test:** this is a docs change. Optionally add a store test that fills `max_mailboxes × floor` rows past a full cap, to back the stated bound.
+
+**P3R4-2: The new `firewall-unit` CI job fails as written, and the README misdescribes the drop-in.** [HIGH for step 3, reproduced. MEDIUM for step 2, which is a timing race that failed 10 of 10 times here]
+- **Where:**
+  - `.github/workflows/ci.yml:292-301`;
+  - `deploy/firewall/docker-veil-turn.conf:4` (`Wants=veil-turn-firewall.service`);
+  - `deploy/README.md:137-138`.
+- **What is wrong:**
+  - **Step 3:** after `systemctl stop veil-turn-firewall`, the job expects `systemctl restart docker` to fail. But the drop-in's `Wants=` makes systemd start the firewall unit again as part of Docker's restart. The rule is loaded, `ExecStartPre` passes, Docker starts, and the job exits 1.
+  - So the README sentence "refuses to start Docker if the rule is not loaded" is inaccurate. Docker re-loads the rule itself, and refuses only when the rule *cannot* be loaded (verified: with `/etc/veil-turn.nft` missing, Docker fails).
+  - **Step 2:** `systemctl restart nftables` and `systemctl reload nftables` return before the propagated job on `veil-turn-firewall` has finished. The `nft list table` on the next line runs inside that window. Here it failed 10 of 10 times; one second later the rule was present.
+- **Scenario:** the job is red on its first run. The TEST_REPORT row for P3R3-5 rests entirely on this job, which has not passed yet.
+- **Fix:**
+  - Step 2: wait for the propagated job before checking (`systemctl is-active --wait`-style polling, or a short retry loop on `nft list table`).
+  - Step 3: either `systemctl mask veil-turn-firewall`, or move `/etc/veil-turn.nft` aside before `restart docker`, so the rule genuinely cannot load. Then expect failure.
+  - Reword README L137: "Docker loads the rule when it starts and refuses to start if it cannot".
+- **Test:** the corrected job, run once on GitHub. Mutant: put `RequiredBy=docker.service` back, and step 3's `is-active docker` must fail.
+
+**P3R4-3: The TURN rule is silently lost when `nftables.service` is started from inactive, or stopped. The README says it is re-applied on start.** [HIGH, reproduced under systemd 255 with Ubuntu's `nftables.service`]
+- **Where:**
+  - `deploy/firewall/veil-turn-firewall.service:11-15` (`After=`, `PartOf=`, `ReloadPropagatedFrom=`);
+  - `deploy/README.md:135` ("re-applied whenever `nftables.service` starts, restarts or reloads").
+- **What is wrong:**
+  - `PartOf=` propagates only stop and restart, and `ReloadPropagatedFrom=` only reload. Starting an inactive `nftables.service` runs `flush ruleset` from `/etc/nftables.conf`, and nothing re-applies the rule. The unit stays "active". `nftables.service` is disabled by default on Debian and Ubuntu, so this is the common first-time case.
+  - `systemctl stop nftables` stops the unit, which deletes the table, while Docker and coturn keep running.
+  - Every restart or reload also leaves a gap of a few milliseconds with no rule.
+- **Scenario:** after installing Veil, the operator hardens the VPS with `systemctl enable --now nftables`.
+  - From then until the next reboot, anyone with TURN credentials (mailbox creation is open) can relay UDP into every service on `TURN_EXTERNAL_IP`: DNS, Pi-hole, WireGuard and SNMP. That is exactly what P3-8 closed.
+  - `nft list table inet veil_turn` fails, but nothing alerts the operator.
+- **Fix (either):**
+  - Ship an `nftables.service` drop-in with `ExecStartPost=/usr/sbin/nft -f /etc/veil-turn.nft`, plus `ExecReload=` re-listing the original command followed by `/usr/sbin/nft -f /etc/veil-turn.nft`. This makes loading the rule part of nftables' own start and reload.
+  - Or document `include "/etc/veil-turn.nft"` in `/etc/nftables.conf`, which loads it atomically, and keep the unit for hosts without nftables.service.
+  - In both cases, correct README L135. State that `systemctl stop nftables` removes the protection.
+- **Test:** add a CI step that runs `systemctl stop nftables; systemctl start veil-turn-firewall; systemctl start nftables`, waits, then runs `nft list table inet veil_turn`. It must succeed.
+
+**P3R4-4: `VEIL_MAX_CONN_PER_SOURCE` ≤ 8 makes every full `Fetch` fail; the C2 scaling broke it.** [HIGH, reproduced in-process and on the deployed image]
+- **Where:**
+  - `crates/relay/src/server.rs:178-190` (`set_per_source_connections` scales the share down as well as up);
+  - `server.rs:904` (a fetch reserves `limit × (MAX_ENVELOPE + 64)`; 2 050 KiB for `limit: 32`);
+  - `server.rs:752-760` (`reserve` refuses when the reservation is larger than the source's share);
+  - `main.rs` and `.env.example` accept 1–1024 with no warning.
+- **What is wrong:**
+  - The share becomes 8 MiB × n/32. For n ≤ 8 that is ≤ 2 048 KiB, smaller than one `MAX_FETCH` reservation, so every `Fetch{limit:32}` is `RateLimited` permanently, even on an idle relay.
+  - n = 1 also cuts creation and upload tokens to one per 32 min per source.
+  - Before d12d769, lowering the connection cap did not touch these allowances.
+- **Scenario:** an operator lowers the cap to 4 or 8 "for safety" on a personal relay. No client can retrieve messages. The deployed smoke test fails at `smoke.rs:58` with `RateLimited`.
+- **Fix:** clamp the per-source share to at least one worst-case response, `max(share, MAX_FRAME)` still capped by the relay-wide budget, or scale only upwards (`factor.max(1.0)`). Document what lowering the cap does.
+- **Test:** for n ∈ {1, 8, 1024}, `set_per_source_connections(n)` followed by `client.fetch(m, 0)` succeeds. Mutant: drop the clamp, and n = 8 fails.
+
+**P3R4-5: `BlobPut` re-sends are an unthrottled write path that costs no quota. The documented residual write load names only deposits.** [HIGH, measured]
+- **Where:**
+  - `crates/relay/src/server.rs:989-997` (no rate limit on `BlobPut`, only 50 frames/s per connection × 32 connections);
+  - `crates/relay/src/store.rs:755-850` (`put_chunk` rewrites and commits an existing chunk on every re-send until the blob completes);
+  - docs: `deploy/README.md:274-277` and the THREAT_MODEL §5 "Resource exhaustion" bullet.
+- **What is wrong:**
+  - One upload token and one chunk of a two-chunk blob, re-sent forever.
+  - Each re-send is a committed 64 KiB write. `STAT_BLOB_BYTES` doesn't change, so no quota ever stops it, and the upload token lasts 24 h.
+  - The docs say the writer can be kept busy "with real writes into its own mailboxes: deposits…" and quote 62 ms.
+- **Measured:**
+  - Release image, one source: 1 433 re-sends/s = **89.6 MiB/s** of commits. Victim deposit p50 rose from 1.1 ms to 22.6 ms.
+  - Debug build: 171 ms p50, against the documented 62 ms (also debug).
+- **Scenario:** on the Raspberry Pi target, one host saturates the SD card's write bandwidth for 24 h per upload token, at about 7 TB/day of rewrites. That is SD-card wear, not just latency, and it costs the attacker no storage quota.
+- **Fix:**
+  - Bound chunk writes per upload token in the store. For example, store a put counter in the token record and refuse after `total + 16` puts.
+  - Or add a per-token `KeyedLimiter` (for example burst 64, then 50/s).
+  - Name this path and its numbers in README and THREAT_MODEL.
+- **Test:** a store test showing that put number `total + 17` on one token returns `Quota` or `RateLimited`. Mutant: no counter → fails.
+
+### Low
+**P3R4-6: "Requests that change nothing are not written" is not quite true.**
+- **Where:** `store.rs:519-536`; `deploy/README.md:239`; `docs/PROTOCOL.md:214`.
+- **What is wrong:** `UpdateTokens{add:[X], remove:[X]}` with X already present removes and re-inserts X, then commits. Probe: 30 snapshot-identical commits; 19 of 40 accepted in-process. The per-mailbox limiter bounds it, so the impact is small.
+- **Fix:** skip ids that appear in both `add` and `remove`, or reword the claim to "no-op requests".
+
+**P3R4-7: Two counter and schema clauses have no killing test (CLAUDE.md rule 9).**
+- **M7:** `remove_mailbox` subtracting all rows instead of the rows over the floor (`store.rs:323`) survives the suite. Every delete or expiry test uses floor 0. My probe kills it, which shows the bug class is real: the counter undercounts and the disk bound breaks.
+- **M8:** dropping the `STATS` emptiness check (`store.rs:411`) survives.
+- **Fix:**
+  - Add a delete and an idle-expiry test with `token_floor_per_mailbox > 0` that checks the over-floor counter.
+  - Extend `foreign_schema_is_refused` with a database holding only a `STATS` counter.
+
+**P3R4-8: Leftover doc imprecisions.**
+- **Where:** `deploy/README.md:9` and `deploy/README.md:255`, plus the PROTOCOL §14 table.
+- **What is wrong:**
+  - README L9 and L255 still say IP addresses are held only "for as long as a connection is open" or "while connected". Source-keyed buckets keep them for up to about 31 min after, and about 33 min at n = 1.
+  - PROTOCOL §14 omits the Ack limit (20, then 1/s per mailbox) that §6.3 states.
+- **Fix:** align these with the README "Relay connections" bullet, and add the Ack row to §14.
+
+**P3R4-9: The README update path now leaves the relay stopped on an existing database.**
+- **Where:** `store.rs` (`SCHEMA_VERSION` 2 → 3); `deploy/README.md:173` "Updates".
+- **What is wrong:** a v2 database makes `serve` exit with `StoreError::Schema`. The documented `git pull && docker compose build && docker compose up -d` then leaves the relay crash-looping. The DB shares the volume with the TLS key, and moving it aside inside a distroless container is not documented.
+- **Fix:** add an "incompatible database" note to Updates, with the exact commands to move `/data/relay.redb` aside while keeping `/data/tls`.
+
+**P3R4-10: The P3R3-9 pattern remains on upload tokens.**
+- **Where:** `server.rs:975-983`.
+- **What is wrong:**
+  - The per-mailbox upload bucket is spent before the per-source check, so a per-source refusal still costs the mailbox a token.
+  - When `add_upload_token` returns `Quota`, both buckets have been spent.
+- **Fix:** check both buckets with a non-spending peek first, or refund on refusal, as for creation.
+
+## Claims I checked and found accurate
+- TEST_REPORT round-3 counts: 74 / 3 / 22+1 / 23 / 1 / 23 / 0+2 / 5, plus fmt, clippy, deny, vet (43/5/207) and gitleaks "no leaks found".
+- "Every mailbox keeps a floor of 64": the floor is guaranteed (540 probes, 0 refused). Counters are exact on every path over 30 000 random operations, including delete, idle expiry and FF-prefixed tokens. The relay-wide over-floor rows never pass the cap. An over-cap mailbox can shrink but not grow (M12, M14).
+- The "sources needed" table in README and THREAT_MODEL: 1 host in about 37 h, 32, 11, about 60, about 680. All recomputed and correct.
+- The no-op early returns for `update_tokens` and `ack`, the `commit` helper as the single commit path, and the per-mailbox UpdateTokens and Ack limits (20, then 1/s; deployed image: 19 ok, 6 refused).
+- `would_allow` plus `refund`: refused creations no longer spend the source's allowance (both-removed mutant killed).
+- `KeyedLimiter::prune` runs every sweep for all 8 keyed limiters, and source keys are forgotten after refill (M4, M10 killed).
+- "Never by IP" is gone everywhere. ARCHITECTURE, PROTOCOL §6.3, THREAT_MODEL §5, `limits.rs` and `server.rs` now describe the source key accurately.
+- The gitleaks allowlist covers only `generic-api-key`, only in `Cargo.lock`, and only crate-name pairs. Hex and secret-looking values in a `Cargo.lock` are still reported.
+- The schema check requires all 8 tables and `STATS` to be empty. The new image stamps v3, and the deployed smoke test passes.
+- Firewall unit:
+  - `systemd-analyze verify` is clean;
+  - under a real systemd, nftables restart and reload re-apply the rule;
+  - stopping the unit no longer stops Docker;
+  - Docker fails to start when the rule cannot load.
+- The nft rule body is unchanged since round 3; only comments changed. The deployed stack loads it at `priority mangle`.
+- 583d14b only narrows the round-trip CI step to `deployed_relay_round_trip`. The soak keeps its own step (`ci.yml:245-247`).
+- The `firewall-unit` job pins `actions/checkout` by SHA with `persist-credentials: false`, and the workflow sets top-level `permissions`.
+
+## Claims I could not verify
+- The `firewall-unit` job and `relay-deploy` as actually run on GitHub runners. My systemd checks used a stand-in `docker.service` (`sleep infinity`), not Docker Engine.
+- Whether the step-2 race (P3R4-2) also fails on a GitHub runner, where `sudo` adds latency. It failed 10 of 10 times here.
+- The TURN probes (turnutils, host and Docker-published ports). I did not re-run them, because the rule body is unchanged since round 3.
+- The SD-card or arm64 impact of P3R4-5 (measured only on this disk), and IPv6 behind `docker-proxy` (no IPv6 here).
+- How the Phase 4 client handles a `RateLimited` Ack or UpdateTokens, and which fetch `limit` it uses (the test helper uses 32).
+- A soak or a large DB fill. I did none, because the disk had only 2.1 to 2.5 GB free.
+
+---
+**Housekeeping:**
+- **Git:** working tree clean (`git status --short` empty), HEAD still 583d14b. Nothing was committed or pushed.
+- **Docker:** I ran `docker compose down -v` (volume `veil_relay-data` and network removed) and removed the anonymous volume my deploy created (`3c01f0b5…`). The throwaway `r4sysd` container and the `r4-systemd` and `ubuntu:24.04` images are gone.
+- **Files:** `deploy/.env` and `deploy/secrets` are deleted. `nft delete table inet veil_turn` is done; only the pre-existing ip/ip6 tables remain. The temporary tests and the store probe are removed or reverted, and `/tmp/veil-r4-*` is deleted.
+- **Left behind:**
+  - incremental build artifacts in the git-ignored `target/` (the free disk went from about 2.5 GB to 2.1 GB);
+  - probe sources in `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r4/`.
