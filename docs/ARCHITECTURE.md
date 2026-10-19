@@ -205,7 +205,7 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
   - Expiry uses an index table (`kind ‖ due ‖ id`), so a sweep reads only due entries, in batches of 256, each its own write transaction.
   - Writes to clients time out, and large responses share a relay-wide byte budget.
   - Measured in a 512 MiB container: 71 MB peak while filling 630 MB of envelopes; a sweep with nothing due takes 1.5 ms; expiring 9 600 envelopes takes 0.77 s at 36 MB.
-  - The cost: redb's file reached an apparent size of 3.4× the stored payload in that test (it grows in large steps), with about 2× actually allocated. Disk is sized from the caps (`deploy/README.md`).
+  - The cost: redb's file reached an apparent size of 3.4× the stored payload in that test (it grows in large steps), with about 2× actually allocated. Disk is sized from the caps, including the token-row and upload-token caps (`deploy/README.md`).
 - **Schema version (P3R2-9).** The store records its layout version and refuses a database of another version, or an unversioned one that holds data. An older layout would otherwise open with no expiry entries, and its records would never expire.
 
 ## 7. Distribution (recorded owner request)

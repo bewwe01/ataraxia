@@ -1109,3 +1109,23 @@ async fn source_keys_are_forgotten_after_refill() {
         "refilled bucket still held"
     );
 }
+
+/// P3R4-4: lowering the per-source connection cap never shrinks the other allowances, so a
+/// full-size fetch still fits the response share.
+#[tokio::test]
+async fn a_low_connection_cap_keeps_full_fetches_working() {
+    for n in [1, 8] {
+        let mut cfg = Config::default();
+        cfg.set_per_source_connections(n);
+        assert_eq!(cfg.max_connections_per_source, n);
+        assert_eq!(
+            cfg.response_budget_per_source,
+            Config::default().response_budget_per_source
+        );
+        let relay = TestRelay::start(cfg).await;
+        let mut c = relay.client().await;
+        let m: [u8; 32] = rand::random();
+        c.new_mailbox(relay.pin, m).await;
+        c.fetch(m, 0).await.expect("full fetch with a low connection cap");
+    }
+}

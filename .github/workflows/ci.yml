@@ -267,7 +267,7 @@ jobs:
         run: docker compose down -v
 
   firewall-unit:
-    name: TURN firewall unit under systemd (review P3R3-5)
+    name: TURN firewall units under systemd (review P3R3-5, P3R4-2, P3R4-3)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -280,25 +280,30 @@ jobs:
           sudo install -m 0644 deploy/firewall/veil-turn.nft /etc/veil-turn.nft
           sudo install -m 0644 deploy/firewall/veil-turn-firewall.service /etc/systemd/system/
           sudo install -D -m 0644 deploy/firewall/docker-veil-turn.conf /etc/systemd/system/docker.service.d/veil-turn.conf
+          sudo install -D -m 0644 deploy/firewall/nftables-veil-turn.conf /etc/systemd/system/nftables.service.d/veil-turn.conf
           sudo systemd-analyze verify /etc/systemd/system/veil-turn-firewall.service
           sudo systemctl daemon-reload
           sudo systemctl enable --now veil-turn-firewall
           sudo systemctl restart docker
           sudo nft list table inet veil_turn
           systemctl is-active docker
-      - name: The rule survives nftables.service restart and reload (flush ruleset)
+      - name: The rule survives every nftables.service transition (flush ruleset)
         run: |
+          rule() { for _ in $(seq 1 20); do sudo nft list table inet veil_turn >/dev/null 2>&1 && return 0; sleep 0.25; done; echo "rule missing after: $1"; return 1; }
           grep -q "flush ruleset" /etc/nftables.conf
-          sudo systemctl restart nftables
-          sudo nft list table inet veil_turn
-          sudo systemctl reload nftables
-          sudo nft list table inet veil_turn
-      - name: Stopping the unit does not stop Docker; Docker refuses to start without the rule
+          sudo systemctl stop nftables;    rule "stop (from active)"
+          sudo systemctl start nftables;   rule "start (from inactive)"
+          sudo systemctl restart nftables; rule "restart"
+          sudo systemctl reload nftables;  rule "reload"
+          sudo systemctl stop nftables;    rule "stop"
+      - name: Stopping the unit does not stop Docker; Docker refuses to start if the rule cannot load
         run: |
           sudo systemctl stop veil-turn-firewall
           systemctl is-active docker
-          if sudo nft list table inet veil_turn; then exit 1; fi
+          sudo mv /etc/veil-turn.nft /etc/veil-turn.nft.aside
           if sudo systemctl restart docker; then echo "Docker started without the rule"; exit 1; fi
+          sudo mv /etc/veil-turn.nft.aside /etc/veil-turn.nft
           sudo systemctl start veil-turn-firewall
           sudo systemctl restart docker
           systemctl is-active docker
+          sudo nft list table inet veil_turn

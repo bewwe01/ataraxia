@@ -6,8 +6,9 @@ credentials. coturn, next to it, forwards encrypted call media when two phones c
 directly, which in Veil's default relay-only mode is always.
 
 **What the relay can see:** connection times, envelope sizes (padded to 1, 4, 16 or 64 KiB) and
-counts, random mailbox IDs, and, for as long as a connection is open, the IP addresses of connected
-devices. It never sees message content, names, contact lists or identity keys, and it never writes
+counts, random mailbox IDs, and the IP addresses of connected devices. It holds those addresses in
+memory while a device is connected, and as a rate-limit key for up to about 30 minutes after it
+was last active (*Hardening*). It never sees message content, names, contact lists or identity keys, and it never writes
 IP addresses to disk or logs (`docs/THREAT_MODEL.md`, `docs/INVARIANTS.md` INV-META-1, INV-LOG-1).
 The person who runs the relay, or anyone who controls the machine, can still watch traffic at the
 network level, so run it on hardware you control. This software has not had an independent security
@@ -28,9 +29,13 @@ audit.
     file's apparent size was 2.16 GB (redb grows in large steps), and about 2× the payload was
     actually allocated. Budget **3.5× the caps** to be safe, about 18 GB free for the defaults, and
     lower the caps on a small SD card.
-  * Two kinds of small records are capped separately, so they cannot grow without bound either:
-    - delivery-token rows: at most 1 000 000 relay-wide, about 165 MB;
-    - live upload tokens: at most 20 000, about 3 MB.
+  * Small records are capped separately, so they cannot grow without bound either. Add their worst
+    case to the budget:
+    - delivery-token rows: 64 per mailbox are always allowed, plus 1 000 000 beyond that
+      relay-wide. With 100 000 mailboxes that is 7.4 M rows, about 1.2 GB;
+    - live upload tokens: at most 1 000 000, about 160 MB.
+
+    So the defaults need about 18 GB plus 1.4 GB × 3.5, roughly **23 GB free** in the worst case.
   * Anyone who can reach the relay can create a mailbox, so these caps are what keep a stranger from
     filling the disk. When a cap is reached, new deposits are refused until old data expires (see
     *Known limits*).
@@ -124,6 +129,7 @@ boot, before Docker starts:
 sudo install -m 0644 firewall/veil-turn.nft /etc/veil-turn.nft
 sudo install -m 0644 firewall/veil-turn-firewall.service /etc/systemd/system/
 sudo install -D -m 0644 firewall/docker-veil-turn.conf /etc/systemd/system/docker.service.d/veil-turn.conf
+sudo install -D -m 0644 firewall/nftables-veil-turn.conf /etc/systemd/system/nftables.service.d/veil-turn.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now veil-turn-firewall
 sudo systemctl restart docker          # picks up the drop-in
@@ -132,12 +138,16 @@ sudo nft list table inet veil_turn     # shows the rule
 
 It only stops coturn's relay sockets from reaching services on this host, including services that
 Docker publishes; nothing else changes. Two safeguards:
-- The rule is re-applied whenever `nftables.service` starts, restarts or reloads. Debian's default
-  `/etc/nftables.conf` begins with `flush ruleset`, which would otherwise drop it.
-- The Docker drop-in refuses to start Docker if the rule is not loaded, so coturn never runs
-  without it.
+- The nftables drop-in re-loads the rule after every start, reload and stop of `nftables.service`.
+  Debian's default `/etc/nftables.conf` begins with `flush ruleset`, which would otherwise drop
+  it. Between those two commands the rule is briefly absent, for milliseconds.
+- The Docker drop-in makes Docker load the rule when it starts, and refuse to start if the rule
+  cannot be loaded, so coturn never starts without it.
 
-Stopping the firewall unit does not stop Docker or your other containers.
+Stopping the firewall unit removes the rule but does not stop Docker or your other containers;
+`systemctl start veil-turn-firewall` puts it back. Check it any time with
+`sudo nft list table inet veil_turn`. These units were tested on a GitHub Ubuntu runner (CI job
+`firewall-unit`), not on Raspberry Pi OS.
 
 Start everything:
 
@@ -172,6 +182,16 @@ expire after 14 days. Run it only on a relay you are about to reset.
 
 * **Updates:** `git pull && docker compose build && docker compose up -d`. Data and the TLS key live
   in the `veil_relay-data` volume and survive rebuilds.
+  * Until Veil 1.0, an update may change the database layout. The relay then refuses to start and
+    logs `database: the database was written by an incompatible relay version`.
+  * Queued messages are lost by the reset, but the TLS key and pin are kept. To reset only the
+    database:
+    ```sh
+    docker compose stop relay
+    docker run --rm -v veil_relay-data:/data --entrypoint "" docker.io/library/busybox:1.37 \
+      rm -f /data/relay.redb
+    docker compose up -d relay
+    ```
 * **Backups:** the only thing worth backing up is the TLS key (`/data/tls/key.pem` in the volume).
   If you lose it, every client must re-pin a new relay. Queued messages are ciphertext and expire on
   their own. Copy the key out with `docker cp $(docker compose ps -q relay):/data/tls ./tls-backup`,
@@ -236,7 +256,8 @@ expire after 14 days. Run it only on a relay you are about to reset.
     through, for example with IPv6 enabled on the Docker network.
   * Each mailbox can always hold 64 delivery tokens, however full the relay-wide cap for tokens
     beyond that is. Token changes and acknowledgements are limited to 20, then 1 per second, per
-    mailbox, and requests that change nothing are not written.
+    mailbox. Requests that change nothing at all (an empty change, or an ack with nothing to
+    remove) are not written.
   * A connection must authenticate a mailbox, or deliver, upload or download something, within 30 s.
   * Every write to a client has a 30 s timeout.
   * A mailbox that is never authenticated is deleted after 24 h; an authenticated one after 60
@@ -253,8 +274,8 @@ expire after 14 days. Run it only on a relay you are about to reset.
   observer can see that you're using TURN. `turns:` requires a certificate from a public CA, because
   WebRTC doesn't accept pinned certificates for TURN.
 * **IP addresses in memory.** The relay must hold connected clients' IP addresses in memory while
-  they're connected, and coturn must hold them for the length of a call. Neither writes them
-  anywhere.
+  they're connected, and as a rate-limit key for up to about 30 minutes after their last
+  activity. coturn must hold them for the length of a call. Neither writes them anywhere.
 * **Open mailbox creation.** The relay doesn't know who its users are, by design, so anyone can
   create mailboxes and use up the storage caps. That stops new messages and uploads, but it can't
   read or delete anything already stored. Rate limits don't really slow it down: with many tokens per
@@ -271,8 +292,12 @@ expire after 14 days. Run it only on a relay you are about to reset.
   | Mailbox creation (20, then 1 per second) | about 60, continuously | Onboarding and mailbox rotation refused |
   | Upload tokens (1 000 000 live) | about 680 | Attachment uploads refused |
 
-  One host can also keep the database writer busy with real writes into its own mailboxes: deposits
-  with its own tokens, up to the per-connection frame limits. The review measured a victim's
-  deposit latency rising from 3.4 ms to 62 ms under a comparable load, on a fast disk. On an SD
-  card it would be worse.
+  One host can also keep the database writer busy with real writes:
+  - deposits into its own mailboxes with its own tokens, up to the per-connection frame limits;
+  - attachment chunk uploads. Chunk re-sends are bounded per upload token (each chunk once, plus
+    16 resumes), but a host can keep requesting new tokens within its per-source rate.
+
+  The review measured a victim's deposit latency rising from 3.4 ms to 62 ms under deposit load
+  (debug build, fast disk). Under unbounded chunk re-sends, before that bound existed, it measured
+  about 90 MiB/s of writes. On an SD card this means latency, and wear.
 * **Not audited.** Treat this as a carefully built but independently unverified system.

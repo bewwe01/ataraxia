@@ -177,7 +177,9 @@ impl Config {
     /// (review P3R3-2).
     pub fn set_per_source_connections(&mut self, n: u32) {
         let base = Self::default().max_connections_per_source.max(1);
-        let factor = f64::from(n.max(1)) / f64::from(base);
+        // Only ever scaled up: a lower connection cap must not starve clients of the other
+        // allowances, nor shrink the response share below one full fetch (review P3R4-4).
+        let factor = (f64::from(n.max(1)) / f64::from(base)).max(1.0);
         let scale = |r: Rate| Rate {
             burst: scaled(r.burst, factor),
             per_sec: r.per_sec * factor,
@@ -972,15 +974,24 @@ impl Conn {
 
             Request::BlobUploadToken(b) => {
                 let m = self.require_auth(&b.mailbox_id).await?;
-                if !lock(&sh.upload_tokens).allow(&m)
-                    || !lock(&sh.upload_tokens_per_source).allow(&limiter_key(self.source))
+                // Peek both buckets first, so one refusal does not spend the other; give both
+                // back if the relay-wide cap refuses (review P3R4-10).
+                let source = limiter_key(self.source);
+                if !lock(&sh.upload_tokens).would_allow(&m)
+                    || !lock(&sh.upload_tokens_per_source).would_allow(&source)
                 {
                     return Err(ErrorCode::RateLimited);
                 }
+                lock(&sh.upload_tokens).allow(&m);
+                lock(&sh.upload_tokens_per_source).allow(&source);
                 let mut token = [0u8; 32];
                 rand::rng().fill(&mut token);
                 let h = upload_hash(&token);
-                sh.db(move |s| s.add_upload_token(&h, now)).await.map_err(code)?;
+                if let Err(e) = sh.db(move |s| s.add_upload_token(&h, now)).await {
+                    lock(&sh.upload_tokens).refund(&m);
+                    lock(&sh.upload_tokens_per_source).refund(&source);
+                    return Err(code(e));
+                }
                 Ok(Response::UploadToken(UploadTokenResponse {
                     upload_token: token.to_vec(),
                 }))

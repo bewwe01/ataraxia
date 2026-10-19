@@ -2,6 +2,31 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 3: after review round 4 conditions (2026-10-19)
+
+Review round 4 returned **PASS WITH CONDITIONS** (no Critical or High). All five conditions and the Lows are addressed. Each new test was mutation-checked.
+
+| Finding | Fix | Test (mutant that fails it) |
+|---|---|---|
+| P3R4-1 disk sizing | README and `.env.example` give the full bound: 7.4 M token rows (about 1.2 GB), 1 M upload tokens (about 160 MB), roughly 23 GB worst case with the defaults | docs |
+| P3R4-2 CI job wrong | Step 2 polls for the rule; step 3 moves `/etc/veil-turn.nft` aside so the rule genuinely cannot load, then expects Docker to refuse. README wording: "Docker loads the rule when it starts and refuses to start if it cannot". | CI `firewall-unit` (first run pending) |
+| P3R4-3 rule lost on nftables start/stop | New drop-in `nftables-veil-turn.conf`: `ExecStartPost`, `ExecReload` (after the distribution's reload) and `ExecStopPost` re-load the rule. The unit drops `PartOf`/`ReloadPropagatedFrom`. | CI `firewall-unit` step 2: stop, start from inactive, restart, reload, stop; the rule must be present after each (first run pending) |
+| P3R4-4 low cap breaks fetches | `set_per_source_connections` only scales allowances up (factor ≥ 1) | `a_low_connection_cap_keeps_full_fetches_working` (n = 1 and 8; the unclamped factor fails it) |
+| P3R4-5 unbounded `BlobPut` re-sends | Upload-token record counts puts; more than chunks + 16 → `QuotaExceeded`. Schema version 4. README and THREAT_MODEL name the path. | `chunk_resends_per_token_are_bounded` (no bound → fails) |
+| P3R4-6 "no-op" wording | Reworded: only *empty* changes and acks are skipped | docs |
+| P3R4-7 M7/M8 survived | `floor_rows_are_released_correctly` (M7 now fails it); `foreign_schema_is_refused` extended with a lone `STATS` counter (M8 now fails it) | as named |
+| P3R4-8 doc gaps | README L9/L255 retention wording; PROTOCOL §14 Ack row | docs |
+| P3R4-9 update path | README "Updates" explains the schema refusal and how to reset only the database | docs |
+| P3R4-10 upload buckets | Peek both buckets before spending; refund both on a quota refusal | covered by the `upload_tokens_are_limited_per_source` path; the refund itself has no dedicated test |
+
+```text
+$ cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings   # exit 0
+$ cargo test --workspace --locked
+  veil_core 74 | secrets 3 | session 22 (+1 ignored) | veil_relay lib 25 | logs 1 | relay 24 | smoke 0 (+2 ignored) | veil_wire 5
+```
+
+To save budget, no separate round 5 was run. The final review gate covers these fixes together with the Phase 4 client and app.
+
 ## Phase 3: after review round 3 conditions (2026-10-19)
 
 Review round 3 returned **PASS WITH CONDITIONS**: no Critical or High findings, four Medium conditions and five Lows (`docs/REVIEW_REPORT.md`). All nine are addressed. Each new test was mutation-checked.

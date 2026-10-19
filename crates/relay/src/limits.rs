@@ -106,6 +106,14 @@ impl KeyedLimiter {
             .take(rate, now)
     }
 
+    /// Whether `key` has a token available now, without taking it.
+    pub fn would_allow(&self, key: &[u8; 32]) -> bool {
+        self.buckets.get(key).is_none_or(|b| {
+            let mut probe = *b;
+            probe.take(self.rate, Instant::now())
+        })
+    }
+
     /// Gives back a token taken by [`Self::allow`] for a request that was then refused
     /// for another reason (review P3R3-9).
     pub fn refund(&mut self, key: &[u8; 32]) {

@@ -211,7 +211,7 @@ Defined in `crates/wire` (shared by client and relay).
 
 **Storage.** For an envelope the relay stores `{ mailbox_id, seq, received_minute, envelope }` with a TTL (default 14 days); a full mailbox (5 000 envelopes) or a full relay (byte cap, default 1 GiB) refuses new deposits with `QuotaExceeded`. It never drops queued envelopes to make room. Mailboxes not authenticated for 60 days expire, and mailboxes never authenticated at all expire after 24 h. Every mailbox may always hold 64 delivery-token hashes. Rows beyond that are capped at 1 000 000 relay-wide, and live upload tokens at 1 000 000. Incomplete blobs expire with their upload token (24 h), complete ones 30 days after completion. Expiry runs from an index of due times, in short batches. **No sender, no IP, no User-Agent, no connection record** is stored or logged (INV-META-2, INV-LOG-1).
 
-**Rate limits** are token buckets keyed by delivery token, mailbox, connection or source key (below), plus relay-wide ones for mailbox creation. Nothing IP-derived is stored or logged, and source-keyed buckets are forgotten once they refill. Token changes and acknowledgements are limited to 20, then 1/s, per mailbox, and requests that change nothing are not written. Rate-limit refusals echo the request id.
+**Rate limits** are token buckets keyed by delivery token, mailbox, connection or source key (below), plus relay-wide ones for mailbox creation. Nothing IP-derived is stored or logged, and source-keyed buckets are forgotten once they refill. Token changes and acknowledgements are limited to 20, then 1/s, per mailbox, and requests that change nothing at all (an empty token change, an ack with nothing to remove) are not written. Rate-limit refusals echo the request id.
 
 **Connections.**
 - At most 1 024 concurrent connections. The only use of the peer address is a source key (IPv4 address or IPv6 /64), held in memory only and never stored or logged. Per source, the relay allows:
@@ -356,6 +356,7 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 | Per source (scale with the connection cap) | response budget 8 MiB of 64; mailbox creations 10, then 1/min; upload tokens 30, then 1/min |
 | Mailboxes | 100 000 per relay; deleted after 24 h if never authenticated, after 60 days without authentication otherwise |
 | Delivery tokens | 512 per mailbox; the first 64 always allowed; 1 000 000 beyond that relay-wide; changes 20, then 1/s per mailbox |
-| Upload tokens | 1 000 000 live relay-wide; 20, then 0.1/s per mailbox; 24 h lifetime |
+| Upload tokens | 1 000 000 live relay-wide; 20, then 0.1/s per mailbox; 24 h lifetime; at most (chunks + 16) chunk writes each |
+| Acknowledgements | 20, then 1/s per mailbox |
 | Invite TTL | ≤ 7 days (default 24 h) |
 | Clock skew accepted | ±120 s for auth; message timestamps never security-relevant |

@@ -42,13 +42,16 @@ const STAT_TOKEN_ROWS: &[u8] = b"token_rows_over_floor";
 /// Database layout version (P3R2-9). A database without it, or with another, is refused:
 /// silently opening an older layout would leave records without expiry entries.
 const STAT_SCHEMA: &[u8] = b"schema";
-pub const SCHEMA_VERSION: u64 = 3;
+pub const SCHEMA_VERSION: u64 = 4;
 
 const X_ENVELOPE: u8 = b'e';
 const X_INVITE: u8 = b'i';
 const X_UPLOAD: u8 = b'u';
 const X_BLOB: u8 = b'b';
 const X_MAILBOX: u8 = b'm';
+
+/// Chunk writes allowed per upload token beyond one per chunk (resumes after drops).
+const MAX_EXTRA_PUTS: u32 = 16;
 
 /// Expired records handled per sweep transaction, so the writer is never held for long.
 const SWEEP_BATCH: usize = 256;
@@ -725,7 +728,7 @@ impl Store {
             if let Some(old) = t
                 .insert(
                     &token_hash[..],
-                    &cat(&[&expires.to_be_bytes(), &[0u8], &[0u8; 32]])[..],
+                    &cat(&[&expires.to_be_bytes(), &[0u8], &[0u8; 32], &0u32.to_be_bytes()])[..],
                 )
                 .map_err(io)?
             {
@@ -787,6 +790,13 @@ impl Store {
             if bound && bound_blob != *blob {
                 return Err(StoreError::Unauthorized);
             }
+            // Each put rewrites a chunk and commits, and a re-send costs no quota, so the
+            // number of puts per token is bounded: every chunk once, plus some resumes
+            // (review P3R4-5: unbounded re-sends were ~90 MiB/s of writes from one host).
+            let puts = u32_at(&tok, 41)?.saturating_add(1);
+            if puts > total.saturating_add(MAX_EXTRA_PUTS) {
+                return Err(StoreError::Quota);
+            }
             let mut blobs = txn.open_table(BLOBS).map_err(io)?;
             let existing = blobs
                 .get(&blob[..])
@@ -843,9 +853,9 @@ impl Store {
                 toks.remove(&token_hash[..]).map_err(io)?;
                 index_del(&mut x, X_UPLOAD, tok_expires, token_hash)?;
                 sub_stat(&mut stats, STAT_UPLOAD_TOKENS, 1)?;
-            } else if !bound {
-                let rebound = cat(&[&tok_expires.to_be_bytes(), &[1u8], blob]);
-                toks.insert(&token_hash[..], &rebound[..]).map_err(io)?;
+            } else {
+                let record = cat(&[&tok_expires.to_be_bytes(), &[1u8], blob, &puts.to_be_bytes()]);
+                toks.insert(&token_hash[..], &record[..]).map_err(io)?;
             }
         }
         self.commit(txn)?;
@@ -1521,10 +1531,60 @@ mod tests {
         s.set_schema(None);
         drop(s);
         assert_eq!(Store::open(&up, quotas()).unwrap_err(), StoreError::Schema);
+        // P3R4-7 (M8): a lone counter, with every table empty, is refused too.
+        let counter = dir.join("counter");
+        let s = Store::open(&counter, quotas()).unwrap();
+        s.add_upload_token(&[1; 32], 1000).unwrap();
+        s.sweep(10_000).unwrap(); // the token expires; its counter row stays (at 0)
+        s.set_schema(None);
+        drop(s);
+        assert_eq!(Store::open(&counter, quotas()).unwrap_err(), StoreError::Schema);
         // An empty, unversioned database is simply stamped.
         let fresh = dir.join("fresh");
         drop(redb::Database::create(&fresh).unwrap());
         Store::open(&fresh, quotas()).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// P3R4-5: chunk re-sends per upload token are bounded (each one is a committed write
+    /// that costs no quota).
+    #[test]
+    fn chunk_resends_per_token_are_bounded() {
+        let (s, dir) = store();
+        s.add_upload_token(&[1; 32], 1000).unwrap();
+        // A 2-chunk blob allows 2 + 16 puts; re-send chunk 0 until refused.
+        for i in 0..18 {
+            assert!(
+                !s.put_chunk(&[1; 32], &[2; 32], 0, 2, &[0; 100], 100, 1000)
+                    .unwrap(),
+                "put {i}"
+            );
+        }
+        assert_eq!(
+            s.put_chunk(&[1; 32], &[2; 32], 0, 2, &[0; 100], 100, 1000),
+            Err(StoreError::Quota)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// P3R4-7 (M7): deleting or idling out a mailbox gives back only its rows *over the floor*.
+    #[test]
+    fn floor_rows_are_released_correctly() {
+        let (s, dir) = store_with(Quotas {
+            token_floor_per_mailbox: 2,
+            max_token_rows: 3,
+            ..quotas()
+        });
+        let t = |i: u8| [i; 32];
+        let (one, two, three) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        for m in [&one, &two, &three] {
+            s.create_mailbox(m, &[9; 32], 1000).unwrap();
+            s.update_tokens(m, &[t(1), t(2), t(3)], &[]).unwrap(); // 1 over the floor each
+        }
+        // Cap (3) full. Deleting one mailbox frees exactly its 1 row over the floor, not 3.
+        s.delete_mailbox(&one).unwrap();
+        s.update_tokens(&three, &[t(4)], &[]).unwrap();
+        assert_eq!(s.update_tokens(&two, &[t(4)], &[]), Err(StoreError::Quota));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
