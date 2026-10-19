@@ -282,3 +282,221 @@ all 12 Content variants round-trip through decode_strict   // code is fine; INV-
 3. Address or explicitly defer (with a phase) L1 to L8.
 
 VERDICT: FAIL
+
+---
+
+## Phase 2 review, round 2 (2026-10-19)
+
+**Reviewer:** independent code-reviewer agent (adversarial gate), round 2.
+**Scope:** `git diff 32f8b16..HEAD` (HEAD = `09a2963`, 8 commits: `3e95085` H1/L5, `4c47566` H2/L6, `86bf928` H3/M1/L2/L3, `32c907c` M2/M3, `6975947` M4, `f4521a4` M5/L1/L4/L7/L8, `2c72705` inout bump, `09a2963` docs). I also re-read all of `crates/core/` (src, tests, fuzz targets, vectors), `Cargo.toml`, `deny.toml`, `.cargo/audit.toml`, `supply-chain/`, `.github/workflows/`, and the Phase 2 parts of the docs. Binary corpus files were skipped.
+**libsignal consulted:** `~/.cargo/git/checkouts/libsignal-2a193a9867decbc4/4beb029`: `sealed_sender.rs` (`UnidentifiedSenderMessageContent::new`, `sealed_sender_encrypt_from_usmc`), `protocol.rs`, `consts.rs`, `triple_ratchet.rs`, and `rust/crypto/src/aes_cbc.rs`.
+
+**Verdict: PASS WITH CONDITIONS.** All 3 High findings from round 1 are fixed, and I re-verified each with my own probes. No new Critical or High was found. One new Medium is open (N1: the `contact_plaintext` fuzz target cannot reach the code it claims to fuzz). M2, M4, M5 and L7 are only partially fixed. There are 7 new Low findings.
+
+### 1. Evidence re-run (real output, 2026-10-19)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | no output, exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | `Finished 'dev' profile … in 4.41s`, exit 0, no warnings |
+| `cargo test --workspace --locked` | unit `72 passed`; `tests/secrets.rs` `3 passed`; `tests/session.rs` `21 passed`; doctests `0`. **96 in total, which matches TEST_REPORT.** |
+| `cargo deny --locked check` | `advisories ok, bans ok, licenses ok, sources ok`, exit 0. Warnings: 8 × `duplicate` and the `license-not-encountered` notes (CC0-1.0, CDLA-Permissive-2.0, …). |
+| `cargo audit --deny warnings` | `Loaded 1338 security advisories`, `Scanning Cargo.lock for vulnerabilities (203 crate dependencies)`, exit 0. One documented ignore (RUSTSEC-2026-0173). |
+| `cargo vet --locked` | `Vetting Succeeded (36 fully audited, 3 partially audited, 158 exempted)`, exit 0 |
+| `RUSTFLAGS="--cfg fuzzing" cargo clippy -p veil-core --locked -- -D warnings` (scratch copy, scratch target) | clean. CI never lints the fuzz-only hooks, so I checked them here. |
+
+**Fuzzing.** `cargo +nightly-2026-10-01 fuzz run -O <t> <scratch copy of corpus/t> -- -max_total_time=60 -max_len=70000 -rss_limit_mb=2048`, with corpora copied to the scratchpad and the artifact prefix pointed there:
+
+| Target | Runs / 61 s | Final cov / ft | `lim` | Crashes |
+|---|---|---|---|---|
+| ice_sdp | 1,537,215 | 962 / 4694 | 3918 | 0 |
+| contact_inner | 18,320 | 8391 / 10729 | 427 | 0 |
+| contact_plaintext | 2,961 | 4302 / 6147 | **40** | 0 |
+| envelope_unframe | 28,085,913 | 33 / 34 | 70000 | 0 |
+
+`git status` was clean after every run.
+
+**Oracle and vectors.** I ran `pyenv/bin/python3 -I crates/core/tests/vectors/gen.py` with argon2-cffi. Its output differs from the committed `tests/vectors/vectors.rs` only in line wrapping; after `rustfmt --edition 2024` the two are **byte-identical**. Its built-in self-tests passed: libsignal's published fingerprint `300354…079131` and the HChaCha20 draft vector.
+
+**Supply chain checks.**
+- gitleaks: the SHA-256 pinned in `ci.yml`, `551f6fc8…70eb`, equals the entry in the release's `gitleaks_8.30.1_checksums.txt`, which I fetched.
+- inout: I diffed the `inout` 0.2.3 → 0.2.4 sources myself; see N6.
+
+**Probe crate.** I wrote a scratch crate outside the repo with a path dependency on an unmodified copy of HEAD, built with `--cfg fuzzing` so it can reach `fuzz_seal_inner`, plus mutation runs on a second scratch copy:
+
+```
+# H1: seal_to_bucket over every inner Whisper length 0..65600 (one call each)
+len 0 -> bucket 1024 | len 653 -> 4096 | len 3725 -> 16384 | len 16013 -> 65536 | len >= 65163 -> ERR TooLarge
+done: errors only at len >= 65163 (437 = 65600-65163), mean 846 us, worst 6.4 ms per seal
+
+# Max-size valid content
+validate(Text 63488 = MAX_BODY_LEN) = true
+alice (PreKey phase) seal: Err(TooLarge)      bob (Whisper) seal: Ok(65536)
+
+# Mutation: transact() commits instead of rolling back on error
+rollback_tests::* -> 2 FAILED            tests/session.rs -> 21 passed (no other test notices)
+# Mutation: remove `if ik != invite.identity` (account.rs:546)
+pairing_tests::package_with_swapped_identity_or_signature_refused -> ok ; bundle_must_match_invite_identity -> ok
+# Mutation: accept sealed-sender byte by high nibble only (libsignal's own rule)
+every_bit_flip_rejected_and_state_unchanged -> FAILED
+# Mutation: (RelayOnly, "relay") => true
+relay_candidates_must_be_public, relay_only_never_emits_non_relay, relay_only_sdp_never_leaks -> FAILED
+
+# H3: real browser SDPs, relay-only offer
+Firefox audio+video offer (68 lines) -> OK, 67 kept (host candidate dropped)
+Chrome video offer with VP8/VP9/AV1/H265/H264, rid, simulcast (45 lines) -> OK, 45 kept
+"a=ssrc:1 cname:3232235796" / "cname:0xC0A80114" / "cname:abcd1234.local" -> passed through (no dot or colon)
+"candidate:1 +1 udp 1 8.8.4.4 9 typ relay generation +7" -> "... 1 +1 udp ... generation +7" (not canonical)
+"a=candidate:1 1 udp 1 ::ffff:0:10.0.0.1 9 typ relay" -> kept as public
+"a=candidate:1 1 udp 1 abc.local 9 typ host", Direct { allow_lan: true } -> None
+```
+
+Not re-run: Miri (TEST_REPORT: 31 passed), and fuzz targets `account_open`, `content_decode`, `invite_link` and `vault_header`.
+
+### 2. Status of the round-1 findings
+
+| # | Status | Evidence |
+|---|---|---|
+| **H1** cleartext length | **FIXED** | Framing v2 is `0x02 ‖ sealed`, with no length field and no outer padding (`envelope.rs`). `unframe` is strict: exact bucket and version 2. `seal_to_bucket` (`account.rs:471`) always terminates, with at most 1 + 4 × 2 × 8 seals. **My exhaustive scan of every inner length found no gap below the 64 KiB cap.** The filler sits inside the sealed-sender AES-CTR/HMAC layer, which is deterministic in length. The relay-visible outer protobuf lengths are therefore constant per bucket, which `relay_learns_only_the_bucket` checks across PreKey and Whisper messages. On receipt, `groupId` and `contentHint` are ignored, so a contact gains nothing they could not already send as content. Residuals: the PreKey→4 KiB leak is documented; the missing ADR is under N4; the capacity mismatch is N7. |
+| **H2** non-atomic commit | **FIXED** | `KvBackend` now has only `get`, `keys_with_prefix` and `apply(batch)`. **No write path bypasses the batch:** `VeilStore::put`/`delete` write to the overlay, `commit` makes one `apply` call and keeps the overlay on error, and `Account::create` writes through `apply`. `failed_commit_changes_nothing_and_retry_succeeds` checks a byte-identical backend, a successful retry and one batch per transaction. Note: atomicity now depends entirely on each backend's `apply`. Ship a reusable backend-conformance test with the SQLCipher backend in Phase 4. |
+| **H3** SDP leaks | **FIXED** | `filter_sdp` is now an allowlist:<br>• `o=`, `c=` and `m=` are rebuilt;<br>• unknown `a=`, `i=`, `u=`, `e=` and other lines are dropped;<br>• candidates are re-serialised from parsed fields;<br>• bare LF and CR are refused as control characters;<br>• non-ASCII is refused;<br>• attribute names are case-folded before both the allowlist and the DTLS checks.<br>None of my bypass attempts got through: CRLF/LF, odd casing, whitespace in attribute names, zone ids, brackets, hostnames, leading-zero/octal and `0x` dotted IPv4, IPs glued to text, the `m=` tail, `a=rtcp`, `a=remote-candidates` and `RADDR`. Real Firefox and Chrome SDPs pass, so I found no false positive that breaks a normal call. Residuals (docs, nits): N4 and §4. |
+| **M1** relay candidates unchecked | **FIXED** | `(RelayOnly, "relay") => is_public_ip(ip)`. Mutation-verified: three tests fail when the check is removed. |
+| **M2** Debug leaks | **PARTIALLY FIXED** | Every prost type has `skip_debug` plus `redacted_debug!`, `Opened`'s Debug is redacted through `Content`, and `InviteRecordPb` zeroizes `proof_key` on drop. Not done (N5): the attachment key, delivery tokens, invite proofs and re-key links in decoded `Content` are plain `Vec`s that are never zeroized, and INV-REST-4 does not list this as a known gap. |
+| **M3** argument-only claims | **FIXED** | `downgraded_messages_refused` (a v3 Whisper from a real contact gives `UnsupportedVersion`; a PreKey without Kyber is built and refused), `certificate_key_must_match_sealing_key` (foreign sealing key, wrong root, wrong name) and `strangers_and_self_addressed_envelopes_dropped`. Still missing, but minor: a v3 *PreKey* message and a certificate with a device id other than 1. |
+| **M4** rollback untested | **PARTIALLY FIXED** | `rollback_tests::*` cover decrypt-then-refuse for new-contact intros and for undecodable content from a known contact. **I reproduced the author's mutation check: both tests fail when `transact` commits on error.** Still untested (N3): the known-contact `consume_invite_if_proven` path (`account.rs:739`), which round 1 named explicitly. |
+| **M5** fuzz depth | **PARTIALLY FIXED** | `contact_inner` really does act as an authenticated contact: cov 8391 against 794 for `account_open`, reaching libsignal parsing and SPQR before the MAC check. `contact_plaintext` **cannot** reach content handling (N1). The `cfg(fuzzing)` hooks cannot enter a normal build: the cfg is set only by `cargo fuzz` (`RUSTFLAGS`), and dependents cannot set it. I found no dependency whose behaviour changes under `cfg(fuzzing)`; libsignal, spqr and the RustCrypto crates have no such code. The INV-MSG-5 status of **partial** is honest about the missing 1 h runs. |
+| **L1** KDF cost | **FIXED** | `CEILING` (512 MiB, t = 8, p = 4) is checked in `decode` before Argon2 runs; tested, including timing. Residual: a tampered header can still ask a phone running the 64 MiB preset for 512 MiB × 8 passes, about 8× its normal unlock cost. That is acceptable; a per-device cap is optional. |
+| **L2** IPv6 classes | **FIXED** | v4-compatible, NAT64, 6to4, Teredo and `fec0::/10` are now covered. Nit: the IPv4-translated `::ffff:0:a.b.c.d` form is still treated as public; it is not exploitable. |
+| **L3** `a=setup` consistency | **FIXED** | `dtls_validation` now includes mixed `a=setup` roles. |
+| **L4** chunk nonce reuse | **FIXED** | `encrypt_chunk` is private, and `encrypt` draws a fresh key and prefix on every call. |
+| **L5** sealed sender v2 | **FIXED** | The first sealed byte must be exactly `0x11` (`account.rs` `open`). Mutation-verified: the bit-flip test fails at byte 1 (0x13) when only the high nibble is checked. |
+| **L6** silent delete | **FIXED** | `delete_invite` propagates the borrow error. |
+| **L7** weak tests | **PARTIALLY FIXED** | Now covered:<br>• all 12 `Body` and 5 `CallKind` variants round-trip;<br>• strangers and self-sends are refused on the receiver side;<br>• one-time prekeys are deleted;<br>• safety-number KAT, reproduced by me;<br>• multi-chunk attachment KAT, reproduced by me;<br>• vectors moved to `tests/vectors/`.<br>Not fixed:<br>• the INV-PAIR-1 test still does not isolate the identity check (N2; mutation-verified);<br>• `gen.py` is not run in CI;<br>• the ICE proptest oracle reuses the code under test (N9). |
+| **L8** CI | **FIXED** | gitleaks hash pinned and checked by me; fuzz lockfile checked with `cargo metadata --locked`; crash inputs printed as hex; nightly 1 h workflow added. Both workflows pin actions by SHA, set `permissions: contents: read`, and use `persist-credentials: false`. The nightly has no recorded run yet, which the docs disclose. |
+
+### 3. New findings
+
+| # | Sev | Area | Location | Summary |
+|---|---|---|---|---|
+| N1 | **Medium** | Fuzzing claims (INV-MSG-5) | `fuzz/fuzz_targets/contact_plaintext.rs`; `account.rs:838`; INVARIANTS INV-MSG-5; TEST_REPORT | `contact_plaintext` passes raw fuzz bytes as already-padded plaintext. `unpad_block` rejects any length that is not a multiple of 256, and the committed corpus maxes out at 40 bytes, so **no input ever reaches content decoding, validation, invite-proof handling or the post-decrypt transaction logic it claims to fuzz** |
+| N2 | Low | Weak test (INV-PAIR-1) | `account.rs` `pairing_tests`, `tests/session.rs:423`; INVARIANTS INV-PAIR-1 | With `if ik != invite.identity` (`account.rs:546`) **removed**, both INV-PAIR-1 tests still pass: libsignal's signature check under the swapped key rejects the bundle first |
+| N3 | Low | Untested rollback path (M4 residual) | `account.rs:739` `consume_invite_if_proven` | No test of a known contact redeeming a re-key invite: neither success (invite and prekeys consumed) nor refusal (bad proof or expired → state unchanged) |
+| N4 | Low | Docs vs code | PROTOCOL §8 (`:205-213`), `ice.rs:8-12`, ARCHITECTURE ADR-0006 | §8 still describes the old line filter and the "Independently, Rust filters…" claim that round 1 asked to qualify. It and the `ice.rs` header promise mDNS in LAN mode, but the code drops `.local` in every mode. The new USMC `groupId`-filler composition has no ADR entry (CLAUDE.md non-negotiable 1) |
+| N5 | Low | Secret hygiene (M2 residual) | `content.rs` (`Attachment.key`, `ContactIntro.delivery_token`/`invite_proof`, `RekeyInvite.link`, `MailboxUpdate.new_delivery_token`); `account.rs:83` | Decoded secrets live in plain `Vec`/`String` and are never zeroized. `InviteRecordPb`, which holds the proof key, derives `Clone` and a non-constant-time `PartialEq`. `Opened::NewContact`'s derived Debug prints the full identity public key, which CLAUDE.md's logging rule forbids |
+| N6 | Low | Supply chain | `supply-chain/audits.toml:3-8`, `supply-chain/config.toml:309` | The AI-written `safe-to-deploy` delta audit for `inout` 0.2.3→0.2.4 counts as a real audit in `cargo vet`. Its rationale "Veil's AEAD paths do not use block padding" is misleading: libsignal's Triple Ratchet encrypts **every message** with AES-256-CBC/PKCS7 (`aes_cbc.rs:34` → `cipher::encrypt_padded` → `inout::into_padded_blocks`), the function this release changed. I checked the delta itself and it is accurate. The stale 0.2.3 exemption remains |
+| N7 | Low | Correctness (likely pre-existing) | `content.rs:13,15`; `account.rs:471` | `Content` at `MAX_BODY_LEN` validates, but `seal` returns `TooLarge` for it while the session is in its PreKey phase (probe above): the 1569-byte Kyber ciphertext plus SPQR overhead does not fit the 65,163-byte inner cap |
+| N8 | Low | Fuzz efficiency | `contact_inner.rs`; `account.rs:828-832` | Half of all inputs are wasted: types 2 and 3 are refused at once. No corpus seed is a genuine PreKey/Whisper message (max 403 B against ~1.7 KB for a PreKey with Kyber), so the PreKey-from-contact path with a Kyber ciphertext is barely explored (`lim` 427 after 60 s) |
+| N9 | Low | Oracle quality / claims | `ice.rs:708` (`assert_relay_only_output`); `fuzz_targets/ice_sdp.rs:12`; INVARIANTS INV-MSG-5 and INV-SUP-3 | Weak oracles and stale numbers (details below) |
+
+#### N1. `contact_plaintext` never gets past unpadding. [HIGH confidence]
+
+- **Why nothing gets through:**
+  - `fuzz_seal_plaintext` hands `data` unchanged to `seal_bytes_in_tx` ("already padded plaintext"). On receipt, `decrypt_in_tx` calls `unpad_block`, which returns `Malformed` unless `len % 256 == 0`, the marker is `0x80`, and the rest is zeros (`padding.rs:34-44`).
+  - All 84 committed corpus files are 4–40 bytes, and none is a multiple of 256.
+  - With `-len_control`, the length limit grows slowly: `lim: 40` after my 61 s run (2,961 runs). At about 16 execs/s, even an hour of fuzzing is unlikely to produce a 256-multiple with a valid marker *and* a canonical protobuf.
+- **What is therefore never fuzzed:**
+  - `Content::decode_strict` and `validate` on authenticated input;
+  - the known-contact `ContactIntro` → `consume_invite_if_proven` path;
+  - every post-decrypt rollback branch.
+- **What the docs claim instead:** the target's doc comment, INVARIANTS INV-MSG-5 ("reach libsignal, SPQR and content handling") and TEST_REPORT all say otherwise. Its cov 4302 is libsignal encrypt/decrypt, not content handling. This is the claims-vs-evidence gap round 1 flagged as M5.
+- **Long-run concern (MEDIUM confidence):** every refused input leaves Bob's receive chain behind Alice's. More than 25,000 consecutive refusals (libsignal `MAX_FORWARD_JUMPS`) would wedge the target into "too far in the future" errors for the rest of the run.
+- **Fix:**
+  - Pad in the hook: `seal_bytes_in_tx(rng, &remote, &pad_block(plaintext), now)`. Keep a raw-bytes mode behind a selector byte, so unpadding is still fuzzed.
+  - Seed `corpus/contact_plaintext` with `encode()` of every `Body` variant, including a `ContactIntro` carrying `invite_id`/`invite_proof` for an invite that exists in the paired fixture.
+  - Re-run, record the coverage, and correct INV-MSG-5 and TEST_REPORT until then.
+  - Optionally, have Bob reply every N inputs so the chains never drift.
+
+#### N2. INV-PAIR-1 tests don't isolate the identity check. [HIGH, mutation-verified]
+
+- I removed `if ik != invite.identity { return Err(AuthFailed) }`. Both `package_with_swapped_identity_or_signature_refused` and `bundle_must_match_invite_identity` still pass.
+- The reason: the swapped package keeps Bob's prekey signatures, so libsignal's `SignatureValidationFailed` (also mapped to `AuthFailed`) rejects it anyway.
+- The comment "so the identity and signature checks themselves are exercised" overclaims.
+- **Fix:** in the swapped case, also replace `signed_prekey_pub/sig` and `kyber_prekey_pub/sig` with prekeys generated and signed by Mallory, so the bundle is internally consistent for Mallory. Then only the explicit identity check can reject it. Assert `AuthFailed`, and that no peer or session was recorded.
+
+#### N3. Known-contact re-key consumption is untested. [HIGH]
+
+- `consume_invite_if_proven` runs after a *successful* decrypt from a known contact, and can fail with `InviteInvalid` (expired) or `AuthFailed` (bad proof). Both are state-mutating rollback paths, and M4 listed them.
+- No test exercises the path at all, not even the success case. `grep -i rekey tests/` shows only Debug tests.
+- **Fix:**
+  - Add to `rollback_tests` a known contact sending a `ContactIntro { invite_id: <live invite>, invite_proof: <wrong> }` and the same with an expired invite. Assert a byte-identical backend, that the invite is still redeemable, and that the next genuine message opens.
+  - Add a success case asserting that `invite/`, `pk/`, `spk/` and `kpk/` are gone.
+
+#### N4. Docs out of step with the fixes.
+
+- **PROTOCOL §8** (`:205-213`):
+  - It still says only that non-relay `candidate` lines are removed. It does not say that `o=`, `c=` and `m=` are rebuilt, that unknown attributes are dropped, that relay addresses must be public, or that address-like content invalidates the SDP.
+  - Round 1 asked §8 to state that an SDP filter cannot stop the webview's own STUN checks from host candidates; only `iceTransportPolicy` can. That was not done.
+- **mDNS in LAN mode:** §8 says "LAN pairing mode is the only exception" for mDNS, and so does `ice.rs:10-12`. The code drops every `.local` candidate in every mode. That is fail-safe, but Chromium-based webviews obfuscate host candidates with mDNS by default, so LAN-mode direct calls will rarely get host candidates. Either document this or design it.
+- **Missing ADR:** the H1 fix changes how sealed sender is composed: `sealed_sender_encrypt_from_usmc` with a zero-filled `groupId` and a toggled `contentHint`, instead of `sealed_sender_encrypt`. CLAUDE.md non-negotiable 1 asks for an ADR for a new composition, so add a short note to ADR-0006.
+
+#### N5. Content secrets not zeroized; `InviteRecordPb` is `Clone`.
+
+- Round 1 M2 asked to "wrap `proof_key` and the attachment key in `Zeroizing` … or convert … right after decoding". Only `proof_key` was handled.
+- **Fix:**
+  - Implement `Drop` with `zeroize` for `Attachment`, `ContactIntro`, `RekeyInvite` and `MailboxUpdate`, as was done for `InviteRecordPb`. Alternatively, document the gap under INV-REST-4.
+  - Drop `Clone`/`PartialEq` from `InviteRecordPb`; nothing clones it.
+  - Make `Opened`'s Debug print the `Address` only, not the `IdentityKey` bytes.
+
+#### N6. cargo-vet audit rationale is wrong.
+
+- The delta content is fine. I confirmed it: a length check, `assert_eq!` → `debug_assert_eq!` after that check, and a test, with no new `unsafe` and no new dependencies.
+- **Fix:**
+  - Rewrite the `notes` to state that the changed function *is* on Veil's message path (libsignal AES-256-CBC/PKCS7).
+  - Until a human signs, record 0.2.4 as an `exemptions` entry rather than an `audits` entry, so `cargo vet` does not count an unconfirmed AI audit.
+  - Run `cargo vet prune` to remove the stale `inout 0.2.3` exemption.
+
+#### N7. Max-size content cannot be sealed as a first message.
+
+- **Fix:** set `MAX_CONTENT_LEN` so that `pad_block(MAX_CONTENT_LEN)` plus the worst-case PreKey overhead fits the 65,163-byte inner cap. That overhead is about 1569 (Kyber ciphertext) + ~33 base key + SPQR chunk + ~60 headers + 16 CBC; measure it.
+- Add a test that seals and opens maximum-size `Text` in both the PreKey and the Whisper phase.
+
+#### N8. `contact_inner` wastes inputs and lacks seeds.
+
+- **Fix:** map `ty` to Whisper/PreKey only (keep one rare value for the other types), and seed the corpus with genuine serialized PreKey and Whisper messages captured from the paired fixture.
+
+#### N9. Oracle quality and stale numbers.
+
+- **ICE proptest:** it checks its output with the filter's own `contains_ip_literal`, so it is not an independent oracle.
+- **`ice_sdp` fuzz oracle:** it exempts any line containing `127.0.0.1` and every loopback IPv4 from the IPv4 check. A line `…127.0.0.1 … 10.0.0.5` would not be flagged by the oracle, though the filter itself rejects it today.
+- **`contains_ip_literal` doc** ("any spelling … `inet_aton` accepts"): this overclaims. Bare decimal `3232235796` and `0xC0A80114` pass. That is harmless, because no browser writes those and no kept attribute is used for transport, but correct the comment.
+- **Stale numbers:**
+  - INV-MSG-5 says "3 min for the others", but after the framing and filter changes only `ice_sdp` (300 s) and `envelope_unframe` (20 s) were re-run. `account_open` was not.
+  - INV-SUP-3 still says "159 exempted" and "36 fully audited"; the real output is 158 exempted and 3 partially audited.
+- **Fix:**
+  - Use the fuzz target's independent `leaks` in the proptest.
+  - Remove the `line.contains("127.0.0.1")` blanket exemption; allow only the exact `o=` placeholder.
+  - Fix the doc comment and the numbers.
+
+### 4. Nits (no action required for this gate)
+
+- `filter_candidate` re-emits `+1` / `+7` / leading-zero numeric tokens verbatim (component and extension values), and accepts duplicate extension keys. The doc says "canonical form". Emit the parsed integers instead.
+- `seal_to_bucket` skips a bucket when its slack is 0–1 byte. PROTOCOL says "smallest that fits". This is harmless, but word it as "smallest with ≥ 2 bytes of slack".
+- `gen.py` output must be run through `rustfmt` before it matches the committed file; say so in its docstring. The script is still not run in CI.
+- CI clippy never compiles the `cfg(fuzzing)` hooks. Consider a `RUSTFLAGS="--cfg fuzzing" cargo clippy -p veil-core` step; it is clean today.
+
+### 5. Invariant status corrections required
+
+| ID | Claimed | Should be | Reason |
+|---|---|---|---|
+| INV-MSG-5 | partial, "reach … content handling" | partial; remove the content-handling claim until N1 is fixed | N1 |
+| INV-PAIR-1 | tested (core) | tested, but evidence weak; fix the test | N2 |
+| INV-REST-4 | partial | partial; add the decoded-content secrets gap | N5 |
+| INV-SUP-3 | numbers 36 / 159 | 36 / 3 partial / 158 | N9 |
+
+All other **tested** and **partial** statuses are backed by tests that exist and assert what is claimed. I grepped every test name cited in INVARIANTS.md and all exist.
+
+### 6. What is done well
+
+- **H1:** a clean fix. The sealed payload fills the bucket exactly, inside the encryption, using only libsignal's public API, and the regression test compares every relay-readable field across sizes and message types.
+- **H2:** fixed at the right layer. The backend trait can no longer express a non-atomic write.
+- **H3:** an allowlist rebuild instead of a blocklist, and it fails closed. Real Firefox and Chrome offers survive unchanged apart from dropped candidates, and fuzzing found and fixed a real `m=` tail bug.
+- **Mutation-checked tests:** the M4, M1 and L5 regression tests all fail when their fix is reverted (verified).
+- **Honest docs:** the reports are honest about what has not run yet (nightly 1 h fuzzing, PreKey 4 KiB visibility, the unconfirmed AI vet audit), and all TEST_REPORT numbers reproduce exactly.
+
+### 7. Conditions for PASS
+
+1. Fix N1: `contact_plaintext` must reach `decode_strict`/`validate`/`consume_invite_if_proven`, with seeded corpora and a recorded run. Until then, correct the INV-MSG-5, TEST_REPORT and target doc-comment claims.
+2. Fix N2 and N3, the remaining INV-PAIR-1 and INV-STATE-1 test gaps.
+3. Address N4 to N9 in docs or code, or defer each with a named phase, before the Phase 3 gate.
+
+VERDICT: PASS WITH CONDITIONS
