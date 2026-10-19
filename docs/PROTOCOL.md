@@ -146,19 +146,19 @@ A leaked invite link lets a third party redeem it. Mitigations:
    - `ServerCertificate { key_id = 1, key = signer_pub }` signed by the sender's **identity key** (the sender is its own trust root);
    - `SenderCertificate { sender_uuid = address, device_id = 1, key = identity_pub, expires = now + 30 days }` signed by the signer.
    
-   `sealed_sender_encrypt` encrypts the padded content with the libsignal session (Triple Ratchet) and seals it to the recipient's identity key.
-4. Frame: `version (1) = 1 || len (u32 BE) || sealed || zero padding`, with the total exactly one of {**1 KiB, 4 KiB, 16 KiB, 64 KiB**}, using the smallest that fits (INV-META-3). Larger payloads MUST go through attachments (§9).
+   `message_encrypt` encrypts the padded content with the libsignal session (Triple Ratchet). The result is wrapped in an `UnidentifiedSenderMessageContent` and sealed to the recipient's identity key with `sealed_sender_encrypt_from_usmc`. This is the same composition as libsignal's `sealed_sender_encrypt`, with one difference: the USMC's `groupId` field (unused by Veil) carries zero filler bytes. Their count is chosen so that the sealed output is exactly `bucket − 1` bytes for the smallest bucket that fits. When a protobuf varint boundary makes one size unreachable, the `contentHint` field is set as well (+2 bytes). Both fields are inside the sealed-sender encryption and are ignored on receipt.
+4. Frame: `version (1) = 2 || sealed`, with the total exactly one of {**1 KiB, 4 KiB, 16 KiB, 64 KiB**} (INV-META-3). There is no length field and no padding outside the encryption, so within a bucket every relay-visible length is identical whatever the content size or message type (test `relay_learns_only_the_bucket`). Because a PreKey message carries a 1569-byte ML-KEM ciphertext, it never fits 1 KiB: a short first message is visible as 4 KiB rather than 1 KiB. Larger payloads MUST go through attachments (§9).
+
+   *Changed after review round 1 (H1).* Framing v1 had a plaintext `len (u32 BE)` field and trailing zero padding, which revealed the exact sealed size and the message type.
 
 ### 6.2 Unsealing (recipient)
 
 Every step runs inside a store transaction that commits only on success, so **rejected input never changes state** (INV-STATE-1).
 
 1. Strict unframe:
-   - the size is exactly a bucket and the smallest that fits;
-   - the version is known;
-   - the length is in range;
-   - every padding byte is zero.
-2. `sealed_sender_decrypt_to_usmc`. libsignal checks, in constant time, that the certificate key == the static key authenticated by the outer ECDH.
+   - the size is exactly a bucket;
+   - the framing version is 2.
+2. The sealed payload must start with exactly `0x11` (sealed sender v1; v2 and malleated low nibbles are refused). Then `sealed_sender_decrypt_to_usmc`. libsignal checks, in constant time, that the certificate key == the static key authenticated by the outer ECDH.
 3. Derive the sender address from that key, then require:
    - the certificate names exactly that address and device 1;
    - it validates with that key as trust root and is unexpired;

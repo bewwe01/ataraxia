@@ -8,11 +8,12 @@ use core::cell::RefCell;
 use std::time::{Duration, SystemTime};
 
 use libsignal_protocol::{
-    CiphertextMessage, CiphertextMessageType, DeviceId, GenericSignedPreKey as _, IdentityKey,
+    CiphertextMessage, CiphertextMessageType, ContentHint, DeviceId, GenericSignedPreKey as _, IdentityKey,
     IdentityKeyPair, IdentityKeyStore as _, KeyPair, KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle,
     PreKeyRecord, PreKeySignalMessage, PreKeyStore as _, ProtocolAddress, PublicKey, SenderCertificate,
-    ServerCertificate, SignalMessage, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp, kem,
-    message_decrypt, process_prekey_bundle, sealed_sender_decrypt_to_usmc, sealed_sender_encrypt,
+    ServerCertificate, SignalMessage, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp,
+    UnidentifiedSenderMessageContent, kem, message_decrypt, message_encrypt, process_prekey_bundle,
+    sealed_sender_decrypt_to_usmc, sealed_sender_encrypt_from_usmc,
 };
 use prost::Message as _;
 use rand::{CryptoRng, Rng};
@@ -32,6 +33,8 @@ pub const MIN_MESSAGE_VERSION: u8 = 4;
 /// Sender certificates outlive relay storage (14 days) with margin for clock skew.
 const CERT_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 const SERVER_CERT_KEY_ID: u32 = 1;
+/// First byte of every sealed-sender v1 message (version 1 in both nibbles).
+const SEALED_SENDER_V1: u8 = 0x11;
 const DEVICE: u8 = 1;
 
 /// Fields we send in our `ContactIntro` when redeeming an invite.
@@ -422,19 +425,86 @@ impl<B: KvBackend> Account<B> {
     ) -> Result<Vec<u8>> {
         let plaintext = Zeroizing::new(pad_block(&content.encode()));
         let cert = self.sender_certificate(rng, now)?;
+        let local = ProtocolAddress::new(cert.sender_uuid()?.to_owned(), cert.sender_device_id()?);
         let mut session = self.handle();
         let mut ids = self.handle();
-        let sealed = sealed_sender_encrypt(
-            remote,
-            &cert,
+        let message = message_encrypt(
             &plaintext,
+            remote,
+            &local,
             &mut session,
             &mut ids,
             system_time(now),
             rng,
         )
         .await?;
+        let sealed = self.seal_to_bucket(rng, remote, &message, &cert).await?;
         envelope::frame(&sealed)
+    }
+
+    /// Wraps an encrypted message in sealed sender so that the result fills an envelope bucket
+    /// *exactly* (review round 1, H1). This is the same composition as libsignal's
+    /// `sealed_sender_encrypt`, except that the USMC's `groupId` field (unused by Veil and
+    /// inside the sealed-sender encryption) carries zero filler bytes. A filler length is
+    /// searched for; protobuf varint boundaries can skip one size, which toggling the
+    /// equally encrypted `contentHint` field (+2 bytes) covers. The relay sees only the bucket.
+    async fn seal_to_bucket<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        remote: &ProtocolAddress,
+        message: &CiphertextMessage,
+        cert: &SenderCertificate,
+    ) -> Result<Vec<u8>> {
+        let base = self
+            .seal_usmc(rng, remote, message, cert, ContentHint::Default, None)
+            .await?
+            .len();
+        for bucket in crate::padding::ENVELOPE_BUCKETS {
+            let target = envelope::sealed_len_for(bucket);
+            if target < base.saturating_add(2) {
+                continue;
+            }
+            for hint in [ContentHint::Default, ContentHint::Implicit] {
+                let mut filler = target.saturating_sub(base).saturating_sub(2);
+                for _ in 0..8 {
+                    let sealed = self
+                        .seal_usmc(rng, remote, message, cert, hint, Some(filler))
+                        .await?;
+                    if sealed.len() == target {
+                        return Ok(sealed);
+                    }
+                    let next = if sealed.len() > target {
+                        filler.checked_sub(sealed.len().saturating_sub(target))
+                    } else {
+                        filler.checked_add(target.saturating_sub(sealed.len()))
+                    };
+                    match next {
+                        Some(n) if n != filler => filler = n,
+                        _ => break,
+                    }
+                }
+            }
+        }
+        Err(CoreError::TooLarge)
+    }
+
+    async fn seal_usmc<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        remote: &ProtocolAddress,
+        message: &CiphertextMessage,
+        cert: &SenderCertificate,
+        hint: ContentHint,
+        filler: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let usmc = UnidentifiedSenderMessageContent::new(
+            message.message_type(),
+            cert.clone(),
+            message.serialize().to_vec(),
+            hint,
+            filler.map(|n| vec![0u8; n]),
+        )?;
+        Ok(sealed_sender_encrypt_from_usmc(remote, &usmc, &self.handle(), rng).await?)
     }
 
     /// Self-issued sender certificate (ADR-0006): our identity key is the trust root.
@@ -457,6 +527,11 @@ impl<B: KvBackend> Account<B> {
     /// Opens an envelope (PROTOCOL §6.2). Never changes state unless it returns `Ok`.
     pub async fn open<R: Rng + CryptoRng>(&self, rng: &mut R, env: &[u8], now: u64) -> Result<Opened> {
         let sealed = envelope::unframe(env)?;
+        // Sealed sender v1 only (ADR-0006, review L5), with the exact version byte libsignal
+        // writes: libsignal reads just the high nibble, so the low one would be malleable.
+        if sealed.first() != Some(&SEALED_SENDER_V1) {
+            return Err(CoreError::UnsupportedVersion);
+        }
         let usmc = sealed_sender_decrypt_to_usmc(sealed, &self.handle()).await?;
         let cert = usmc.sender()?;
         let sender_key = cert.key()?;

@@ -128,6 +128,67 @@ fn pairing_and_conversation() {
     }
 }
 
+/// The outer sealed-sender v1 structure, as the relay could parse it.
+#[derive(Clone, PartialEq, prost::Message)]
+struct OuterSealed {
+    #[prost(bytes = "vec", optional, tag = "1")]
+    ephemeral_public: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    encrypted_static: Option<Vec<u8>>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    encrypted_message: Option<Vec<u8>>,
+}
+
+/// Everything about an envelope's shape that is readable without keys.
+fn relay_view(env: &[u8]) -> (usize, u8, u8, usize, usize, usize) {
+    use prost::Message as _;
+    let sealed = &env[1..];
+    let outer = OuterSealed::decode(&sealed[1..]).unwrap();
+    (
+        env.len(),
+        env[0],
+        sealed[0],
+        outer.ephemeral_public.unwrap().len(),
+        outer.encrypted_static.unwrap().len(),
+        outer.encrypted_message.unwrap().len(),
+    )
+}
+
+/// Review round 1, H1 (INV-META-3): within a bucket, nothing the relay can read depends on the
+/// content length or on the message type (`PreKey` vs. normal). The old framing exposed a
+/// plaintext length field and zero padding.
+#[test]
+fn relay_learns_only_the_bucket() {
+    let (alice, bob, _) = paired();
+    // Alice's messages are PreKey messages until Bob replies.
+    let mut views = Vec::new();
+    for n in [0, 1, 300, 600, 900] {
+        let env = send(&alice, &bob, &"a".repeat(n));
+        views.push(relay_view(&env));
+        recv(&bob, &env).unwrap();
+    }
+    // After Bob's reply, Alice sends normal (non-PreKey) messages.
+    recv(&alice, &send(&bob, &alice, "reply")).unwrap();
+    for n in [0, 1, 300, 600, 900] {
+        let env = send(&alice, &bob, &"b".repeat(n));
+        views.push(relay_view(&env));
+        recv(&bob, &env).unwrap();
+    }
+    // PreKey messages (carrying a 1569-byte ML-KEM ciphertext) never fit the 1 KiB bucket.
+    assert!(views[..5].iter().all(|v| v.0 == 4096), "{views:?}");
+    for bucket in [1024, 4096] {
+        let same: Vec<_> = views.iter().filter(|v| v.0 == bucket).collect();
+        assert!(!same.is_empty(), "no envelope in bucket {bucket}");
+        assert!(same.iter().all(|v| v == &same[0]), "bucket {bucket}: {views:?}");
+    }
+    // Every bucket is reachable and exactly filled.
+    for n in [0, 3000, 14_000, 60_000] {
+        let env = send(&alice, &bob, &"c".repeat(n));
+        assert!([1024, 4096, 16_384, 65_536].contains(&env.len()));
+        assert_eq!(recv(&bob, &env).unwrap().1.len(), n);
+    }
+}
+
 #[test]
 fn envelopes_are_bucket_sized_and_relay_sees_no_identity() {
     let (alice, bob, _) = paired();
