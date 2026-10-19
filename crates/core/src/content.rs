@@ -11,8 +11,10 @@ use crate::error::{CoreError, Result};
 
 /// Maximum encoded `Content` size (before block padding).
 pub const MAX_CONTENT_LEN: usize = 65_536 - 1024;
-/// Maximum text body length in bytes.
-pub const MAX_BODY_LEN: usize = 64 * 1024 - 2048;
+/// Maximum text body length in bytes. Chosen so that the largest valid `Text` or `Edit`
+/// still seals into the 64 KiB bucket while the session is in its `PreKey` phase, which
+/// carries ~1.6 KiB of ML-KEM ciphertext (review round 2, N7: 63 488 did not fit).
+pub const MAX_BODY_LEN: usize = 61 * 1024;
 const ID_LEN: usize = 16;
 const MAX_IDS: usize = 256;
 const MAX_SDP_LEN: usize = 16 * 1024;
@@ -427,8 +429,10 @@ pub(crate) mod tests {
             body: Some(Body::ContactIntro(ContactIntro {
                 mailbox_id: vec![0; 32],
                 delivery_token: vec![0; 32],
+                display_name: None,
                 invite_id: Some(vec![0; 16]),
-                ..Default::default()
+                invite_proof: None,
+                rekey: None,
             })),
         };
         assert_eq!(c.validate(), Err(CoreError::Malformed), "invite id without proof");
@@ -453,6 +457,39 @@ pub(crate) mod tests {
         fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
             let _ = Content::decode_strict(&bytes);
         }
+    }
+}
+
+// Review round 2, N5: secrets that arrive in decoded content (attachment keys, mailbox
+// capabilities, invite proofs, re-key links that embed an invite secret) are wiped when the
+// value is dropped. (`Drop` means these types cannot be built with `..Default::default()`.)
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.key);
+        zeroize::Zeroize::zeroize(&mut self.nonce_prefix);
+    }
+}
+
+impl Drop for ContactIntro {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.mailbox_id);
+        zeroize::Zeroize::zeroize(&mut self.delivery_token);
+        zeroize::Zeroize::zeroize(&mut self.invite_id);
+        zeroize::Zeroize::zeroize(&mut self.invite_proof);
+    }
+}
+
+impl Drop for RekeyInvite {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.link);
+        zeroize::Zeroize::zeroize(&mut self.sealed_package);
+    }
+}
+
+impl Drop for MailboxUpdate {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.new_mailbox_id);
+        zeroize::Zeroize::zeroize(&mut self.new_delivery_token);
     }
 }
 

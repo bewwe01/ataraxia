@@ -2,6 +2,44 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 2: after review round 2 conditions (2026-10-19)
+
+Review round 2 returned **PASS WITH CONDITIONS**: the round-1 Highs are confirmed fixed, there are no new Critical or High findings, one new Medium (N1) and eight new Lows (N2–N9). All of them were addressed. Local: Ubuntu 24.04, rustc 1.97.0.
+
+```
+$ cargo fmt --all --check                                   # exit 0
+$ cargo clippy --workspace --all-targets -- -D warnings     # clean
+$ RUSTFLAGS="--cfg fuzzing" cargo clippy -p veil-core --lib -- -D warnings   # clean (fuzz-only hooks; now a CI job)
+$ cargo test --workspace --locked
+test result: ok. 73 passed; 0 failed; 1 ignored; ...   # unit (src/); the ignored one writes fuzz seeds
+test result: ok. 3 passed; 0 failed; ...                # tests/secrets.rs
+test result: ok. 22 passed; 0 failed; 1 ignored; ...    # tests/session.rs; the ignored one writes fuzz seeds
+test result: ok. 0 passed; 0 failed; ...                # doctests
+$ cargo deny --locked check      # advisories ok, bans ok, licenses ok, sources ok
+$ cargo audit --deny warnings    # exit 0 (one documented ignore)
+$ cargo vet --locked             # Vetting Succeeded (36 fully audited, 2 partially audited, 159 exempted)
+```
+
+| Finding | Change and evidence |
+|---|---|
+| N1 `contact_plaintext` never reached content handling | The hook pads its input like real content (raw mode is chosen by the first byte); 18 seeds, one per body variant, plus re-key intros; the pair is re-created every 2 000 inputs so the ratchet cannot wedge. 600 s: **54 824 runs, cov 4325 → 10 057 edges**, 0 crashes |
+| N2 INV-PAIR-1 test did not isolate the identity check | The attacker re-signs both prekeys. The test now **fails when the identity check is removed** (mutation-checked) |
+| N3 re-key path untested | `pairing_tests::known_contact_rekey_invite_paths`: valid proof consumes; bad, foreign-bound or expired proofs are refused with no state change; unknown id is ignored |
+| N4 docs | PROTOCOL §8 rewritten for the allowlist filter; mDNS is dropped in every mode (code, docs and `ice.rs` header now agree); ADR-0009 records the `groupId` filler composition, *Proposed, owner approval pending* |
+| N5 secrets | Decoded attachment keys, mailbox capabilities, invite proofs and re-key links are zeroized on drop. `InviteRecordPb` lost `Clone`/`PartialEq`. `Opened`'s `Debug` prints no address or key |
+| N6 `inout` audit | The AI-written audit was replaced by a documented **exemption**. Its note is corrected: libsignal's AES-CBC/PKCS7 does use the changed function |
+| N7 largest valid text could not be sealed as a first message | Probe: the PreKey phase fits 63 203 bytes and the Whisper phase 63 488. `MAX_BODY_LEN` is now 61 KiB. `largest_valid_content_always_seals` seals the largest `Text`, `Edit`, ICE and SDP content in both phases |
+| N8 `contact_inner` wasted inputs | The type selector is weighted to PreKey/Whisper; genuine PreKey (2 030 B, with Kyber) and Whisper seeds. 420 s: **127 480 runs, cov 8748**, 0 crashes |
+| N9 weak oracles, stale numbers | The ICE proptest and the fuzz target check output with an independent substring scan; loopback is allowed only on the exact rebuilt `o=` line. INV numbers corrected. CI now regenerates the vectors with the hash-pinned Python oracle and diffs them |
+| M3 remainder | v3 PreKey message → `UnsupportedVersion`; certificate for another device id → `AuthFailed` |
+| L2 nit | `::ffff:0:a.b.c.d` (IPv4-translated) is judged by its IPv4 |
+
+- **Fuzzing found another real gap.** The stricter `ice_sdp` oracle found that `v=`, `t=` and `b=` lines were passed through verbatim (a fuzz input carried `::` in a `v=` line).
+- **The fix.** Those lines are now validated, and a kept `a=` line with any IP literal, `::` included, rejects the SDP. The input is seeded as `corpus/ice_sdp/regress-v-line`.
+- **Re-run:** 300 s, **4 518 572 runs**, 0 crashes. `realistic_offer_passes` still passes.
+
+Still open, unchanged: the ≥ 1 h nightly fuzz runs have not run yet; libsignal's key types are not zeroized; 159 cargo-vet exemptions; **no independent audit**.
+
 ## Phase 2: after review round 1 fixes (2026-10-19)
 
 Review round 1 returned **FAIL** (3 High, 5 Medium, 8 Low; see [`REVIEW_REPORT.md`](REVIEW_REPORT.md)). Every finding was fixed with a regression test, or documented below where it is out of Phase 2's reach. Local: Ubuntu 24.04, rustc 1.97.0.

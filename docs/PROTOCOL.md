@@ -204,13 +204,31 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
   - Clients MUST reject SDP without a `sha-256` fingerprint, with more than one fingerprint, or with `a=setup` inconsistent with the offer/answer role.
 - **Relay-only mode (default).**
   - The peer connection uses `iceTransportPolicy: "relay"`.
-  - Independently, **Rust filters every outgoing SDP and candidate**: any `a=candidate` / `candidate:` line whose `typ` ≠ `relay` is removed before encryption.
-  - Incoming non-relay candidates are dropped too.
-  - Kept candidates have `raddr`/`rport` rewritten to `0.0.0.0 0`. Even a relay candidate's related address can reveal our reflexive or local IP.
-  - Tests assert that no non-relay candidate is ever sent (INV-NET-1, the brief's key test).
+  - Independently, **Rust rebuilds every outgoing and incoming SDP from an allowlist** (`crates/core/src/ice.rs`, `filter_sdp`). This was rewritten after review round 1 (H3), because a line filter let addresses through outside `a=candidate:` lines.
+    - Lines must be `CRLF`-separated ASCII `x=` lines; bare `LF` or control characters reject the whole SDP.
+    - `o=` is rewritten to `127.0.0.1`, `c=` to `0.0.0.0`, and every `m=` port to `9`. The `m=` tail is validated token by token.
+    - `v=` must be `0`, `t=` two decimals, `b=` `<type>:<decimal>`; any other `v=`/`t=`/`b=` content rejects the SDP. Other line types (`i=`, `u=`, `e=`, …) are dropped.
+    - `a=` attributes not on the allowlist are dropped. That includes `a=rtcp` and `a=remote-candidates`, which carry addresses. Attribute names are matched case-insensitively and re-emitted in lower case.
+    - Candidates (any case) are re-serialised from validated fields only:
+      - the address must be an IP literal (mDNS and other hostnames are dropped);
+      - `typ` must be `relay`;
+      - the relay address must be public (loopback, private, link-local, CGNAT and metadata addresses are refused);
+      - `raddr`/`rport` become `0.0.0.0 0`;
+      - only `tcptype`, `generation`, `ufrag`, `network-id` and `network-cost` extensions are kept.
+    - Any kept `a=` line that could still carry an address (a `hexdigit.digit` sequence, or any embedded IP literal, `::` included) rejects the whole SDP (fail closed).
+    - DTLS checks run on the filtered output.
+  - Tests (INV-NET-1, the brief's key test):
+    - a property test over whole SDPs with addresses in every position;
+    - a fuzz target with an independent output check;
+    - a realistic browser offer that must survive intact.
+    - The end-to-end test with two real clients comes in Phase 6.
 - **Direct mode** (per-contact opt-in, warned):
-  - host/srflx candidates are allowed, but private, link-local, CGNAT and ULA addresses (RFC 1918, 169.254/16, 100.64/10, fc00::/7, fe80::/10) and mDNS `.local` hosts are filtered;
-  - LAN pairing mode is the only exception.
+  - host/srflx/prflx/relay candidates are allowed, but non-public addresses are filtered:
+    - RFC 1918, loopback, 169.254/16, 100.64/10, fc00::/7, fe80::/10 and fec0::/10;
+    - Teredo, NAT64 and 6to4 forms that embed a private IPv4 address;
+    - documentation ranges.
+  - **LAN mode** additionally allows private IP literals.
+  - **mDNS `.local` hostnames are dropped in every mode, including LAN mode**, because the filter only accepts IP literals. LAN calls therefore need the platform to expose IP host candidates.
 - **TURN credentials.**
   - Clients authenticated to a mailbox may request credentials from the relay.
   - Format (coturn `use-auth-secret`): `username = "<expiry_unix>:<16 random hex>"`, `credential = base64(HMAC-SHA1(turn_secret, username))`, TTL 1 hour, rate-limited per mailbox.

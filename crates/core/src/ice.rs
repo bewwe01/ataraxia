@@ -5,11 +5,14 @@
 //! `iceTransportPolicy`, because webviews have been observed to gather host candidates
 //! (docs/SPIKES.md §C).
 //!
-//! * **Relay-only:** only `typ relay` candidates pass, and their `raddr`/`rport` are
-//!   rewritten to `0.0.0.0 0` because they can reveal our own reflexive/local address.
-//! * **Direct:** host/srflx/prflx/relay pass, but private, loopback, link-local, CGNAT,
-//!   ULA and mDNS (`.local`) addresses are dropped unless LAN mode is enabled; `raddr` is
-//!   always zeroed.
+//! * **Relay-only:** only `typ relay` candidates with a public address pass, and their
+//!   `raddr`/`rport` are rewritten to `0.0.0.0 0` because they can reveal our own
+//!   reflexive/local address. The rest of the SDP is rebuilt from an allowlist (see
+//!   [`filter_sdp`]).
+//! * **Direct:** host/srflx/prflx/relay pass, but private, loopback, link-local, CGNAT and
+//!   ULA addresses are dropped unless LAN mode is enabled; `raddr` is always zeroed.
+//! * Candidates must use IP literals: mDNS (`.local`) and other hostnames are dropped in
+//!   every mode, LAN mode included.
 //! * SDP must carry exactly one distinct `sha-256` DTLS fingerprint and a valid `a=setup`
 //!   role for its side of the negotiation.
 
@@ -171,6 +174,10 @@ fn is_public_v6(a: Ipv6Addr) -> bool {
         // IPv4-compatible `::a.b.c.d` (deprecated), and `::`/`::1`.
         return is_public_v4(embedded_v4(s[6], s[7]));
     }
+    if s[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        // IPv4-translated `::ffff:0:a.b.c.d` (RFC 2765).
+        return is_public_v4(embedded_v4(s[6], s[7]));
+    }
     if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
         // NAT64 well-known prefix.
         return is_public_v4(embedded_v4(s[6], s[7]));
@@ -261,7 +268,11 @@ pub fn filter_sdp(sdp: &str, mode: Mode, role: SdpRole) -> Result<String> {
         }
         let (kind, value) = line.split_at_checked(2).ok_or(CoreError::Malformed)?;
         let kept = match kind {
-            "v=" | "t=" | "b=" => Some(line.to_owned()),
+            // Validated, not passed through (review round 2 fuzzing: `v=` carried text).
+            "v=" if value == "0" => Some("v=0".to_owned()),
+            "t=" if is_timing(value) => Some(line.to_owned()),
+            "b=" if is_bandwidth(value) => Some(line.to_owned()),
+            "v=" | "t=" | "b=" => return Err(CoreError::Malformed),
             "s=" => Some("s=-".to_owned()),
             "o=" => Some(rewrite_origin(value)?),
             "c=" => Some("c=IN IP4 0.0.0.0".to_owned()),
@@ -296,6 +307,27 @@ pub fn filter_sdp(sdp: &str, mode: Mode, role: SdpRole) -> Result<String> {
     Ok(out)
 }
 
+/// `t=<start> <stop>`, both decimal.
+fn is_timing(value: &str) -> bool {
+    let mut t = value.split(' ');
+    let num = |v: Option<&str>| {
+        v.is_some_and(|v| !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit()))
+    };
+    num(t.next()) && num(t.next()) && t.next().is_none()
+}
+
+/// `b=<bwtype>:<bandwidth>`, e.g. `b=AS:30` or `b=TIAS:64000`.
+fn is_bandwidth(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(kind, n)| {
+        !kind.is_empty()
+            && kind.len() <= 16
+            && kind.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !n.is_empty()
+            && n.len() <= 20
+            && n.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 /// `o=<username> <sess-id> <sess-version> IN IP4 <addr>`; only the numeric ids are kept.
 fn rewrite_origin(value: &str) -> Result<String> {
     let mut t = value.split(' ');
@@ -327,8 +359,9 @@ fn rewrite_media(value: &str) -> Result<String> {
 }
 
 /// Whether a passed-through line could carry an address: a `hexdigit.digit` sequence (dotted
-/// IPv4 in any spelling, including the leading-zero and `0x` forms `inet_aton` accepts), or any
-/// substring of a `[0-9A-Fa-f:.]` run that parses as an IP other than `::` (catches IPv6,
+/// IPv4 such as `05.0.0.2` or `0x7f.1`; it does not catch bare decimal or bare `0x…` integers,
+/// which no kept attribute treats as an address), or any
+/// substring of a `[0-9A-Fa-f:.]` run that parses as any IP, `::` included (catches IPv6,
 /// even glued to other text as in `cname:fe80::1`). Browser SDP attributes in
 /// [`KEPT_ATTRIBUTES`] never contain either. Fingerprint lines are exempt: they are 32 hex
 /// pairs checked exactly by [`validate_dtls`], and parts of them would read as IPv6.
@@ -348,11 +381,8 @@ fn contains_ip_literal(line: &str) -> bool {
             .any(|run| {
                 (0..run.len()).any(|start| {
                     let end = run.len().min(start.saturating_add(MAX_IP_LITERAL));
-                    (start.saturating_add(2)..=end).any(|stop| {
-                        run.get(start..stop)
-                            .and_then(|t| t.parse::<IpAddr>().ok())
-                            .is_some_and(|ip| !ip.is_unspecified())
-                    })
+                    (start.saturating_add(2)..=end)
+                        .any(|stop| run.get(start..stop).is_some_and(|t| t.parse::<IpAddr>().is_ok()))
                 })
             })
 }
@@ -495,6 +525,7 @@ mod tests {
             "2002:c0a8:101::1",
             "2001:0:4136:e378:8000:63bf:3fff:fdd2",
             "fec0::1",
+            "::ffff:0:10.0.0.1",
         ] {
             assert_eq!(filter_candidate(&cand(private, "host"), d), None, "{private}");
         }
@@ -581,6 +612,22 @@ mod tests {
         assert!(out.contains("o=- 1 2 IN IP4 127.0.0.1\r\n"));
         assert!(out.contains("c=IN IP4 0.0.0.0\r\n"));
         assert!(out.contains("m=application 9 UDP/DTLS/SCTP"));
+        // `v=`, `t=` and `b=` are validated too (found by fuzzing in review round 2).
+        for bad in [
+            "v=c: te cti d:id::(a",
+            "v=1",
+            "t=0 0 x",
+            "t=::1 0",
+            "b=AS:1.2.3.4",
+            "b=:30",
+        ] {
+            let s = sdp("actpass", &[]).replace("v=0\r\n", "") + bad + "\r\n";
+            assert!(filter_sdp(&s, Mode::RelayOnly, SdpRole::Offer).is_err(), "{bad}");
+        }
+        let ok = sdp("actpass", &[]) + "b=AS:30\r\nb=TIAS:64000\r\n";
+        assert!(filter_sdp(&ok, Mode::RelayOnly, SdpRole::Offer).is_ok());
+        let unspecified = sdp("actpass", &[]) + "a=ssrc:1 cname:::\r\n";
+        assert!(filter_sdp(&unspecified, Mode::RelayOnly, SdpRole::Offer).is_err());
         // The `m=` tail is validated, not passed through (found by fuzzing).
         let tail =
             sdp("actpass", &[]) + "m=application 9 UDP/DTLS/SCT typ relay raddr 05.0.0.2 rport 4000\r\n";
@@ -703,8 +750,15 @@ mod tests {
         assert_eq!(out, expected);
     }
 
+    /// Independent oracle (review round 2, N9): deliberately cruder than the filter's own
+    /// `contains_ip_literal`. Any substring that parses as an IP counts, wherever it starts.
+    fn any_ip_in(text: &str) -> Option<IpAddr> {
+        let n = text.len();
+        (0..n).find_map(|i| (i + 2..=n.min(i + 45)).find_map(|j| text.get(i..j)?.parse::<IpAddr>().ok()))
+    }
+
     /// Every IP literal in a filtered relay-only SDP: allowed only as the address of a
-    /// `typ relay` candidate that is public, or as the fixed placeholders.
+    /// public `typ relay` candidate, or as the exact fixed placeholder lines.
     fn assert_relay_only_output(out: &str) {
         for line in out.split("\r\n").filter(|l| !l.is_empty()) {
             if line.starts_with("a=candidate:") || line.starts_with("candidate:") {
@@ -713,14 +767,15 @@ mod tests {
                 assert_eq!(t[7], "relay", "{line}");
                 assert!(is_public_ip(t[4].parse().unwrap()), "{line}");
                 assert_eq!(&t[8..12], ["raddr", "0.0.0.0", "rport", "0"]);
-                assert!(!contains_ip_literal(&t[12..].join(" ")), "{line}");
-            } else if !line.starts_with("o=") && !line.starts_with("c=") {
-                assert!(!contains_ip_literal(line), "{line}");
-            } else {
-                assert!(
-                    line == "c=IN IP4 0.0.0.0" || line.ends_with(" IN IP4 127.0.0.1"),
-                    "{line}"
-                );
+                assert_eq!(any_ip_in(&t[12..].join(" ")), None, "{line}");
+            } else if line.starts_with("o=") {
+                assert!(line.ends_with(" IN IP4 127.0.0.1"), "{line}");
+                let head = line.trim_end_matches(" IN IP4 127.0.0.1");
+                assert_eq!(any_ip_in(head), None, "{line}");
+            } else if line.starts_with("c=") {
+                assert_eq!(line, "c=IN IP4 0.0.0.0");
+            } else if !line.starts_with("a=fingerprint:") {
+                assert_eq!(any_ip_in(line), None, "{line}");
             }
         }
     }

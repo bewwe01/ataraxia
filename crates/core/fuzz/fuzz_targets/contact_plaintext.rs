@@ -1,18 +1,37 @@
 #![no_main]
 //! A legitimate contact encrypts arbitrary plaintext over the real Triple Ratchet session,
-//! bypassing the sender-side content validation (review round 1, M5). This reaches unpadding,
-//! strict content decoding, validation, invite-proof handling and the transaction logic.
-//! Must never panic. Whatever is accepted must re-encode canonically.
+//! bypassing the sender-side content validation (review round 1 M5, round 2 N1). With the
+//! first input byte even, the rest is block-padded like real content, so it reaches strict
+//! decoding, validation, invite-proof handling and the transaction logic; odd bytes test
+//! unpadding with raw input. Must never panic, and whatever opens must be valid content.
+//!
+//! Refused messages do not advance the recipient's ratchet while the sender's keeps moving,
+//! so after ~25 000 refusals libsignal would report "too far in the future". The pair is
+//! therefore re-created every `REPAIR_EVERY` inputs.
 mod pairing;
+use std::cell::RefCell;
+
 use pairing::{Acc, NOW, paired, rng};
 use veil_core::account::Opened;
 
+const REPAIR_EVERY: u32 = 2_000;
+
 thread_local! {
-    static PAIR: (Acc, Acc) = paired();
+    static PAIR: RefCell<(Acc, Acc, u32)> = RefCell::new({
+        let (a, b) = paired();
+        (a, b, 0)
+    });
 }
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
-    PAIR.with(|(alice, bob)| {
+    PAIR.with(|cell| {
+        let mut state = cell.borrow_mut();
+        if state.2 >= REPAIR_EVERY {
+            let (a, b) = paired();
+            *state = (a, b, 0);
+        }
+        state.2 += 1;
+        let (alice, bob, _) = &*state;
         futures_executor::block_on(async {
             let to = bob.identity().address();
             let Ok(env) = alice.fuzz_seal_plaintext(&mut rng(), &to, data, NOW).await else { return };

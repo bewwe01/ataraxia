@@ -677,7 +677,12 @@ fn debug_output_never_contains_content_or_secrets() {
     let opened = block_on(bob.open(&mut rng(), &env, NOW)).unwrap();
     let printed = format!("{opened:?} {opened:#?}");
     assert!(!printed.contains(canary), "{printed}");
-    assert!(printed.contains("Content(<redacted>)"), "{printed}");
+    assert!(printed.contains("Opened::Message(<redacted>)"), "{printed}");
+    // Review round 2, N5: not even the sender's address or key is printed.
+    assert!(
+        !printed.contains(alice.identity().address().as_str()),
+        "{printed}"
+    );
 
     let intro = ContactIntro {
         mailbox_id: vec![0xA1; 32],
@@ -687,14 +692,12 @@ fn debug_output_never_contains_content_or_secrets() {
         invite_proof: Some(vec![0xD4; 32]),
         rekey: Some(RekeyInvite {
             link: format!("veil://i/{canary}"),
-            ..Default::default()
+            sealed_package: Vec::new(),
         }),
     };
-    let att = Attachment {
-        key: vec![0xE5; 32],
-        file_name: Some(canary.into()),
-        ..Default::default()
-    };
+    let mut att = Attachment::default();
+    att.key = vec![0xE5; 32];
+    att.file_name = Some(canary.into());
     for printed in [
         format!("{intro:?}"),
         format!("{att:#?}"),
@@ -736,6 +739,15 @@ mod forged {
         subject: &IdentityKeyPair,
         signer_root: &IdentityKeyPair,
     ) -> SenderCertificate {
+        cert_full(name, 1, subject, signer_root)
+    }
+
+    pub fn cert_full(
+        name: &str,
+        device: u8,
+        subject: &IdentityKeyPair,
+        signer_root: &IdentityKeyPair,
+    ) -> SenderCertificate {
         let mut r = rng();
         let signer = KeyPair::generate(&mut r);
         let server = ServerCertificate::new(1, signer.public_key, signer_root.private_key(), &mut r).unwrap();
@@ -743,7 +755,7 @@ mod forged {
             name.to_owned(),
             None,
             *subject.public_key(),
-            DeviceId::new(1).unwrap(),
+            DeviceId::new(device).unwrap(),
             Timestamp::from_epoch_millis((NOW + 86_400) * 1000),
             server,
             &signer.private_key,
@@ -861,6 +873,21 @@ mod forged {
         .ok()
     }
 
+    /// A version-3 `PreKey` message (pre-PQXDH). libsignal may refuse to build one.
+    pub fn prekey_v3(from: &Acc, to: &Acc) -> Option<PreKeySignalMessage> {
+        PreKeySignalMessage::new(
+            3,
+            1,
+            Some(1.into()),
+            1.into(),
+            None,
+            KeyPair::generate(&mut rng()).public_key,
+            ik(from),
+            message_v(3, from, to),
+        )
+        .ok()
+    }
+
     pub fn prekey_without_kyber(from: &Acc, to: &Acc) -> Option<PreKeySignalMessage> {
         let inner = SignalMessage::new(
             4,
@@ -903,9 +930,17 @@ fn downgraded_messages_refused() {
     // libsignal's parser already refuses this ("Kyber pre key must be present"), before Veil's
     // own `kyber_pre_key_id().is_none()` check (defence in depth). If libsignal ever stops
     // even constructing one, that is an equally good outcome.
+    let pk3 = forged::prekey_v3(&alice, &bob);
     if let Some(pk) = forged::prekey_without_kyber(&alice, &bob) {
         let env = forged::envelope(&a, &bob, &cert, CiphertextMessageType::PreKey, pk.serialized());
         forged::refused(bob, &env, Some(CoreError::AuthFailed));
+    }
+    // Review round 2 (M3 remainder): a version-3 PreKey message is refused too.
+    let (_, bob, _) = paired();
+    {
+        let pk3 = pk3.expect("libsignal builds a v3 PreKey message");
+        let env = forged::envelope(&a, &bob, &cert, CiphertextMessageType::PreKey, pk3.serialized());
+        forged::refused(bob, &env, Some(CoreError::UnsupportedVersion));
     }
     // Control: the same path with a genuine message still works.
     let (alice, bob, _) = paired();
@@ -937,6 +972,16 @@ fn certificate_key_must_match_sealing_key() {
         &m,
         &bob,
         &wrong_root,
+        CiphertextMessageType::Whisper,
+        v4.serialized(),
+    );
+    let bob = forged::refused(bob, &env, Some(CoreError::AuthFailed));
+    // Review round 2 (M3 remainder): a genuine self-issued certificate for another device id.
+    let other_device = forged::cert_full(mallory.identity().address().as_str(), 2, &m, &m);
+    let env = forged::envelope(
+        &m,
+        &bob,
+        &other_device,
         CiphertextMessageType::Whisper,
         v4.serialized(),
     );
@@ -994,16 +1039,11 @@ fn strangers_and_self_addressed_envelopes_dropped() {
     forged::refused(alice, &env, Some(CoreError::AuthFailed));
 }
 
-/// INV-MSG-1 (review L7): every `Body` variant, and every `CallKind`, survives
-/// validate → encode → pad → encrypt → seal → frame → unframe → unseal → decrypt → unpad →
-/// strict decode unchanged.
-#[test]
-fn every_body_variant_roundtrips() {
+fn all_bodies() -> Vec<Body> {
     use veil_core::content::{
         Attachment, Call, CallKind, ContactIntro, Delete, Edit, IceCandidates, MailboxUpdate, Reaction,
         Receipt, ReceiptKind, SessionReset, TimerUpdate, Typing,
     };
-    let (alice, bob, _) = paired();
     let id = || random_id(&mut rng()).clone();
     let call = |kind| {
         Body::Call(Call {
@@ -1011,7 +1051,7 @@ fn every_body_variant_roundtrips() {
             kind: Some(kind),
         })
     };
-    let bodies = vec![
+    vec![
         Body::Text(Text {
             body: "héllo ✓".into(),
             reply_to: Some(id()),
@@ -1058,7 +1098,9 @@ fn every_body_variant_roundtrips() {
             mailbox_id: vec![7; 32],
             delivery_token: vec![8; 32],
             display_name: Some("Alice".into()),
-            ..Default::default()
+            invite_id: None,
+            invite_proof: None,
+            rekey: None,
         }),
         Body::MailboxUpdate(MailboxUpdate {
             new_mailbox_id: vec![9; 32],
@@ -1066,7 +1108,17 @@ fn every_body_variant_roundtrips() {
             relay_url: Some("wss://relay.example.org".into()),
         }),
         Body::SessionReset(SessionReset {}),
-    ];
+    ]
+}
+
+/// INV-MSG-1 (review L7): every `Body` variant, and every `CallKind`, survives
+/// validate → encode → pad → encrypt → seal → frame → unframe → unseal → decrypt → unpad →
+/// strict decode unchanged.
+#[test]
+fn every_body_variant_roundtrips() {
+    let (alice, bob, _) = paired();
+    let id = || random_id(&mut rng()).clone();
+    let bodies = all_bodies();
     for body in bodies {
         let sent = Content {
             id: id(),
@@ -1078,6 +1130,103 @@ fn every_body_variant_roundtrips() {
         match block_on(bob.open(&mut rng(), &env, NOW)).unwrap() {
             Opened::Message { content, .. } => assert!(content == sent, "variant did not round-trip"),
             other @ Opened::NewContact { .. } => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+/// Writes the `contact_plaintext` fuzz seeds (review round 2, N1): one encoded `Content` per
+/// body variant, plus re-key intros carrying an invite id and proof, each prefixed with the
+/// "pad" mode byte. Run: `VEIL_SEED_DIR=crates/core/fuzz/corpus/contact_plaintext cargo
+/// test -p veil-core --test session write_contact_plaintext_seeds -- --ignored`.
+#[test]
+#[ignore = "generates fuzz seeds on demand"]
+fn write_contact_plaintext_seeds() {
+    use prost::Message as _;
+    use veil_core::content::ContactIntro;
+    let dir = std::env::var("VEIL_SEED_DIR").expect("set VEIL_SEED_DIR");
+    let mut bodies = all_bodies();
+    for proof_len in [32, 31] {
+        bodies.push(Body::ContactIntro(ContactIntro {
+            mailbox_id: vec![1; 32],
+            delivery_token: vec![2; 32],
+            display_name: None,
+            invite_id: Some(vec![3; 16]),
+            invite_proof: Some(vec![4; proof_len]),
+            rekey: None,
+        }));
+    }
+    for (i, body) in bodies.into_iter().enumerate() {
+        let c = Content {
+            id: vec![i as u8; 16],
+            sent_at_ms: 1,
+            body: Some(body),
+        };
+        let mut seed = vec![0u8];
+        seed.extend_from_slice(&c.encode_to_vec());
+        std::fs::write(format!("{dir}/seed-body-{i:02}"), seed).unwrap();
+    }
+}
+
+/// Review round 2, N7: the largest content that passes validation can always be sealed,
+/// in the `PreKey` phase (first messages, which carry the ML-KEM ciphertext) and after it.
+#[test]
+fn largest_valid_content_always_seals() {
+    use veil_core::content::{Call, CallKind, Edit, IceCandidates, MAX_BODY_LEN};
+    let id = || random_id(&mut rng()).clone();
+    let biggest = || {
+        vec![
+            Body::Text(Text {
+                body: "é".repeat(MAX_BODY_LEN / 2),
+                reply_to: Some(id()),
+                expire_timer_secs: Some(u32::MAX / 2),
+            }),
+            Body::Edit(Edit {
+                target_id: id(),
+                body: "x".repeat(MAX_BODY_LEN),
+            }),
+            Body::Call(Call {
+                call_id: id(),
+                kind: Some(CallKind::Ice(IceCandidates {
+                    candidates: vec!["c".repeat(512); 64],
+                })),
+            }),
+            Body::Call(Call {
+                call_id: id(),
+                kind: Some(CallKind::Offer("v".repeat(16 * 1024))),
+            }),
+        ]
+    };
+    let too_big = Content {
+        id: id(),
+        sent_at_ms: 1,
+        body: Some(Body::Text(Text {
+            body: "x".repeat(MAX_BODY_LEN + 1),
+            ..Default::default()
+        })),
+    };
+    assert!(too_big.validate().is_err());
+    let (alice, bob, _) = paired();
+    for phase in ["prekey", "whisper"] {
+        if phase == "whisper" {
+            recv(&alice, &send(&bob, &alice, "reply")).unwrap();
+        }
+        for body in biggest() {
+            let mut c = Content {
+                id: id(),
+                sent_at_ms: u64::MAX,
+                body: Some(body),
+            };
+            if let Some(Body::Text(t)) = &mut c.body {
+                t.expire_timer_secs = Some(4 * 7 * 24 * 3600);
+            }
+            c.validate().unwrap();
+            let env = block_on(alice.seal(&mut rng(), &bob.identity().address(), &c, NOW))
+                .unwrap_or_else(|e| panic!("{phase}: largest valid content refused: {e:?}"));
+            assert_eq!(env.len(), 65_536);
+            assert!(matches!(
+                block_on(bob.open(&mut rng(), &env, NOW)).unwrap(),
+                Opened::Message { .. }
+            ));
         }
     }
 }

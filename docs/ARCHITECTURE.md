@@ -147,7 +147,7 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
 ### ADR-0006: Sealed sender with self-issued sender certificates. **Proposed.**
 - Signal's sealed sender assumes a server-issued certificate. Veil has no authority. Each client self-issues its sender certificate under its own identity key.
 - This is sound because libsignal's v1 unseal **checks, in constant time, that the certificate key equals the static key authenticated by the outer ECDH** (verified in source: `sealed_sender.rs`, "sender certificate key does not match message key").
-- The recipient then looks up the contact by identity key and rejects unknown senders. Details in PROTOCOL.md §6. A Phase 2 test suite must confirm it (INV-MSG-6/7).
+- The recipient then looks up the contact by identity key and rejects unknown senders. Details in PROTOCOL.md §6. Confirmed by Phase 2 tests with hand-built hostile envelopes: `certificate_key_must_match_sealing_key`, `strangers_and_self_addressed_envelopes_dropped` (INV-MSG-6/7).
 
 ### ADR-0007: No WASM/PWA build in v1. **Proposed.**
 - `libsignal-protocol` depends on `rayon` (threads) and was not designed for `wasm32`. With Tauri covering desktop and Android, a PWA fallback isn't needed. Revisit only if a platform fails.
@@ -155,6 +155,27 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
 ### ADR-0008: Supply-chain policy. **Accepted (brief).**
 - Exact-pinned dependencies, committed lockfiles, `cargo deny` (licenses: AGPL-compatible allowlist; advisories; bans; sources: crates.io plus the two pinned Signal git repos), `cargo audit`, `cargo vet` (Mozilla/Google/Bytecode Alliance imports plus our own audits), `pnpm audit`, `gitleaks`, lockfile integrity check.
 - GitHub Actions pinned by full commit SHA, `permissions: contents: read` by default, `persist-credentials: false`.
+
+### ADR-0009: Envelopes fill their bucket from inside the sealed-sender encryption. **Proposed (implemented after review round 1, H1; recorded after review round 2, N4). Owner approval pending.**
+- **Problem.** Framing v1 (`len || sealed || zero padding`) showed the relay the exact sealed size and the message type, so it learned more than the bucket that THREAT_MODEL §5 promises.
+- **Composition.** This is libsignal's own `sealed_sender_encrypt` composition, with one change:
+  - `message_encrypt` produces the inner message;
+  - `UnidentifiedSenderMessageContent::new(type, cert, inner, hint, group_id)` wraps it;
+  - `sealed_sender_encrypt_from_usmc` seals it;
+  - the change: the unused `groupId` field carries zero bytes, and `contentHint` is toggled (+2 bytes) where a protobuf varint boundary would skip a size.
+  - The filler length is searched for so that `1 + sealed` equals the bucket exactly. Framing v2 is just `version (2) || sealed`.
+- **No new primitive.**
+  - Both fields sit inside the sealed-sender ciphertext, which is encrypted and MAC'd by libsignal.
+  - Their content is not secret, and the recipient ignores both.
+  - The only property used is "the encrypted part has a length we choose".
+- **Receiver.**
+  - Requires the exact sealed-sender v1 version byte `0x11`. libsignal reads only the high nibble; this also refuses sealed-sender v2.
+  - Ignores `groupId` and `contentHint`.
+- **Cost.** A few extra X25519 operations per seal for the size search: worst case 6.4 ms, measured by reviewer round 2.
+- **Evidence.**
+  - `relay_learns_only_the_bucket`;
+  - reviewer round 2's exhaustive scan of inner lengths 0–65 600, which found no size gap;
+  - `largest_valid_content_always_seals`.
 
 ## 7. Distribution (recorded owner request)
 

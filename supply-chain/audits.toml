@@ -1,8 +1,4 @@
 
 # cargo-vet audits file
 
-[[audits.inout]]
-who = "Claude Code agent (AI review, not yet confirmed by a human)"
-criteria = "safe-to-deploy"
-delta = "0.2.3 -> 0.2.4"
-notes = "Delta adds an output-buffer length check in InOutBufReserved::into_padded_blocks (0.2.3 was yanked for missing it), turns an assert_eq into debug_assert_eq after that check, and adds a Miri-oriented test. No new unsafe, no new deps, no build script changes. Veil's AEAD paths do not use block padding."
+[audits]

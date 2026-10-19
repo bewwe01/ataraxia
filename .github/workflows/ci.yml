@@ -114,3 +114,39 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
         run: |
           cargo +"$NIGHTLY" miri test -p veil-core --lib -- padding:: envelope:: ice:: trust:: content::
+
+  vectors:
+    name: known-answer vectors match the Python oracle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Regenerate vectors with the independent oracle and compare
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          python3 -m venv /tmp/oracle
+          /tmp/oracle/bin/pip install --quiet --require-hashes --only-binary=:all: -r crates/core/tests/vectors/requirements.txt
+          cd crates/core/tests/vectors
+          /tmp/oracle/bin/python3 -I gen.py > /tmp/vectors.rs
+          rustfmt +"$RUST_TOOLCHAIN" --edition 2024 --config-path "$GITHUB_WORKSPACE/rustfmt.toml" /tmp/vectors.rs
+          diff -u vectors.rs /tmp/vectors.rs
+
+  fuzz-hooks-lint:
+    name: clippy on cfg(fuzzing) code
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+      - name: Lint the fuzz-only hooks
+        env:
+          RUSTFLAGS: --cfg fuzzing
+          CARGO_TARGET_DIR: target/fuzzing-lint
+        run: cargo +"$RUST_TOOLCHAIN" clippy -p veil-core --lib --locked -- -D warnings
+

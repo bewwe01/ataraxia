@@ -307,8 +307,9 @@ version = "2.14.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.inout]]
-version = "0.2.3"
+version = "0.2.4"
 criteria = "safe-to-deploy"
+notes = "Exempted, not audited (review round 2, N6). 0.2.3 was yanked for a missing output-length check in InOutBufReserved::into_padded_blocks; 0.2.4 adds it. That path IS used: libsignal's AES-256-CBC/PKCS7 message encryption goes through it. An AI agent read the 0.2.3->0.2.4 diff; a human audit is still to do."
 
 [[exemptions.itertools]]
 version = "0.13.0"

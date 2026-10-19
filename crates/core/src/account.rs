@@ -64,8 +64,8 @@ pub struct Redeemed {
     pub envelope: Vec<u8>,
 }
 
-/// A successfully opened envelope.
-#[derive(Debug)]
+/// A successfully opened envelope. `Debug` names only the variant: neither content, nor
+/// keys, nor addresses belong in logs (review round 2, N5).
 pub enum Opened {
     /// A message from an existing contact.
     Message { from: Address, content: Content },
@@ -79,8 +79,18 @@ pub enum Opened {
     },
 }
 
-/// Stored metadata for an invite we issued.
-#[derive(Clone, PartialEq, prost::Message)]
+impl core::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Message { .. } => "Opened::Message(<redacted>)",
+            Self::NewContact { .. } => "Opened::NewContact(<redacted>)",
+        })
+    }
+}
+
+/// Stored metadata for an invite we issued. Holds the proof key, so it has no `Clone` and no
+/// (non-constant-time) `PartialEq` (review round 2, N5); `Drop` zeroizes the key.
+#[derive(prost::Message)]
 #[prost(skip_debug)]
 struct InviteRecordPb {
     #[prost(uint64, tag = "1")]
@@ -824,26 +834,37 @@ impl<B: KvBackend> Account<B> {
     ) -> Result<Vec<u8>> {
         let remote = ProtocolAddress::new(to.as_str().to_owned(), device()?);
         let cert = self.sender_certificate(rng, now)?;
-        let ty = match ty % 4 {
-            0 => CiphertextMessageType::Whisper,
-            1 => CiphertextMessageType::PreKey,
-            2 => CiphertextMessageType::SenderKey,
+        // Mostly the two types Veil accepts (review round 2, N8); the others are refused early.
+        let ty = match ty % 8 {
+            0..=2 => CiphertextMessageType::Whisper,
+            3..=5 => CiphertextMessageType::PreKey,
+            6 => CiphertextMessageType::SenderKey,
             _ => CiphertextMessageType::Plaintext,
         };
         let sealed = self.seal_to_bucket(rng, &remote, ty, inner, &cert).await?;
         envelope::frame(&sealed)
     }
 
-    /// Encrypts arbitrary plaintext over the real session, skipping content validation.
+    /// Encrypts fuzz input over the real session, skipping content validation. The first
+    /// byte selects the mode: even → the rest is block-padded like real content (so it
+    /// reaches strict decoding, validation, invite proofs and rollback); odd → the rest is
+    /// used raw (exercises unpadding). Review round 2, N1: raw-only input never got past
+    /// `unpad_block`.
     pub async fn fuzz_seal_plaintext<R: Rng + CryptoRng>(
         &self,
         rng: &mut R,
         to: &Address,
-        plaintext: &[u8],
+        input: &[u8],
         now: u64,
     ) -> Result<Vec<u8>> {
+        let (mode, rest) = input.split_first().ok_or(CoreError::Malformed)?;
+        let plaintext = if mode % 2 == 0 {
+            Zeroizing::new(pad_block(rest))
+        } else {
+            Zeroizing::new(rest.to_vec())
+        };
         let remote = ProtocolAddress::new(to.as_str().to_owned(), device()?);
-        self.transact(self.seal_bytes_in_tx(rng, &remote, plaintext, now))
+        self.transact(self.seal_bytes_in_tx(rng, &remote, &plaintext, now))
             .await
     }
 }
@@ -874,6 +895,72 @@ mod pq_tests {
             }
             _ => panic!("unexpected type"),
         }
+    }
+
+    /// Writes genuine inner messages as `contact_inner` fuzz seeds (review round 2, N8):
+    /// `PreKey` messages (type byte 3) and `Whisper` messages (type byte 0), in the target's
+    /// `type || inner` format. Run with `VEIL_SEED_DIR=crates/core/fuzz/corpus/contact_inner
+    /// cargo test -p veil-core --lib write_contact_inner_seeds -- --ignored`.
+    #[test]
+    #[ignore = "generates fuzz seeds on demand"]
+    fn write_contact_inner_seeds() {
+        let dir = std::env::var("VEIL_SEED_DIR").unwrap();
+        block_on(async {
+            let mut rng = OsRng.unwrap_err();
+            let bob = Account::create(MemoryBackend::new(), &mut rng).unwrap();
+            let alice = Account::create(MemoryBackend::new(), &mut rng).unwrap();
+            let created = bob
+                .create_invite(
+                    &mut rng,
+                    InviteMode::Remote,
+                    "wss://r",
+                    [3; 32],
+                    [1; 32],
+                    [2; 32],
+                    NOW,
+                    600,
+                )
+                .await
+                .unwrap();
+            let fields = IntroFields {
+                mailbox_id: [4; 32],
+                delivery_token: [5; 32],
+                display_name: None,
+                rekey: None,
+            };
+            let red = alice
+                .redeem_invite(&mut rng, &created.invite, &created.sealed_package, fields, NOW)
+                .await
+                .unwrap();
+            let mut seeds = vec![(3u8, inner(&bob, &red.envelope).await.serialize().to_vec())];
+            bob.open(&mut rng, &red.envelope, NOW).await.unwrap();
+            let text = |s: &str| Content {
+                id: random_id(&mut OsRng.unwrap_err()).clone(),
+                sent_at_ms: 1,
+                body: Some(Body::Text(Text {
+                    body: s.into(),
+                    ..Default::default()
+                })),
+            };
+            let env = bob
+                .seal(&mut rng, &alice.identity.address(), &text("reply"), NOW)
+                .await
+                .unwrap();
+            seeds.push((0, inner(&alice, &env).await.serialize().to_vec()));
+            alice.open(&mut rng, &env, NOW).await.unwrap();
+            for n in [0, 200, 2000] {
+                let env = alice
+                    .seal(&mut rng, &bob.identity.address(), &text(&"m".repeat(n)), NOW)
+                    .await
+                    .unwrap();
+                seeds.push((0, inner(&bob, &env).await.serialize().to_vec()));
+            }
+            for (i, (ty, bytes)) in seeds.into_iter().enumerate() {
+                let mut seed = vec![ty];
+                seed.extend_from_slice(&bytes);
+                std::fs::write(format!("{dir}/seed-genuine-{i}"), seed).unwrap();
+            }
+        });
     }
 
     #[test]
@@ -1207,8 +1294,20 @@ mod pairing_tests {
         let created = invite(&bob, 600);
         let genuine = created.invite.open_package(&created.sealed_package).unwrap();
 
+        // Mallory's key, with both prekeys re-signed by Mallory: libsignal's signature checks
+        // pass, so only Veil's "bundle identity == invite identity" check can refuse it
+        // (review round 2, N2: previously the signature check rejected it first).
         let mut swapped = genuine.clone();
+        let m = mallory.identity.key_pair().private_key();
         swapped.identity_key = mallory.identity.public().serialize().to_vec();
+        swapped.signed_prekey_sig = m
+            .calculate_signature(&genuine.signed_prekey_pub, &mut rng())
+            .unwrap()
+            .to_vec();
+        swapped.kyber_prekey_sig = m
+            .calculate_signature(&genuine.kyber_prekey_pub, &mut rng())
+            .unwrap()
+            .to_vec();
         let sealed = created.invite.seal_package(&mut rng(), &swapped).unwrap();
         assert!(
             created.invite.open_package(&sealed).is_ok(),
@@ -1302,5 +1401,92 @@ mod pairing_tests {
         assert_eq!(prekeys_present(&bob, &expiring), [true; 4]);
         assert_eq!(block_on(bob.sweep_expired_invites(NOW + 61)).unwrap(), 1);
         assert_eq!(prekeys_present(&bob, &expiring), [false; 4], "expired");
+    }
+
+    fn pair() -> (Acc, Acc) {
+        let (alice, bob) = (acc(), acc());
+        let created = invite(&bob, 600);
+        let red = block_on(alice.redeem_invite(
+            &mut rng(),
+            &created.invite,
+            &created.sealed_package,
+            fields(),
+            NOW,
+        ))
+        .unwrap();
+        block_on(bob.open(&mut rng(), &red.envelope, NOW)).unwrap();
+        (alice, bob)
+    }
+
+    fn rekey_intro(invite_id: &[u8], proof: Vec<u8>) -> Content {
+        Content {
+            id: random_id(&mut rng()),
+            sent_at_ms: 1,
+            body: Some(Body::ContactIntro(ContactIntro {
+                mailbox_id: vec![6; 32],
+                delivery_token: vec![7; 32],
+                display_name: None,
+                invite_id: Some(invite_id.to_vec()),
+                invite_proof: Some(proof),
+                rekey: None,
+            })),
+        }
+    }
+
+    /// Opens at `at`; on error asserts `at` is byte-identical afterwards.
+    fn open_checked(at: Acc, env: &[u8], now: u64) -> (Acc, Result<Opened>) {
+        let before = at.into_backend();
+        let at = Account::load(before.clone()).unwrap();
+        let r = block_on(at.open(&mut rng(), env, now));
+        let after = at.into_backend();
+        if r.is_err() {
+            assert!(after == before, "refused re-key intro changed state");
+        }
+        (Account::load(after).unwrap(), r)
+    }
+
+    /// Review round 2, N3: a *known* contact redeeming one of our re-key invites
+    /// (`consume_invite_if_proven`). A valid proof consumes the invite and all its prekeys;
+    /// a bad proof or an expired invite is refused without any state change and leaves the
+    /// invite usable; an unknown invite id is ignored.
+    #[test]
+    fn known_contact_rekey_invite_paths() {
+        let (alice, bob) = pair();
+        let to_bob = bob.identity.address();
+        let rekey = invite(&bob, 600);
+        let id = rekey.invite.id;
+        let good = rekey.invite.proof(alice.identity.public()).unwrap().to_vec();
+
+        // Bad proof: refused, nothing changes.
+        let env = block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&id, vec![9; 32]), NOW)).unwrap();
+        let (bob, r) = open_checked(bob, &env, NOW);
+        assert_eq!(r.err(), Some(CoreError::AuthFailed));
+        assert_eq!(prekeys_present(&bob, &rekey), [true; 4]);
+
+        // Proof bound to another identity (Mallory's), presented by Alice: refused.
+        let mallory = acc();
+        let foreign = rekey.invite.proof(mallory.identity.public()).unwrap().to_vec();
+        let env = block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&id, foreign), NOW)).unwrap();
+        let (bob, r) = open_checked(bob, &env, NOW);
+        assert_eq!(r.err(), Some(CoreError::AuthFailed));
+
+        // Expired: refused, nothing changes.
+        let env = block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&id, good.clone()), NOW)).unwrap();
+        let (bob, r) = open_checked(bob, &env, NOW + 600);
+        assert_eq!(r.err(), Some(CoreError::InviteInvalid));
+        assert_eq!(prekeys_present(&bob, &rekey), [true; 4]);
+
+        // Unknown invite id: the message is delivered and nothing is consumed.
+        let env =
+            block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&[0xEE; 16], good.clone()), NOW)).unwrap();
+        let (bob, r) = open_checked(bob, &env, NOW);
+        assert!(matches!(r, Ok(Opened::Message { .. })));
+        assert_eq!(prekeys_present(&bob, &rekey), [true; 4]);
+
+        // Valid proof: delivered, and the invite plus all three prekeys are gone.
+        let env = block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&id, good), NOW)).unwrap();
+        let (bob, r) = open_checked(bob, &env, NOW);
+        assert!(matches!(r, Ok(Opened::Message { .. })));
+        assert_eq!(prekeys_present(&bob, &rekey), [false; 4]);
     }
 }
