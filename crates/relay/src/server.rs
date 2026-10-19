@@ -7,7 +7,8 @@
 //! * handshake, idle, pre-authentication and write timeouts, a connection cap, and
 //!   per-connection frame rate limits;
 //! * a relay-wide budget for response bytes in flight, so slow readers cannot exhaust memory;
-//! * rate limits keyed by delivery token, mailbox or connection, **never by IP**.
+//! * rate limits keyed by delivery token, mailbox, connection or the source key below; nothing
+//!   IP-derived is ever logged or stored.
 //!
 //! The one use of the peer address is a truncated **source key** (IPv4 address or IPv6 /64),
 //! held in memory only and never logged or stored. It bounds what one host can take of
@@ -67,6 +68,10 @@ pub struct Limits {
     pub create_mailbox_per_source: Rate,
     /// Upload tokens per source.
     pub upload_token_per_source: Rate,
+    /// Token-set changes per mailbox (each is a database write, P3R3-3).
+    pub update_tokens_per_mailbox: Rate,
+    /// Acknowledgements per mailbox (each is a database write, P3R3-3).
+    pub ack_per_mailbox: Rate,
     /// Deposits per delivery token.
     pub deposit_per_token: Rate,
     /// Invite uploads per authenticated mailbox.
@@ -107,7 +112,15 @@ impl Default for Limits {
             },
             upload_token_per_source: Rate {
                 burst: 30,
-                per_sec: 1.0 / 30.0,
+                per_sec: 1.0 / 60.0,
+            },
+            update_tokens_per_mailbox: Rate {
+                burst: 20,
+                per_sec: 1.0,
+            },
+            ack_per_mailbox: Rate {
+                burst: 20,
+                per_sec: 1.0,
             },
             deposit_per_token: Rate {
                 burst: 60,
@@ -157,6 +170,46 @@ pub struct Config {
     pub sweep_interval: Duration,
 }
 
+impl Config {
+    /// Sets the per-source connection cap and scales every other per-source allowance by the
+    /// same factor (relative to the default of 32), so that an operator whose clients arrive
+    /// through one address (a reverse proxy, Docker's userland proxy) raises them together
+    /// (review P3R3-2).
+    pub fn set_per_source_connections(&mut self, n: u32) {
+        let base = Self::default().max_connections_per_source.max(1);
+        let factor = f64::from(n.max(1)) / f64::from(base);
+        let scale = |r: Rate| Rate {
+            burst: scaled(r.burst, factor),
+            per_sec: r.per_sec * factor,
+        };
+        self.max_connections_per_source = n.max(1);
+        self.limits.create_mailbox_per_source = scale(self.limits.create_mailbox_per_source);
+        self.limits.upload_token_per_source = scale(self.limits.upload_token_per_source);
+        let share = scaled_usize(self.response_budget_per_source, factor);
+        self.response_budget_per_source = share.min(self.response_budget_bytes);
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::as_conversions
+)]
+fn scaled(v: u32, factor: f64) -> u32 {
+    // Saturating float → int casts; `factor` is positive and bounded by main's range check.
+    (f64::from(v) * factor).ceil().clamp(1.0, f64::from(u32::MAX)) as u32
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::as_conversions
+)]
+fn scaled_usize(v: usize, factor: f64) -> usize {
+    ((v as f64) * factor).ceil().max(1.0) as usize
+}
+
 impl core::fmt::Debug for Config {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Config")
@@ -172,8 +225,9 @@ impl Default for Quotas {
             max_envelopes_per_mailbox: 5_000,
             max_envelope_bytes_total: 1024 * 1024 * 1024,
             max_tokens_per_mailbox: 512,
+            token_floor_per_mailbox: 64,
             max_token_rows: 1_000_000,
-            max_upload_tokens: 20_000,
+            max_upload_tokens: 1_000_000,
             max_invites: 50_000,
             max_blob_bytes_total: 4 * 1024 * 1024 * 1024,
             envelope_ttl_secs: 14 * 24 * 3600,
@@ -220,6 +274,8 @@ pub struct Shared {
     upload_tokens: Mutex<KeyedLimiter>,
     create_per_source: Mutex<KeyedLimiter>,
     upload_tokens_per_source: Mutex<KeyedLimiter>,
+    update_tokens: Mutex<KeyedLimiter>,
+    acks: Mutex<KeyedLimiter>,
     turn: Mutex<KeyedLimiter>,
     subscribers: Mutex<Subscribers>,
     next_conn: AtomicU64,
@@ -254,6 +310,8 @@ impl Shared {
             upload_tokens: Mutex::new(KeyedLimiter::new(l.upload_token_per_mailbox, LIMITER_KEYS)),
             create_per_source: Mutex::new(KeyedLimiter::new(l.create_mailbox_per_source, LIMITER_KEYS)),
             upload_tokens_per_source: Mutex::new(KeyedLimiter::new(l.upload_token_per_source, LIMITER_KEYS)),
+            update_tokens: Mutex::new(KeyedLimiter::new(l.update_tokens_per_mailbox, LIMITER_KEYS)),
+            acks: Mutex::new(KeyedLimiter::new(l.ack_per_mailbox, LIMITER_KEYS)),
             turn: Mutex::new(KeyedLimiter::new(l.turn_per_mailbox, LIMITER_KEYS)),
             subscribers: Mutex::new(HashMap::new()),
             next_conn: AtomicU64::new(1),
@@ -278,6 +336,30 @@ impl Shared {
         tokio::task::spawn_blocking(move || f(&store))
             .await
             .map_err(|_| StoreError::Io)?
+    }
+
+    /// Forgets refilled rate buckets, so no key (source keys included) outlives its use by
+    /// more than the bucket's refill time (P3R3-4).
+    fn prune_limiters(&self) {
+        for l in [
+            &self.deposits,
+            &self.put_invite,
+            &self.upload_tokens,
+            &self.create_per_source,
+            &self.upload_tokens_per_source,
+            &self.update_tokens,
+            &self.acks,
+            &self.turn,
+        ] {
+            lock(l).prune();
+        }
+    }
+
+    /// Tracked keys in the per-source limiters (tests check pruning end to end).
+    pub fn source_keys_tracked(&self) -> usize {
+        lock(&self.create_per_source)
+            .len()
+            .saturating_add(lock(&self.upload_tokens_per_source).len())
     }
 
     fn subscribe(&self, mailbox: [u8; 32], conn: u64, key: [u8; 32], tx: mpsc::Sender<ServerFrame>) {
@@ -481,6 +563,7 @@ async fn sweep_loop(shared: Arc<Shared>) {
         if shared.db(move |s| s.sweep(now)).await.is_err() {
             tracing::warn!("expiry sweep failed");
         }
+        shared.prune_limiters();
     }
 }
 
@@ -714,10 +797,17 @@ impl Conn {
                 if sh.db(move |s| s.mailbox_exists(&m)).await.map_err(code)? {
                     return Err(ErrorCode::Conflict);
                 }
-                if !lock(&sh.create_per_source).allow(&limiter_key(self.source)) {
+                // While the relay-wide bucket is empty, refuse without spending this source's
+                // allowance, and give it back if the relay-wide bucket empties meanwhile (P3R3-9).
+                if !lock(&sh.create_mailbox).would_allow() {
+                    return Err(ErrorCode::RateLimited);
+                }
+                let source = limiter_key(self.source);
+                if !lock(&sh.create_per_source).allow(&source) {
                     return Err(ErrorCode::RateLimited);
                 }
                 if !lock(&sh.create_mailbox).allow() {
+                    lock(&sh.create_per_source).refund(&source);
                     return Err(ErrorCode::RateLimited);
                 }
                 sh.db(move |s| s.create_mailbox(&m, &k, now))
@@ -775,6 +865,9 @@ impl Conn {
 
             Request::UpdateTokens(u) => {
                 let m = self.require_auth(&u.mailbox_id).await?;
+                if !lock(&sh.update_tokens).allow(&m) {
+                    return Err(ErrorCode::RateLimited);
+                }
                 let to32 = |v: &[Vec<u8>]| {
                     v.iter()
                         .map(|t| arr32(t).ok_or(ErrorCode::Malformed))
@@ -829,6 +922,9 @@ impl Conn {
 
             Request::Ack(a) => {
                 let m = self.require_auth(&a.mailbox_id).await?;
+                if !lock(&sh.acks).allow(&m) {
+                    return Err(ErrorCode::RateLimited);
+                }
                 let up_to = a.up_to_seq;
                 sh.db(move |s| s.ack(&m, up_to)).await.map_err(code)?;
                 Ok(ok())

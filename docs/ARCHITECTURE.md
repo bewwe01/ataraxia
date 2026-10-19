@@ -193,13 +193,13 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
   - Pure Rust, transactional (ACID, copy-on-write), single file, no `unsafe` in our code paths.
   - Every multi-record change (deposit + counters, take-invite + delete, blob chunk + quota) is one write transaction.
   - Records are fixed-layout byte strings with checked decoding, so a corrupt record yields `Corrupt`, never a panic.
-- **No IP-keyed rate limits or records.** Abuse control is by token, mailbox, connection and relay-wide limits, plus storage caps. The trade-off, that anyone can create mailboxes up to the caps, is documented in `deploy/README.md` and THREAT_MODEL §5.
+- **No IP records.** Abuse control is by token, mailbox, connection, source key (below) and relay-wide limits, plus storage caps. Nothing IP-derived is written to disk or logs. The trade-off, that anyone can create mailboxes up to the caps, is documented in `deploy/README.md` and THREAT_MODEL §5.
 - **The one use of the peer address (reviews P3-4, P3R2-1/2/3):** a truncated source key (IPv4 address or IPv6 /64), held in memory only and never logged or stored. It caps what one host can take of relay-wide resources:
   - concurrent connections (32, configurable);
   - its share of the response budget (8 MiB of 64);
   - mailbox creations and upload tokens (rate buckets in a bounded, evicting map).
 
-  Connection counts and budget shares are dropped at zero. Without the key, one host could exhaust each of these.
+  Connection counts and budget shares are dropped at zero, and rate buckets once they refill (the sweep prunes them; review P3R3-4). Without the key, one host could exhaust each of these.
 - **Bounded memory (review P3-1).**
   - redb's page cache is set explicitly (64 MiB by default, `VEIL_DB_CACHE_MB`); redb's own default of 1 GiB let the process outgrow its container limit.
   - Expiry uses an index table (`kind ‖ due ‖ id`), so a sweep reads only due entries, in batches of 256, each its own write transaction.

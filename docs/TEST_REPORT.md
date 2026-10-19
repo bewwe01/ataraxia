@@ -2,6 +2,49 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 3: after review round 3 conditions (2026-10-19)
+
+Review round 3 returned **PASS WITH CONDITIONS**: no Critical or High findings, four Medium conditions and five Lows (`docs/REVIEW_REPORT.md`). All nine are addressed. Each new test was mutation-checked.
+
+| Finding | Fix | Test (mutant that fails it) |
+|---|---|---|
+| **C1 / P3R3-1** relay-wide token caps are a lockout | Every mailbox keeps a **floor** of 64 delivery tokens; only rows beyond the floor count against the relay-wide 1 000 000. Upload-token cap raised to 1 000 000 (about 160 MB) and the per-source upload rate lowered to 1/min, so the cap needs about 680 sources. README and THREAT_MODEL give the number of sources each relay-wide limit needs. | `token_floor_survives_a_full_relay_wide_cap` (floor removed → fails) |
+| **C2 / P3R3-2** per-source limits not configurable | `Config::set_per_source_connections(n)` scales every per-source allowance (creation, upload tokens, response share) by n/32; `VEIL_MAX_CONN_PER_SOURCE` uses it. README and `.env.example` corrected. | `per_source_limits_scale_with_the_connection_cap` (creation not scaled → fails) |
+| **C3 / P3R3-3** no-op writes keep the writer busy | `update_tokens` and `ack` that change nothing do not commit; `UpdateTokens` and `Ack` are limited to 20, then 1/s per mailbox. The residual, real writes into one's own mailboxes, is documented with the review's numbers. | `no_op_writes_do_not_commit` (a test-only commit counter; removing either early return → fails); `token_changes_and_acks_are_rate_limited_per_mailbox` (either limit removed → fails) |
+| **C4 / P3R3-4** "never by IP" false; keys kept forever | The five texts are corrected (PROTOCOL, THREAT_MODEL, ARCHITECTURE, `limits.rs`, `server.rs`). `KeyedLimiter::prune` drops refilled buckets on every sweep, for all keyed limiters. | `limits::tests::prune_forgets_refilled_buckets`; `source_keys_are_forgotten_after_refill` (no prune call → fails) |
+| P3R3-5 systemd unit stops Docker; nftables flush drops the rule | Unit: `After=`/`PartOf=`/`ReloadPropagatedFrom=nftables.service`, `ExecReload`, tolerant `ExecStop`; no `RequiredBy`. New Docker drop-in `docker-veil-turn.conf`: `ExecStartPre=nft list table inet veil_turn`. | New CI job `firewall-unit` on a systemd runner: restart and reload nftables (flush ruleset) and the rule stays; stop the unit and Docker stays up; Docker refuses to start without the rule. *Not run here (no systemd); pending its first CI run.* |
+| P3R3-6 gitleaks allowlist too wide | Only `generic-api-key`, only in `Cargo.lock`, and only when the match is two quoted crate names | Repo: no leaks. Negative test: a 40-hex `api_key` and a Heroku key in a `Cargo.lock` are reported (generic + heroku), and a crate-name pair outside a `Cargo.lock` is reported. |
+| P3R3-7 schema check incomplete | An unversioned database must have every record table **and** `STATS` empty to be stamped | `foreign_schema_is_refused` extended: a lone orphan token row with no counters, and a lone upload token, are both refused (dropping `TOKENS` from the check → fails) |
+| P3R3-8 untested claims, stale rows | `upload_tokens_are_limited_per_source` (R3-M13 now fails it); `over_cap_mailboxes_can_shrink_but_not_grow` (R3-M6 now fails it); PROTOCOL §14 lists the new limits; INV-LOG-1 cites M3/M4/M8/M9 | as named |
+| P3R3-9 refused creations spend the source allowance | Check the relay-wide bucket without spending first (`Limiter::would_allow`); refund the source token if the relay-wide bucket empties in between (`KeyedLimiter::refund`) | `refused_creations_do_not_spend_the_source_allowance`. Removing both layers → fails. Each layer alone survives by design, since they cover the same case (the refund is for the race). `limits::tests::refund_returns_a_token`. |
+
+### Format, lint, tests, supply chain
+
+```text
+$ cargo fmt --all --check                                         # exit 0
+$ cargo clippy --workspace --all-targets --locked -- -D warnings  # exit 0
+$ cargo test --workspace --locked                                 # exit 0
+  veil_core 74 | secrets 3 | session 22 (+1 ignored) | veil_relay lib 23 | logs 1 | relay 23 | smoke 0 (+2 ignored) | veil_wire 5
+$ cargo deny --locked check   → advisories ok, bans ok, licenses ok, sources ok
+$ cargo vet --locked          → Vetting Succeeded (43 fully audited, 5 partially audited, 207 exempted)
+$ gitleaks git --redact --exit-code 1 .   (8.30.1, repo .gitleaks.toml) → no leaks found
+```
+
+### Deployed stack (image rebuilt at these changes; schema version 3)
+
+```text
+smoke deployed_relay_round_trip ... ok
+-y -c client↔client          Total lost packets 0 (0.000000%)
+-c -e 10.0.0.1               channel bind: error 403 (Forbidden IP)
+wrong password               ERROR: Cannot complete Allocation
+host listener :40000         Total lost packets 5 (100%); udp packets received = 0
+Docker-published :40001      Total lost packets 5 (100%)
+relay log lines: 1; coturn lines other than the firewall-drop line: 0
+docker compose stop relay: 340 ms, exit 0
+```
+
+There was no local soak this round, because the disk here had 2.6 GB free. CI's `relay-deploy` soaks 1.1 GB.
+
 ## Phase 3: after review round 2 fixes (2026-10-19)
 
 Review round 2 returned **FAIL**: P3-1 and P3-2 were confirmed fixed; one new High, four Medium, four Low (`docs/REVIEW_REPORT.md`). Each new test was mutation-checked the same way as before.

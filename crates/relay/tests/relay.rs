@@ -964,3 +964,148 @@ async fn mailbox_creation_is_limited_per_source() {
         .unwrap();
     other.call(create()).await.expect("another source is unaffected");
 }
+
+fn new_key() -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&rand::random())
+        .verifying_key()
+        .to_bytes()
+}
+
+fn create_req(key: [u8; 32]) -> Request {
+    Request::CreateMailbox(veil_wire::CreateMailbox {
+        mailbox_id: rand::random::<[u8; 32]>().to_vec(),
+        auth_pub: key.to_vec(),
+    })
+}
+
+fn source(n: u8) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::new(127, 0, 0, n)
+}
+
+/// P3R3-8: upload tokens are limited per source (30), not only per mailbox (20): the 31st
+/// from one source is refused, another source is unaffected.
+#[tokio::test]
+async fn upload_tokens_are_limited_per_source() {
+    let relay = TestRelay::start(Config::default()).await;
+    let mut c = relay.client().await;
+    let (a, b): ([u8; 32], [u8; 32]) = (rand::random(), rand::random());
+    c.new_mailbox(relay.pin, a).await;
+    c.new_mailbox(relay.pin, b).await;
+    let token = |m: [u8; 32]| {
+        Request::BlobUploadToken(veil_wire::MailboxRef {
+            mailbox_id: m.to_vec(),
+        })
+    };
+    for _ in 0..20 {
+        c.call(token(a)).await.unwrap();
+    }
+    for _ in 0..10 {
+        c.call(token(b)).await.unwrap();
+    }
+    assert_eq!(c.call(token(b)).await, Err(ErrorCode::RateLimited));
+    let mut other = Client::connect_from(relay.addr, relay.pin, source(2))
+        .await
+        .unwrap();
+    let m: [u8; 32] = rand::random();
+    other.new_mailbox(relay.pin, m).await;
+    other.call(token(m)).await.expect("another source is unaffected");
+}
+
+/// P3R3-3: token-set changes and acknowledgements, each a database write, are rate limited
+/// per mailbox.
+#[tokio::test]
+async fn token_changes_and_acks_are_rate_limited_per_mailbox() {
+    let relay = TestRelay::start(Config::default()).await;
+    let mut c = relay.client().await;
+    let m: [u8; 32] = rand::random();
+    c.new_mailbox(relay.pin, m).await;
+    let update = || {
+        Request::UpdateTokens(veil_wire::UpdateTokens {
+            mailbox_id: m.to_vec(),
+            add: vec![],
+            remove: vec![],
+        })
+    };
+    let ack = || {
+        Request::Ack(veil_wire::Ack {
+            mailbox_id: m.to_vec(),
+            up_to_seq: 1,
+        })
+    };
+    for _ in 0..20 {
+        c.call(update()).await.unwrap();
+        c.call(ack()).await.unwrap();
+    }
+    assert_eq!(c.call(update()).await, Err(ErrorCode::RateLimited));
+    assert_eq!(c.call(ack()).await, Err(ErrorCode::RateLimited));
+}
+
+/// P3R3-2: raising the per-source connection cap raises the other per-source allowances
+/// with it (here 2x: 20 creations instead of 10 from one source).
+#[tokio::test]
+async fn per_source_limits_scale_with_the_connection_cap() {
+    let mut cfg = Config::default();
+    cfg.set_per_source_connections(64);
+    assert_eq!(cfg.limits.create_mailbox_per_source.burst, 20);
+    assert_eq!(cfg.limits.upload_token_per_source.burst, 60);
+    assert_eq!(cfg.response_budget_per_source, 16 * 1024 * 1024);
+    let relay = TestRelay::start(cfg).await;
+    let mut made = 0;
+    for _ in 0..5 {
+        let mut c = relay.client().await;
+        for _ in 0..4 {
+            c.call(create_req(new_key())).await.unwrap();
+            made += 1;
+        }
+    }
+    assert_eq!(made, 20);
+}
+
+/// P3R3-9: while the relay-wide creation bucket is empty, refused attempts do not spend the
+/// source's own allowance, so the source can create as soon as the relay-wide bucket refills.
+#[tokio::test]
+async fn refused_creations_do_not_spend_the_source_allowance() {
+    let mut cfg = Config::default();
+    cfg.limits.create_mailbox = Rate {
+        burst: 2,
+        per_sec: 1.0,
+    };
+    let relay = TestRelay::start(cfg).await;
+    let mut a = relay.client().await;
+    a.call(create_req(new_key())).await.unwrap();
+    a.call(create_req(new_key())).await.unwrap();
+    // Relay-wide bucket empty: eleven retries from new connections of the same source.
+    for _ in 0..11 {
+        let mut c = relay.client().await;
+        assert_eq!(c.call(create_req(new_key())).await, Err(ErrorCode::RateLimited));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let mut c = relay.client().await;
+    c.call(create_req(new_key()))
+        .await
+        .expect("the source's own allowance was not spent by refusals");
+}
+
+/// P3R3-4: per-source rate buckets, keyed by the source address, are forgotten by the sweep
+/// once they have refilled.
+#[tokio::test]
+async fn source_keys_are_forgotten_after_refill() {
+    let mut cfg = Config {
+        sweep_interval: std::time::Duration::from_millis(100),
+        ..Config::default()
+    };
+    cfg.limits.create_mailbox_per_source = Rate {
+        burst: 10,
+        per_sec: 100.0,
+    };
+    let relay = TestRelay::start(cfg).await;
+    let mut c = relay.client().await;
+    c.call(create_req(new_key())).await.unwrap();
+    assert_eq!(relay.shared.source_keys_tracked(), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        relay.shared.source_keys_tracked(),
+        0,
+        "refilled bucket still held"
+    );
+}

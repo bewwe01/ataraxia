@@ -32,6 +32,7 @@ pub struct TestRelay {
     pub addr: SocketAddr,
     pub pin: [u8; 32],
     pub dir: PathBuf,
+    pub shared: Arc<Shared>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -52,13 +53,19 @@ impl TestRelay {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(veil_relay::server::serve(listener, tls, shared, async {
-            let _ = rx.await;
-        }));
+        tokio::spawn(veil_relay::server::serve(
+            listener,
+            tls,
+            Arc::clone(&shared),
+            async {
+                let _ = rx.await;
+            },
+        ));
         Self {
             addr,
             pin,
             dir,
+            shared,
             stop: Some(tx),
         }
     }

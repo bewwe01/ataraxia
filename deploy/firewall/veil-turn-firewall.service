@@ -1,17 +1,26 @@
-# Loads /etc/veil-turn.nft before Docker starts, so coturn never runs without it.
-# See deploy/firewall/veil-turn.nft and deploy/README.md.
+# Loads /etc/veil-turn.nft at boot, before Docker, and re-applies it whenever nftables.service
+# starts, restarts or reloads (Debian's /etc/nftables.conf begins with `flush ruleset`, which
+# would otherwise silently drop the rule). See deploy/firewall/veil-turn.nft, deploy/README.md.
+#
+# Docker is made to *require the rule* by docker-veil-turn.conf (a docker.service drop-in that
+# refuses to start Docker without it), not by RequiredBy=: stopping or restarting this unit
+# therefore never stops Docker and its other containers (review P3R3-5).
 [Unit]
 Description=Veil: keep coturn from relaying into this host's services
 DefaultDependencies=no
+After=nftables.service
 Before=network-pre.target docker.service
 Wants=network-pre.target
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/sbin/nft -f /etc/veil-turn.nft
-ExecStop=/usr/sbin/nft delete table inet veil_turn
+ExecReload=/usr/sbin/nft -f /etc/veil-turn.nft
+# The table may already be gone (nftables.service flushes the ruleset when it stops).
+ExecStop=-/usr/sbin/nft delete table inet veil_turn
 
 [Install]
 WantedBy=multi-user.target
-RequiredBy=docker.service

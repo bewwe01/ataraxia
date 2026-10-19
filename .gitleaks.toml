@@ -4,10 +4,13 @@ useDefault = true
 
 # In Cargo.lock, a dependency list such as `"libcrux-secrets",` followed by `"libcrux-sha3",`
 # trips the generic-api-key heuristic: "secrets" reads as a key name and the next crate name as
-# its value. Both conditions must hold: a lockfile path AND a "secret" that is only a crate
-# name (lower-case letters, digits, `-`, `_`).
+# its value. Only that rule is relaxed, and only when all of these hold: a Cargo.lock path, and
+# a matched text that is nothing but quoted crate names separated by a comma and whitespace
+# (review P3R3-6: an earlier, wider version also hid hex and Heroku-style keys).
 [[allowlists]]
-description = "crate names in Cargo.lock"
+description = "crate names in Cargo.lock dependency lists"
+targetRules = ["generic-api-key"]
 condition = "AND"
 paths = ['''(^|/)Cargo\.lock$''']
-regexes = ['''^[a-z0-9][a-z0-9_-]*$''']
+regexTarget = "match"
+regexes = ['''\A"?[a-z0-9][a-z0-9_-]*"?,\s*"[a-z0-9][a-z0-9_-]*"?\z''']

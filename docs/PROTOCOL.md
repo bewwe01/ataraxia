@@ -209,16 +209,18 @@ Defined in `crates/wire` (shared by client and relay).
 | `TurnCredentials { mailbox_id }` → `Turn` | mailbox | §8 |
 | `Ping` → `Ok` | none | keep-alive |
 
-**Storage.** For an envelope the relay stores `{ mailbox_id, seq, received_minute, envelope }` with a TTL (default 14 days); a full mailbox (5 000 envelopes) or a full relay (byte cap, default 1 GiB) refuses new deposits with `QuotaExceeded`. It never drops queued envelopes to make room. Mailboxes not authenticated for 60 days expire, and mailboxes never authenticated at all expire after 24 h. Delivery-token rows (1 000 000) and live upload tokens (20 000) are capped relay-wide. Incomplete blobs expire with their upload token (24 h), complete ones 30 days after completion. Expiry runs from an index of due times, in short batches. **No sender, no IP, no User-Agent, no connection record** is stored or logged (INV-META-2, INV-LOG-1).
+**Storage.** For an envelope the relay stores `{ mailbox_id, seq, received_minute, envelope }` with a TTL (default 14 days); a full mailbox (5 000 envelopes) or a full relay (byte cap, default 1 GiB) refuses new deposits with `QuotaExceeded`. It never drops queued envelopes to make room. Mailboxes not authenticated for 60 days expire, and mailboxes never authenticated at all expire after 24 h. Every mailbox may always hold 64 delivery-token hashes. Rows beyond that are capped at 1 000 000 relay-wide, and live upload tokens at 1 000 000. Incomplete blobs expire with their upload token (24 h), complete ones 30 days after completion. Expiry runs from an index of due times, in short batches. **No sender, no IP, no User-Agent, no connection record** is stored or logged (INV-META-2, INV-LOG-1).
 
-**Rate limits** are token buckets keyed by delivery token, mailbox or connection, plus a relay-wide one for mailbox creation. **Never by IP.** Rate-limit refusals echo the request id.
+**Rate limits** are token buckets keyed by delivery token, mailbox, connection or source key (below), plus relay-wide ones for mailbox creation. Nothing IP-derived is stored or logged, and source-keyed buckets are forgotten once they refill. Token changes and acknowledgements are limited to 20, then 1/s, per mailbox, and requests that change nothing are not written. Rate-limit refusals echo the request id.
 
 **Connections.**
 - At most 1 024 concurrent connections. The only use of the peer address is a source key (IPv4 address or IPv6 /64), held in memory only and never stored or logged. Per source, the relay allows:
   - 32 concurrent connections;
   - an 8 MiB share of the response budget;
   - 10 mailbox creations, then 1 per minute;
-  - 30 upload tokens, then 1 per 30 s.
+  - 30 upload tokens, then 1 per minute.
+
+  Raising the connection cap (`VEIL_MAX_CONN_PER_SOURCE`) scales all of these together.
 - A connection that has not authenticated a mailbox, deposited, taken an invite or transferred a blob chunk within 30 s is closed, whatever it sends meanwhile.
 - Idle timeout: 5 min.
 - Every write has a 30 s timeout. `Fetch` and `BlobGet` responses reserve their worst-case size from a relay-wide 64 MiB budget until sent; when the budget is exhausted they are refused with `RateLimited`.
@@ -351,5 +353,9 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 | WebSocket message | client → relay ≤ 64 KiB + 1 040 bytes (one blob chunk + framing); relay → client ≤ 32 envelopes |
 | Timeouts | TLS and WebSocket handshakes 10 s each; pre-authentication 30 s; idle 5 min (clients ping); each write 30 s |
 | Connections | 1 024 per relay; 32 per source (IPv4 address / IPv6 /64), in memory only |
+| Per source (scale with the connection cap) | response budget 8 MiB of 64; mailbox creations 10, then 1/min; upload tokens 30, then 1/min |
+| Mailboxes | 100 000 per relay; deleted after 24 h if never authenticated, after 60 days without authentication otherwise |
+| Delivery tokens | 512 per mailbox; the first 64 always allowed; 1 000 000 beyond that relay-wide; changes 20, then 1/s per mailbox |
+| Upload tokens | 1 000 000 live relay-wide; 20, then 0.1/s per mailbox; 24 h lifetime |
 | Invite TTL | ≤ 7 days (default 24 h) |
 | Clock skew accepted | ±120 s for auth; message timestamps never security-relevant |

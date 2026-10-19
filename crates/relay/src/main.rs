@@ -15,7 +15,8 @@
 //! * `VEIL_QUOTA_ENVELOPES_MB` (default 1024), `VEIL_QUOTA_BLOBS_MB` (default 4096): disk caps for
 //!   queued envelopes and attachment blobs
 //! * `VEIL_MAX_CONN_PER_SOURCE` (default 32): concurrent connections per IPv4 address or
-//!   IPv6 /64; raise it when a proxy makes many clients share one source address
+//!   IPv6 /64. Every other per-source allowance scales with it; raise it when a proxy makes
+//!   many clients share one source address
 //! * `VEIL_DB_CACHE_MB` (default 64): database page cache, the main part of the relay's memory
 //! * `VEIL_LOG` (default `info`): `error`, `warn`, `info` or `debug`
 #![forbid(unsafe_code)]
@@ -96,7 +97,7 @@ fn limits_from_env(cfg: &mut Config) -> Result<(), String> {
     }
     if let Some(v) = env("VEIL_MAX_CONN_PER_SOURCE") {
         match v.parse::<u32>() {
-            Ok(n) if (1..=1024).contains(&n) => cfg.max_connections_per_source = n,
+            Ok(n) if (1..=1024).contains(&n) => cfg.set_per_source_connections(n),
             _ => return Err("VEIL_MAX_CONN_PER_SOURCE must be between 1 and 1024".into()),
         }
     }

@@ -123,14 +123,21 @@ boot, before Docker starts:
 ```sh
 sudo install -m 0644 firewall/veil-turn.nft /etc/veil-turn.nft
 sudo install -m 0644 firewall/veil-turn-firewall.service /etc/systemd/system/
+sudo install -D -m 0644 firewall/docker-veil-turn.conf /etc/systemd/system/docker.service.d/veil-turn.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now veil-turn-firewall
+sudo systemctl restart docker          # picks up the drop-in
 sudo nft list table inet veil_turn     # shows the rule
 ```
 
 It only stops coturn's relay sockets from reaching services on this host, including services that
-Docker publishes; nothing else changes. The unit is `RequiredBy=docker.service`, so if the rule
-cannot load, Docker does not start either. That is deliberate: coturn must not run without it.
+Docker publishes; nothing else changes. Two safeguards:
+- The rule is re-applied whenever `nftables.service` starts, restarts or reloads. Debian's default
+  `/etc/nftables.conf` begins with `flush ruleset`, which would otherwise drop it.
+- The Docker drop-in refuses to start Docker if the rule is not loaded, so coturn never runs
+  without it.
+
+Stopping the firewall unit does not stop Docker or your other containers.
 
 Start everything:
 
@@ -214,13 +221,22 @@ expire after 14 days. Run it only on a relay you are about to reset.
 * **Relay connections:**
   * Each connection's source (IPv4 address or IPv6 /64) is kept in memory only, never logged or
     stored, to bound what one host can take:
-    - at most 32 concurrent connections (`VEIL_MAX_CONN_PER_SOURCE`);
+    - at most 32 concurrent connections;
     - at most 8 MiB of the 64 MiB response budget;
     - 10 mailbox creations, then 1 per minute;
-    - 30 upload tokens, then 1 per 30 s.
+    - 30 upload tokens, then 1 per minute.
+  * The rate buckets keyed by source are dropped once they refill (within about 10 min for
+    creation and 30 min for upload tokens). A memory image of the relay therefore holds the
+    addresses of currently connected clients and of recently active ones, not of everyone since
+    it started.
   * If clients reach the relay through something that hides their address, they all count as one
-    source; raise `VEIL_MAX_CONN_PER_SOURCE` then. This applies to a reverse proxy, and to Docker's
-    userland proxy for IPv6 clients of this IPv4-only container.
+    source. That happens behind a reverse proxy, and behind Docker's userland proxy for IPv6
+    clients of this IPv4-only container. Raise `VEIL_MAX_CONN_PER_SOURCE` then: every per-source
+    allowance above scales with it (64 doubles them all). Better still, let real addresses
+    through, for example with IPv6 enabled on the Docker network.
+  * Each mailbox can always hold 64 delivery tokens, however full the relay-wide cap for tokens
+    beyond that is. Token changes and acknowledgements are limited to 20, then 1 per second, per
+    mailbox, and requests that change nothing are not written.
   * A connection must authenticate a mailbox, or deliver, upload or download something, within 30 s.
   * Every write to a client has a 30 s timeout.
   * A mailbox that is never authenticated is deleted after 24 h; an authenticated one after 60
@@ -243,14 +259,20 @@ expire after 14 days. Run it only on a relay you are about to reset.
   create mailboxes and use up the storage caps. That stops new messages and uploads, but it can't
   read or delete anything already stored. Rate limits don't really slow it down: with many tokens per
   mailbox, an attacker can fill the caps as fast as their uplink allows.
-* **Denial of service by many sources.** One host is limited per source (above). An attacker with
-  many addresses can still exhaust relay-wide limits:
-  - the 1 024 connection slots;
-  - the response budget;
-  - mailbox creation (20, then 1 per second relay-wide), which also blocks onboarding and mailbox
-    rotation;
-  - the token caps.
+* **Denial of service.** These are denials of service, not data exposure. Each relay-wide limit
+  needs this many attacking sources, with the defaults (IPv6 makes sources cheap: one /48 holds
+  65 536 /64s):
 
-  IPv6 makes many sources cheap: one /48 holds 65 536 /64s. These are denials of service, not data
-  exposure.
+  | Limit | Sources needed | Effect while exhausted |
+  |---|---|---|
+  | Delivery tokens beyond each mailbox's 64 | **1**, over about 37 h of mailbox creation | Mailboxes with more than 64 tokens (about 64 contacts) cannot add more. Everyone keeps 64. |
+  | Connection slots (1 024) | 32 | New connections refused |
+  | Response budget (64 MiB) | 11 | Large fetches and downloads refused |
+  | Mailbox creation (20, then 1 per second) | about 60, continuously | Onboarding and mailbox rotation refused |
+  | Upload tokens (1 000 000 live) | about 680 | Attachment uploads refused |
+
+  One host can also keep the database writer busy with real writes into its own mailboxes: deposits
+  with its own tokens, up to the per-connection frame limits. The review measured a victim's
+  deposit latency rising from 3.4 ms to 62 ms under a comparable load, on a fast disk. On an SD
+  card it would be worse.
 * **Not audited.** Treat this as a carefully built but independently unverified system.

@@ -13,8 +13,12 @@
 # Install and keep across reboots (required: coturn restarts on boot without it):
 #   sudo install -m 0644 deploy/firewall/veil-turn.nft /etc/veil-turn.nft
 #   sudo install -m 0644 deploy/firewall/veil-turn-firewall.service /etc/systemd/system/
+#   sudo install -D -m 0644 deploy/firewall/docker-veil-turn.conf \
+#        /etc/systemd/system/docker.service.d/veil-turn.conf
 #   sudo systemctl daemon-reload && sudo systemctl enable --now veil-turn-firewall
-# Remove:   sudo systemctl disable --now veil-turn-firewall
+#   sudo systemctl restart docker
+# Remove:   sudo rm /etc/systemd/system/docker.service.d/veil-turn.conf
+#           sudo systemctl disable --now veil-turn-firewall && sudo systemctl daemon-reload
 # Keep the port range in sync with min-port/max-port in coturn/turnserver.conf.
 
 table inet veil_turn

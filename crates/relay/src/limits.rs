@@ -1,5 +1,7 @@
-//! Rate limiting: token buckets keyed by delivery-token hash, mailbox or connection.
-//! **Never keyed by IP address** (PROTOCOL §2; INV-META-2): the relay does not record IPs.
+//! Rate limiting: token buckets keyed by delivery-token hash, mailbox, connection or an
+//! in-memory source key (IPv4 address or IPv6 /64; see `server.rs`). Nothing here is logged or
+//! stored, and [`KeyedLimiter::prune`] forgets every bucket that has refilled, so a source key
+//! is held only while its bucket is in use (PROTOCOL §6.3; review P3R3-4).
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -56,6 +58,19 @@ impl Limiter {
     pub fn allow(&mut self) -> bool {
         self.bucket.take(self.rate, Instant::now())
     }
+
+    /// Whether a token is available now, without taking it.
+    pub fn would_allow(&self) -> bool {
+        let mut probe = self.bucket;
+        probe.take(self.rate, Instant::now())
+    }
+}
+
+impl Bucket {
+    fn is_full(&self, rate: Rate, now: Instant) -> bool {
+        let tokens = self.tokens + now.saturating_duration_since(self.last).as_secs_f64() * rate.per_sec;
+        tokens >= f64::from(rate.burst)
+    }
 }
 
 /// Buckets keyed by a 32-byte value, with a hard cap on how many keys are tracked so the
@@ -91,16 +106,40 @@ impl KeyedLimiter {
             .take(rate, now)
     }
 
-    /// Drops full buckets (indistinguishable from fresh ones); if none, the oldest half.
-    fn evict(&mut self, now: Instant) {
+    /// Gives back a token taken by [`Self::allow`] for a request that was then refused
+    /// for another reason (review P3R3-9).
+    pub fn refund(&mut self, key: &[u8; 32]) {
+        let burst = f64::from(self.rate.burst);
+        if let Some(b) = self.buckets.get_mut(key) {
+            b.tokens = (b.tokens + 1.0).min(burst);
+        }
+    }
+
+    /// Forgets every bucket that has refilled to its burst: it is indistinguishable from a
+    /// fresh one, so nothing is lost, and keys (source keys included) are not kept longer
+    /// than their bucket is in use. Called from the relay's periodic sweep.
+    pub fn prune(&mut self) {
+        self.prune_at(Instant::now());
+    }
+
+    fn prune_at(&mut self, now: Instant) {
         let rate = self.rate;
-        self.buckets.retain(|_, b| {
-            let mut probe = *b;
-            probe.tokens = (probe.tokens
-                + now.saturating_duration_since(probe.last).as_secs_f64() * rate.per_sec)
-                .min(f64::from(rate.burst));
-            probe.tokens < f64::from(rate.burst)
-        });
+        self.buckets.retain(|_, b| !b.is_full(rate, now));
+    }
+
+    /// Number of tracked keys.
+    pub fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// Whether no key is tracked.
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    /// Drops full buckets; if none, the oldest half.
+    fn evict(&mut self, now: Instant) {
+        self.prune_at(now);
         if self.buckets.len() >= self.max_keys {
             let mut ages: Vec<Instant> = self.buckets.values().map(|b| b.last).collect();
             ages.sort_unstable();
@@ -132,6 +171,43 @@ mod tests {
         assert!(!l.allow_at(&k, t0 + Duration::from_millis(1100)));
         // Other keys are independent.
         assert!(l.allow_at(&[2u8; 32], t0));
+    }
+
+    /// P3R3-4: refilled buckets, and with them their keys, are forgotten.
+    #[test]
+    fn prune_forgets_refilled_buckets() {
+        let rate = Rate {
+            burst: 2,
+            per_sec: 1.0,
+        };
+        let mut l = KeyedLimiter::new(rate, 10);
+        let t0 = Instant::now();
+        assert!(l.allow_at(&[1u8; 32], t0));
+        assert!(l.allow_at(&[2u8; 32], t0));
+        assert!(l.allow_at(&[2u8; 32], t0));
+        l.prune_at(t0 + Duration::from_millis(1100));
+        assert_eq!(
+            l.len(),
+            1,
+            "key 1 refilled and is forgotten; key 2 is still in use"
+        );
+        l.prune_at(t0 + Duration::from_millis(2100));
+        assert!(l.is_empty());
+    }
+
+    /// P3R3-9: a refunded token is usable again.
+    #[test]
+    fn refund_returns_a_token() {
+        let rate = Rate {
+            burst: 1,
+            per_sec: 0.0001,
+        };
+        let mut l = KeyedLimiter::new(rate, 10);
+        let t0 = Instant::now();
+        assert!(l.allow_at(&[1u8; 32], t0));
+        assert!(!l.allow_at(&[1u8; 32], t0));
+        l.refund(&[1u8; 32]);
+        assert!(l.allow_at(&[1u8; 32], t0));
     }
 
     #[test]
