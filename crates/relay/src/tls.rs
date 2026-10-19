@@ -17,6 +17,8 @@ use sha2::{Digest as _, Sha256};
 pub enum TlsError {
     #[error("cannot read or write the certificate/key files")]
     Io,
+    #[error("a key already exists there; delete it first to rotate (clients must re-pin)")]
+    Exists,
     #[error("invalid certificate or key")]
     Invalid,
     #[error("the certificate does not match the private key")]
@@ -56,13 +58,27 @@ fn write_private(path: &Path, data: &[u8]) -> Result<(), TlsError> {
         .create_new(true)
         .mode(0o600)
         .open(path)
-        .map_err(|_| TlsError::Io)?;
+        .map_err(|e| open_error(&e))?;
     f.write_all(data).map_err(|_| TlsError::Io)
 }
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, data: &[u8]) -> Result<(), TlsError> {
-    std::fs::write(path, data).map_err(|_| TlsError::Io)
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| open_error(&e))?;
+    f.write_all(data).map_err(|_| TlsError::Io)
+}
+
+fn open_error(e: &std::io::Error) -> TlsError {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        TlsError::Exists
+    } else {
+        TlsError::Io
+    }
 }
 
 /// Loads `cert.pem`/`key.pem` and builds a TLS 1.3-only server config. Returns it with the
@@ -130,7 +146,10 @@ mod tests {
             Err(TlsError::Mismatch)
         ));
         // Refuses to overwrite an existing key.
-        assert!(generate(&dir, vec!["relay.test".into()]).is_err());
+        assert!(matches!(
+            generate(&dir, vec!["relay.test".into()]),
+            Err(TlsError::Exists)
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

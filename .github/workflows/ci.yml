@@ -150,3 +150,62 @@ jobs:
           CARGO_TARGET_DIR: target/fuzzing-lint
         run: cargo +"$RUST_TOOLCHAIN" clippy -p veil-core --lib --locked -- -D warnings
 
+
+  relay-deploy:
+    name: relay container + coturn smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Bring up deploy/ exactly as the README describes
+        working-directory: deploy
+        run: |
+          ip=$(hostname -I | awk '{print $1}')
+          {
+            echo "TURN_EXTERNAL_IP=$ip"
+            echo "VEIL_TURN_URLS=turn:$ip:3478?transport=udp,turn:$ip:3478?transport=tcp"
+          } > .env
+          mkdir -m 0700 secrets
+          openssl rand -hex 32 > secrets/turn_secret
+          chmod 0644 secrets/turn_secret
+          docker compose build
+          docker compose run --rm relay gen-cert /data/tls localhost 127.0.0.1 | tee gen.txt
+          echo "PIN=$(awk '/pin:/ {print $NF}' gen.txt)" >> "$GITHUB_ENV"
+          echo "TURN_IP=$ip" >> "$GITHUB_ENV"
+          # A second gen-cert must refuse to replace the key.
+          if docker compose run --rm relay gen-cert /data/tls other; then exit 1; fi
+          docker compose up -d
+          sleep 3
+          docker compose ps
+          test "$(docker compose ps --status running -q | wc -l)" = 2
+      - name: Relay round trip through the container
+        env:
+          VEIL_SMOKE_ADDR: 127.0.0.1:8443
+          VEIL_SMOKE_TURN_OUT: ${{ runner.temp }}/turn
+        run: VEIL_SMOKE_PIN="$PIN" cargo test --locked -p veil-relay --test smoke -- --ignored
+      - name: coturn accepts relay-minted credentials and refuses private peers
+        run: |
+          cred() { sed -n "$1p" "$RUNNER_TEMP/turn"; }
+          uc() { docker run --rm --network host --entrypoint turnutils_uclient \
+            docker.io/coturn/coturn:4.7.0@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93 "$@" 2>&1; }
+          uc -y -c -n 20 -m 1 -l 170 -u "$(cred 1)" -w "$(cred 2)" -r veil "$TURN_IP" | tee ok.txt
+          grep -q "Total lost packets 0 " ok.txt
+          uc -c -e 10.0.0.1 -n 5 -m 1 -u "$(cred 3)" -w "$(cred 4)" -r veil "$TURN_IP" | tee denied.txt
+          grep -q "403 (Forbidden IP)" denied.txt
+          uc -y -c -n 5 -m 1 -u "$(cred 5)" -w "wrong$(cred 6)" -r veil "$TURN_IP" | tee bad.txt
+          grep -q "Cannot complete Allocation" bad.txt
+      - name: Nothing about clients in either container's logs
+        working-directory: deploy
+        run: |
+          docker compose logs relay | tee relay.log
+          test "$(wc -l < relay.log)" = 1
+          grep -q "veil-relay started" relay.log
+          test "$(docker compose logs coturn | wc -l)" = 0
+      - if: always()
+        working-directory: deploy
+        run: docker compose down -v

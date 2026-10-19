@@ -1,0 +1,7 @@
+# Build context for deploy/Dockerfile: only what the relay build needs.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+crates/core/fuzz/
+crates/**/target/

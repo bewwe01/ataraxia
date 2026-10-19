@@ -15,7 +15,7 @@
 //! * `VEIL_LOG` (default `info`): `error`, `warn`, `info` or `debug`
 #![forbid(unsafe_code)]
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -83,6 +83,7 @@ fn serve() -> ExitCode {
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 
     let data = PathBuf::from(env("VEIL_RELAY_DATA").unwrap_or_else(|| "/data".into()));
