@@ -24,14 +24,19 @@ use zeroize::Zeroizing;
 
 use crate::error::{CoreError, Result};
 
+/// One write in a [`KvBackend::apply`] batch: `Some(value)` puts, `None` deletes.
+pub type Write = (Vec<u8>, Option<Zeroizing<Vec<u8>>>);
+
 /// Minimal persistent key-value interface. Values may contain secrets (session
 /// records, private prekeys); implementations must store them encrypted.
 pub trait KvBackend {
     fn get(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>>;
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
-    fn delete(&mut self, key: &[u8]) -> Result<()>;
     /// All keys starting with `prefix` (used for invite expiry sweeps).
     fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>>;
+    /// Applies every write in `batch` **atomically**: on `Ok` all of them are durable, on
+    /// `Err` none of them is visible (one database transaction). This is the only way state
+    /// changes, which is what makes INV-STATE-1 hold across backend failures (review H2).
+    fn apply(&mut self, batch: &[Write]) -> Result<()>;
 }
 
 /// In-memory backend for tests and ephemeral use. Values are zeroized on drop.
@@ -51,12 +56,14 @@ impl KvBackend for MemoryBackend {
     fn get(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
         Ok(self.map.get(key).cloned())
     }
-    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.map.insert(key.to_vec(), Zeroizing::new(value.to_vec()));
-        Ok(())
-    }
-    fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.map.remove(key);
+    fn apply(&mut self, batch: &[Write]) -> Result<()> {
+        // In-memory map operations cannot fail part-way, so this is trivially atomic.
+        for (k, v) in batch {
+            match v {
+                Some(v) => self.map.insert(k.clone(), v.clone()),
+                None => self.map.remove(k),
+            };
+        }
         Ok(())
     }
     fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -147,15 +154,15 @@ impl<B: KvBackend> VeilStore<B> {
         Ok(ks.into_iter().collect())
     }
 
-    /// Applies all pending writes to the backend.
+    /// Applies all pending writes to the backend as one atomic batch. On error the backend
+    /// is unchanged and the overlay is kept for the caller to roll back.
     pub(crate) fn commit(&mut self) -> Result<()> {
-        let pending = core::mem::take(&mut self.overlay);
-        for (k, v) in pending {
-            match v {
-                Some(v) => self.backend.put(&k, &v)?,
-                None => self.backend.delete(&k)?,
-            }
+        if self.overlay.is_empty() {
+            return Ok(());
         }
+        let batch: Vec<Write> = self.overlay.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.backend.apply(&batch)?;
+        self.overlay.clear();
         Ok(())
     }
 

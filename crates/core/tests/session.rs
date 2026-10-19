@@ -18,7 +18,7 @@ use veil_core::account::{Account, IntroFields, Opened, random_id};
 use veil_core::content::{Body, Content, Text};
 use veil_core::identity::Address;
 use veil_core::invite::{Invite, InviteMode};
-use veil_core::store::MemoryBackend;
+use veil_core::store::{KvBackend, MemoryBackend, Write};
 
 const NOW: u64 = 1_800_000_000;
 type Acc = Account<MemoryBackend>;
@@ -555,4 +555,113 @@ mod ratchet_properties {
             prop_assert_eq!(recv(&bob, &send(&alice, &bob, "both ways")).unwrap().1, "both ways");
         }
     }
+}
+
+/// A backend whose next `apply` fails (like a full disk), otherwise a `MemoryBackend`.
+struct FlakyBackend {
+    inner: MemoryBackend,
+    fail_next: std::rc::Rc<std::cell::Cell<bool>>,
+    applies: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl KvBackend for FlakyBackend {
+    fn get(&self, key: &[u8]) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, CoreError> {
+        self.inner.get(key)
+    }
+    fn keys_with_prefix(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, CoreError> {
+        self.inner.keys_with_prefix(prefix)
+    }
+    fn apply(&mut self, batch: &[Write]) -> Result<(), CoreError> {
+        self.applies.set(self.applies.get() + 1);
+        if self.fail_next.replace(false) {
+            return Err(CoreError::Storage);
+        }
+        self.inner.apply(batch)
+    }
+}
+
+/// Review round 1, H2 (INV-STATE-1): a storage failure while committing the acceptance of
+/// an invite leaves no trace. The old per-key commit had already consumed the invite and
+/// recorded the peer, so the retry failed and the contact was broken for good.
+#[test]
+fn failed_commit_changes_nothing_and_retry_succeeds() {
+    block_on(async {
+        let alice = account();
+        let fail = std::rc::Rc::new(std::cell::Cell::new(false));
+        let applies = std::rc::Rc::new(std::cell::Cell::new(0));
+        let bob = Account::create(
+            FlakyBackend {
+                inner: MemoryBackend::new(),
+                fail_next: fail.clone(),
+                applies: applies.clone(),
+            },
+            &mut rng(),
+        )
+        .unwrap();
+        let created = bob
+            .create_invite(
+                &mut rng(),
+                InviteMode::Remote,
+                "wss://r",
+                [3; 32],
+                [1; 32],
+                [2; 32],
+                NOW,
+                3600,
+            )
+            .await
+            .unwrap();
+        let red = alice
+            .redeem_invite(
+                &mut rng(),
+                &created.invite,
+                &created.sealed_package,
+                intro(1),
+                NOW,
+            )
+            .await
+            .unwrap();
+        let snapshot = {
+            let be = bob.into_backend();
+            let snap = be.inner.clone();
+            (snap, Account::load(be).unwrap())
+        };
+        let (before, bob) = snapshot;
+
+        fail.set(true);
+        assert_eq!(
+            bob.open(&mut rng(), &red.envelope, NOW).await.unwrap_err(),
+            CoreError::Storage
+        );
+        let bob = {
+            let be = bob.into_backend();
+            assert!(be.inner == before, "a failed commit left partial state");
+            Account::load(be).unwrap()
+        };
+        // The same envelope now succeeds and yields a working contact in both directions.
+        // Its many writes (session, peer, invite and prekey deletions) reach the backend as
+        // exactly one atomic batch.
+        let calls = applies.get();
+        assert!(matches!(
+            bob.open(&mut rng(), &red.envelope, NOW).await.unwrap(),
+            Opened::NewContact { .. }
+        ));
+        assert_eq!(applies.get(), calls + 1, "one transaction must be one batch");
+        let env = bob
+            .seal(&mut rng(), &alice.identity().address(), &text("after"), NOW)
+            .await
+            .unwrap();
+        match alice.open(&mut rng(), &env, NOW).await.unwrap() {
+            Opened::Message { content, .. } => assert_eq!(body(&content), "after"),
+            other @ Opened::NewContact { .. } => panic!("unexpected {other:?}"),
+        }
+        let env = alice
+            .seal(&mut rng(), &bob.identity().address(), &text("back"), NOW)
+            .await
+            .unwrap();
+        match bob.open(&mut rng(), &env, NOW).await.unwrap() {
+            Opened::Message { content, .. } => assert_eq!(body(&content), "back"),
+            other @ Opened::NewContact { .. } => panic!("unexpected {other:?}"),
+        }
+    });
 }

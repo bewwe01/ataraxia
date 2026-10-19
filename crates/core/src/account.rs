@@ -137,8 +137,16 @@ impl<B: KvBackend> Account<B> {
         let identity = Identity::generate(rng);
         // libsignal registration ids are 14-bit and non-zero.
         let reg_id = rng.random_range(1..0x3FFF_u32);
-        backend.put(keys::IDENTITY, &identity.to_secret_bytes())?;
-        backend.put(keys::REG_ID, &reg_id.to_be_bytes())?;
+        backend.apply(&[
+            (
+                keys::IDENTITY.to_vec(),
+                Some(Zeroizing::new(identity.to_secret_bytes().to_vec())),
+            ),
+            (
+                keys::REG_ID.to_vec(),
+                Some(Zeroizing::new(reg_id.to_be_bytes().to_vec())),
+            ),
+        ])?;
         Ok(Self::assemble(backend, identity, reg_id))
     }
 
@@ -604,7 +612,7 @@ impl<B: KvBackend> Account<B> {
                     }
                     let proof = intro.invite_proof.as_deref().ok_or(CoreError::InviteInvalid)?;
                     verify_proof(&record.proof_key, &invite_id, &sender_ik, proof)?;
-                    self.delete_invite(&invite_id, &record);
+                    self.delete_invite(&invite_id, &record)?;
                     let invite_mode = if record.mode == InviteMode::InPerson.to_u32() {
                         InviteMode::InPerson
                     } else {
@@ -690,12 +698,12 @@ impl<B: KvBackend> Account<B> {
             return Err(CoreError::InviteInvalid);
         }
         verify_proof(&rec.proof_key, id, sender, proof)?;
-        self.delete_invite(id, &rec);
-        Ok(())
+        self.delete_invite(id, &rec)
     }
 
-    fn delete_invite(&self, id: &[u8], rec: &InviteRecordPb) {
-        if let Ok(mut s) = self.store.try_borrow_mut() {
+    /// Fails (and so aborts the transaction) if the store is unavailable, never skips (review L6).
+    fn delete_invite(&self, id: &[u8], rec: &InviteRecordPb) -> Result<()> {
+        self.with_store(|s| {
             s.delete(keys::with(keys::INVITE, id));
             s.delete(keys::with(keys::PREKEY, &rec.prekey_id.to_be_bytes()));
             s.delete(keys::with(
@@ -703,7 +711,8 @@ impl<B: KvBackend> Account<B> {
                 &rec.signed_prekey_id.to_be_bytes(),
             ));
             s.delete(keys::with(keys::KYBER_PREKEY, &rec.kyber_prekey_id.to_be_bytes()));
-        }
+            Ok(())
+        })
     }
 
     /// Revokes an unused invite: its prekeys are deleted, so it can never be redeemed.
@@ -713,7 +722,7 @@ impl<B: KvBackend> Account<B> {
                 .with_store(|s| s.get(&keys::with(keys::INVITE, id)))?
                 .ok_or(CoreError::InviteInvalid)?;
             let rec = InviteRecordPb::decode(raw.as_slice()).map_err(|_| CoreError::Storage)?;
-            self.delete_invite(id, &rec);
+            self.delete_invite(id, &rec)?;
             Ok(())
         })
         .await
@@ -731,7 +740,7 @@ impl<B: KvBackend> Account<B> {
                 let rec = InviteRecordPb::decode(raw.as_slice()).map_err(|_| CoreError::Storage)?;
                 if now >= rec.expires_at {
                     let id = key.get(keys::INVITE.len()..).ok_or(CoreError::Storage)?.to_vec();
-                    self.delete_invite(&id, &rec);
+                    self.delete_invite(&id, &rec)?;
                     removed = removed.saturating_add(1);
                 }
             }
