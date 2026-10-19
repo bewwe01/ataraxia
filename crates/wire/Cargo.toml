@@ -1,0 +1,19 @@
+[package]
+name = "veil-wire"
+version = "0.1.0"
+description = "Veil client<->relay wire messages: versioned, strictly decoded, no crypto. Shared by client and relay."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+[package]
+name = "veil-relay"
+version = "0.1.0"
+description = "Veil relay: untrusted store-and-forward server for sealed envelopes, invites, blobs and TURN credentials."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+veil-wire.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+futures-util.workspace = true
+redb.workspace = true
+ed25519-dalek.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+hmac.workspace = true
+base64.workspace = true
+rand.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+veil-core.workspace = true
+proptest.workspace = true
+futures-executor.workspace = true
+
+[lints]
+workspace = true
