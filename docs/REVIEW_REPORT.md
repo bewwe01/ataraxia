@@ -677,3 +677,199 @@ All other statuses changed in `8fe1c75` are backed by tests that exist and asser
 3. R3-5 and the remaining nits can be fixed or deferred, with a named phase, before the Phase 3 gate.
 
 VERDICT: PASS WITH CONDITIONS
+
+## Phase 2 review, round 4 (2026-10-19)
+
+**Reviewer:** independent code-reviewer agent (adversarial gate), round 4.
+**Scope:** `git diff cbc8712..HEAD` (HEAD = `b7cee0a`, "Address review round 3 conditions (R3-1 to R3-5, round-2 nits)"): `crates/core/src/ice.rs`, `crates/core/fuzz/fuzz_targets/{contact_plaintext,contact_inner}.rs`, `crates/core/tests/vectors/requirements.txt`, and `docs/{PROTOCOL,INVARIANTS,TEST_REPORT}.md`. I also read `pairing.rs`, `account.rs` (`create_invite`, `consume_invite_if_proven`, `seal_to_bucket`), `invite.rs` (id, secret and proof derivation), `gen.py`, `SPIKES.md` §C, ADR-0003, and libsignal `4beb029` `state/kyber_prekey.rs`, `state/signed_prekey.rs` and `kem.rs`.
+
+**Verdict: PASS WITH CONDITIONS.** No Critical, High or Medium findings are open. The code changes are correct:
+- R3-3 is fixed and mutation-verified.
+- R3-4 and R3-5 are fixed.
+- The new canonicalisation and extension dedupe in `filter_candidate` behave correctly on every probe I ran.
+- Real Chrome and Firefox offers still pass unchanged (103/106 and 80/82 lines kept, the same as in round 3).
+- The corrected `contact_plaintext` coverage figures reproduce.
+
+Three new Low findings stay open:
+- **R4-1:** the stated reasons for deferring R3-1 and R3-2 are wrong. Both fixes are feasible, and one is a one-line change that I verified.
+- **R4-2:** the new canonicalisation and dedupe code has no test, although TEST_REPORT says one was added.
+- **R4-3:** one round-2 nit is reported as fixed but was not changed.
+
+### 1. Evidence re-run (real output, 2026-10-19)
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all --check` | no output, exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | `Finished 'dev' profile`, exit 0 |
+| `RUSTFLAGS="--cfg fuzzing" CARGO_TARGET_DIR=target/fuzzing-lint cargo clippy -p veil-core --lib --locked -- -D warnings` | `Finished`, exit 0 |
+| `cargo test --workspace --locked` | unit `73 passed; 1 ignored`; `tests/secrets.rs` `3 passed`; `tests/session.rs` `22 passed; 1 ignored`; doctests `0`; exit 0. **Matches TEST_REPORT.** The counts did not change from round 3, so no test was added (see R4-2). |
+| `cargo deny --locked check` | `advisories ok, bans ok, licenses ok, sources ok`, exit 0 |
+| `cargo audit --deny warnings` | `Loaded 1338 security advisories`, `Scanning Cargo.lock … (203 crate dependencies)`, exit 0 |
+| `cargo vet --locked` | `Vetting Succeeded (36 fully audited, 2 partially audited, 159 exempted)`, exit 0 |
+
+**Vectors (the CI `vectors` job, reproduced).** For each of `/usr/bin/python3.12` and `/usr/bin/python3.13` I made a fresh venv and ran:
+1. `pip install --require-hashes --only-binary=:all: -r requirements.txt`: **exit 0 on both**.
+2. `python3 -I gen.py`.
+3. `rustfmt +1.97.0 --edition 2024 --config-path rustfmt.toml`.
+4. A comparison with the committed `vectors.rs`: **byte-identical on both**.
+
+I checked the two `cffi` pins against PyPI's metadata for `cffi 2.1.1`:
+- `c1453022…` is `cp312-cp312-manylinux2014_x86_64`;
+- `a9310795…` is `cp313-cp313-manylinux2014_x86_64`.
+
+**Fuzzing.** Command: `cargo +nightly-2026-10-01 fuzz run -O <t> <scratch copy> -- -max_len=70000 -rss_limit_mb=2048 -artifact_prefix=<scratch>`, with the committed corpora copied to the scratchpad. The three targets ran in parallel on 4 cores.
+
+| Target | Time | Runs | INITED cov → final cov | Crashes |
+|---|---|---|---|---|
+| ice_sdp | 121 s | 2,089,735 | 592 → 1084 | 0 |
+| contact_plaintext | 301 s | 23,008 | 6292 → **6300** (last line before #2001) → **10,172 at #2001** → 10,343 | 0 |
+| contact_inner | 121 s | 27,636 | 8743 → 8745 | 0 |
+
+- **contact_plaintext:** the #2001 line logs `NEW_FUNC` entries such as `Account::create` and `delete_invite`, so the jump is the fixture rebuild. This matches TEST_REPORT's corrected figures (6275 → 6282 → 10,171 → 10,356) within run-to-run noise. **The corrected claim is accurate.**
+- **contact_inner:** coverage is still flat, as R3-2 predicted and as the deferral now documents.
+- **Repository state:** no artifacts were written, and `git status` was clean after every run, mutation and probe.
+
+**Mutation runs.** These ran on a `git archive HEAD` copy in the scratchpad, with a separate target dir, using `cargo test -p veil-core --lib -- ice::`:
+
+```
+baseline                                                          -> 12 passed
+[R3-3] contains_ip_literal ignores unspecified IPs again          -> addresses_outside_candidates_removed FAILED
+        (panic message: "a=mid:x::", i.e. the new input is the one that catches it)
+[nit]  emit the raw component token instead of the parsed u16     -> 12 passed  (survives; R4-2)
+[nit]  emit raw generation/network-id/network-cost values         -> 12 passed  (survives; R4-2)
+[nit]  remove the `seen` dedupe check                             -> 12 passed  (survives; R4-2)
+[R3-1] fuzz harness returns early on empty input (libFuzzer's
+       dummy run), so the fixture builds on the first real input  -> 60 s: INITED cov 10,191, no jump at #2001 (R4-1)
+```
+
+**Probes.** These used a scratch crate with a path dependency on the unmodified HEAD copy.
+
+```
+# filter_candidate, new canonicalisation / dedupe
+a=candidate:1 +1 udp 1 8.8.4.4 9 typ relay                -> "... 1 udp 1 8.8.4.4 9 typ relay raddr 0.0.0.0 rport 0"
+a=candidate:1 001 udp ...                                 -> component 1
+a=candidate:1 1 udp +7 8.8.4.4 +09 typ relay              -> priority 7, port 9
+... generation +0 generation 5 network-id 007 network-cost 0010
+                                                          -> "generation 0 network-id 7 network-cost 10"
+... generation x generation 5                              -> "generation 5"   (first *valid* occurrence wins)
+... ufrag abcd UFRAG efgh ufrag 10.0.0.1                   -> "ufrag abcd"
+... generation 4294967296 / generation -0                  -> extension dropped
+tcp host (Direct, LAN) tcptype ACTIVE tcptype passive      -> "tcptype active"
+component 0 / 257 / 65537                                  -> None
+# Real browser SDPs, relay-only
+Chrome a+v+dc offer (106 lines) -> OK, 103 kept (2 x a=rtcp, the host candidate dropped; relay candidate re-serialised)
+Chrome answer (a=setup:active)  -> OK, 103 kept
+Firefox 128 a+v offer (82 lines) -> OK, 80 kept (o= placeholder normalised, 2 host candidates dropped, relay re-serialised)
+b=CT/X-YZ/RR/as, t=NTP, ptime/maxptime, cname:dead:beef -> ok (unchanged from round 3)
+```
+
+### 2. Status of the round-3 findings and round-2 nits
+
+| # | Status | Evidence |
+|---|---|---|
+| **R3-1** `contact_plaintext` coverage inflated; invite-proof branches unreachable | **Claim CORRECTED; reach DEFERRED to Phase 8. The justification is inaccurate (R4-1).** | **Corrected:** INV-MSG-5 no longer claims invite proofs, and TEST_REPORT's N1 row carries a correction pointing to honest figures, which my run reproduces. The target's doc comment documents both limitations.<br>**Deferral accepted on its merits:**<br>• The proof branches are pinned by `known_contact_rekey_invite_paths`, mutation-verified in round 3.<br>• `validate` enforces the 32-byte proof before `consume_invite_if_proven`.<br>**But the reasons given are wrong:**<br>• "random per run and so cannot appear in a committed corpus": the invite id, secret and proof key come from the *caller's* RNG (`invite.rs:132-134`, HKDF at `:208`), and so does the redeemer identity (`Account::create`, `account.rs:150-154`). The harness chooses that RNG (`pairing.rs:11-12`).<br>• "Pairing twice at start-up did not move the jump": true, but because libFuzzer discards the coverage of its initial empty-input dummy run. A one-line early return for empty input removes the jump (verified above). |
+| **R3-2** `contact_inner` seeds from a foreign pairing | **DEFERRED to Phase 8. The justification is inaccurate (R4-1).** | Documented in the target and in INV-MSG-5.<br>**What is true:** `KyberPreKeyRecord::generate` uses `OsRng` internally (`kyber_prekey.rs:58`).<br>**What is not:** "a deterministic pairing is impossible from the harness" does not follow. libsignal exposes both `kem::KeyPair::generate(key_type, csprng)` (`kem.rs:439`, `pub mod kem`) and `GenericSignedPreKey::new(id, timestamp, &key_pair, &signature)` (`signed_prekey.rs:59`, a public trait method implemented for `KyberPreKeyRecord`). `account.rs:289` can therefore build the Kyber prekey from the caller's RNG, using public API only.<br>Every other libsignal call in Veil's paths takes Veil's RNG; I grepped `account.rs` for `sealed_sender_decrypt_to_usmc`, `message_decrypt` and `process_prekey_bundle` with an explicit `rng`. |
+| **R3-3** `::` rule not pinned | **FIXED** | `a=mid:x::` added (`ice.rs:636-642`). The mutant fails on exactly that input. |
+| **R3-4** STUN caveat | **FIXED** | PROTOCOL §8 ("What the SDP filter cannot do") and INV-NET-1 state the limitation: only `iceTransportPolicy: "relay"` or the webrtc-rs configuration prevents host or srflx connectivity checks. The Phase 6 packet-capture test is named.<br>I checked the references: ADR-0003 is indeed webrtc-rs on Linux. SPIKES §C's probe did record `host/udp` candidates, under the default policy. |
+| **R3-5** vectors job tied to Python 3.12 | **FIXED** | The cp313 wheel hash was added, and the requirements file documents that other interpreters fail closed. Both 3.12 and 3.13 reproduce byte-identical vectors (above).<br>The round-3 "while there" part (the `gen.py` docstring) was not done; see R4-3. |
+| Nit: `+1`/`007` numeric tokens not canonical | **FIXED in code, UNTESTED (R4-2)** | The component (`ice.rs:77`) and the numeric extension values (`:118`) are re-emitted from parsed integers. Priority and port were already re-emitted from parsed integers. The probes confirm this. |
+| Nit: duplicate extension keys accepted | **FIXED in code, UNTESTED (R4-2)** | `seen` (`ice.rs:104-127`) keeps the first *valid* occurrence; the comment at `:108` says "the first wins". Behaviour is correct and fail-safe: an invalid first occurrence is not recorded, so a later valid one is kept. |
+| Nit: PROTOCOL "smallest bucket that fits" | **FIXED** | PROTOCOL §6 step 3 now says "at least 2 bytes to spare", which matches `seal_to_bucket` (`account.rs:495`: `if target < base.saturating_add(2) { continue; }`). |
+| Nit: `gen.py` docstring/header omits the `rustfmt` step | **NOT FIXED, not deferred (R4-3)** | `gen.py:5` and `:35`, and therefore `vectors.rs:4`, still say `python3 gen.py > vectors.rs`. The commit message says "Nits: …" without listing this one. The TEST_REPORT row heading "Round-2 nits | **Fixed.**" implies all of them were fixed. |
+| Nit: CI never lints `cfg(fuzzing)` | **FIXED (round 2)** | The `fuzz-hooks-lint` job exists (`ci.yml:136`). The local equivalent is clean (above). |
+
+### 3. New findings
+
+| # | Sev | Area | Location | Summary |
+|---|---|---|---|---|
+| R4-1 | Low | Docs accuracy (deferral reasons) | `fuzz_targets/contact_plaintext.rs:8-15`, `fuzz_targets/contact_inner.rs:8-11`, `docs/TEST_REPORT.md:11-12`, `docs/INVARIANTS.md:25` | The R3-1 and R3-2 deferrals rest on technical claims that are false; both fixes are feasible, and one is a single line |
+| R4-2 | Low | Test gap / false claim | `crates/core/src/ice.rs:75-77, 104-127`; test `candidate_case_and_extensions_canonicalised` (`:474-488`); `docs/TEST_REPORT.md:15` | Canonicalisation and dedupe survive mutation, yet TEST_REPORT says "test added" |
+| R4-3 | Low | Docs / process | `crates/core/tests/vectors/gen.py:5, 35`, `vectors.rs:4`; `docs/TEST_REPORT.md:15` | The round-2 `gen.py` nit is reported as fixed but is unchanged |
+
+#### R4-1. The deferral reasons for R3-1 and R3-2 are wrong. [HIGH confidence, verified in source and by experiment]
+
+**What the documents claim:**
+- The `contact_plaintext` doc comment and TEST_REPORT say the invite-proof branches "need a live random invite id and proof, which no committed corpus can hold".
+- The same doc comment says that because pairing twice at start-up "did not move the jump", the jump "is reported rather than hidden".
+- `contact_inner` and TEST_REPORT say "a deterministic pairing is impossible from the harness".
+- INV-MSG-5 says the Kyber step is "covered by mutation-checked unit tests instead". The PreKey path is exercised by many session tests, but none of them is a mutation check of the Kyber step.
+
+**Why these claims are false:**
+1. **Invite id and proof.** The id and secret come from `rng.fill` with the caller's RNG (`invite.rs:132-134`). The proof key is an HKDF of that secret (`:208`). The proof is an HMAC over id and redeemer identity (`:300-306`). The redeemer identity also comes from the caller's RNG (`Account::create`, `account.rs:154`). With a seeded `ChaCha20Rng` in `pairing.rs:11` instead of `OsRng`, a re-key invite created in the fixture has a fixed id and a fixed valid proof that a committed seed can carry. Kyber randomness does not enter the proof.
+2. **The coverage jump.** libFuzzer runs the callback once on a dummy empty input before loading the corpus and does not keep that run's coverage. The `thread_local!` fixture is built during that run, so its edges are first credited to whichever input triggers the next re-pair. Adding `if data.is_empty() { return; }` before `PAIR.with(…)` moves the build to the first real corpus input. Result: `INITED cov: 10191`, no jump at #2001, and from then on the per-input NEW/REDUCE lines are honest (60 s run above).
+3. **Deterministic Kyber.** `account.rs:289` can replace `KyberPreKeyRecord::generate(…)` with three public-API calls, all taking the caller's RNG: `kem::KeyPair::generate(kem::KeyType::Kyber1024, rng)`, `private.calculate_signature(&kp.public_key.serialize(), rng)` and `KyberPreKeyRecord::new(id, Timestamp::from_epoch_millis(now_ms), &kp, &sig)`. This is not new cryptography: it is the same three steps `generate` performs (`kyber_prekey.rs:53-70`), with the RNG passed in. I did not build the full deterministic fixture, so I rate the end-to-end feasibility [MEDIUM]. The API itself is verified.
+
+**Why it matters:** these reasons are recorded as the basis for the Phase 8 deferral. A Phase 8 implementer reading "impossible" would skip work that is small, in particular the one-line fix in point 2. The deferral itself is acceptable: the branches are unit-tested and length-checked first.
+
+**Fix (docs only for this gate):**
+- In all four places, replace the "impossible" and "cannot" wording with the actual reason for deferral: effort or priority, with the unit-test cover.
+- Record the three concrete approaches above in INV-MSG-5's Phase 8 note.
+- Optionally apply the empty-input early return now. It is one line in the harness, not in shipped code, and makes every future coverage figure honest.
+
+#### R4-2. Canonicalisation and dedupe have no test; TEST_REPORT says one was added. [HIGH, mutation-verified]
+
+**What survives:** all 12 `ice::` tests stay green under each of three independent reversions:
+- the raw component token;
+- raw numeric extension values;
+- no `seen` check.
+
+The unit-test counts are unchanged from round 3 (73 / 3 / 22). TEST_REPORT `:15` nevertheless says "each candidate extension is kept at most once (test added)". The `ice_sdp` fuzz oracle checks for leaked addresses, not canonical form, so it cannot catch these either.
+
+**Scenario:** a later refactor re-emits the raw token. The doc promise "re-serialized in canonical form" (`ice.rs:44`) breaks silently. This is not a leak today, because the values are still validated as integers. The real harm is that CLAUDE.md rule 9 ("every security claim needs a test") is broken and the test report states something untrue.
+
+**Fix:** extend `candidate_case_and_extensions_canonicalised`:
+```rust
+assert_eq!(
+    filter_candidate(
+        "a=candidate:1 +01 udp +7 8.8.4.4 +09 typ relay generation +0 generation 5 network-id 007 \
+         ufrag abcd ufrag efgh network-cost 0010",
+        Mode::RelayOnly,
+    )
+    .as_deref(),
+    Some("a=candidate:1 1 udp 7 8.8.4.4 9 typ relay raddr 0.0.0.0 rport 0 generation 0 network-id 7 ufrag abcd network-cost 10")
+);
+```
+Also change the `ice.rs:108` comment to "the first valid occurrence wins", and correct TEST_REPORT `:15`.
+
+#### R4-3. The round-2 `gen.py` nit is reported as fixed but is unchanged.
+
+**What is unchanged:** `gen.py:5` (docstring) and `:35` (emitted header), and so `vectors.rs:4`, still give `python3 gen.py > vectors.rs` as the regeneration command. The CI job (`ci.yml:129-134`) runs `rustfmt` before the diff, and without that step the output does not match.
+
+**Why it is still open:** round 3 restated this nit under R3-5 ("While there, update `gen.py`'s docstring …"). TEST_REPORT's "Round-2 nits | **Fixed.**" covers it by omission.
+
+**Fix:** in `gen.py`, make the docstring and header say ``python3 -I gen.py > /tmp/v.rs && rustfmt +1.97.0 --edition 2024 --config-path ../../../../rustfmt.toml /tmp/v.rs && cp /tmp/v.rs vectors.rs``. Regenerate `vectors.rs`, because its header line changes too, so the CI diff stays empty. Alternatively, defer the nit explicitly with a named phase.
+
+**What I checked and found sound:**
+- **`filter_candidate` changes:** these cannot widen what is emitted.
+  - Every emitted value is either a parsed integer re-formatted by `u16`/`u32::to_string`, a lower-cased keyword from a fixed set, or a `ufrag` that still passes `is_ice_token`.
+  - `seen` is pushed only for kept extensions, and its size is bounded by `MAX_CANDIDATE`.
+  - Component 0 or > 256 and values that overflow `u32` are still refused or dropped.
+  - `+`/`-` signs: `u32` parsing accepts a leading `+` and rejects `-`, and the output never contains a sign.
+- **R3-4 text:** it does not overclaim, and it names the Phase 6 end-to-end test.
+- **TEST_REPORT corrections:** the corrected R3-1 numbers reproduce. The historical N1 row is annotated, not rewritten.
+
+### 4. Invariant status corrections required
+
+| ID | Claimed | Should be | Reason |
+|---|---|---|---|
+| INV-MSG-5 | partial; Kyber step "covered by mutation-checked unit tests instead"; deferral "impossible" per TEST_REPORT | partial (unchanged). Say "the PreKey/Kyber path is exercised by session tests" and give the real deferral reason | R4-1 |
+
+INV-NET-1's new wording is backed by tests that exist, and the `::` rule is mutation-verified. No other status changed in `b7cee0a`.
+
+### 5. What is done well
+
+- **R3-3:** the new test input was chosen so that only the intended rule can reject it, which the mutant confirms.
+- **R3-1 correction:** honest. The inflated headline was withdrawn, the historical row annotated rather than silently rewritten, and the re-measured numbers reproduce exactly. An attempted fix that did not work was reverted and reported, not kept.
+- **R3-4:** the STUN caveat now sits where a Phase 6 implementer will read it, in both PROTOCOL §8 and INV-NET-1, with a concrete verification method (packet capture).
+- **R3-5:** the hash pins were verified against both interpreters, and the fail-closed behaviour for others is documented in the file.
+- **Canonicalisation code:** small and fail-safe. Real Chrome and Firefox offers are unaffected.
+
+### 6. Conditions for PASS
+
+1. **R4-1:** correct the deferral reasons in the four places listed. Either apply the one-line empty-input fix or record it with the other approaches in the Phase 8 note.
+2. **R4-2:** add the canonicalisation and dedupe assertions (one test edit), and correct TEST_REPORT `:15`.
+3. **R4-3:** fix the `gen.py` docstring and header and regenerate `vectors.rs`, or defer the nit explicitly with a named phase.
+
+All three are Low, and none blocks starting Phase 3 work. They must be closed or explicitly deferred before the Phase 3 gate.
+
+VERDICT: PASS WITH CONDITIONS
