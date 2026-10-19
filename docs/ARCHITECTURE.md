@@ -156,7 +156,7 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
 - Exact-pinned dependencies, committed lockfiles, `cargo deny` (licenses: AGPL-compatible allowlist; advisories; bans; sources: crates.io plus the two pinned Signal git repos), `cargo audit`, `cargo vet` (Mozilla/Google/Bytecode Alliance imports plus our own audits), `pnpm audit`, `gitleaks`, lockfile integrity check.
 - GitHub Actions pinned by full commit SHA, `permissions: contents: read` by default, `persist-credentials: false`.
 
-### ADR-0009: Envelopes fill their bucket from inside the sealed-sender encryption. **Proposed (implemented after review round 1, H1; recorded after review round 2, N4). Owner approval pending.**
+### ADR-0009: Envelopes fill their bucket from inside the sealed-sender encryption. **Accepted (owner, 2026-10-19). Implemented after review round 1, H1; recorded after review round 2, N4.**
 - **Problem.** Framing v1 (`len || sealed || zero padding`) showed the relay the exact sealed size and the message type, so it learned more than the bucket that THREAT_MODEL §5 promises.
 - **Composition.** This is libsignal's own `sealed_sender_encrypt` composition, with one change:
   - `message_encrypt` produces the inner message;
