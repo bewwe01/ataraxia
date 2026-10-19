@@ -343,34 +343,10 @@ impl<B: KvBackend> Account<B> {
         intro: IntroFields,
         now: u64,
     ) -> Result<Redeemed> {
-        if invite.is_expired(now) || &invite.identity == self.identity.public() {
-            return Err(CoreError::InviteInvalid);
-        }
-        let pkg = invite.open_package(sealed_package)?;
-        let ik = IdentityKey::decode(&pkg.identity_key).map_err(|_| CoreError::Malformed)?;
-        // INV-PAIR-1: the bundle must belong to the identity in the QR code / link.
-        if ik != invite.identity {
-            return Err(CoreError::AuthFailed);
-        }
+        let (pkg, ik, bundle) = self.open_invite(invite, sealed_package, now)?;
         let contact_mailbox_id = arr32(&pkg.mailbox_id)?;
         let contact_delivery_token = arr32(&pkg.delivery_token)?;
-        let bundle = PreKeyBundle::new(
-            pkg.registration_id,
-            device()?,
-            Some((
-                pkg.prekey_id.into(),
-                PublicKey::deserialize(&pkg.prekey_pub).map_err(|_| CoreError::Malformed)?,
-            )),
-            pkg.signed_prekey_id.into(),
-            PublicKey::deserialize(&pkg.signed_prekey_pub).map_err(|_| CoreError::Malformed)?,
-            pkg.signed_prekey_sig.clone(),
-            pkg.kyber_prekey_id.into(),
-            kem::PublicKey::deserialize(&pkg.kyber_prekey_pub).map_err(|_| CoreError::Malformed)?,
-            pkg.kyber_prekey_sig.clone(),
-            ik,
-        )?;
         let contact = Address::of(&ik);
-        let remote = ProtocolAddress::new(contact.as_str().to_owned(), device()?);
         let content = Content {
             id: random_id(rng),
             sent_at_ms: now.saturating_mul(1000),
@@ -384,27 +360,9 @@ impl<B: KvBackend> Account<B> {
             })),
         };
         content.validate()?;
-
+        let plaintext = Zeroizing::new(pad_block(&content.encode()));
         let envelope = self
-            .transact(async {
-                self.with_store(|s| {
-                    s.set_peer_identity(contact.as_str(), &ik);
-                    Ok(())
-                })?;
-                let mut session = self.handle();
-                let mut ids = self.handle();
-                process_prekey_bundle(
-                    &remote,
-                    &self.local_address()?,
-                    &mut session,
-                    &mut ids,
-                    &bundle,
-                    system_time(now),
-                    rng,
-                )
-                .await?;
-                self.seal_in_tx(rng, &remote, &content, now).await
-            })
+            .establish_and_seal(rng, &bundle, &ik, &plaintext, now)
             .await?;
         Ok(Redeemed {
             contact,
@@ -431,6 +389,39 @@ impl<B: KvBackend> Account<B> {
         self.transact(self.seal_in_tx(rng, &remote, content, now)).await
     }
 
+    /// Starts a session from an invite bundle and seals the first message, as one transaction.
+    async fn establish_and_seal<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        bundle: &PreKeyBundle,
+        ik: &IdentityKey,
+        plaintext: &[u8],
+        now: u64,
+    ) -> Result<Vec<u8>> {
+        let contact = Address::of(ik);
+        let remote = ProtocolAddress::new(contact.as_str().to_owned(), device()?);
+        self.transact(async {
+            self.with_store(|s| {
+                s.set_peer_identity(contact.as_str(), ik);
+                Ok(())
+            })?;
+            let mut session = self.handle();
+            let mut ids = self.handle();
+            process_prekey_bundle(
+                &remote,
+                &self.local_address()?,
+                &mut session,
+                &mut ids,
+                bundle,
+                system_time(now),
+                rng,
+            )
+            .await?;
+            self.seal_bytes_in_tx(rng, &remote, plaintext, now).await
+        })
+        .await
+    }
+
     async fn seal_in_tx<R: Rng + CryptoRng>(
         &self,
         rng: &mut R,
@@ -439,12 +430,24 @@ impl<B: KvBackend> Account<B> {
         now: u64,
     ) -> Result<Vec<u8>> {
         let plaintext = Zeroizing::new(pad_block(&content.encode()));
+        self.seal_bytes_in_tx(rng, remote, &plaintext, now).await
+    }
+
+    /// Seals already padded plaintext. Callers validate content first; tests use this
+    /// directly to produce well-encrypted envelopes around hostile content.
+    async fn seal_bytes_in_tx<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        remote: &ProtocolAddress,
+        plaintext: &[u8],
+        now: u64,
+    ) -> Result<Vec<u8>> {
         let cert = self.sender_certificate(rng, now)?;
         let local = ProtocolAddress::new(cert.sender_uuid()?.to_owned(), cert.sender_device_id()?);
         let mut session = self.handle();
         let mut ids = self.handle();
         let message = message_encrypt(
-            &plaintext,
+            plaintext,
             remote,
             &local,
             &mut session,
@@ -520,6 +523,40 @@ impl<B: KvBackend> Account<B> {
             filler.map(|n| vec![0u8; n]),
         )?;
         Ok(sealed_sender_encrypt_from_usmc(remote, &usmc, &self.handle(), rng).await?)
+    }
+
+    /// Opens and checks an invite package, returning it with the inviter's key and bundle.
+    fn open_invite(
+        &self,
+        invite: &Invite,
+        sealed_package: &[u8],
+        now: u64,
+    ) -> Result<(PackagePb, IdentityKey, PreKeyBundle)> {
+        if invite.is_expired(now) || &invite.identity == self.identity.public() {
+            return Err(CoreError::InviteInvalid);
+        }
+        let pkg = invite.open_package(sealed_package)?;
+        let ik = IdentityKey::decode(&pkg.identity_key).map_err(|_| CoreError::Malformed)?;
+        // INV-PAIR-1: the bundle must belong to the identity in the QR code / link.
+        if ik != invite.identity {
+            return Err(CoreError::AuthFailed);
+        }
+        let bundle = PreKeyBundle::new(
+            pkg.registration_id,
+            device()?,
+            Some((
+                pkg.prekey_id.into(),
+                PublicKey::deserialize(&pkg.prekey_pub).map_err(|_| CoreError::Malformed)?,
+            )),
+            pkg.signed_prekey_id.into(),
+            PublicKey::deserialize(&pkg.signed_prekey_pub).map_err(|_| CoreError::Malformed)?,
+            pkg.signed_prekey_sig.clone(),
+            pkg.kyber_prekey_id.into(),
+            kem::PublicKey::deserialize(&pkg.kyber_prekey_pub).map_err(|_| CoreError::Malformed)?,
+            pkg.kyber_prekey_sig.clone(),
+            ik,
+        )?;
+        Ok((pkg, ik, bundle))
     }
 
     /// Self-issued sender certificate (ADR-0006): our identity key is the trust root.
@@ -874,3 +911,198 @@ mod pq_tests {
 }
 
 crate::redacted_debug!(InviteRecordPb);
+
+#[cfg(test)]
+mod rollback_tests {
+    //! Review round 1, M4 (INV-STATE-1): input that *decrypts successfully* and is refused
+    //! afterwards (wrong invite id, bad proof, wrong body, undecodable content) must leave
+    //! the recipient byte-identical, and the genuine message must still work afterwards.
+    //! A plain bit flip is rejected before any state is touched, so it cannot show this.
+    use super::*;
+    use crate::content::Text;
+    use crate::store::MemoryBackend;
+    use futures_executor::block_on;
+    use rand::TryRngCore as _;
+    use rand::rngs::OsRng;
+
+    const NOW: u64 = 1_800_000_000;
+    type Acc = Account<MemoryBackend>;
+
+    fn rng() -> rand::rand_core::UnwrapErr<OsRng> {
+        OsRng.unwrap_err()
+    }
+
+    fn intro(invite: &Invite, from: &Acc, invite_id: Vec<u8>, proof: Option<Vec<u8>>) -> Content {
+        Content {
+            id: random_id(&mut rng()),
+            sent_at_ms: 1,
+            body: Some(Body::ContactIntro(ContactIntro {
+                mailbox_id: vec![1; 32],
+                delivery_token: vec![2; 32],
+                display_name: None,
+                invite_id: Some(invite_id),
+                invite_proof: Some(
+                    proof.unwrap_or_else(|| invite.proof(from.identity.public()).unwrap().to_vec()),
+                ),
+                rekey: None,
+            })),
+        }
+    }
+
+    fn text(s: &str) -> Content {
+        Content {
+            id: random_id(&mut rng()),
+            sent_at_ms: 1,
+            body: Some(Body::Text(Text {
+                body: s.into(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// Redeems `invite` as `from` but seals arbitrary padded plaintext as the first message.
+    fn redeem_raw(from: &Acc, invite: &Invite, pkg: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        block_on(async {
+            let (_, ik, bundle) = from.open_invite(invite, pkg, NOW).unwrap();
+            from.establish_and_seal(&mut rng(), &bundle, &ik, plaintext, NOW)
+                .await
+                .unwrap()
+        })
+    }
+
+    /// Opens `env` at `at`, asserts it is refused and that `at` is byte-identical after.
+    fn refused(at: Acc, env: &[u8]) -> (Acc, CoreError) {
+        let before = at.into_backend();
+        let at = Account::load(before.clone()).unwrap();
+        let err = block_on(at.open(&mut rng(), env, NOW)).unwrap_err();
+        let after = at.into_backend();
+        assert!(
+            after == before,
+            "state changed after a decrypted-then-refused envelope ({err:?})"
+        );
+        (Account::load(after).unwrap(), err)
+    }
+
+    #[test]
+    fn refused_intros_change_nothing_and_invite_stays_usable() {
+        let bob = Account::create(MemoryBackend::new(), &mut rng()).unwrap();
+        let created = block_on(bob.create_invite(
+            &mut rng(),
+            InviteMode::Remote,
+            "wss://r",
+            [3; 32],
+            [1; 32],
+            [2; 32],
+            NOW,
+            3600,
+        ))
+        .unwrap();
+        let (inv, pkg) = (&created.invite, &created.sealed_package);
+        let mut bob = bob;
+        let cases: [(&str, Vec<u8>, CoreError); 4] = {
+            let m = || Account::create(MemoryBackend::new(), &mut rng()).unwrap();
+            let pad = |c: &Content| pad_block(&c.encode());
+            let (m1, m2, m3, m4) = (m(), m(), m(), m());
+            [
+                (
+                    "wrong invite id",
+                    redeem_raw(&m1, inv, pkg, &pad(&intro(inv, &m1, vec![9; 16], None))),
+                    CoreError::InviteInvalid,
+                ),
+                (
+                    "bad proof",
+                    redeem_raw(
+                        &m2,
+                        inv,
+                        pkg,
+                        &pad(&intro(inv, &m2, inv.id.to_vec(), Some(vec![7; 32]))),
+                    ),
+                    CoreError::AuthFailed,
+                ),
+                (
+                    "not an intro",
+                    redeem_raw(&m3, inv, pkg, &pad(&text("hi"))),
+                    CoreError::InviteInvalid,
+                ),
+                (
+                    "undecodable content",
+                    redeem_raw(&m4, inv, pkg, &pad_block(&[0xFF; 40])),
+                    CoreError::Malformed,
+                ),
+            ]
+        };
+        for (what, env, want) in cases {
+            let (b, err) = refused(bob, &env);
+            assert_eq!(err, want, "{what}");
+            bob = b;
+        }
+        // The invite was not consumed: a genuine redemption still succeeds.
+        let alice = Account::create(MemoryBackend::new(), &mut rng()).unwrap();
+        let fields = IntroFields {
+            mailbox_id: [4; 32],
+            delivery_token: [5; 32],
+            display_name: None,
+            rekey: None,
+        };
+        let red = block_on(alice.redeem_invite(&mut rng(), inv, pkg, fields, NOW)).unwrap();
+        assert!(matches!(
+            block_on(bob.open(&mut rng(), &red.envelope, NOW)).unwrap(),
+            Opened::NewContact { .. }
+        ));
+    }
+
+    #[test]
+    fn known_contact_with_undecodable_content_changes_nothing() {
+        let (alice, bob) = {
+            let bob = Account::create(MemoryBackend::new(), &mut rng()).unwrap();
+            let alice = Account::create(MemoryBackend::new(), &mut rng()).unwrap();
+            let created = block_on(bob.create_invite(
+                &mut rng(),
+                InviteMode::Remote,
+                "wss://r",
+                [3; 32],
+                [1; 32],
+                [2; 32],
+                NOW,
+                3600,
+            ))
+            .unwrap();
+            let fields = IntroFields {
+                mailbox_id: [4; 32],
+                delivery_token: [5; 32],
+                display_name: None,
+                rekey: None,
+            };
+            let red = block_on(alice.redeem_invite(
+                &mut rng(),
+                &created.invite,
+                &created.sealed_package,
+                fields,
+                NOW,
+            ))
+            .unwrap();
+            block_on(bob.open(&mut rng(), &red.envelope, NOW)).unwrap();
+            (alice, bob)
+        };
+        let to = ProtocolAddress::new(bob.identity.address().as_str().to_owned(), device().unwrap());
+        let mut bob = bob;
+        // Undecodable bytes, an all-zero block (bad padding), and an empty `Content` (fails validation).
+        for plaintext in [
+            pad_block(&[0xFF; 40]),
+            vec![0; 256],
+            pad_block(&Content::default().encode()),
+        ] {
+            let env =
+                block_on(alice.transact(alice.seal_bytes_in_tx(&mut rng(), &to, &plaintext, NOW))).unwrap();
+            let (b, err) = refused(bob, &env);
+            assert!(matches!(err, CoreError::Malformed), "{err:?}");
+            bob = b;
+        }
+        let env =
+            block_on(alice.seal(&mut rng(), &bob.identity.address(), &text("still fine"), NOW)).unwrap();
+        assert!(matches!(
+            block_on(bob.open(&mut rng(), &env, NOW)).unwrap(),
+            Opened::Message { .. }
+        ));
+    }
+}
