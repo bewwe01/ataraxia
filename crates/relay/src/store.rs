@@ -35,6 +35,12 @@ const STAT_MAILBOXES: &[u8] = b"mailboxes";
 const STAT_INVITES: &[u8] = b"invites";
 const STAT_BLOB_BYTES: &[u8] = b"blob_bytes";
 const STAT_ENVELOPE_BYTES: &[u8] = b"envelope_bytes";
+const STAT_UPLOAD_TOKENS: &[u8] = b"upload_tokens";
+const STAT_TOKEN_ROWS: &[u8] = b"token_rows";
+/// Database layout version (P3R2-9). A database without it, or with another, is refused:
+/// silently opening an older layout would leave records without expiry entries.
+const STAT_SCHEMA: &[u8] = b"schema";
+pub const SCHEMA_VERSION: u64 = 2;
 
 const X_ENVELOPE: u8 = b'e';
 const X_INVITE: u8 = b'i';
@@ -63,6 +69,8 @@ pub enum StoreError {
     Corrupt,
     #[error("storage failure")]
     Io,
+    #[error("the database was written by an incompatible relay version; move it aside to start fresh")]
+    Schema,
 }
 
 pub type Result<T> = core::result::Result<T, StoreError>;
@@ -79,6 +87,11 @@ pub struct Quotas {
     /// Bound on all queued envelopes together, so open mailbox creation cannot fill the disk.
     pub max_envelope_bytes_total: u64,
     pub max_tokens_per_mailbox: u32,
+    /// Delivery-token rows relay-wide (P3R2-1): with `max_tokens_per_mailbox` alone the rows
+    /// were bounded only by `max_mailboxes × 512`.
+    pub max_token_rows: u64,
+    /// Live one-time upload tokens relay-wide (P3R2-1).
+    pub max_upload_tokens: u64,
     pub max_invites: u64,
     pub max_blob_bytes_total: u64,
     pub envelope_ttl_secs: u64,
@@ -86,6 +99,8 @@ pub struct Quotas {
     pub blob_ttl_secs: u64,
     pub upload_token_ttl_secs: u64,
     pub mailbox_idle_secs: u64,
+    /// Lifetime of a mailbox that has never been authenticated (P3R2-3).
+    pub unauthed_mailbox_secs: u64,
 }
 
 // --- fixed-layout records -------------------------------------------------------------
@@ -120,11 +135,14 @@ struct Mailbox {
     count: u64,
     tokens: u32,
     last_auth_minute: u64,
+    /// Whether the mailbox was ever authenticated; until then it lives only
+    /// `unauthed_mailbox_secs`.
+    authed: bool,
 }
 
 impl Mailbox {
     fn decode(b: &[u8]) -> Result<Self> {
-        if b.len() != 32 + 8 + 8 + 4 + 8 {
+        if b.len() != 32 + 8 + 8 + 4 + 8 + 1 {
             return Err(StoreError::Corrupt);
         }
         Ok(Self {
@@ -133,6 +151,7 @@ impl Mailbox {
             count: u64_at(b, 40)?,
             tokens: u32_at(b, 48)?,
             last_auth_minute: u64_at(b, 52)?,
+            authed: take::<1>(b, 60)? == [1],
         })
     }
 
@@ -143,6 +162,7 @@ impl Mailbox {
             &self.count.to_be_bytes(),
             &self.tokens.to_be_bytes(),
             &self.last_auth_minute.to_be_bytes(),
+            &[u8::from(self.authed)],
         ])
     }
 }
@@ -214,7 +234,12 @@ fn prefix_end(prefix: &[u8; 32]) -> Vec<u8> {
 }
 
 fn idle_due(rec: &Mailbox, q: &Quotas) -> u64 {
-    rec.last_auth_minute.saturating_add(q.mailbox_idle_secs)
+    let ttl = if rec.authed {
+        q.mailbox_idle_secs
+    } else {
+        q.unauthed_mailbox_secs
+    };
+    rec.last_auth_minute.saturating_add(ttl)
 }
 
 fn xkey(kind: u8, due: u64, id: &[u8]) -> Vec<u8> {
@@ -275,9 +300,15 @@ fn remove_mailbox(txn: &WriteTransaction, id: &[u8; 32], q: &Quotas) -> Result<b
         Mailbox::decode(g.value())?
     };
     let end = prefix_end(id);
+    let mut token_rows = 0u64;
     {
         let mut tokens = txn.open_table(TOKENS).map_err(io)?;
-        tokens.retain_in(&id[..]..&end[..], |_, _| false).map_err(io)?;
+        tokens
+            .retain_in(&id[..]..&end[..], |_, _| {
+                token_rows = token_rows.saturating_add(1);
+                false
+            })
+            .map_err(io)?;
     }
     let (_, freed) = remove_envelopes(txn, &id[..]..&end[..])?;
     let mut x = txn.open_table(EXPIRY).map_err(io)?;
@@ -285,6 +316,7 @@ fn remove_mailbox(txn: &WriteTransaction, id: &[u8; 32], q: &Quotas) -> Result<b
     let mut stats = txn.open_table(STATS).map_err(io)?;
     sub_stat(&mut stats, STAT_MAILBOXES, 1)?;
     sub_stat(&mut stats, STAT_ENVELOPE_BYTES, freed)?;
+    sub_stat(&mut stats, STAT_TOKEN_ROWS, token_rows)?;
     Ok(true)
 }
 
@@ -343,7 +375,27 @@ impl Store {
         ] {
             txn.open_table(t).map_err(io)?;
         }
-        txn.open_table(STATS).map_err(io)?;
+        {
+            let mut stats = txn.open_table(STATS).map_err(io)?;
+            let version = stats.get(STAT_SCHEMA).map_err(io)?.map(|g| g.value());
+            match version {
+                Some(SCHEMA_VERSION) => {}
+                Some(_) => return Err(StoreError::Schema),
+                None => {
+                    // Only a database with no records at all may be stamped as current.
+                    let mb = txn.open_table(MAILBOXES).map_err(io)?;
+                    let inv = txn.open_table(INVITES).map_err(io)?;
+                    let blobs = txn.open_table(BLOBS).map_err(io)?;
+                    if mb.first().map_err(io)?.is_some()
+                        || inv.first().map_err(io)?.is_some()
+                        || blobs.first().map_err(io)?.is_some()
+                    {
+                        return Err(StoreError::Schema);
+                    }
+                    stats.insert(STAT_SCHEMA, SCHEMA_VERSION).map_err(io)?;
+                }
+            }
+        }
         txn.commit().map_err(io)?;
         Ok(s)
     }
@@ -378,6 +430,7 @@ impl Store {
                 count: 0,
                 tokens: 0,
                 last_auth_minute: minute(now),
+                authed: false,
             };
             mb.insert(&id[..], &rec.encode()[..]).map_err(io)?;
             let mut x = txn.open_table(EXPIRY).map_err(io)?;
@@ -404,12 +457,13 @@ impl Store {
                 let g = mb.get(&id[..]).map_err(io)?.ok_or(StoreError::NotFound)?;
                 Mailbox::decode(g.value())?
             };
-            if rec.last_auth_minute == minute(now) {
+            if rec.authed && rec.last_auth_minute == minute(now) {
                 return Ok(()); // nothing changes; the write transaction is dropped
             }
             let mut x = txn.open_table(EXPIRY).map_err(io)?;
             index_del(&mut x, X_MAILBOX, idle_due(&rec, &self.q), id)?;
             rec.last_auth_minute = minute(now);
+            rec.authed = true;
             index_put(&mut x, X_MAILBOX, idle_due(&rec, &self.q), id)?;
             mb.insert(&id[..], &rec.encode()[..]).map_err(io)?;
         }
@@ -433,6 +487,7 @@ impl Store {
                 let g = mb.get(&id[..]).map_err(io)?.ok_or(StoreError::NotFound)?;
                 Mailbox::decode(g.value())?
             };
+            let before = u64::from(rec.tokens);
             let mut tokens = txn.open_table(TOKENS).map_err(io)?;
             for h in remove {
                 if tokens.remove(&cat(&[id, h])[..]).map_err(io)?.is_some() {
@@ -447,6 +502,14 @@ impl Store {
             if rec.tokens > self.q.max_tokens_per_mailbox {
                 return Err(StoreError::Quota);
             }
+            let mut stats = txn.open_table(STATS).map_err(io)?;
+            let rows = stat!(stats, STAT_TOKEN_ROWS)
+                .saturating_sub(before)
+                .saturating_add(u64::from(rec.tokens));
+            if rows > self.q.max_token_rows && u64::from(rec.tokens) > before {
+                return Err(StoreError::Quota);
+            }
+            stats.insert(STAT_TOKEN_ROWS, rows).map_err(io)?;
             mb.insert(&id[..], &rec.encode()[..]).map_err(io)?;
         }
         txn.commit().map_err(io)
@@ -612,8 +675,14 @@ impl Store {
     pub fn add_upload_token(&self, token_hash: &[u8; 32], now: u64) -> Result<()> {
         let txn = self.db.begin_write().map_err(io)?;
         {
+            let mut stats = txn.open_table(STATS).map_err(io)?;
+            let live = stat!(stats, STAT_UPLOAD_TOKENS);
+            if live >= self.q.max_upload_tokens {
+                return Err(StoreError::Quota);
+            }
             let mut t = txn.open_table(UPLOAD_TOKENS).map_err(io)?;
             let expires = now.saturating_add(self.q.upload_token_ttl_secs);
+            let mut replaced = false;
             if let Some(old) = t
                 .insert(
                     &token_hash[..],
@@ -626,9 +695,15 @@ impl Store {
                 drop(old);
                 let mut x = txn.open_table(EXPIRY).map_err(io)?;
                 index_del(&mut x, X_UPLOAD, old_due, token_hash)?;
+                replaced = true;
             }
             let mut x = txn.open_table(EXPIRY).map_err(io)?;
             index_put(&mut x, X_UPLOAD, expires, token_hash)?;
+            if !replaced {
+                stats
+                    .insert(STAT_UPLOAD_TOKENS, live.saturating_add(1))
+                    .map_err(io)?;
+            }
         }
         txn.commit().map_err(io)
     }
@@ -728,6 +803,7 @@ impl Store {
             if complete {
                 toks.remove(&token_hash[..]).map_err(io)?;
                 index_del(&mut x, X_UPLOAD, tok_expires, token_hash)?;
+                sub_stat(&mut stats, STAT_UPLOAD_TOKENS, 1)?;
             } else if !bound {
                 let rebound = cat(&[&tok_expires.to_be_bytes(), &[1u8], blob]);
                 toks.insert(&token_hash[..], &rebound[..]).map_err(io)?;
@@ -764,7 +840,8 @@ impl Store {
     // ---- expiry ----
 
     /// Deletes expired envelopes, invites, upload tokens and blobs, and idle mailboxes.
-    /// Returns the number of envelopes, invites, blobs and mailboxes removed.
+    /// Returns the number of index entries that removed a record: envelopes, invites, blobs
+    /// and mailboxes, where a mailbox counts once however many envelopes went with it.
     ///
     /// Only index entries that are due are read, in batches of [`SWEEP_BATCH`], each in its
     /// own short write transaction: the cost depends on what expires, not on what is stored
@@ -885,6 +962,8 @@ impl Store {
                     && d == due
                 {
                     toks.remove(id).map_err(io)?;
+                    let mut stats = txn.open_table(STATS).map_err(io)?;
+                    sub_stat(&mut stats, STAT_UPLOAD_TOKENS, 1)?;
                 }
                 Ok(false)
             }
@@ -930,6 +1009,20 @@ impl Store {
         }
     }
 
+    /// Test hook: overwrite (or remove) the stored schema version.
+    #[cfg(test)]
+    fn set_schema(&self, v: Option<u64>) {
+        let txn = self.db.begin_write().unwrap();
+        {
+            let mut stats = txn.open_table(STATS).unwrap();
+            match v {
+                Some(v) => stats.insert(STAT_SCHEMA, v).unwrap(),
+                None => stats.remove(STAT_SCHEMA).unwrap(),
+            };
+        }
+        txn.commit().unwrap();
+    }
+
     /// Rows in each table, for tests that check nothing is left behind.
     #[cfg(test)]
     fn row_counts(&self) -> Vec<(&'static str, u64)> {
@@ -967,6 +1060,8 @@ mod tests {
             max_envelopes_per_mailbox: 3,
             max_envelope_bytes_total: 10_000,
             max_tokens_per_mailbox: 4,
+            max_token_rows: 1_000,
+            max_upload_tokens: 1_000,
             max_invites: 2,
             max_blob_bytes_total: 300,
             envelope_ttl_secs: 100,
@@ -974,6 +1069,7 @@ mod tests {
             blob_ttl_secs: 100,
             upload_token_ttl_secs: 10,
             mailbox_idle_secs: 1000,
+            unauthed_mailbox_secs: 1000,
         }
     }
 
@@ -1181,6 +1277,118 @@ mod tests {
         assert_eq!(s.get_chunk(&[4; 32], 0, 1100).unwrap().0, 1);
         assert_eq!(s.sweep(1115).unwrap(), 1);
         assert_eq!(rows(&s), vec![]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn store_with(q: Quotas) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("veil-store-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Store::open(&dir.join("db"), q).unwrap(), dir)
+    }
+
+    /// P3R2-1: live upload tokens are capped relay-wide; completion and expiry free slots.
+    #[test]
+    fn upload_tokens_are_capped_and_released() {
+        let (s, dir) = store_with(Quotas {
+            max_upload_tokens: 2,
+            ..quotas()
+        });
+        s.add_upload_token(&[1; 32], 1000).unwrap();
+        s.add_upload_token(&[2; 32], 1000).unwrap();
+        assert_eq!(s.add_upload_token(&[3; 32], 1000), Err(StoreError::Quota));
+        // Completing an upload consumes its token and frees a slot.
+        assert!(
+            s.put_chunk(&[1; 32], &[9; 32], 0, 1, &[0; 10], 100, 1000)
+                .unwrap()
+        );
+        s.add_upload_token(&[3; 32], 1000).unwrap();
+        assert_eq!(s.add_upload_token(&[4; 32], 1000), Err(StoreError::Quota));
+        // Expiry (ttl 10) frees the rest.
+        s.sweep(1010).unwrap();
+        s.add_upload_token(&[4; 32], 1010).unwrap();
+        s.add_upload_token(&[5; 32], 1010).unwrap();
+        assert_eq!(s.add_upload_token(&[6; 32], 1010), Err(StoreError::Quota));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// P3R2-1: delivery-token rows are capped relay-wide, not only per mailbox; removal,
+    /// deletion and idle expiry give rows back.
+    #[test]
+    fn token_rows_are_capped_relay_wide() {
+        let (s, dir) = store_with(Quotas {
+            max_token_rows: 5,
+            ..quotas()
+        });
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        s.create_mailbox(&a, &[9; 32], 1000).unwrap();
+        s.create_mailbox(&b, &[9; 32], 1000).unwrap();
+        s.update_tokens(&a, &[[1; 32], [2; 32], [3; 32], [4; 32]], &[])
+            .unwrap();
+        assert_eq!(
+            s.update_tokens(&b, &[[1; 32], [2; 32]], &[]),
+            Err(StoreError::Quota)
+        );
+        s.update_tokens(&b, &[[1; 32]], &[]).unwrap();
+        assert_eq!(s.update_tokens(&b, &[[2; 32]], &[]), Err(StoreError::Quota));
+        // Shrinking is always allowed, and frees rows.
+        s.update_tokens(&a, &[], &[[4; 32]]).unwrap();
+        s.update_tokens(&b, &[[2; 32]], &[]).unwrap();
+        s.delete_mailbox(&a).unwrap();
+        s.update_tokens(&b, &[[3; 32], [4; 32]], &[]).unwrap();
+        s.sweep(1000 + 2000).unwrap(); // b idles out
+        s.create_mailbox(&a, &[9; 32], 3000).unwrap();
+        s.update_tokens(&a, &[[1; 32], [2; 32], [3; 32], [4; 32]], &[])
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// P3R2-3: a mailbox that is never authenticated lives `unauthed_mailbox_secs`, not the
+    /// full idle period.
+    #[test]
+    fn never_authenticated_mailboxes_expire_early() {
+        let (s, dir) = store_with(Quotas {
+            unauthed_mailbox_secs: 100,
+            ..quotas()
+        });
+        let (used, unused) = ([1u8; 32], [2u8; 32]);
+        s.create_mailbox(&used, &[9; 32], 1000).unwrap();
+        s.create_mailbox(&unused, &[9; 32], 1000).unwrap();
+        s.touch_mailbox(&used, 1000).unwrap(); // authenticated in the same minute
+        assert_eq!(s.sweep(1100).unwrap(), 1);
+        assert_eq!(s.mailbox_auth_key(&unused), Err(StoreError::NotFound));
+        assert_eq!(s.mailbox_auth_key(&used).unwrap(), [9; 32]);
+        assert_eq!(s.sweep(1959).unwrap(), 0, "authenticated: idle 1000 s from 960");
+        assert_eq!(s.sweep(1960).unwrap(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// P3R2-9: a database of another layout version, or an unversioned one holding data, is
+    /// refused instead of being opened without expiry entries.
+    #[test]
+    fn foreign_schema_is_refused() {
+        let (s, dir) = store();
+        let path = dir.join("db");
+        s.create_mailbox(&[1; 32], &[9; 32], 1000).unwrap();
+        drop(s);
+        Store::open(&path, quotas()).unwrap(); // same version: fine
+        let s = Store::open(&path, quotas()).unwrap();
+        s.set_schema(Some(1));
+        drop(s);
+        assert_eq!(Store::open(&path, quotas()).unwrap_err(), StoreError::Schema);
+        // An older relay's database: data present, no version row at all. Built around the
+        // version check, which would refuse to open it.
+        let old = Store {
+            db: redb::Database::create(&path).unwrap(),
+            q: quotas(),
+            examined: core::sync::atomic::AtomicU64::new(0),
+        };
+        old.set_schema(None);
+        drop(old);
+        assert_eq!(Store::open(&path, quotas()).unwrap_err(), StoreError::Schema);
+        // An empty, unversioned database is simply stamped.
+        let fresh = dir.join("fresh");
+        drop(redb::Database::create(&fresh).unwrap());
+        Store::open(&fresh, quotas()).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -24,8 +24,13 @@ audit.
 * About 2 GB of disk for the build, plus room for the database.
   * Queued messages and attachments are capped at 1 GiB and 4 GiB by default (`VEIL_QUOTA_ENVELOPES_MB`,
     `VEIL_QUOTA_BLOBS_MB` in `.env`).
-  * The database file can grow to about **3.5× the caps** (measured: 2.16 GB on disk for 630 MB of
-    queued messages), so the defaults need about 18 GB free. Lower the caps on a small SD card.
+  * The database file is larger than what it stores. Measured with 630 MB of queued messages: the
+    file's apparent size was 2.16 GB (redb grows in large steps), and about 2× the payload was
+    actually allocated. Budget **3.5× the caps** to be safe, about 18 GB free for the defaults, and
+    lower the caps on a small SD card.
+  * Two kinds of small records are capped separately, so they cannot grow without bound either:
+    - delivery-token rows: at most 1 000 000 relay-wide, about 165 MB;
+    - live upload tokens: at most 20 000, about 3 MB.
   * Anyone who can reach the relay can create a mailbox, so these caps are what keep a stranger from
     filling the disk. When a cap is reached, new deposits are refused until old data expires (see
     *Known limits*).
@@ -112,15 +117,20 @@ again any time:
 docker compose run --rm relay pin /data/tls/cert.pem /data/tls/key.pem
 ```
 
-Install the TURN firewall rule (**required**, see *Hardening* for why):
+Install the TURN firewall rule (**required**, see *Hardening* for why) so that it loads on every
+boot, before Docker starts:
 
 ```sh
-sudo nft -f firewall/veil-turn.nft
+sudo install -m 0644 firewall/veil-turn.nft /etc/veil-turn.nft
+sudo install -m 0644 firewall/veil-turn-firewall.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now veil-turn-firewall
+sudo nft list table inet veil_turn     # shows the rule
 ```
 
-It only stops coturn's relay sockets from reaching other services on this host; nothing else changes.
-To keep it across reboots, add `include "/full/path/to/deploy/firewall/veil-turn.nft"` to
-`/etc/nftables.conf` and run `sudo systemctl enable nftables`.
+It only stops coturn's relay sockets from reaching services on this host, including services that
+Docker publishes; nothing else changes. The unit is `RequiredBy=docker.service`, so if the rule
+cannot load, Docker does not start either. That is deliberate: coturn must not run without it.
 
 Start everything:
 
@@ -191,19 +201,30 @@ expire after 14 days. Run it only on a relay you are about to reset.
     tailnet.
   * The one exception is the server's own `TURN_EXTERNAL_IP`, because both legs of a call are
     relayed through it. Without the firewall rule, that exception would let anyone send UDP to
-    *every* service listening on that address (DNS, Pi-hole, WireGuard, ...). `firewall/veil-turn.nft`
-    restricts coturn's relay sockets, towards this host's own addresses, to the relay port range
-    (tested: a host UDP service on port 40000 received 0 of 5 relayed packets with the rule and 5 of
-    5 without it; calls still relay with 0 loss).
-  * Not verified: home deployments behind NAT (option B), where relayed packets to the public
-    address depend on the router's hairpin NAT. If calls fail there, report it rather than widening
-    `allowed-peer-ip`.
+    *every* service listening on that address (DNS, Pi-hole, WireGuard, ...).
+  * `firewall/veil-turn.nft` restricts coturn's relay sockets, towards this host's own addresses, to
+    the relay port range. It runs before Docker's NAT, so services Docker publishes are covered too.
+  * Tested in CI:
+    - a host UDP service received 0 of 5 relayed packets;
+    - a Docker-published UDP service lost 5 of 5 with the rule, and was reachable when the rule ran
+      after Docker's NAT, as the first version did;
+    - calls still relay with 0 loss.
+  * Option B (`public/private` external IP): the review reproduced the coturn side, and calls relay
+    through the public address without router hairpin NAT. A real home router was not tested.
 * **Relay connections:**
-  * At most 32 concurrent connections per source (IPv4 address or IPv6 /64), counted in memory
-    only while connected.
-  * A connection must authenticate a mailbox, or deliver, fetch or upload something, within 30 s.
-  * Every write to a client has a 30 s timeout, and large responses share a 64 MiB budget, so slow
-    or non-reading clients cannot hold memory or connection slots.
+  * Each connection's source (IPv4 address or IPv6 /64) is kept in memory only, never logged or
+    stored, to bound what one host can take:
+    - at most 32 concurrent connections (`VEIL_MAX_CONN_PER_SOURCE`);
+    - at most 8 MiB of the 64 MiB response budget;
+    - 10 mailbox creations, then 1 per minute;
+    - 30 upload tokens, then 1 per 30 s.
+  * If clients reach the relay through something that hides their address, they all count as one
+    source; raise `VEIL_MAX_CONN_PER_SOURCE` then. This applies to a reverse proxy, and to Docker's
+    userland proxy for IPv6 clients of this IPv4-only container.
+  * A connection must authenticate a mailbox, or deliver, upload or download something, within 30 s.
+  * Every write to a client has a 30 s timeout.
+  * A mailbox that is never authenticated is deleted after 24 h; an authenticated one after 60
+    days without use.
   * `docker stop` shuts the relay down cleanly (SIGTERM).
 
 ## Known limits
@@ -222,8 +243,14 @@ expire after 14 days. Run it only on a relay you are about to reset.
   create mailboxes and use up the storage caps. That stops new messages and uploads, but it can't
   read or delete anything already stored. Rate limits don't really slow it down: with many tokens per
   mailbox, an attacker can fill the caps as fast as their uplink allows.
-* **Connection exhaustion.** The relay has 1 024 connection slots. One host can take only 32 of them,
-  but an attacker with many addresses (a botnet, or many IPv6 /64s) can still take all of them.
-  Mailbox creation also has a relay-wide budget (20, then 1 per second), which a distributed attacker
-  can drain. Both are denials of service, not data exposure.
+* **Denial of service by many sources.** One host is limited per source (above). An attacker with
+  many addresses can still exhaust relay-wide limits:
+  - the 1 024 connection slots;
+  - the response budget;
+  - mailbox creation (20, then 1 per second relay-wide), which also blocks onboarding and mailbox
+    rotation;
+  - the token caps.
+
+  IPv6 makes many sources cheap: one /48 holds 65 536 /64s. These are denials of service, not data
+  exposure.
 * **Not audited.** Treat this as a carefully built but independently unverified system.

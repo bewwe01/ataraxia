@@ -158,6 +158,18 @@ async fn relay_logs_nothing_about_clients() {
 
     let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("capture-canary-7e11"), "capture is not global");
+    // The relay logs nothing at all during a session (P3R2-4): any line, whatever its
+    // format (hex, `Debug` arrays, sizes of derived records), is a failure.
+    let other: Vec<&str> = logs
+        .lines()
+        .filter(|l| !l.contains("capture-canary-7e11"))
+        .collect();
+    assert!(
+        other.is_empty(),
+        "relay logged during a session:\n{}",
+        other.join("\n")
+    );
+    // Second check, kept for clarity of intent: specific identifiers never appear.
     for (what, needle) in [
         ("client IP", "127.0.0.1".to_owned()),
         ("relay port (connection info)", relay.addr.port().to_string()),

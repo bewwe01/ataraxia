@@ -195,7 +195,7 @@ Defined in `crates/wire` (shared by client and relay).
 |---|---|---|
 | `CreateMailbox { mailbox_id, auth_pub }` | none (per-connection limit, then relay-wide limit spent only by requests that would succeed) | registers the mailbox's Ed25519 key |
 | `Challenge { mailbox_id }` → `Challenge { nonce }` | none | single-use 32-byte nonce, bound to this connection and mailbox (≤ 64 outstanding) |
-| `Authenticate { mailbox_id, unix_secs, signature }` | signs §2 message | marks the mailbox authenticated **on this connection** (≤ 64 per connection) and subscribes it to pushes. Every later use re-checks that the mailbox still has the key it was authenticated with, so deleting a mailbox revokes all connections |
+| `Authenticate { mailbox_id, unix_secs, signature }` | signs §2 message | marks the mailbox authenticated **on this connection** (≤ 64 per connection) and subscribes it to pushes. Every later use re-checks that the mailbox still has the key it was authenticated with, so deleting a mailbox revokes all connections. Pushes go only to connections authenticated with the mailbox's current key |
 | `UpdateTokens { mailbox_id, add[], remove[] }` | mailbox | registers/removes `SHA-256("veil/v1/tok" ‖ token)` (≤ 512 per mailbox) |
 | `Deposit { mailbox_id, token, envelope }` | delivery token | stores the envelope, pushes `NewEnvelopes` to subscribed connections |
 | `Fetch { mailbox_id, after_seq, limit ≤ 32 }` → `Envelopes { items[], last_seq }` | mailbox | `items` = `{ seq, received_minute, envelope }`, oldest first |
@@ -209,12 +209,16 @@ Defined in `crates/wire` (shared by client and relay).
 | `TurnCredentials { mailbox_id }` → `Turn` | mailbox | §8 |
 | `Ping` → `Ok` | none | keep-alive |
 
-**Storage.** For an envelope the relay stores `{ mailbox_id, seq, received_minute, envelope }` with a TTL (default 14 days); a full mailbox (5 000 envelopes) or a full relay (byte cap, default 1 GiB) refuses new deposits with `QuotaExceeded`. It never drops queued envelopes to make room. Mailboxes not authenticated for 60 days expire. Incomplete blobs expire with their upload token (24 h), complete ones 30 days after completion. Expiry runs from an index of due times, in short batches. **No sender, no IP, no User-Agent, no connection record** is stored or logged (INV-META-2, INV-LOG-1).
+**Storage.** For an envelope the relay stores `{ mailbox_id, seq, received_minute, envelope }` with a TTL (default 14 days); a full mailbox (5 000 envelopes) or a full relay (byte cap, default 1 GiB) refuses new deposits with `QuotaExceeded`. It never drops queued envelopes to make room. Mailboxes not authenticated for 60 days expire, and mailboxes never authenticated at all expire after 24 h. Delivery-token rows (1 000 000) and live upload tokens (20 000) are capped relay-wide. Incomplete blobs expire with their upload token (24 h), complete ones 30 days after completion. Expiry runs from an index of due times, in short batches. **No sender, no IP, no User-Agent, no connection record** is stored or logged (INV-META-2, INV-LOG-1).
 
 **Rate limits** are token buckets keyed by delivery token, mailbox or connection, plus a relay-wide one for mailbox creation. **Never by IP.** Rate-limit refusals echo the request id.
 
 **Connections.**
-- At most 1 024 concurrent connections, and at most 32 per source (IPv4 address or IPv6 /64). The per-source count is the only use of the peer address: it is held in memory while the connection is open, then forgotten, and never stored or logged.
+- At most 1 024 concurrent connections. The only use of the peer address is a source key (IPv4 address or IPv6 /64), held in memory only and never stored or logged. Per source, the relay allows:
+  - 32 concurrent connections;
+  - an 8 MiB share of the response budget;
+  - 10 mailbox creations, then 1 per minute;
+  - 30 upload tokens, then 1 per 30 s.
 - A connection that has not authenticated a mailbox, deposited, taken an invite or transferred a blob chunk within 30 s is closed, whatever it sends meanwhile.
 - Idle timeout: 5 min.
 - Every write has a 30 s timeout. `Fetch` and `BlobGet` responses reserve their worst-case size from a relay-wide 64 MiB budget until sent; when the budget is exhausted they are refused with `RateLimited`.

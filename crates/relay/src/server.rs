@@ -9,10 +9,12 @@
 //! * a relay-wide budget for response bytes in flight, so slow readers cannot exhaust memory;
 //! * rate limits keyed by delivery token, mailbox or connection, **never by IP**.
 //!
-//! The one use of the peer address is an in-memory count of *concurrent* connections per
-//! source (IPv4 address or IPv6 /64), so one host cannot take every connection slot
-//! (review P3-4). The count exists only while a connection is open; it is never logged or
-//! stored, and an entry is removed when it reaches zero.
+//! The one use of the peer address is a truncated **source key** (IPv4 address or IPv6 /64),
+//! held in memory only and never logged or stored. It bounds what one host can take of
+//! relay-wide resources: concurrent connections (P3-4), its share of the response budget
+//! (P3R2-2), and mailbox creations and upload tokens (P3R2-3, P3R2-1). Connection counts and
+//! budget shares are forgotten when they reach zero; the rate buckets live in a bounded,
+//! evicting in-memory map.
 //!
 //! Nothing about a connection is logged: no address, no mailbox id, no size (INV-META-2).
 
@@ -61,6 +63,10 @@ pub struct Limits {
     pub create_mailbox: Rate,
     /// Mailbox creations per connection (so one connection cannot drain the relay-wide bucket).
     pub create_mailbox_per_conn: Rate,
+    /// Mailbox creations per source (so reconnecting does not help either).
+    pub create_mailbox_per_source: Rate,
+    /// Upload tokens per source.
+    pub upload_token_per_source: Rate,
     /// Deposits per delivery token.
     pub deposit_per_token: Rate,
     /// Invite uploads per authenticated mailbox.
@@ -93,6 +99,15 @@ impl Default for Limits {
             create_mailbox_per_conn: Rate {
                 burst: 4,
                 per_sec: 1.0 / 60.0,
+            },
+            // Generous enough for a household or carrier-grade NAT behind one address.
+            create_mailbox_per_source: Rate {
+                burst: 10,
+                per_sec: 1.0 / 60.0,
+            },
+            upload_token_per_source: Rate {
+                burst: 30,
+                per_sec: 1.0 / 30.0,
             },
             deposit_per_token: Rate {
                 burst: 60,
@@ -137,6 +152,8 @@ pub struct Config {
     pub write_timeout: Duration,
     /// Response bytes (fetches, blob chunks) that may be in flight relay-wide.
     pub response_budget_bytes: usize,
+    /// The most of that budget one source may hold at once.
+    pub response_budget_per_source: usize,
     pub sweep_interval: Duration,
 }
 
@@ -155,6 +172,8 @@ impl Default for Quotas {
             max_envelopes_per_mailbox: 5_000,
             max_envelope_bytes_total: 1024 * 1024 * 1024,
             max_tokens_per_mailbox: 512,
+            max_token_rows: 1_000_000,
+            max_upload_tokens: 20_000,
             max_invites: 50_000,
             max_blob_bytes_total: 4 * 1024 * 1024 * 1024,
             envelope_ttl_secs: 14 * 24 * 3600,
@@ -162,6 +181,7 @@ impl Default for Quotas {
             blob_ttl_secs: 30 * 24 * 3600,
             upload_token_ttl_secs: 24 * 3600,
             mailbox_idle_secs: 60 * 24 * 3600,
+            unauthed_mailbox_secs: 24 * 3600,
         }
     }
 }
@@ -179,12 +199,14 @@ impl Default for Config {
             pre_auth_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(30),
             response_budget_bytes: 64 * 1024 * 1024,
+            response_budget_per_source: 8 * 1024 * 1024,
             sweep_interval: Duration::from_mins(1),
         }
     }
 }
 
-type Subscribers = HashMap<[u8; 32], Vec<(u64, mpsc::Sender<ServerFrame>)>>;
+/// Mailbox → (connection, the auth key it authenticated with, push channel).
+type Subscribers = HashMap<[u8; 32], Vec<(u64, [u8; 32], mpsc::Sender<ServerFrame>)>>;
 
 /// State shared by all connections.
 pub struct Shared {
@@ -196,11 +218,15 @@ pub struct Shared {
     deposits: Mutex<KeyedLimiter>,
     put_invite: Mutex<KeyedLimiter>,
     upload_tokens: Mutex<KeyedLimiter>,
+    create_per_source: Mutex<KeyedLimiter>,
+    upload_tokens_per_source: Mutex<KeyedLimiter>,
     turn: Mutex<KeyedLimiter>,
     subscribers: Mutex<Subscribers>,
     next_conn: AtomicU64,
     /// Response bytes in flight, in KiB units.
     response_budget: Arc<Semaphore>,
+    /// KiB of that budget held per source.
+    budget_by_source: Arc<Mutex<HashMap<[u8; 8], u32>>>,
 }
 
 impl core::fmt::Debug for Shared {
@@ -226,12 +252,15 @@ impl Shared {
             deposits: Mutex::new(KeyedLimiter::new(l.deposit_per_token, LIMITER_KEYS)),
             put_invite: Mutex::new(KeyedLimiter::new(l.put_invite_per_mailbox, LIMITER_KEYS)),
             upload_tokens: Mutex::new(KeyedLimiter::new(l.upload_token_per_mailbox, LIMITER_KEYS)),
+            create_per_source: Mutex::new(KeyedLimiter::new(l.create_mailbox_per_source, LIMITER_KEYS)),
+            upload_tokens_per_source: Mutex::new(KeyedLimiter::new(l.upload_token_per_source, LIMITER_KEYS)),
             turn: Mutex::new(KeyedLimiter::new(l.turn_per_mailbox, LIMITER_KEYS)),
             subscribers: Mutex::new(HashMap::new()),
             next_conn: AtomicU64::new(1),
             response_budget: Arc::new(Semaphore::new(
                 (cfg.response_budget_bytes / 1024).min(Semaphore::MAX_PERMITS),
             )),
+            budget_by_source: Arc::new(Mutex::new(HashMap::new())),
             cfg,
         })
     }
@@ -251,25 +280,43 @@ impl Shared {
             .map_err(|_| StoreError::Io)?
     }
 
-    fn subscribe(&self, mailbox: [u8; 32], conn: u64, tx: mpsc::Sender<ServerFrame>) {
+    fn subscribe(&self, mailbox: [u8; 32], conn: u64, key: [u8; 32], tx: mpsc::Sender<ServerFrame>) {
         let mut subs = lock(&self.subscribers);
         let list = subs.entry(mailbox).or_default();
-        if !list.iter().any(|(c, _)| *c == conn) {
-            list.push((conn, tx));
+        list.retain(|(c, _, _)| *c != conn);
+        list.push((conn, key, tx));
+    }
+
+    fn unsubscribe(&self, mailbox: [u8; 32], conn: u64) {
+        let mut subs = lock(&self.subscribers);
+        if let Some(list) = subs.get_mut(&mailbox) {
+            list.retain(|(c, _, _)| *c != conn);
+            if list.is_empty() {
+                subs.remove(&mailbox);
+            }
         }
+    }
+
+    /// A deleted mailbox loses every subscription, whoever holds it (P3R2-6).
+    fn drop_subscribers(&self, mailbox: [u8; 32]) {
+        lock(&self.subscribers).remove(&mailbox);
     }
 
     fn unsubscribe_all(&self, conn: u64) {
         let mut subs = lock(&self.subscribers);
         subs.retain(|_, list| {
-            list.retain(|(c, _)| *c != conn);
+            list.retain(|(c, _, _)| *c != conn);
             !list.is_empty()
         });
     }
 
-    fn notify(&self, mailbox: [u8; 32], last_seq: u64) {
-        let subs = lock(&self.subscribers);
-        if let Some(list) = subs.get(&mailbox) {
+    /// Pushes to connections authenticated with the mailbox's *current* key only, and drops
+    /// the others: a mailbox that expired and was re-created by someone else must not leak
+    /// deposit timing to the previous owner's connections (P3R2-6).
+    fn notify(&self, mailbox: [u8; 32], key: [u8; 32], last_seq: u64) {
+        let mut subs = lock(&self.subscribers);
+        if let Some(list) = subs.get_mut(&mailbox) {
+            list.retain(|(_, k, _)| *k == key);
             let push = ServerFrame {
                 v: VERSION,
                 id: 0,
@@ -278,12 +325,45 @@ impl Shared {
                     last_seq,
                 })),
             };
-            for (_, tx) in list {
+            for (_, _, tx) in list.iter() {
                 // A slow client misses a push, not data: it fetches by sequence number.
                 let _ = tx.try_send(push.clone());
             }
+            if list.is_empty() {
+                subs.remove(&mailbox);
+            }
         }
     }
+}
+
+/// A share of the relay-wide response budget, also counted against the source's share;
+/// both are returned on drop.
+pub struct Reservation {
+    _permit: OwnedSemaphorePermit,
+    by_source: Arc<Mutex<HashMap<[u8; 8], u32>>>,
+    source: [u8; 8],
+    kib: u32,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut map = lock(&self.by_source);
+        if let Some(n) = map.get_mut(&self.source) {
+            *n = n.saturating_sub(self.kib);
+            if *n == 0 {
+                map.remove(&self.source);
+            }
+        }
+    }
+}
+
+/// Pads a source key to the keyed limiters' key size.
+fn limiter_key(source: [u8; 8]) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    if let Some(dst) = k.get_mut(..8) {
+        dst.copy_from_slice(&source);
+    }
+    k
 }
 
 /// Connection source for the concurrency cap: the IPv4 address, or the IPv6 /64.
@@ -383,7 +463,7 @@ pub async fn serve(
                 let acceptor = acceptor.clone();
                 let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
-                    connection(stream, acceptor, shared).await;
+                    connection(stream, acceptor, shared, key).await;
                     drop(permit);
                     drop(source);
                 });
@@ -412,7 +492,7 @@ fn ws_config() -> WebSocketConfig {
         .max_write_buffer_size(MAX_FRAME.saturating_add(256 * 1024))
 }
 
-async fn connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared>) {
+async fn connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared>, source_key: [u8; 8]) {
     let hs = shared.cfg.handshake_timeout;
     let Ok(Ok(tls)) = tokio::time::timeout(hs, acceptor.accept(stream)).await else {
         return;
@@ -427,7 +507,7 @@ async fn connection(stream: TcpStream, acceptor: TlsAcceptor, shared: Arc<Shared
     };
     let (mut sink, mut source) = ws.split();
     let (push_tx, mut push_rx) = mpsc::channel::<ServerFrame>(64);
-    let mut conn = Conn::new(Arc::clone(&shared), push_tx);
+    let mut conn = Conn::new(Arc::clone(&shared), push_tx, source_key);
     let (idle, write) = (shared.cfg.idle_timeout, shared.cfg.write_timeout);
     let start = tokio::time::Instant::now();
     let pre_auth_deadline = start.checked_add(shared.cfg.pre_auth_timeout).unwrap_or(start);
@@ -474,7 +554,7 @@ fn code(e: StoreError) -> ErrorCode {
         StoreError::Conflict => ErrorCode::Conflict,
         StoreError::Quota => ErrorCode::QuotaExceeded,
         StoreError::Unauthorized => ErrorCode::Unauthorized,
-        StoreError::Corrupt | StoreError::Io => ErrorCode::Internal,
+        StoreError::Corrupt | StoreError::Io | StoreError::Schema => ErrorCode::Internal,
     }
 }
 
@@ -499,6 +579,8 @@ fn upload_hash(token: &[u8]) -> [u8; 32] {
 /// Per-connection state.
 struct Conn {
     id: u64,
+    /// In-memory source key (see the module docs); never logged or stored.
+    source: [u8; 8],
     shared: Arc<Shared>,
     push: mpsc::Sender<ServerFrame>,
     frames: Limiter,
@@ -513,10 +595,11 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(shared: Arc<Shared>, push: mpsc::Sender<ServerFrame>) -> Self {
+    fn new(shared: Arc<Shared>, push: mpsc::Sender<ServerFrame>, source: [u8; 8]) -> Self {
         let l = shared.cfg.limits;
         Self {
             id: shared.next_conn.fetch_add(1, Ordering::Relaxed),
+            source,
             push,
             frames: Limiter::new(l.frames_per_conn),
             take_invite: Limiter::new(l.take_invite_per_conn),
@@ -529,7 +612,7 @@ impl Conn {
     }
 
     /// One request → one reply, plus the response-budget share the reply holds until sent.
-    async fn handle(&mut self, bytes: &[u8]) -> (ServerFrame, Option<OwnedSemaphorePermit>) {
+    async fn handle(&mut self, bytes: &[u8]) -> (ServerFrame, Option<Reservation>) {
         // Every frame counts, decodable or not. Decoding first (the size is already capped by
         // the WebSocket limits) lets a refusal echo the request id, so clients can match it.
         let allowed = self.frames.allow();
@@ -574,25 +657,41 @@ impl Conn {
             Ok(current) if current == key => Ok(m),
             Ok(_) | Err(StoreError::NotFound) => {
                 self.authed.remove(&m);
+                self.shared.unsubscribe(m, self.id);
                 Err(ErrorCode::Unauthorized)
             }
             Err(e) => Err(code(e)),
         }
     }
 
-    /// Reserves `bytes` of the relay-wide response budget, or refuses with `RateLimited`.
-    fn reserve(&self, bytes: usize) -> Result<OwnedSemaphorePermit, ErrorCode> {
+    /// Reserves `bytes` of the relay-wide response budget, within this source's share, or
+    /// refuses with `RateLimited`.
+    fn reserve(&self, bytes: usize) -> Result<Reservation, ErrorCode> {
+        let sh = &self.shared;
         let kib = u32::try_from(bytes.div_ceil(1024)).map_err(|_| ErrorCode::Internal)?;
-        Arc::clone(&self.shared.response_budget)
+        let share = u32::try_from(sh.cfg.response_budget_per_source / 1024).unwrap_or(u32::MAX);
+        let mut map = lock(&sh.budget_by_source);
+        let held = map.get(&self.source).copied().unwrap_or(0);
+        if held.saturating_add(kib) > share {
+            return Err(ErrorCode::RateLimited);
+        }
+        let permit = Arc::clone(&sh.response_budget)
             .try_acquire_many_owned(kib)
-            .map_err(|_| ErrorCode::RateLimited)
+            .map_err(|_| ErrorCode::RateLimited)?;
+        map.insert(self.source, held.saturating_add(kib));
+        Ok(Reservation {
+            _permit: permit,
+            by_source: Arc::clone(&sh.budget_by_source),
+            source: self.source,
+            kib,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
     async fn dispatch(
         &mut self,
         req: Request,
-        budget: &mut Option<OwnedSemaphorePermit>,
+        budget: &mut Option<Reservation>,
     ) -> Result<Response, ErrorCode> {
         let sh = Arc::clone(&self.shared);
         let now = sh.now();
@@ -610,9 +709,13 @@ impl Conn {
                 );
                 // Reject keys that are not valid Ed25519 points now rather than at every auth.
                 ed25519_dalek::VerifyingKey::from_bytes(&k).map_err(|_| ErrorCode::Malformed)?;
-                // Only requests that would succeed spend the relay-wide budget (P3-5).
+                // Only requests that would succeed spend the per-source and relay-wide budgets
+                // (P3-5, P3R2-3).
                 if sh.db(move |s| s.mailbox_exists(&m)).await.map_err(code)? {
                     return Err(ErrorCode::Conflict);
+                }
+                if !lock(&sh.create_per_source).allow(&limiter_key(self.source)) {
+                    return Err(ErrorCode::RateLimited);
                 }
                 if !lock(&sh.create_mailbox).allow() {
                     return Err(ErrorCode::RateLimited);
@@ -666,7 +769,7 @@ impl Conn {
                 sh.db(move |s| s.touch_mailbox(&m, now)).await.map_err(code)?;
                 self.authed.insert(m, key);
                 self.established = true;
-                sh.subscribe(m, self.id, self.push.clone());
+                sh.subscribe(m, self.id, key, self.push.clone());
                 Ok(ok())
             }
 
@@ -695,7 +798,9 @@ impl Conn {
                     .db(move |s| s.deposit(&m, &h, &envelope, now))
                     .await
                     .map_err(code)?;
-                sh.notify(m, seq);
+                if let Ok(key) = sh.db(move |s| s.mailbox_auth_key(&m)).await {
+                    sh.notify(m, key, seq);
+                }
                 self.established = true;
                 Ok(ok())
             }
@@ -733,6 +838,7 @@ impl Conn {
                 let m = self.require_auth(&d.mailbox_id).await?;
                 sh.db(move |s| s.delete_mailbox(&m)).await.map_err(code)?;
                 self.authed.remove(&m);
+                sh.drop_subscribers(m);
                 Ok(ok())
             }
 
@@ -770,7 +876,9 @@ impl Conn {
 
             Request::BlobUploadToken(b) => {
                 let m = self.require_auth(&b.mailbox_id).await?;
-                if !lock(&sh.upload_tokens).allow(&m) {
+                if !lock(&sh.upload_tokens).allow(&m)
+                    || !lock(&sh.upload_tokens_per_source).allow(&limiter_key(self.source))
+                {
                     return Err(ErrorCode::RateLimited);
                 }
                 let mut token = [0u8; 32];

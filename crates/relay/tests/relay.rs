@@ -772,6 +772,14 @@ async fn deleting_a_mailbox_revokes_other_connections() {
     .await
     .unwrap();
     one.new_mailbox(relay.pin, m).await; // same id, new key
+    // P3R2-6: no pushes for the re-created mailbox reach the revoked connection.
+    let tok: [u8; 32] = rand::random();
+    one.add_token(m, tok).await;
+    let mut sender = relay.client().await;
+    sender.deposit(m, tok, vec![0; 1024]).await.unwrap();
+    sender.deposit(m, tok, vec![0; 1024]).await.unwrap();
+    assert!(two.try_ping().await && two.try_ping().await);
+    assert!(two.pushes.is_empty(), "revoked connection got {:?}", two.pushes);
     assert_eq!(two.fetch(m, 0).await.unwrap_err(), ErrorCode::Unauthorized);
     assert_eq!(
         two.call(Request::UpdateTokens(veil_wire::UpdateTokens {
@@ -831,4 +839,128 @@ async fn frame_rate_limit_echoes_the_request_id() {
         c.call(Request::Ping(veil_wire::Empty {})).await,
         Err(ErrorCode::RateLimited)
     );
+}
+
+/// P3R2-6: a mailbox that idles out and is re-created by someone else under the same id
+/// never pushes to connections of the previous owner (no explicit delete is involved).
+#[tokio::test]
+async fn pushes_follow_the_current_mailbox_key() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let t = Arc::new(AtomicU64::new(now()));
+    let clock: veil_relay::server::Clock = {
+        let t = Arc::clone(&t);
+        Arc::new(move || t.load(Ordering::Relaxed))
+    };
+    let cfg = Config {
+        sweep_interval: std::time::Duration::from_millis(50),
+        ..Config::default()
+    };
+    let relay = TestRelay::start_with_clock(cfg, clock).await;
+    let m: [u8; 32] = rand::random();
+    let old_key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let mut old = relay.client().await;
+    old.call(Request::CreateMailbox(veil_wire::CreateMailbox {
+        mailbox_id: m.to_vec(),
+        auth_pub: old_key.verifying_key().to_bytes().to_vec(),
+    }))
+    .await
+    .unwrap();
+    old.auth_at(relay.pin, m, &old_key, t.load(Ordering::Relaxed))
+        .await
+        .unwrap();
+    // 61 days later the sweeper removes the idle mailbox; someone else takes the id.
+    t.fetch_add(61 * 24 * 3600, Ordering::Relaxed);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let new_key = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let mut new = Client::connect_from(relay.addr, relay.pin, std::net::Ipv4Addr::new(127, 0, 0, 2))
+        .await
+        .unwrap();
+    new.call(Request::CreateMailbox(veil_wire::CreateMailbox {
+        mailbox_id: m.to_vec(),
+        auth_pub: new_key.verifying_key().to_bytes().to_vec(),
+    }))
+    .await
+    .unwrap();
+    new.auth_at(relay.pin, m, &new_key, t.load(Ordering::Relaxed))
+        .await
+        .unwrap();
+    let tok: [u8; 32] = rand::random();
+    new.add_token(m, tok).await;
+    new.deposit(m, tok, vec![0; 1024]).await.unwrap();
+    assert!(new.try_ping().await);
+    assert_eq!(new.pushes.len(), 1, "the current owner is notified");
+    assert!(old.try_ping().await && old.try_ping().await);
+    assert!(old.pushes.is_empty(), "previous owner got {:?}", old.pushes);
+}
+
+/// P3R2-2: one source cannot hold the whole response budget: with 31 connections pipelining
+/// full-size fetches and never reading, another source can still fetch.
+#[tokio::test]
+async fn one_source_cannot_hold_the_response_budget() {
+    let cfg = Config {
+        max_connections_per_source: 64,
+        ..Config::default()
+    };
+    let relay = TestRelay::start(cfg).await;
+    let mut owner = relay.client().await;
+    let (m, tok): ([u8; 32], [u8; 32]) = (rand::random(), rand::random());
+    let key = owner.new_mailbox(relay.pin, m).await;
+    owner.add_token(m, tok).await;
+    for _ in 0..32 {
+        owner.deposit(m, tok, vec![0; 65_536]).await.unwrap();
+    }
+    let mut hogs = Vec::new();
+    for i in 0..31u64 {
+        let mut c = relay.client().await;
+        c.auth(relay.pin, m, &key).await.unwrap();
+        for j in 0..5 {
+            c.send_raw(fetch_frame(m, 10_000 + i * 10 + j)).await;
+        }
+        hogs.push(c);
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut victim = Client::connect_from(relay.addr, relay.pin, std::net::Ipv4Addr::new(127, 0, 0, 2))
+        .await
+        .unwrap();
+    let v: [u8; 32] = rand::random();
+    victim.new_mailbox(relay.pin, v).await;
+    for _ in 0..5 {
+        victim.fetch(v, 0).await.expect("another source can still fetch");
+    }
+    drop(hogs);
+}
+
+/// P3R2-3: reconnecting does not reset the creation limit: one source is capped, while
+/// another source can still create.
+#[tokio::test]
+async fn mailbox_creation_is_limited_per_source() {
+    let relay = TestRelay::start(Config::default()).await;
+    let create = || {
+        Request::CreateMailbox(veil_wire::CreateMailbox {
+            mailbox_id: rand::random::<[u8; 32]>().to_vec(),
+            auth_pub: ed25519_dalek::SigningKey::from_bytes(&rand::random())
+                .verifying_key()
+                .to_bytes()
+                .to_vec(),
+        })
+    };
+    let mut made = 0;
+    let mut refused = false;
+    for _ in 0..5 {
+        let mut c = relay.client().await; // a fresh connection each time
+        for _ in 0..4 {
+            match c.call(create()).await {
+                Ok(_) => made += 1,
+                Err(ErrorCode::RateLimited) => refused = true,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+    assert_eq!(made, 10, "per-source burst");
+    assert!(refused);
+    let mut other = Client::connect_from(relay.addr, relay.pin, std::net::Ipv4Addr::new(127, 0, 0, 2))
+        .await
+        .unwrap();
+    other.call(create()).await.expect("another source is unaffected");
 }

@@ -217,6 +217,14 @@ jobs:
           wait
           cat host.txt
           grep -q "udp packets received = 0" host.txt
+          # Also a UDP service *published by Docker* on the host (Pi-hole in Docker, say): the
+          # rule must run before Docker's NAT (review P3R2-5).
+          docker run -d --name udp-svc -p 40001:3480/udp --entrypoint turnutils_peer \
+            docker.io/coturn/coturn:4.7.0@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93
+          sleep 1
+          uc -c -e "$TURN_IP" -r 40001 -n 5 -m 1 -u "$(cred 9)" -w "$(cred 10)" "$TURN_IP" | tee docker-probe.txt
+          docker rm -f udp-svc
+          grep -q "Total lost packets 5 (100" docker-probe.txt
           sudo nft list table inet veil_turn | grep -E "counter packets [1-9]"
       - name: Nothing about clients in either container's logs
         working-directory: deploy

@@ -14,6 +14,8 @@
 //! * `VEIL_TURN_URLS`: comma-separated `turn:`/`turns:` URLs handed to clients
 //! * `VEIL_QUOTA_ENVELOPES_MB` (default 1024), `VEIL_QUOTA_BLOBS_MB` (default 4096): disk caps for
 //!   queued envelopes and attachment blobs
+//! * `VEIL_MAX_CONN_PER_SOURCE` (default 32): concurrent connections per IPv4 address or
+//!   IPv6 /64; raise it when a proxy makes many clients share one source address
 //! * `VEIL_DB_CACHE_MB` (default 64): database page cache, the main part of the relay's memory
 //! * `VEIL_LOG` (default `info`): `error`, `warn`, `info` or `debug`
 #![forbid(unsafe_code)]
@@ -76,6 +78,31 @@ fn main() -> ExitCode {
     }
 }
 
+/// Storage caps and the per-source connection cap from the environment.
+fn limits_from_env(cfg: &mut Config) -> Result<(), String> {
+    for (name, slot) in [
+        (
+            "VEIL_QUOTA_ENVELOPES_MB",
+            &mut cfg.quotas.max_envelope_bytes_total,
+        ),
+        ("VEIL_QUOTA_BLOBS_MB", &mut cfg.quotas.max_blob_bytes_total),
+    ] {
+        if let Some(v) = env(name) {
+            match v.parse::<u64>().ok().and_then(|mb| mb.checked_mul(1024 * 1024)) {
+                Some(bytes) if bytes > 0 => *slot = bytes,
+                _ => return Err(format!("{name} must be a positive number of megabytes")),
+            }
+        }
+    }
+    if let Some(v) = env("VEIL_MAX_CONN_PER_SOURCE") {
+        match v.parse::<u32>() {
+            Ok(n) if (1..=1024).contains(&n) => cfg.max_connections_per_source = n,
+            _ => return Err("VEIL_MAX_CONN_PER_SOURCE must be between 1 and 1024".into()),
+        }
+    }
+    Ok(())
+}
+
 fn serve() -> ExitCode {
     let level = match env("VEIL_LOG").as_deref() {
         Some("error") => tracing::Level::ERROR,
@@ -99,19 +126,8 @@ fn serve() -> ExitCode {
         Err(e) => return fail(&format!("TLS: {e} (run `veil-relay gen-cert` first)")),
     };
     let mut cfg = Config::default();
-    for (name, slot) in [
-        (
-            "VEIL_QUOTA_ENVELOPES_MB",
-            &mut cfg.quotas.max_envelope_bytes_total,
-        ),
-        ("VEIL_QUOTA_BLOBS_MB", &mut cfg.quotas.max_blob_bytes_total),
-    ] {
-        if let Some(v) = env(name) {
-            match v.parse::<u64>().ok().and_then(|mb| mb.checked_mul(1024 * 1024)) {
-                Some(bytes) if bytes > 0 => *slot = bytes,
-                _ => return fail(&format!("{name} must be a positive number of megabytes")),
-            }
-        }
+    if let Err(e) = limits_from_env(&mut cfg) {
+        return fail(&e);
     }
     if let Some(path) = env("VEIL_TURN_SECRET_FILE") {
         let Ok(raw) = std::fs::read(&path).map(Zeroizing::new) else {

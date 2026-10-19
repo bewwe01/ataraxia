@@ -31,6 +31,7 @@ services:
       VEIL_QUOTA_ENVELOPES_MB: ${VEIL_QUOTA_ENVELOPES_MB:-1024}
       VEIL_QUOTA_BLOBS_MB: ${VEIL_QUOTA_BLOBS_MB:-4096}
       VEIL_DB_CACHE_MB: ${VEIL_DB_CACHE_MB:-64}
+      VEIL_MAX_CONN_PER_SOURCE: ${VEIL_MAX_CONN_PER_SOURCE:-32}
     secrets: [turn_secret]
     logging:
       driver: local

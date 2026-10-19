@@ -2,6 +2,63 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 3: after review round 2 fixes (2026-10-19)
+
+Review round 2 returned **FAIL**: P3-1 and P3-2 were confirmed fixed; one new High, four Medium, four Low (`docs/REVIEW_REPORT.md`). Each new test was mutation-checked the same way as before.
+
+| Finding | Fix | Test (mutant that fails it) |
+|---|---|---|
+| **P3R2-1 (High)** upload tokens and token rows outside every cap | Relay-wide caps: 20 000 live upload tokens and 1 000 000 delivery-token rows, counted in `STATS` in the same transaction, released on completion, expiry, removal, delete and idle expiry. Upload tokens are also limited per source (30, then 1 per 30 s). | `upload_tokens_are_capped_and_released` (no cap → fails; completion not freeing → fails); `token_rows_are_capped_relay_wide` (no cap → fails; delete not freeing → fails) |
+| P3R2-2 one source holds the response budget | Per-source share of 8 MiB (in memory, keyed by the source key, dropped at zero), on top of the relay-wide 64 MiB | `one_source_cannot_hold_the_response_budget`: 31 non-reading connections pipelining 5 full fetches each from 127.0.0.1; a client from 127.0.0.2 still fetches. Without the share it fails. |
+| P3R2-3 creation budget drained by reconnecting | Per-source creation limit (10, then 1/min), checked before the relay-wide one; never-authenticated mailboxes expire after 24 h | `mailbox_creation_is_limited_per_source` (no per-source check → fails); `never_authenticated_mailboxes_expire_early` (touch not marking → fails) |
+| P3R2-4 log test blind to `?id` and derived sizes | The test requires **no log line at all** during the session (besides the canary); the needle search stays as a second check | M8 (`m = ?id` in `Store::deposit`) and M9 (`bytes = value.len()`) both fail it now |
+| P3R2-5 nft rule misses Docker-published services | Chain at `priority mangle` (before Docker's dstnat). A systemd unit `veil-turn-firewall.service` loads it at boot, `RequiredBy=docker.service`. | CI probe adds a Docker-published UDP echo service (`-p 40001:3480/udp turnutils_peer`) and requires 5/5 lost. The same step **fails** with the old `priority filter` rule (exit 1). |
+| P3R2-6 revoked connection still gets pushes | Subscribers carry the auth key; `notify` sends only to the mailbox's current key and drops the rest; `DeleteMailbox` drops all subscribers; a failed re-check unsubscribes | `deleting_a_mailbox_revokes_other_connections` (extended: no pushes after re-creation); `pushes_follow_the_current_mailbox_key` (idle expiry on a test clock, re-creation from another source). No key filter → fails; no filter and no drop → both fail. |
+| P3R2-7 IPv6 clients may share one source behind Docker's proxy | `VEIL_MAX_CONN_PER_SOURCE` (1–1024), documented in README and `.env.example`; not reproduced here (no IPv6) | — |
+| P3R2-8 inaccurate figures | Disk: apparent 3.4× vs allocated about 2× now stated as such; INV-ROB-1 says the soak covers filling, not mass expiry; `Store::sweep` doc says what it counts | — |
+| P3R2-9 no schema version | `STATS["schema"] = 2`; another version, or an unversioned database holding data, is refused with `StoreError::Schema`; an empty one is stamped. The mailbox record gained a field, so the version matters now. | `foreign_schema_is_refused` (accepting another version → fails) |
+
+### Format, lint, tests
+
+```text
+$ cargo fmt --all --check                                         # exit 0
+$ cargo clippy --workspace --all-targets --locked -- -D warnings  # exit 0
+$ cargo test --workspace --locked                                 # exit 0 (condensed as before)
+     Running unittests src/lib.rs (veil_core)       test result: ok. 74 passed; 0 failed
+     Running tests/secrets.rs                       test result: ok. 3 passed; 0 failed
+     Running tests/session.rs                       test result: ok. 22 passed; 0 failed; 1 ignored
+     Running unittests src/lib.rs (veil_relay)      test result: ok. 18 passed; 0 failed
+     Running tests/logs.rs                          test result: ok. 1 passed; 0 failed
+     Running tests/relay.rs                         test result: ok. 18 passed; 0 failed
+     Running tests/smoke.rs                         test result: ok. 0 passed; 0 failed; 2 ignored
+     Running unittests src/lib.rs (veil_wire)       test result: ok. 5 passed; 0 failed
+```
+
+### Deployed stack (rebuilt image at the round-2 fixes, firewall rule at `priority mangle`)
+
+```text
+coturn, relay-minted credentials:
+  -y -c (client↔client)                       Total lost packets 0 (0.000000%)
+  -c -e 10.0.0.1                              channel bind: error 403 (Forbidden IP)
+  wrong password                              ERROR: Cannot complete Allocation
+  -c -e <host IP> -r 40000 (host listener)    Total lost packets 5 (100%); listener: udp packets received = 0
+  -c -e <host IP> -r 40001 (Docker-published) Total lost packets 5 (100%)
+  same, rule at priority filter (round-1)     Total lost packets 0 (0.000000%) → CI step exit=1
+relay log lines after smoke + probes: 1; coturn lines other than the firewall-drop line: 0
+soak: deposited 9600 × 64 KiB (600 MiB) into 2 mailboxes in 20.166669228s; docker stats 96.36MiB / 512MiB
+  +128 s after the soak: OOMKilled=false Restarts=0 Running=true; docker stats 96.11MiB / 512MiB; smoke round trip ok
+docker compose stop relay: stopped in 299 ms, ExitCode=0, "veil-relay stopped"
+```
+
+**Still not verified:**
+- the systemd unit on a real systemd host (this sandbox has no systemd);
+- arm64 / Raspberry Pi;
+- a real home router (option B);
+- IPv6 clients behind Docker's proxy (P3R2-7);
+- the `relay-deploy` job on GitHub's runners with these changes (pending the push).
+
+The P3R2-9 refusal is proven by the unit test only. A deployed volume from the previous image opened normally, because the smoke tests had deleted their mailboxes, so the database was empty, and an empty database is stamped.
+
 ## Phase 3: after review round 1 fixes (2026-10-19)
 
 Review round 1 returned **FAIL**: 2 High, 6 Medium, 5 Low (`docs/REVIEW_REPORT.md`). Every finding was addressed. Each new test was mutation-checked: the fix was reverted or broken by hand, the test failed, the fix was restored.

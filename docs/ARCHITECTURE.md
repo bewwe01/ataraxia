@@ -194,13 +194,19 @@ Rust workspace + pnpm workspace at the root. A single `Cargo.lock` and a single 
   - Every multi-record change (deposit + counters, take-invite + delete, blob chunk + quota) is one write transaction.
   - Records are fixed-layout byte strings with checked decoding, so a corrupt record yields `Corrupt`, never a panic.
 - **No IP-keyed rate limits or records.** Abuse control is by token, mailbox, connection and relay-wide limits, plus storage caps. The trade-off, that anyone can create mailboxes up to the caps, is documented in `deploy/README.md` and THREAT_MODEL §5.
-- **The one use of the peer address (review P3-4):** a count of concurrent connections per source (IPv4 address or IPv6 /64), capped at 32. It is held in memory while the connection is open and removed at zero; it is never logged or stored. Without it, one host could take every connection slot.
+- **The one use of the peer address (reviews P3-4, P3R2-1/2/3):** a truncated source key (IPv4 address or IPv6 /64), held in memory only and never logged or stored. It caps what one host can take of relay-wide resources:
+  - concurrent connections (32, configurable);
+  - its share of the response budget (8 MiB of 64);
+  - mailbox creations and upload tokens (rate buckets in a bounded, evicting map).
+
+  Connection counts and budget shares are dropped at zero. Without the key, one host could exhaust each of these.
 - **Bounded memory (review P3-1).**
   - redb's page cache is set explicitly (64 MiB by default, `VEIL_DB_CACHE_MB`); redb's own default of 1 GiB let the process outgrow its container limit.
   - Expiry uses an index table (`kind ‖ due ‖ id`), so a sweep reads only due entries, in batches of 256, each its own write transaction.
   - Writes to clients time out, and large responses share a relay-wide byte budget.
   - Measured in a 512 MiB container: 71 MB peak while filling 630 MB of envelopes; a sweep with nothing due takes 1.5 ms; expiring 9 600 envelopes takes 0.77 s at 36 MB.
-  - The cost: redb's file reached about 3.4× the stored payload in that test, so disk is sized from the caps (`deploy/README.md`).
+  - The cost: redb's file reached an apparent size of 3.4× the stored payload in that test (it grows in large steps), with about 2× actually allocated. Disk is sized from the caps (`deploy/README.md`).
+- **Schema version (P3R2-9).** The store records its layout version and refuses a database of another version, or an unversioned one that holds data. An older layout would otherwise open with no expiry entries, and its records would never expire.
 
 ## 7. Distribution (recorded owner request)
 

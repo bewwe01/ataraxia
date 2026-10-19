@@ -1,0 +1,17 @@
+# Loads /etc/veil-turn.nft before Docker starts, so coturn never runs without it.
+# See deploy/firewall/veil-turn.nft and deploy/README.md.
+[Unit]
+Description=Veil: keep coturn from relaying into this host's services
+DefaultDependencies=no
+Before=network-pre.target docker.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/veil-turn.nft
+ExecStop=/usr/sbin/nft delete table inet veil_turn
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=docker.service

@@ -230,7 +230,21 @@ pub struct Client {
 
 impl Client {
     pub async fn connect(addr: SocketAddr, pin: [u8; 32]) -> Result<Self, String> {
-        let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+        Self::connect_from(addr, pin, std::net::Ipv4Addr::LOCALHOST).await
+    }
+
+    /// Connects from a chosen loopback address (127.0.0.0/8 is all local on Linux), so tests
+    /// can act as a second source.
+    pub async fn connect_from(
+        addr: SocketAddr,
+        pin: [u8; 32],
+        local: std::net::Ipv4Addr,
+    ) -> Result<Self, String> {
+        let socket = tokio::net::TcpSocket::new_v4().map_err(|e| e.to_string())?;
+        socket
+            .bind(SocketAddr::new(local.into(), 0))
+            .map_err(|e| e.to_string())?;
+        let tcp = socket.connect(addr).await.map_err(|e| e.to_string())?;
         let connector =
             tokio_rustls::TlsConnector::from(Arc::new(client_tls(pin, &[&rustls::version::TLS13])));
         let tls = connector
@@ -307,6 +321,21 @@ impl Client {
         mailbox: [u8; 32],
         key: &ed25519_dalek::SigningKey,
     ) -> Result<(), ErrorCode> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        self.auth_at(pin, mailbox, key, now).await
+    }
+
+    /// Authenticates with an explicit timestamp (for relays on a test clock).
+    pub async fn auth_at(
+        &mut self,
+        pin: [u8; 32],
+        mailbox: [u8; 32],
+        key: &ed25519_dalek::SigningKey,
+        now: u64,
+    ) -> Result<(), ErrorCode> {
         let Response::Challenge(c) = self
             .call(Request::Challenge(veil_wire::MailboxRef {
                 mailbox_id: mailbox.to_vec(),
@@ -315,10 +344,6 @@ impl Client {
         else {
             panic!("expected challenge")
         };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
         let sig = key.sign(&veil_wire::auth_message(&pin, &mailbox, &c.nonce, now));
         self.call(Request::Authenticate(veil_wire::Authenticate {
             mailbox_id: mailbox.to_vec(),
