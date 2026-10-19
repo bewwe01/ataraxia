@@ -2,6 +2,19 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 4: final gate round 2 conditions (2026-10-19)
+
+Round 2 returned **PASS WITH CONDITIONS** (no Critical/High). Conditions:
+- P4R2-1: `deliver()` sends a contact's pending introduction first and holds the message (status failed, retried) until it is out. Not covered by a dedicated test (it needs the relay to fail exactly between TakeInvite and the introduction deposit); argued in code.
+- P4R2-2: `atomically` rolls back the whole transaction when its savepoint cannot be closed; `SqlBackend::apply` never leaves its savepoint open. Test `db::tests::apply_nests_in_an_outer_savepoint`.
+- P4R2-3: the repository settings the signing job relies on are documented in ARCHITECTURE §7. **They must be set by the owner in GitHub; I cannot set or verify them.**
+- P4R2-4/5: `zipalign -P 16` plus a `-c` check; pwsh steps fail on any failing native command.
+
+```text
+$ cargo clippy --workspace --all-targets --locked -- -D warnings   # exit 0
+$ cargo test -p veil-client    # unit 5 | lock_and_setup 3 | pair_and_message 1, all ok
+```
+
 ## Phase 4: client, app, release (2026-10-19), after final gate round 1
 
 Final gate round 1 returned **FAIL** (5 High). All five Highs, the Mediums and the Lows are addressed. Each new behavioural test was checked against a mutant that reverts its fix.

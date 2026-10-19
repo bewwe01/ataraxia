@@ -167,6 +167,9 @@ jobs:
       - name: Rust toolchain, protoc
         shell: pwsh
         run: |
+          # Fail on any failing native command, not only the last one (review P4R2-5).
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = "Stop"
           rustup toolchain install 1.97.0 --profile minimal
           rustup default 1.97.0
           choco install protoc --version 29.3.0 -y --no-progress
@@ -179,9 +182,10 @@ jobs:
           # OpenSSL's Configure needs a full Perl; Git for Windows' Perl lacks modules.
           OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ErrorActionPreference = "Stop"
           pnpm install --frozen-lockfile
           pnpm tauri build --bundles nsis -- --locked
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force ../out | Out-Null
           $exe = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           Copy-Item $exe.FullName ../out/Veil-windows-x64-setup.exe
@@ -227,7 +231,9 @@ jobs:
             SIGNING="throwaway key generated in this CI run (cannot be updated in place)"
           fi
           mkdir -p out
-          "$BT/zipalign" -f 4 in/Veil-android-arm64-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+          # -P 16: native libraries stay 16 KiB page-aligned (review P4R2-4).
+          "$BT/zipalign" -f -P 16 4 in/Veil-android-arm64-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/zipalign" -c -P 16 4 "$RUNNER_TEMP/aligned.apk"
           # The password reaches apksigner through the environment, never argv.
           "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD \
             --out out/Veil-android-arm64.apk "$RUNNER_TEMP/aligned.apk"

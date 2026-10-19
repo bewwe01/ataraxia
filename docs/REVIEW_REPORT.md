@@ -2520,3 +2520,92 @@ The result is FAIL because of five High findings. Two of them let the relay or c
 - **Identity changes:** addresses are key hashes, so a changed key becomes a new, unverified contact and is never auto-accepted.
 - **Invite single use:** enforced at the relay, in core (invite record deleted) and in the app's `invites` table.
 - **Locking drops all session state:** the account, the DB `Rc` and the mailbox key.
+
+## Final gate, round 2 (2026-10-19)
+
+**Reviewer:** independent code-reviewer agent. Scope: verification of commit `087a72a` (fixes for P4-1 to P4-15) and new findings.
+
+VERDICT: PASS WITH CONDITIONS
+
+I found no Critical or High issues in the shipped scope. All five round-1 Highs are fixed in code, and the regression tests for P4-1, P4-2 and P4-3 pass. The fixes introduced one Medium regression (P4R2-1) and left one Medium edge case (P4R2-2). P4-5 depends on GitHub repository settings that I cannot see from the repo (P4R2-3).
+
+What I ran:
+- `cargo test -p veil-client --locked`: 4 unit, 3 in `lock_and_setup`, 1 in `pair_and_message`, all pass.
+- `cargo test -p veil-relay --locked`: 25 lib, 24 relay, 1 logs, all pass.
+- `cargo clippy -p veil-client -p veil-relay --all-targets --locked -- -D warnings`: clean.
+
+I did not edit any files.
+
+### Round-1 findings
+
+| # | Status | Note |
+|---|---|---|
+| P4-1 | Fixed | Every relay round trip goes through `interruptible()`, and it is correct. Notify is enabled before the pending flag is checked, so a lock cannot slip in between. The auto-lock deadline is also a select branch. `sync` skips items with `seq <= last`, stops when nothing advances, and runs at most 16 batches before continuing on the next tick. `lock_now` clears the pending flag. The only way the flag sticks is if the `lock()` future is dropped before its command is sent, which Tauri does not do (no fix needed). `setup`'s relay calls are not interruptible, but they are bounded by the connect and call timeouts and no session exists yet. The actor runs one command at a time (`handle` is awaited inside the select arm), so nothing can interleave inside a savepoint. |
+| P4-2 | Fixed | Only setup, unlock, touch, send, create and accept invite, verify and rename count as activity. The UI sends `touch` on pointer, key, wheel and touch input, at most every 20 s. Refreshes, `mark_read` and `me` do not count. |
+| P4-3 | Fixed | `setup` checks `state()==New` before `wipe()`, so an existing vault is never wiped. Debris is wiped, the header is written via temp file + fsync + rename + directory fsync, and the device secret via temp file + rename. On Windows, `set_secret` overwrites any leftover credential and `delete_credential` treats `NoEntry` as success. Reset sits behind a two-step confirmation. Nit: `wipe()` does not remove `*.tmp` leftovers. |
+| P4-4 | Fixed (pending CI) | `harden.py` sets `allowBackup=false` and excludes every domain in both cloud backup and device transfer; `aapt2` checks the built APK's manifest. The first CI run is still pending. |
+| P4-5 | Partially | The workflow side is right: build jobs have no secrets, and signing runs in `environment: release` with no checkout. It is only safe if the `release` environment and tags are restricted in the repo settings and the old repo-level secrets are deleted, none of which the repo can show (P4R2-3). |
+| P4-6 | Partially | Using savepoints is correct: the core's overlay is cleared on commit and it reads from the backend, so a rollback leaves no stale in-memory state. However, the change to pairing created P4R2-1, a failed RELEASE can leave a savepoint open (P4R2-2), and there is still no SqlBackend conformance or crash test. INV-STATE-1 says so honestly. |
+| P4-7 | Partially | `cargo deny` and `cargo audit` now cover `app/src-tauri`, `pnpm audit --prod` runs, and builds use `--locked`. `cargo vet` still does not cover the app tree; INVARIANTS says so. It is unconfirmed that `-- --locked` actually reaches cargo for `tauri android build`. |
+| P4-8 | Fixed (unverified on device) | `harden.py` sets FLAG_SECURE before `super.onCreate`. CI does not check that it reached the APK. |
+| P4-9 | Fixed | THREAT_MODEL "who you talk to", the onboarding text, ADR-0011, INV-UI-1, INV-SUP-2 and the Settings text are all now accurate. TEST_REPORT states what was not verified. |
+| P4-10 | Fixed | The token is now taken before `TakeInvite`. |
+| P4-11 | Fixed | Cf, bidi and variation-selector characters are now stripped from names. |
+| P4-12 | Fixed | IPv6 hosts are bracketed in the URL, unbalanced brackets are refused, and there are tests. |
+| P4-13 | Fixed | App state is cleared on lock (event and Settings), sends have an in-flight guard, rejections are handled, and the header comment is corrected. |
+| P4-14 | Partially | The tag is validated and message retries are capped at 20. Still open: `choco install protoc` has no checksum, and introduction retries have no cap (see P4R2-1). |
+| P4-15 | Fixed | Both rate buckets are checked and taken under both locks, and the result of `allow` is acted on. No deadlock risk: the only other places those two mutexes are taken (`prune_limiters`, `source_keys_tracked` and the refund path) take them one at a time. |
+
+### New findings
+
+**P4R2-1 (Medium): first messages after pairing can be silently lost** `[HIGH]`
+- **Where:** `crates/client/src/service.rs:1033`, `:1146`, `:1199-1206`.
+- **What happens:** `accept_invite` now commits the contact and stores the introduction for retry, even when sending the introduction fails. The contact then shows up in the UI. Nothing stops `send` before the introduction is out: `deliver()` deposits the message straight away, and `retry_failed` sends the messages even when that contact's introduction just failed in the same pass.
+- **Why the message is lost:** the inviter's core cannot place a message from someone who is not a contact yet. It finds the invite, decrypts, sees the body is not a `ContactIntro` and returns `InviteInvalid` (`crates/core/src/account.rs:672-688`). The client maps that to `Protocol` and acks it, so the relay deletes it.
+- **Scenario:** a brief network drop at pairing, then the user types "hi". The sender sees "sent"; the recipient never gets it.
+- **This is a regression:** before the fix, a failed introduction failed the whole `accept_invite`, so the user had no contact to write to.
+- **Fix:** in `deliver()`, check the contact's `intro` column first.
+  ```rust
+  if intro_pending(contact) && !self.deliver_intro(contact).await {
+      mark_failed(message);
+      return false;
+  }
+  ```
+  Then cap introduction retries the same way as messages.
+
+**P4R2-2 (Medium): a failed RELEASE can leave a transaction open, losing acked messages** `[MEDIUM]`
+- **Where:** `service.rs:1042-1049` and `db.rs:137-155`.
+- **What happens:** if the end statement fails, the code just returns `Err` via `?`. On disk-full, IO error or busy, SQLite does not always roll back on its own, so the outermost savepoint can stay open.
+- **Effect:** every later `SAVEPOINT veil_op … RELEASE veil_op` only releases inside that open transaction and never commits. `sync` keeps acking messages to the relay, and they are lost when the app locks or crashes. Disk-full is exactly the scenario P4-6 was about.
+- **Fix:** in `atomically` (always the outermost), on any error after the savepoint opened, run `if !conn.is_autocommit() { conn.execute_batch("ROLLBACK") }` and return `Storage`. Add a SqlBackend test that nests `apply` inside an outer savepoint and checks both commit and rollback.
+
+**P4R2-3 (Condition, would be High if unmet): signing-key isolation depends on repository settings**
+- **Where:** `release.yml:196-243`.
+- **What happens:** anyone with push access can add `environment: release` to a job on a branch, or dispatch the workflow with `inputs.tag` from a branch. They can also push a `v*` tag on an unreviewed commit. Any of these reaches the key or produces a signed release unless the repo settings stop it.
+- **Fix:** in the repo settings:
+  - restrict the `release` environment's deployment refs to `v*` tags and require reviewers;
+  - add a tag ruleset for `v*`;
+  - delete the old repo-level `ANDROID_KEYSTORE_*` secrets.
+
+  Then document these settings in ARCHITECTURE §7 or the README. Nothing in the docs states them today.
+
+**P4R2-4 (Low): the signed APK is probably no longer 16 KB page-aligned** `[MEDIUM]`
+- **Where:** `release.yml:230`.
+- **What happens:** the old `-P 16` flag was dropped. `zipalign` rewrites the archive, so uncompressed `.so` files probably end up only 4-byte aligned.
+- **Effect:** depending on how the template packages native libraries (not checked), the APK may fail to install or load. This would affect 16 KB-page devices in particular.
+- **Fix:** restore `-P 16` (or `-p`) and add `zipalign -c -P 16 4 out/Veil-android-arm64.apk` as a check.
+
+**P4R2-5 (Low): the Windows build can carry on after a failed command**
+- **Where:** `release.yml:166-187`.
+- **What happens:** in pwsh steps only the last native exit code counts, so a failed `pnpm install` or `choco install` does not stop the step.
+- **Fix:** set `$PSNativeCommandUseErrorActionPreference = $true`, or check `$LASTEXITCODE` after each command.
+
+### Docs
+THREAT_MODEL, INVARIANTS (REST-2, UI-1, SUP-2, STATE-1) and ADR-0011 now match the code. TEST_REPORT says what it did not verify (no stale-`seq` fake-relay test, no crash-injection test, CI runs pending, no device testing). I could not check its mutation-testing claims without re-running them.
+
+### Conditions for PASS
+1. Fix P4R2-1.
+2. Fix P4R2-2.
+3. Confirm and document the P4R2-3 repository settings before the first `v*` tag.
+
+Before the first release, also confirm the first CI runs of the `aapt2` manifest check and of `app-supply-chain`, and check the APK's alignment (P4R2-4).

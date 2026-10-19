@@ -151,8 +151,11 @@ impl KvBackend for SqlBackend {
         } else {
             "ROLLBACK TO kv_apply; RELEASE kv_apply"
         };
-        conn.execute_batch(end)
-            .map_err(|_| veil_core::CoreError::Storage)?;
+        if conn.execute_batch(end).is_err() {
+            // Leave no savepoint behind; an enclosing `atomically` rolls back the rest.
+            let _ = conn.execute_batch("ROLLBACK TO kv_apply; RELEASE kv_apply");
+            return Err(veil_core::CoreError::Storage);
+        }
         r.map_err(|_| veil_core::CoreError::Storage)
     }
 }
@@ -193,6 +196,42 @@ mod tests {
             db.setting("canary").unwrap().unwrap().as_slice(),
             b"plaintext-canary-7e11"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `apply` nests inside an outer savepoint: the outer rollback undoes it, the outer release
+    /// commits it, and nothing is left open either way (review P4-6, P4R2-2).
+    #[test]
+    fn apply_nests_in_an_outer_savepoint() {
+        let dir = std::env::temp_dir().join(format!("veil-db-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("veil.db"), &[9u8; 32]).unwrap();
+        let mut b = SqlBackend(db.clone());
+        let w = |k: &[u8]| vec![(k.to_vec(), Some(Zeroizing::new(b"v".to_vec())))];
+
+        db.conn().execute_batch("SAVEPOINT outer_sp").unwrap();
+        b.apply(&w(b"rolled-back")).unwrap();
+        db.set_setting("row", b"x").unwrap();
+        db.conn()
+            .execute_batch("ROLLBACK TO outer_sp; RELEASE outer_sp")
+            .unwrap();
+        assert!(db.conn().is_autocommit());
+        assert!(b.get(b"rolled-back").unwrap().is_none());
+        assert!(db.setting("row").unwrap().is_none());
+
+        db.conn().execute_batch("SAVEPOINT outer_sp").unwrap();
+        b.apply(&w(b"kept")).unwrap();
+        db.conn().execute_batch("RELEASE outer_sp").unwrap();
+        assert!(db.conn().is_autocommit());
+        assert!(b.get(b"kept").unwrap().is_some());
+
+        // Standalone, apply is its own transaction.
+        b.apply(&w(b"alone")).unwrap();
+        assert!(db.conn().is_autocommit());
+        drop((b, db));
+        let db = Db::open(&dir.join("veil.db"), &[9u8; 32]).unwrap();
+        let b = SqlBackend(db);
+        assert!(b.get(b"kept").unwrap().is_some() && b.get(b"alone").unwrap().is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

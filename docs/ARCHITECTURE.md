@@ -224,3 +224,8 @@ The final step, after all phases pass the code-reviewer gate, is a GitHub Action
 - A SHA-256 checksum file and the exact source tag are attached to each release, which also satisfies AGPL.
 - Implemented in `.github/workflows/release.yml`: an arm64 APK and a Windows NSIS installer, published as a pre-release on a `v*` tag with `SHA256SUMS.txt`. The owner asked for Windows; Linux/macOS packages are not built yet.
 - Without the keystore secrets the APK is signed with a throwaway key made in that run, and the release notes say so. The Windows installer is not code-signed.
+- **Repository settings the workflow relies on (review P4R2-3; not visible in the repo, must be set by the owner before the first `v*` tag with a real key):**
+  - Settings → Environments → `release`: deployment branches and tags restricted to the `v*` tag pattern; required reviewer = the owner; the `ANDROID_KEYSTORE_*` secrets stored here only.
+  - No repository-level `ANDROID_KEYSTORE_*` secrets.
+  - Settings → Rules → a tag ruleset for `v*` so only the owner can create these tags.
+  Without these, anyone with push access could reach the signing job. With no keystore secrets at all, releases are signed with a throwaway key and the notes say so.

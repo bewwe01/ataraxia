@@ -350,6 +350,9 @@ fn parse_pin(s: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// mailbox, token, envelope, contact id, introduction pending.
+type DeliveryRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, bool);
+
 fn token_hash(token: &[u8; 32]) -> Vec<u8> {
     Sha256::new()
         .chain_update(b"veil/v1/tok")
@@ -1039,14 +1042,23 @@ impl Actor {
     /// store, is committed together or not at all.
     async fn atomically<T>(&self, fut: impl Future<Output = Result<T>>) -> Result<T> {
         let db = self.s()?.db.clone();
-        db.conn().execute_batch("SAVEPOINT veil_op")?;
+        let conn = db.conn();
+        conn.execute_batch("SAVEPOINT veil_op")?;
         let r = fut.await;
         let end = if r.is_ok() {
             "RELEASE veil_op"
         } else {
             "ROLLBACK TO veil_op; RELEASE veil_op"
         };
-        db.conn().execute_batch(end)?;
+        if conn.execute_batch(end).is_err() || !conn.is_autocommit() {
+            // This is always the outermost savepoint: if it could not be closed, roll the whole
+            // transaction back, or every later write would sit in a transaction that never
+            // commits while its messages are acked (review P4R2-2).
+            if !conn.is_autocommit() {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+            return Err(ClientError::Storage);
+        }
         r
     }
 
@@ -1145,21 +1157,30 @@ impl Actor {
     /// Deposits a stored outgoing envelope. On success the envelope is erased.
     async fn deliver(&self, message: i64) -> bool {
         let Ok(s) = self.s() else { return false };
-        let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = s
-            .db
-            .conn()
-            .query_row(
-                "SELECT c.mailbox, c.token, m.envelope FROM messages m JOIN contacts c ON c.id = m.contact
+        let row: Option<DeliveryRow> =
+            s.db.conn()
+                .query_row(
+                    "SELECT c.mailbox, c.token, m.envelope, c.id, c.intro IS NOT NULL
+                 FROM messages m JOIN contacts c ON c.id = m.contact
                  WHERE m.id = ?1 AND m.envelope IS NOT NULL",
-                [message],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        let Some((mailbox, token, envelope)) = row else {
+                    [message],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+        let Some((mailbox, token, envelope, contact, intro_pending)) = row else {
             return false;
         };
+        // The contact can only place our messages after our introduction: never send ahead
+        // of it, or the message would be dropped on arrival (review P4R2-1).
+        if intro_pending && !self.deliver_intro(contact).await {
+            let _ = s.db.conn().execute(
+                "UPDATE messages SET status = 'failed', attempts = attempts + 1 WHERE id = ?1",
+                [message],
+            );
+            return false;
+        }
         let ok = self
             .call(Request::Deposit(veil_wire::Deposit {
                 mailbox_id: mailbox,
