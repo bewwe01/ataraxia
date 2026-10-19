@@ -1312,3 +1312,250 @@ No changes needed. INV-MSG-5 stays **partial**, and its new wording matches the 
 None. R6-N1 and R6-N2 are optional nits and can go in with any later docs change.
 
 VERDICT: PASS
+
+---
+
+## Phase 3 review, round 1 (2026-10-19)
+
+**Reviewer:** code-reviewer agent (Agent tool, `subagent_type: "code-reviewer"`, model override `opus`), adversarial brief. Scope: `git diff 0958b70^..HEAD` (HEAD = `80043a9`). Report follows verbatim.
+
+# Phase 3 review: round 1
+
+## Verdict: FAIL
+fmt, clippy and the tests pass, and so do the smoke test against the container, `cargo deny` and `cargo vet`. The wire layer, the auth handshake, token hashing and invite atomicity are sound. Two High findings still block Phase 3. I reproduced both.
+
+- **P3-1:** the relay is OOM-killed under the shipped `mem_limit: 512m` once it holds about 600 MB of envelopes. The cause is redb's default 1 GiB in-process cache plus the full-table scan in `sweep`. Anyone can trigger it, because mailbox creation is open. `restart: unless-stopped` and the immediate first sweep tick then turn it into a crash loop.
+- **P3-2:** delivery-token rows whose hash starts with 16 `0xFF` bytes survive `DeleteMailbox` and the idle sweep. An anonymous client can use this to grow the database without bound, outside every quota.
+
+Neither is a one-line fix with an existing test: P3-1 needs a cache setting, a sweep redesign and a memory test. So the verdict is FAIL, not PASS WITH CONDITIONS. Six Medium findings add test soundness gaps (two tests that the docs rely on cannot fail for the property they claim), denial-of-service gaps with no timeouts, and a coturn config that lets anyone relay UDP to any port on the host.
+
+## Commands I ran and their results
+
+```text
+$ cargo fmt --all --check                                         → exit 0
+$ cargo clippy --workspace --all-targets --locked -- -D warnings  → exit 0
+$ cargo test --workspace --locked                                 → exit 0
+  veil_core 74 passed | secrets 3 | session 22 passed, 1 ignored | veil_relay (lib) 10 | relay.rs 10 | smoke 0 (1 ignored) | veil_wire 5
+$ cargo deny --locked check   → advisories ok, bans ok, licenses ok, sources ok
+$ cargo vet --locked          → Vetting Succeeded (43 fully audited, 5 partially audited, 207 exempted)
+$ cargo +nightly-2026-10-01 fuzz run -O wire_frames corpus/wire_frames -- -max_total_time=60 -max_len=70000
+  #2166798 DONE cov: 1827 ft: 5743 ... exec/s: 35521   Done 2166798 runs in 61 second(s)   (0 crashes; new corpus files removed afterwards)
+```
+
+Mutation checks. Each mutant was applied, the test run, then reverted with `git checkout`.
+
+```text
+M1 store.rs ack(): drop sub_stat(ENVELOPE_BYTES)               → envelope_bytes_are_capped_and_released FAILED  (good)
+M2 store.rs sweep(): drop env_freed += len for expired rows    → envelope_bytes_are_capped_and_released FAILED  (good)
+M3 server.rs Deposit handler: tracing::warn!(hex(mailbox))     → relay_logs_nothing_about_clients FAILED        (good; the documented mutant)
+M4 store.rs Store::deposit: tracing::warn!(hex(mailbox))       → relay_logs_nothing_about_clients ... ok        (SURVIVES, P3-6)
+M5 tls.rs: with_protocol_versions(&[TLS13, TLS12])             → tls_is_1_3_only_and_pinned ... ok              (SURVIVES, P3-7)
+```
+
+Memory and sweep cost. A scratch crate outside the repo called the real `veil_relay::store::Store`. The DB was on tmpfs because the root disk had only 1.2 GB free.
+
+```text
+$ bench fill db.redb 9600     (9 600 × 64 KiB envelopes = 630 MB payload; file 1.48 GB)
+filled 9600 in 8.86s          VmHWM: 1086124 kB
+$ bench sweep db.redb          (fresh process, nothing expired)
+sweep removed 0 in 980ms; second sweep 410ms     VmHWM: 1053444 kB
+$ docker run --memory=512m --memory-swap=512m ... veil-relay:local (bench sweep)  → OOMKilled=true Exit=137
+$ docker run --memory=2g ...                                                     → exit 0, VmHWM 1084432 kB
+```
+
+Token-row leak (P3-2), same scratch crate:
+
+```text
+normal token after delete+recreate: Err(Unauthorized)
+FF-prefixed token after delete+recreate: Ok(1)
+FF-prefixed token after idle sweep+recreate: Ok(1)
+```
+
+Deployment, `deploy/` exactly as the README describes (`.env`, `secrets/turn_secret` 0644 in a 0700 dir, `gen-cert`, `up -d`):
+
+```text
+SPKI SHA-256 pin: fca73b1b…; coturn running; relay running
+smoke: test deployed_relay_round_trip ... ok
+coturn /proc/<pid>/status: Uid 65534, CapPrm 0, CapEff 0, CapBnd 0x400, NoNewPrivs 1
+relay: Uid 65532, CapEff 0, ReadOnly=true CapDrop=[ALL] no-new-privileges, Memory=536870912, SigCgt 0x100000442 (SIGTERM not caught)
+turnutils_uclient -c -e 192.0.2.2 -r 40000 (relay-minted creds; 192.0.2.0/24 is in denied-peer-ip)
+  → host UDP listener on 192.0.2.2:40000: "udp packets received = 5"
+$ time docker compose stop relay → real 0m10.307s, Exit=137, no "veil-relay stopped" line
+$ docker compose down -v; rm -rf deploy/.env deploy/secrets; git status --short → (empty)
+```
+
+## Findings
+
+### Critical
+None.
+
+### High
+
+**P3-1: The relay is OOM-killed and crash-loops once it stores about 600 MB of envelopes (redb 1 GiB default cache, full-table sweep, 512m limit).** `crates/relay/src/store.rs:237-238` (`Database::create` with defaults), `store.rs:639-737` (`sweep`), `server.rs:289-298` (`sweep_loop`), `deploy/docker-compose.yml` (`mem_limit: 512m`).
+- **What is wrong:**
+  - redb 4.4.0's default cache is 1 GiB (`redb-4.4.0/src/db.rs:2045`), held in the process heap.
+  - `sweep` runs every 60 s in one write transaction. It calls `env.retain(...)`, which reads every envelope value. Then it iterates all mailboxes and all blobs.
+  - Scanning 630 MB of envelopes drives RSS to 1.05 GB. Under the compose limit the process is OOM-killed (`OOMKilled=true`, reproduced above). Deposits alone also reached 1.08 GB RSS.
+  - `tokio::time::interval` fires its first tick immediately. After `restart: unless-stopped` the sweep runs again at once, so the relay crash-loops. Expiry only happens in the sweep, so the data never shrinks and the loop never ends.
+  - The sweep also holds the single redb writer for the whole scan (0.4–1 s on tmpfs, much longer on an SD card), which blocks every deposit, ack, auth touch and creation.
+- **Exploit:** anyone creates 2 mailboxes, registers tokens and deposits about 10 000 × 64 KiB envelopes (well under the 5 000-per-mailbox and 4 GiB caps). Within a minute the relay dies and stays down. It also happens under ordinary load. This contradicts README "1 GB RAM is plenty" and TEST_REPORT "the sweeper scans all envelopes once a minute (fine at Pi scale)".
+- **Required fix:**
+  - Open the DB with `redb::Builder::new().set_cache_size(..)`: a bounded, configurable size such as 64–128 MiB (`VEIL_DB_CACHE_MB`), consistent with `mem_limit`.
+  - Replace the value-reading full scans with an expiry index table, e.g. `EXPIRY: expires_be ‖ mailbox ‖ seq → ()` for envelopes and the same for invites and blobs. Range-delete `..=now` in bounded batches, each its own short transaction.
+  - Fix the README and TEST_REPORT claims.
+- **Test:**
+  - A store test that fills N records and asserts the sweep touches only expired keys, for example a counter in a test-only hook, or timing that does not scale with live data.
+  - A CI step in `relay-deploy` (or an `#[ignore]` soak test run there) that loads at least 1 GB of envelopes into the container and runs past two sweep intervals. It asserts `docker inspect -f '{{.State.OOMKilled}}'` is `false` and the restart count is 0.
+
+**P3-2: Token rows with a hash starting `FF×16` survive mailbox deletion and idle expiry. This allows unbounded, unaccounted disk growth.** `store.rs:212-215` (`prefix_end`), used at `store.rs:319-321` (`delete_mailbox`) and `store.rs:685-686` (idle sweep).
+- **What is wrong:**
+  - `prefix_end(id)` returns `id ‖ FF×16` (48 bytes) and is used as an exclusive upper bound.
+  - TOKENS keys are `id ‖ h` (64 bytes), and `h` is chosen freely by the client in `UpdateTokens.add`.
+  - Any key with `h[0..16] == FF×16` sorts above the bound, so it is never deleted. Nothing else ever removes TOKENS rows, and they count against no quota.
+  - Reproduced above: the row still authorises deposits after delete+recreate and after the idle sweep.
+- **Exploit:**
+  - Loop: CreateMailbox → Authenticate → UpdateTokens add 512 hashes of the form `FF×16 ‖ random16` → DeleteMailbox.
+  - Even at the relay-wide creation rate (1/s), that leaks about 44 M rows (several GB) per day.
+  - Nothing reclaims them. When the disk fills, every redb write fails and the relay is down for good. This bypasses "the caps are what keep a stranger from filling the disk" (README).
+  - ENVELOPES and BLOB_CHUNKS are not affected today, because their suffixes are 8 and 4 bytes.
+- **Required fix:** make the upper bound cover every possible suffix. Either `prefix_end = id ‖ [0xFF; 33]`, or better, compute the lexicographic successor of the 32-byte prefix, or use an inclusive `..=id ‖ [0xFF; suffix_len]` per table.
+- **Test:** a store unit test that adds tokens `[0xFF;32]` and `FF×16 ‖ 00×16`, then deletes the mailbox (and separately idle-sweeps it). It asserts that a test-only `count_rows(TOKENS)` is 0, and that a deposit with those hashes into a recreated mailbox returns `Unauthorized`.
+
+### Medium
+
+**P3-3: No write timeout. A client that stops reading pins a connection slot forever, plus about 2 MB or more of buffered response.** `server.rs:323-342`.
+- **What is wrong:**
+  - Only `source.next()` is wrapped in the idle timeout.
+  - `sink.send(...).await` (lines 332 and 337) has no timeout. Once the peer's TCP window is full, the task blocks forever inside `send`. It holds its semaphore permit and the fully encoded `ServerFrame` in tungstenite's out buffer, up to `MAX_FRAME` ≈ 2.1 MB for a 32 × 64 KiB fetch.
+- **Exploit:** one attacker fills its own mailbox with 32 × 64 KiB envelopes, then opens connections that authenticate, send `Fetch{limit:32}` and never read. About 150–250 such connections reach the 512m limit and OOM the relay. 1024 connections hold every slot permanently, with no keep-alive needed. This contradicts INV-ROB-1 "timeouts".
+- **Required fix:**
+  - Wrap every `sink.send` in `tokio::time::timeout(write_timeout, ...)` and hang up on expiry.
+  - Set `WebSocketConfig::max_write_buffer_size`.
+  - Bound total in-flight response bytes relay-wide, e.g. a byte semaphore of 64 MiB acquired before building a `Fetch` or `BlobGet` reply.
+- **Test:** an integration test with `max_connections = 1` and a short `write_timeout`. Client A authenticates, fetches 32 × 64 KiB and never reads. The test asserts that client B can connect within `write_timeout + ε`.
+
+**P3-4: One anonymous client can take the whole connection cap indefinitely, and this is not documented.** `server.rs:264-283`, `Config::default` (`max_connections: 1024`, `idle_timeout: 5 min`).
+- **What is wrong:** the slot is taken before the TLS handshake. A connection needs no authentication to stay open, because a WS ping every under-5 minutes resets the idle timer. Nothing limits connections per source.
+- **Exploit:** one host opens 1024 TLS+WS connections and pings each every 4 min (about 4 pings/s in total). Every legitimate client is then refused. THREAT_MODEL §5, README "Known limits" and ADR-0010 cover storage-cap exhaustion but not this cheaper, total outage.
+- **Required fix:**
+  - Add an in-memory per-peer-address concurrent-connection cap (e.g. 32). Keep the count only while the connection is open: never logged, never persisted, entry removed at zero. This keeps INV-META-2, which is about storage and logs; the relay already holds IPs in memory (README).
+  - Add a short pre-auth idle timeout, e.g. 30 s until the first successful Authenticate or Deposit.
+  - If the project rejects per-IP state on principle, state this DoS explicitly in THREAT_MODEL §5 and the README instead.
+- **Test:** with a per-source cap of 2, a third connection from 127.0.0.1 is refused. A connection that never authenticates is closed after the pre-auth timeout.
+
+**P3-5: Anyone can drain the relay-wide CreateMailbox bucket at about 1 request/s, blocking onboarding and the mandatory 7-day mailbox rotation for everyone.** `server.rs:447-461`.
+- **What is wrong:** `create_mailbox.allow()` is consumed before any validation, including for invalid keys and for ids that already exist (Conflict). The bucket is global (burst 20, 1/s).
+- **Exploit:** one connection sends CreateMailbox with a bad key once per second. Every legitimate creation gets `RateLimited`. Rotation (PROTOCOL §2, every 7 days) also fails for all users.
+- **Required fix:**
+  - Validate first (key decodes, mailbox count, id free), then consume.
+  - Add a per-connection creation limit.
+  - Consider a small proof-of-work, or an optional operator gate such as a registration secret, for creation.
+  - Document the remaining starvation risk.
+- **Test:** flood the bucket with invalid-key requests, then assert a valid creation still succeeds. Add a per-connection-limit test.
+
+**P3-6: `relay_logs_nothing_about_clients` cannot see anything logged from the store layer, and does not exercise what INV-META-2 says it does.** `crates/relay/tests/relay.rs:620-691`.
+- **What is wrong:**
+  - The test uses `tracing::subscriber::set_default`, which is thread-local.
+  - Every `Store` call runs on `spawn_blocking` threads (`server.rs:211-219`), so those events go to no subscriber in the test. In production, `main.rs` installs a global subscriber and they would be printed.
+  - Mutant M4 (logging the mailbox id inside `Store::deposit`) survives.
+  - INV-META-2 says the session covers "blobs". The test never calls BlobUploadToken, BlobPut, BlobGet or TurnCredentials.
+- **Required fix:** move the test to its own test binary (e.g. `tests/logs.rs`) and install the capture with `tracing::subscriber::set_global_default`. Add blob upload/download and TURN credentials to the session. Record M4 as a required mutant.
+- **Test:** M3 and M4 must both fail the test.
+
+**P3-7: `tls_is_1_3_only_and_pinned` passes even if the relay accepts TLS 1.2.** `relay.rs:528-545`, `tests/common/mod.rs:151-160`.
+- **What is wrong:** the TLS 1.2 client uses `PinVerifier`, whose `verify_tls12_signature` always returns `Err`. The handshake therefore fails on the client side whatever the server negotiates. Mutant M5 (server offering TLS13 + TLS12) survives. INV-NET-2 and TEST_REPORT cite this test as proof of "TLS 1.3 only". The production code is correct today; the test does not guard it.
+- **Required fix:**
+  - Give the TLS 1.2 probe a verifier that accepts TLS 1.2 signatures: pin check plus `rustls::crypto::verify_tls12_signature`.
+  - Assert the specific failure: `rustls::Error::AlertReceived(AlertDescription::ProtocolVersion)` or the equivalent peer-incompatible error.
+  - Add a positive control: the same verifier with TLS 1.3 connects.
+- **Test:** M5 must fail it.
+
+**P3-8: coturn relays UDP to every port on the server's own addresses, for anyone. The README says nobody can use it to reach your LAN.** `deploy/coturn/entrypoint.sh:27-31`, `deploy/README.md:162-169`.
+- **What is wrong:**
+  - The entrypoint adds `allowed-peer-ip` for the public and the private address, with no port restriction (coturn cannot express one).
+  - TURN credentials need only an authenticated mailbox, and mailbox creation is open to anyone. So any internet user can relay UDP to any service on the relay host.
+  - Reproduced: relay-minted credentials delivered 5 datagrams to 192.0.2.2:40000, inside a denied range, apart from the allow line.
+  - On a home Pi (option B, `public/192.168.1.20`) this exposes LAN-bound UDP services such as Pi-hole DNS, mDNS, SNMP and WireGuard/Tailscale ports through the TURN server.
+  - The README line "Only clients holding relay-minted credentials (… authenticated mailboxes only)" also suggests a restriction that does not exist. The TURN server is an open UDP relay to the public internet for anyone, and on a home deployment abuse traffic leaves from the operator's IP.
+- **Required fix:**
+  - Allow only what relayed calls need: drop the private-address allow unless it is shown to be required.
+  - Ship a documented host firewall rule limiting coturn's traffic to its own addresses to the relay port range, e.g. nftables `meta skuid 65534 ip daddr { <own IPs> } udp dport != 49160-49259 drop`.
+  - Correct the README and THREAT_MODEL: anyone can obtain TURN credentials, and the host's own UDP services are in scope.
+- **Test:** extend the CI `relay-deploy` step with a host UDP listener on a port outside 49160–49259 and `turnutils_uclient -e $TURN_IP -r <that port>`. Assert 0 datagrams are received.
+
+### Low
+
+**P3-9: The relay ignores SIGTERM, so every `docker stop` or upgrade is a SIGKILL.** `main.rs:314-316`.
+- **What is wrong:** only `ctrl_c` (SIGINT) is handled. As PID 1, SIGTERM is ignored. Reproduced: `docker compose stop` took 10.3 s, exit 137, and no "stopped" line was logged.
+- **Consequence:** redb has to recover after each unclean shutdown. With P3-1 that recovery can itself exceed the memory limit.
+- **Fix:** also handle `tokio::signal::unix::signal(SignalKind::terminate())`, or add `STOPSIGNAL SIGINT` to the Dockerfile. Drain connections, then drop the DB.
+- **Test:** in CI, `docker compose stop relay` exits 0 within 3 s and logs "veil-relay stopped".
+
+**P3-10: Incomplete blobs are not reclaimed when their upload token expires, despite the comment.** `store.rs:711-720`.
+- **What is wrong:** the comment says "and incomplete blobs whose token is gone", but only `meta.expires <= now` (30 days) is checked. An abandoned upload holds up to 100 MiB of the blob quota for 30 days instead of about 24 h.
+- **Fix:** give incomplete blobs the token's expiry and extend it to `blob_ttl` on completion, or delete incomplete blobs whose bound token is gone.
+- **Test:** upload 1 of 2 chunks, sweep past `upload_token_ttl`, assert the blob and its bytes are freed.
+
+**P3-11: `DeleteMailbox` leaves other connections authenticated and subscribed for that id.** `server.rs:566-571`.
+- **What is wrong:** only this connection's `authed` set and none of the subscribers are cleared. If the id is recreated (by the owner, or by anyone after the idle sweep), stale connections can Fetch, Ack and UpdateTokens on the new mailbox. This needs id reuse, so the impact is low.
+- **Fix:** keep a per-mailbox generation or auth key in `authed` and re-check it in `require_auth`, or broadcast a revocation to connections.
+- **Test:** A authenticates on two connections, deletes on one, recreates with a new key; the other connection's Fetch returns `Unauthorized`.
+
+**P3-12: The TURN secret's first in-memory copy is not zeroized.** `main.rs:271-274`.
+- **What is wrong:** `std::fs::read` returns a plain `Vec` that is dropped without wiping, and only the trimmed copy is `Zeroizing`.
+- **Fix:** `let raw = Zeroizing::new(std::fs::read(&path)?);` and then trim from `raw`.
+- **Test:** a code review check is enough.
+
+**P3-13: Several doc claims are inaccurate.**
+- README "Rate limits slow this down" and THREAT_MODEL §5 "slow this down without stopping it": with 512 tokens × burst 60 per mailbox and 20 mailboxes per burst, the 4 GiB envelope cap fills as fast as the uplink allows.
+- README "1 GB RAM is plenty" (see P3-1).
+- INV-ROB-1 "timeouts" (no write timeout, P3-3).
+- INV-META-2 "full session (… blobs …)" (P3-6).
+- INV-NET-2 "a TLS 1.2-only client is refused" as tested evidence (P3-7).
+- **Fix:** correct these with the fixes above.
+
+## Claims I checked and found accurate
+- The test, clippy and fmt results and counts in the TEST_REPORT Phase 3 section reproduce exactly (74/3/22+1/10/10/0+1/5). The `cargo deny` result and the `cargo vet` numbers (43/5/207) reproduce.
+- The documented mutation checks reproduce: an async-path log of the mailbox id fails the log test; dropping byte releases fails `envelope_bytes_are_capped_and_released`. I also killed the ack and expiry-path variants.
+- **`wire`:**
+  - The size check comes before parsing.
+  - Canonical re-encode is required, so unknown, duplicate and out-of-order fields are rejected.
+  - `v == 1` is enforced and `id != 0` for client frames.
+  - Every request field is length- or range-checked.
+  - `NewEnvelopes` must have `id == 0`.
+  - Envelope seq ≤ last_seq.
+  - TURN URLs must be `turn:`/`turns:` ASCII.
+  - `MAX_CLIENT_FRAME` = 64 KiB + 1 040, matching PROTOCOL §14.
+  - A 32-envelope fetch fits `MAX_FRAME`.
+  - The fuzz target ran 2.17 M runs in 61 s with 0 crashes.
+- **Auth:**
+  - The nonce is removed before any check (single use), is per connection, and is bound to the mailbox.
+  - The signed message includes the relay SPKI pin.
+  - The ±120 s skew applies both to `unix_secs` and to challenge age.
+  - `verify_strict` is used, keys are checked at creation, and auth is required for UpdateTokens, Fetch, Ack, DeleteMailbox, PutInvite, BlobUploadToken and TurnCredentials.
+- Delivery and upload tokens are stored only as domain-separated SHA-256 hashes. Unknown mailbox and unknown token both return `Unauthorized`.
+- TakeInvite reads and deletes in one write transaction. The invite TTL is capped. PutInvite does not store the mailbox.
+- Every store mutation is one redb transaction. Counter updates are consistent on the ack, delete, expiry and idle-expiry paths for envelopes, apart from the P3-2 key-range bug. Records are decoded with checked offsets.
+- The peer address from `accept()` is dropped. Nothing IP-keyed exists. The deployed relay logged exactly one startup line and coturn logged nothing.
+- `#![forbid(unsafe_code)]` is present in `wire/lib.rs`, `relay/lib.rs` and `relay/main.rs`. Secret-holding types (`TurnConfig`, `Config`, `Shared`, `Store`) have redacting or opaque `Debug` and no `Clone` or `Serialize`.
+- **TLS:**
+  - The server config is TLS 1.3 only with ring.
+  - `gen-cert` writes `key.pem` with mode 0600 and `create_new`, refuses to overwrite (also in the container), and prints a pin equal to the loaded pin.
+  - A cert/key mismatch is refused.
+  - A wrong pin is refused, both in-process and against the container.
+- TURN credentials (`expiry:hex16`, base64 HMAC-SHA1) are accepted by coturn 4.7.0: allocation succeeded with relay-minted credentials, and wrong passwords and private peers were refused, per CI and my run.
+- **Containers:**
+  - The relay runs as uid 65532 with a read-only root, `CapDrop=[ALL]`, `no-new-privileges` and CapEff 0.
+  - coturn runs as uid 65534 with CapPrm and CapEff 0, CapBnd only `NET_BIND_SERVICE`, and NoNewPrivs 1. This matches the README claim that the effective set is empty.
+  - Base images are digest-pinned.
+- **GitHub Actions:** the `relay-deploy` job uses a SHA-pinned checkout with `persist-credentials: false` and inherits the workflow-level `permissions: contents: read`. Its log-line and coturn-403 assertions can fail.
+
+## Claims I could not verify
+- arm64 / Raspberry Pi build and run. The README says amd64 only.
+- Image build reproducibility from the committed Dockerfile. I did not rebuild; the existing `veil-relay:local` image was used.
+- The "7.6 M runs in 180 s" and the earlier 180 s fuzz figures in INV-MSG-5 and TEST_REPORT. I ran 60 s only. Any ≥ 1 h nightly fuzz run (none recorded).
+- The `relay-deploy` CI job as actually executed on GitHub runners.
+- Sweep and recovery timings on real SD-card storage. My measurements were on tmpfs, so real-disk times will be longer than those shown.
+
+---
+Housekeeping: the working tree is clean (`git status --short` is empty). I ran `docker compose down -v` and removed `deploy/.env` and `deploy/secrets`. I removed the new fuzz corpus files and my scratch DB in `/dev/shm`. I stopped the dockerd I had started; a defunct `dockerd` process entry remains. A container `eager_chatterjee` (coturn, created 17:07, before this review) was left untouched. The scratch benchmark crate is at `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/bench`. Nothing was committed or pushed.
