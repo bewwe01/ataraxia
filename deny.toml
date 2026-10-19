@@ -41,10 +41,10 @@ multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
 deny = [
-    # Only reviewed crypto (CLAUDE.md non-negotiable 1). OpenSSL is reserved for SQLCipher (ADR-0005)
-    # and must be explicitly allowed here when that lands.
-    { crate = "openssl", reason = "only via SQLCipher (ADR-0005), allow explicitly when added" },
-    { crate = "openssl-sys", reason = "only via SQLCipher (ADR-0005), allow explicitly when added" },
+    # Only reviewed crypto (CLAUDE.md non-negotiable 1). OpenSSL is reserved for SQLCipher's page
+    # cipher (ADR-0005): the vendored build is reachable only through libsqlite3-sys.
+    { crate = "openssl", reason = "only via SQLCipher (ADR-0005)" },
+    { crate = "openssl-sys", reason = "only via SQLCipher (ADR-0005)", wrappers = ["libsqlite3-sys"] },
 ]
 
 [sources]

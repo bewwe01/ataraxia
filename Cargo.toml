@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/wire", "crates/relay"]
+members = ["crates/core", "crates/wire", "crates/relay", "crates/client"]
 exclude = ["crates/core/fuzz", "spikes"]
 
 [workspace.package]
@@ -44,7 +44,15 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "std", "ansi"] }
 veil-wire = { path = "crates/wire", version = "=0.1.0" }
 veil-core = { path = "crates/core", version = "=0.1.0" }
+veil-relay = { path = "crates/relay", version = "=0.1.0" }
+# client (Phase 4). SQLCipher is vendored with its OpenSSL so the build is identical on every
+# platform (no system libcrypto); see ARCHITECTURE ADR-0011.
+rusqlite = { version = "=0.40.2", features = ["bundled-sqlcipher-vendored-openssl"] }
+qrcode = { version = "=0.14.1", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
 # dev
+tempfile = "=3.23.0"
 proptest = "=1.12.0"
 futures-executor = "=0.3.34"
 
