@@ -1,0 +1,9 @@
+/* App shell over the Phase 0 prototype styles: full-window instead of the phone frame. */
+@media (min-width: 600px) and (min-height: 700px) {
+  .stage { background: var(--bg-0); }
+  .device { width: min(100%, 560px); height: 100%; border-radius: 0; box-shadow: none; }
+}
+.app-error { margin: var(--space-4); }
+.qr-svg { width: 100%; height: auto; display: block; background: #fff; border-radius: var(--radius-md, 12px); }
+.chat-scroll { flex: 1; overflow-y: auto; }
+.mono-wrap { font-family: var(--font-mono); overflow-wrap: anywhere; font-size: var(--fs-sm, 13px); }

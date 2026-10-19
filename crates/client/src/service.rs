@@ -123,12 +123,17 @@ pub enum ChangeKind {
 
 pub type Notify = Arc<dyn Fn(ChangeKind, Option<i64>) + Send + Sync>;
 
-#[derive(Debug)]
 pub struct SetupInput {
     pub relay: String,
     pub pin: String,
     pub name: String,
     pub passphrase: Zeroizing<String>,
+}
+
+impl core::fmt::Debug for SetupInput {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SetupInput { .. }")
+    }
 }
 
 // ---- commands ----------------------------------------------------------------------------

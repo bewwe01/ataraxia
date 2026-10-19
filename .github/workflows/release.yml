@@ -1,0 +1,222 @@
+# Release builds: Android APK (arm64) and Windows installer (NSIS), published to a GitHub
+# pre-release with SHA-256 checksums when a version tag is pushed.
+#
+# Signing, stated plainly:
+# - Android: signed with the release keystore from repository secrets when they are set
+#   (ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS). Otherwise with a
+#   throwaway key generated in this run: such an APK installs, but the next build cannot
+#   update it in place (uninstall first, which deletes local data).
+# - Windows: not code-signed. SmartScreen will warn; check the SHA-256 instead.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create, e.g. v0.1.0-preview.1 (empty: build only)"
+        required: false
+  push:
+    # A version tag builds and publishes; a branch push touching the app only builds.
+    tags: ["v*"]
+    branches: ["**"]
+    paths:
+      - "app/**"
+      - "crates/**"
+      - "Cargo.lock"
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: "10.28.0"
+      - name: Typecheck, lint, build
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm lint
+          pnpm build
+
+  android:
+    needs: frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          df -h /
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: "10.28.0"
+
+      - name: Rust toolchain, Android target, protoc
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+          rustup target add aarch64-linux-android
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+          echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          # OpenSSL (vendored for SQLCipher) configures itself for Android from these.
+          echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
+      - name: Build release APK (arm64, unsigned)
+        working-directory: app
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm tauri android init --ci
+          pnpm tauri icon app-icon.png
+          pnpm tauri android build --target aarch64 --apk --ci
+          find src-tauri/gen/android -name '*.apk' -print
+
+      - name: Sign APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          IN=$(find app/src-tauri/gen/android -name '*-release-unsigned.apk' | head -1)
+          test -n "$IN"
+          KS="$RUNNER_TEMP/release.jks"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$KS"
+            echo "SIGNING=release key from repository secrets" >> "$GITHUB_ENV"
+          else
+            export KEYSTORE_PASSWORD KEY_ALIAS
+            KEYSTORE_PASSWORD=$(openssl rand -hex 24)
+            KEY_ALIAS=veil-ephemeral
+            keytool -genkeypair -keystore "$KS" -storepass "$KEYSTORE_PASSWORD" -keypass "$KEYSTORE_PASSWORD" \
+              -alias "$KEY_ALIAS" -keyalg EC -groupname secp256r1 -validity 3650 -dname "CN=Veil ephemeral CI key"
+            echo "SIGNING=throwaway key generated in this CI run (not updatable in place)" >> "$GITHUB_ENV"
+          fi
+          mkdir -p out
+          "$BT/zipalign" -P 16 -f 4 "$IN" "$RUNNER_TEMP/aligned.apk"
+          # The password reaches apksigner through the environment, never argv.
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias "$KEY_ALIAS" --ks-pass "env:KEYSTORE_PASSWORD" \
+            --out out/Veil-android-arm64.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs out/Veil-android-arm64.apk | grep -E "Signer #1 certificate (DN|SHA-256)"
+          rm -f "$KS"
+          echo "$SIGNING" > out/android-signing.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    needs: frontend
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: "10.28.0"
+
+      - name: Rust toolchain, protoc
+        shell: bash
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+          choco install protoc --version 29.3.0 -y --no-progress
+          protoc --version
+
+      - name: Build NSIS installer
+        working-directory: app
+        shell: bash
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm tauri build --bundles nsis
+          mkdir -p ../out
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe ../out/Veil-windows-x64-setup.exe
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [android, windows]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+          SIGNING=$(cat android-signing.txt)
+          rm android-signing.txt
+          sha256sum Veil-android-arm64.apk Veil-windows-x64-setup.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cat > notes.md <<EOF
+          Preview build of Veil from commit $SHA. **Not independently audited.**
+
+          Scope: one relay, one-to-one text messaging, invites by link, safety-number verification.
+          Not in this build: attachments, voice notes, calls, disappearing messages, backup, notifications.
+
+          - Android (arm64): signed with a $SIGNING.
+          - Windows (x64): not code-signed; SmartScreen will warn.
+
+          Verify downloads against SHA256SUMS.txt:
+          \`\`\`
+          $(cat SHA256SUMS.txt)
+          \`\`\`
+          EOF
+          gh release create "$TAG" --target "$SHA" --prerelease --title "Veil $TAG" --notes-file notes.md \
+            Veil-android-arm64.apk Veil-windows-x64-setup.exe SHA256SUMS.txt

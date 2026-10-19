@@ -1,0 +1,42 @@
+[package]
+name = "veil-app"
+version = "0.1.0"
+description = "Veil desktop and Android app shell (Tauri 2)."
+edition = "2024"
+rust-version = "1.97"
+license = "AGPL-3.0-only"
+repository = "https://github.com/bewwe01/ataraxia"
+publish = false
+
+[lib]
+name = "veil_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.7.3", features = [] }
+
+[dependencies]
+# No Tauri plugins at all: no shell, fs, http, clipboard or updater (CLAUDE.md rules 2, 6, 8).
+tauri = { version = "=2.12.4", features = [] }
+veil-client = { path = "../../crates/client" }
+serde = { version = "=1.0.229", features = ["derive"] }
+zeroize = { version = "=1.9.1", features = ["serde"] }
+
+[profile.release]
+overflow-checks = true
+codegen-units = 1
+lto = true
+strip = "debuginfo"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+
+# Its own workspace: the app pulls in Tauri and the platform webview, which the core CI jobs
+# must not need.
+[workspace]

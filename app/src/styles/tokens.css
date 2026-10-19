@@ -1,0 +1,501 @@
+/*
+ * Veil design tokens
+ * ------------------------------------------------------------------
+ * Single source of truth for colour, type, space, shape, elevation,
+ * blur and motion. Ported 1:1 into the React app in Phase 4.
+ *
+ * Theming axes (attributes on <html>):
+ *   data-style      = "aurora" (default, "Aurora Glass") | "ink" ("Ink & Signal")
+ *   data-theme      = "dark" (default) | "light"          (user-facing name: Mode)
+ *   data-accent     = "aurora" (default) | "lagoon" | "ember"
+ *   data-bubble     = "gradient" (default) | "soft" | "minimal"
+ *   data-text-size  = "sm" | "md" (default) | "lg" | "xl"
+ *   data-motion     = "full" (default) | "reduced"
+ *
+ * Every text/background pair below is checked for WCAG AA (4.5:1) by
+ * design/tools/check.mjs, including every point along each sent-bubble
+ * gradient. Do not change a colour without re-running it.
+ *
+ * Fonts are self-hosted (SIL OFL 1.1). No network requests, ever.
+ */
+
+@font-face {
+  font-family: "Inter Veil";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/inter-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Inter Veil";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/inter-latin-ext-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308,
+    U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113,
+    U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "JetBrains Mono Veil";
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url("/fonts/jetbrains-mono-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+/* ------------------------------------------------------------------ */
+/* Theme-independent tokens                                            */
+/* ------------------------------------------------------------------ */
+:root {
+  /* Type */
+  --font-sans: "Inter Veil", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono Veil", ui-monospace, "SF Mono", Consolas, monospace;
+  --text-scale: 1;
+  --text-2xs: 0.6875rem; /* 11px – badges only, always weight ≥ 600 */
+  --text-xs: 0.75rem; /* 12px – timestamps, captions */
+  --text-sm: 0.8125rem; /* 13px – secondary lines */
+  --text-base: 0.9375rem; /* 15px – body, bubbles */
+  --text-md: 1.0625rem; /* 17px – titles in rows/headers */
+  --text-lg: 1.25rem; /* 20px – section titles */
+  --text-xl: 1.5rem; /* 24px – screen titles */
+  --text-2xl: 2rem; /* 32px – onboarding headlines */
+  --text-3xl: 2.5rem; /* 40px – hero / call timer */
+  --leading-tight: 1.2;
+  --leading-snug: 1.32;
+  --leading-normal: 1.45;
+  --weight-regular: 420;
+  --weight-medium: 520;
+  --weight-semibold: 620;
+  --weight-bold: 720;
+  --tracking-display: -0.025em;
+  --tracking-tight: -0.012em;
+  --tracking-wide: 0.06em; /* overlines, ALL-CAPS labels */
+  --bubble-font-size: calc(var(--text-base) * var(--text-scale));
+
+  /* Space (4px grid) */
+  --space-0: 0;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* Shape */
+  --radius-xs: 6px;
+  --radius-sm: 10px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+  --radius-xl: 28px;
+  --radius-2xl: 36px;
+  --radius-pill: 999px;
+  --bubble-radius: 20px;
+  --bubble-radius-tail: 6px;
+
+  /* Sizing */
+  --tap-min: 44px; /* minimum touch/click target */
+  --avatar-sm: 32px;
+  --avatar-md: 44px;
+  --avatar-lg: 56px;
+  --avatar-xl: 96px;
+  --rail-w: 72px; /* desktop sidebar rail */
+  --list-w: 340px; /* desktop conversation list, user-resizable 280–480 */
+  --list-w-min: 280px;
+  --list-w-max: 480px;
+  --info-w: 340px; /* desktop right info panel */
+  --header-h: 64px;
+  --bottom-nav-h: 64px;
+  --composer-min-h: 56px;
+  --bubble-max-w: min(78%, 560px);
+
+  /* Blur */
+  --blur-glass: 24px;
+  --blur-heavy: 48px;
+  --saturate-glass: 1.4;
+
+  /* Motion
+   * Only transform and opacity are ever animated.
+   * --ease-spring is a cubic-bezier fallback, upgraded to a true
+   * spring curve with linear() where supported (see below).
+   */
+  --dur-instant: 90ms;
+  --dur-fast: 160ms;
+  --dur-base: 240ms;
+  --dur-slow: 420ms;
+  --dur-slower: 700ms;
+  --dur-ambient: 48s;
+  --dur-pulse: 2.4s;
+  --stagger: 40ms;
+  --ease-out: cubic-bezier(0.22, 0.8, 0.24, 1);
+  --ease-in: cubic-bezier(0.5, 0, 0.75, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.4, 0.64, 1);
+  --ease-spring-soft: cubic-bezier(0.3, 1.2, 0.6, 1);
+
+  /* Layering */
+  --z-base: 0;
+  --z-sticky: 10;
+  --z-nav: 20;
+  --z-panel: 30;
+  --z-overlay: 40;
+  --z-modal: 50;
+  --z-toast: 60;
+
+  /* Component tokens (Aurora Glass defaults; Ink & Signal overrides below) */
+  --btn-radius: var(--radius-pill);
+  --btn-primary-bg: var(--sent-gradient);
+  --btn-primary-fg: var(--text-on-accent);
+  --btn-primary-shadow: var(--glow-accent);
+  --control-on: var(--sent-gradient);
+  --composer-radius: 24px;
+  --signal-line: none;
+
+  /* Status colours shared by both themes are overridden per theme below */
+  --noise: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 .55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+}
+
+@supports (animation-timing-function: linear(0, 1)) {
+  :root {
+    /* Damped spring, ~stiffness 260 / damping 22, sampled */
+    --ease-spring: linear(
+      0, 0.009, 0.035 2.1%, 0.141 4.4%, 0.723 12.9%, 0.938 16.7%, 1.017 19.4%, 1.067, 1.099 24.3%,
+      1.108 26%, 1.102, 1.081 31.2%, 1.008 39.5%, 0.985 43.4%, 0.98 46.5%, 0.983 50.6%, 1.002 61%, 1.004 68.9%, 1
+    );
+    --ease-spring-soft: linear(
+      0, 0.017, 0.067 3.5%, 0.27 7.9%, 0.736 17.5%, 0.92 23.1%, 1.012 28.6%, 1.045 33.4%, 1.049 37.7%,
+      1.036 42.9%, 1.002 56%, 0.995 65.4%, 1
+    );
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Dark theme (default)                                                */
+/* ------------------------------------------------------------------ */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Canvas */
+  --bg-0: #06071a; /* deepest – window background behind ambient */
+  --bg-1: #0b0d22; /* app canvas */
+  --bg-2: #101331; /* panels, list pane */
+
+  /* Surfaces (solid = fallback when backdrop-filter unsupported/disabled) */
+  --surface-1: #171a3d; /* received bubble, cards */
+  --surface-2: #1e2250; /* selected row, inputs */
+  --surface-3: #272c63; /* hover on surface-2, pressed */
+  --surface-glass: rgb(20 23 56 / 0.62);
+  --surface-glass-strong: rgb(16 19 49 / 0.82);
+  --surface-scrim: rgb(4 5 18 / 0.66);
+
+  /* Borders */
+  --border-subtle: rgb(160 170 255 / 0.1);
+  --border-default: rgb(160 170 255 / 0.16);
+  --border-strong: rgb(160 170 255 / 0.28);
+
+  /* Text */
+  --text-1: #f1f2ff; /* primary */
+  --text-2: #b4b8e0; /* secondary */
+  --text-3: #9aa0cf; /* tertiary: timestamps, captions (≥4.5 on surface-2) */
+  --text-on-accent: #ffffff;
+  --text-on-accent-2: rgb(255 255 255 / 0.86); /* meta inside sent bubbles */
+  --text-on-warm: #1a0b05;
+
+  /* Brand aurora */
+  --aurora-indigo: #4338ff;
+  --aurora-violet: #8b3dff;
+  --aurora-cyan: #00b8d9;
+  --aurora-warm: #ff8f6b; /* the single warm accent */
+
+  /* Interactive accent (links, toggles, focus) – set per accent preset */
+  --accent: #a49dff;
+  --accent-strong: #6d5dff;
+  --accent-soft: rgb(124 108 255 / 0.18);
+  --focus: #b9b3ff;
+
+  /* Status – always paired with an icon/shape + text, never colour alone */
+  --success: #4be3a3;
+  --success-soft: rgb(75 227 163 / 0.14);
+  --warning: #ffc670;
+  --warning-soft: rgb(255 181 71 / 0.14);
+  --warning-border: rgb(255 198 112 / 0.42);
+  --danger: #ff7a8c;
+  --danger-strong: #c42a42;
+  --danger-soft: rgb(255 93 115 / 0.14);
+  --info: #6fd6f2;
+
+  /* Presence / transport */
+  --presence-online: #4be3a3;
+  --presence-away: #ffc670;
+  --presence-offline: #7d83b3;
+
+  /* Bubbles */
+  --received-bg: var(--surface-1);
+  --received-border: var(--border-subtle);
+  --received-text: var(--text-1);
+
+  /* Elevation */
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 1px 1px rgb(0 0 0 / 0.2);
+  --shadow-2: 0 6px 20px -6px rgb(0 0 0 / 0.55), 0 2px 6px rgb(0 0 0 / 0.3);
+  --shadow-3: 0 24px 64px -16px rgb(0 0 0 / 0.7), 0 8px 24px -8px rgb(0 0 0 / 0.5);
+  --glow-accent: 0 8px 28px -6px rgb(109 93 255 / 0.55);
+  --glow-success: 0 0 0 6px rgb(75 227 163 / 0.12), 0 8px 32px -4px rgb(75 227 163 / 0.45);
+  --inner-highlight: inset 0 1px 0 rgb(255 255 255 / 0.06);
+
+  /* Ambient mesh (slowly drifting backdrop) */
+  --ambient-a: rgb(67 56 255 / 0.34);
+  --ambient-b: rgb(139 61 255 / 0.26);
+  --ambient-c: rgb(0 184 217 / 0.18);
+  --ambient-d: rgb(255 143 107 / 0.1);
+  --noise-opacity: 0.045;
+}
+
+/* ------------------------------------------------------------------ */
+/* Light theme                                                         */
+/* ------------------------------------------------------------------ */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-0: #e7e9f5;
+  --bg-1: #f6f7fc;
+  --bg-2: #eef0f9;
+
+  --surface-1: #ffffff;
+  --surface-2: #e9ebf6;
+  --surface-3: #dde0f0;
+  --surface-glass: rgb(255 255 255 / 0.68);
+  --surface-glass-strong: rgb(255 255 255 / 0.86);
+  --surface-scrim: rgb(22 24 52 / 0.42);
+
+  --border-subtle: rgb(30 35 90 / 0.08);
+  --border-default: rgb(30 35 90 / 0.13);
+  --border-strong: rgb(30 35 90 / 0.24);
+
+  --text-1: #12142b;
+  --text-2: #3f4368;
+  --text-3: #575b82;
+  --text-on-accent: #ffffff;
+  --text-on-accent-2: rgb(255 255 255 / 0.88);
+  --text-on-warm: #1a0b05;
+
+  --accent: #4b3fd6;
+  --accent-strong: #4b3fd6;
+  --accent-soft: rgb(75 63 214 / 0.1);
+  --focus: #4b3fd6;
+
+  --success: #086b41;
+  --success-soft: rgb(11 122 75 / 0.1);
+  --warning: #8a5300;
+  --warning-soft: #fff4e0;
+  --warning-border: rgb(178 110 0 / 0.38);
+  --danger: #c0213b;
+  --danger-strong: #c0213b;
+  --danger-soft: rgb(192 33 59 / 0.08);
+  --info: #0b6a8a;
+
+  --presence-online: #0f9a5f;
+  --presence-away: #b26e00;
+  --presence-offline: #8c90b0;
+
+  --received-bg: var(--surface-1);
+  --received-border: var(--border-default);
+  --received-text: var(--text-1);
+
+  --shadow-1: 0 1px 2px rgb(20 24 70 / 0.08), 0 1px 1px rgb(20 24 70 / 0.04);
+  --shadow-2: 0 8px 24px -8px rgb(20 24 70 / 0.18), 0 2px 6px rgb(20 24 70 / 0.06);
+  --shadow-3: 0 28px 64px -18px rgb(20 24 70 / 0.32), 0 8px 24px -8px rgb(20 24 70 / 0.12);
+  --glow-accent: 0 8px 24px -8px rgb(75 63 214 / 0.45);
+  --glow-success: 0 0 0 6px rgb(11 122 75 / 0.1), 0 8px 28px -6px rgb(11 122 75 / 0.35);
+  --inner-highlight: inset 0 1px 0 rgb(255 255 255 / 0.7);
+
+  --ambient-a: rgb(99 88 255 / 0.2);
+  --ambient-b: rgb(160 92 255 / 0.16);
+  --ambient-c: rgb(0 184 217 / 0.16);
+  --ambient-d: rgb(255 143 107 / 0.14);
+  --noise-opacity: 0.03;
+}
+
+/* ------------------------------------------------------------------ */
+/* Theme: Ink & Signal  (data-style="ink")                             */
+/* Matte graphite, hairlines, one cyan→violet "signal" line. No glass, */
+/* no glow, no ambient drift. Solid sent bubbles.                      */
+/* ------------------------------------------------------------------ */
+:root[data-style="ink"] {
+  --btn-radius: 10px;
+  --btn-primary-bg: var(--text-1);
+  --btn-primary-fg: var(--bg-2);
+  --btn-primary-shadow: none;
+  --control-on: var(--sent-ink);
+  --composer-radius: 14px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --radius-2xl: 22px;
+  --signal-line: linear-gradient(90deg, #00b8d9, #8b3dff);
+  --sent-bg: var(--sent-ink);
+  --glow-accent: none;
+  --glow-success: 0 0 0 6px var(--success-soft);
+  --inner-highlight: none;
+  --ambient-a: transparent;
+  --ambient-b: transparent;
+  --ambient-c: transparent;
+  --ambient-d: transparent;
+  --noise-opacity: 0;
+}
+:root[data-style="ink"]:not([data-bubble="soft"]):not([data-bubble="minimal"]) {
+  --bubble-radius: 14px;
+  --bubble-radius-tail: 14px;
+}
+:root[data-style="ink"][data-theme="dark"] {
+  --bg-0: #0a0a0c;
+  --bg-1: #0e0e11;
+  --bg-2: #111114;
+  --surface-1: #1a1a1f;
+  --surface-2: #1f1f25;
+  --surface-3: #2a2a31;
+  --surface-glass: #131317;
+  --surface-glass-strong: #16161b;
+  --surface-scrim: rgb(0 0 0 / 0.7);
+  --border-subtle: rgb(255 255 255 / 0.07);
+  --border-default: rgb(255 255 255 / 0.11);
+  --border-strong: rgb(255 255 255 / 0.2);
+  --text-1: #ededf0;
+  --text-2: #a9a9b3;
+  --text-3: #9c9ca6;
+  --accent: #6fd6f2;
+  --accent-strong: #6fd6f2;
+  --accent-soft: rgb(111 214 242 / 0.12);
+  --focus: #8fe2f7;
+  --presence-offline: #85858f;
+  --shadow-1: none;
+  --shadow-2: 0 0 0 1px rgb(255 255 255 / 0.08), 0 8px 24px -8px rgb(0 0 0 / 0.6);
+  --shadow-3: 0 0 0 1px rgb(255 255 255 / 0.1), 0 24px 64px -16px rgb(0 0 0 / 0.8);
+}
+:root[data-style="ink"][data-theme="light"] {
+  --bg-0: #e9e9ec;
+  --bg-1: #f7f7f8;
+  --bg-2: #f2f2f4;
+  --surface-1: #ffffff;
+  --surface-2: #ebebef;
+  --surface-3: #dfdfe5;
+  --surface-glass: #f4f4f6;
+  --surface-glass-strong: #fbfbfc;
+  --surface-scrim: rgb(17 17 20 / 0.45);
+  --border-subtle: rgb(17 17 20 / 0.08);
+  --border-default: rgb(17 17 20 / 0.13);
+  --border-strong: rgb(17 17 20 / 0.24);
+  --text-1: #111114;
+  --text-2: #45454f;
+  --text-3: #5a5a66;
+  --accent: #0b6a8a;
+  --accent-strong: #0b6a8a;
+  --accent-soft: rgb(11 106 138 / 0.09);
+  --focus: #0b6a8a;
+  --presence-offline: #8a8a96;
+  --shadow-1: none;
+  --shadow-2: 0 0 0 1px rgb(17 17 20 / 0.08), 0 8px 20px -10px rgb(17 17 20 / 0.2);
+  --shadow-3: 0 0 0 1px rgb(17 17 20 / 0.1), 0 24px 56px -20px rgb(17 17 20 / 0.3);
+}
+
+/* ------------------------------------------------------------------ */
+/* Accent presets – drive the sent-bubble gradient and accent colour   */
+/* Every stop keeps #fff text ≥ 4.5:1 (checked incl. interpolation).   */
+/* ------------------------------------------------------------------ */
+:root,
+:root[data-accent="aurora"] {
+  --sent-a: #4f3ae6;
+  --sent-b: #7334dc;
+  --sent-c: #2d55d6;
+  --sent-solid: #5a37e0;
+  --sent-ink: #3a2fb8;
+  --accent-swatch: linear-gradient(135deg, #4f3ae6, #7334dc 55%, #2d55d6);
+}
+:root[data-accent="lagoon"] {
+  --sent-a: #0a6b8c;
+  --sent-b: #0f5aa8;
+  --sent-c: #2b46c2;
+  --sent-solid: #0e5e9c;
+  --sent-ink: #0e5e9c;
+  --accent-swatch: linear-gradient(135deg, #0a6b8c, #0f5aa8 55%, #2b46c2);
+  --accent-soft: rgb(15 140 190 / 0.18);
+  --glow-accent: 0 8px 28px -6px rgb(15 120 190 / 0.5);
+}
+:root[data-theme="dark"][data-accent="lagoon"],
+:root:not([data-theme])[data-accent="lagoon"] {
+  --accent: #6fd6f2;
+  --focus: #8fe2f7;
+}
+:root[data-theme="light"][data-accent="lagoon"] {
+  --accent: #095d7a;
+  --accent-strong: #095d7a;
+  --focus: #095d7a;
+}
+:root[data-accent="ember"] {
+  --sent-a: #a8324a;
+  --sent-b: #8a2f86;
+  --sent-c: #5c33bb;
+  --sent-solid: #8f2f6a;
+  --sent-ink: #8f2f6a;
+  --accent-swatch: linear-gradient(135deg, #a8324a, #8a2f86 55%, #5c33bb);
+  --accent-soft: rgb(255 120 140 / 0.16);
+  --glow-accent: 0 8px 28px -6px rgb(200 60 100 / 0.5);
+}
+:root[data-theme="dark"][data-accent="ember"],
+:root:not([data-theme])[data-accent="ember"] {
+  --accent: #ff9fb0;
+  --focus: #ffb3c1;
+}
+:root[data-theme="light"][data-accent="ember"] {
+  --accent: #a8324a;
+  --accent-strong: #a8324a;
+  --focus: #a8324a;
+}
+
+:root {
+  --sent-gradient: linear-gradient(135deg, var(--sent-a) 0%, var(--sent-b) 58%, var(--sent-c) 100%);
+  --sent-bg: var(--sent-gradient);
+  --sent-text: var(--text-on-accent);
+  --sent-meta: var(--text-on-accent-2);
+  --brand-gradient: linear-gradient(120deg, var(--aurora-indigo), var(--aurora-violet) 50%, var(--aurora-cyan));
+}
+
+/* Bubble styles */
+:root[data-bubble="soft"] {
+  --sent-bg: var(--sent-solid);
+  --bubble-radius: 22px;
+  --bubble-radius-tail: 22px;
+}
+:root[data-bubble="minimal"] {
+  --sent-bg: var(--sent-solid);
+  --bubble-radius: 12px;
+  --bubble-radius-tail: 4px;
+}
+
+/* Text size */
+:root[data-text-size="sm"] { --text-scale: 0.9; }
+:root[data-text-size="lg"] { --text-scale: 1.12; }
+:root[data-text-size="xl"] { --text-scale: 1.28; }
+
+/* Reduced motion: system preference OR explicit app setting */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0.01ms;
+    --dur-base: 0.01ms;
+    --dur-slow: 0.01ms;
+    --dur-slower: 0.01ms;
+    --stagger: 0ms;
+  }
+}
+:root[data-motion="reduced"] {
+  --dur-fast: 0.01ms;
+  --dur-base: 0.01ms;
+  --dur-slow: 0.01ms;
+  --dur-slower: 0.01ms;
+  --stagger: 0ms;
+}
