@@ -34,6 +34,12 @@ tracing-subscriber.workspace = true
 veil-core.workspace = true
 proptest.workspace = true
 futures-executor.workspace = true
+tokio-tungstenite = { workspace = true, features = ["handshake"] }
+# Tests only: lets a test client *offer* TLS 1.2 to prove the relay refuses it.
+rustls = { workspace = true, features = ["tls12"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true

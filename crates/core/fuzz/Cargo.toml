@@ -11,6 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "=0.4.10"
 veil-core = { path = ".." }
+veil-wire = { path = "../../wire" }
 futures-executor = "=0.3.34"
 rand = "=0.9.5"
 prost = "=0.14.4"
@@ -69,6 +70,13 @@ bench = false
 [[bin]]
 name = "contact_plaintext"
 path = "fuzz_targets/contact_plaintext.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_frames"
+path = "fuzz_targets/wire_frames.rs"
 test = false
 doc = false
 bench = false

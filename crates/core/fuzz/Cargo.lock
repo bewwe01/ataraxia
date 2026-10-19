@@ -1728,6 +1728,15 @@ dependencies = [
  "prost",
  "rand 0.9.5",
  "veil-core",
+ "veil-wire",
+]
+
+[[package]]
+name = "veil-wire"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "thiserror",
 ]
 
 [[package]]
