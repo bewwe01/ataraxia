@@ -1,0 +1,2 @@
+v=0
+m=application 9 UDP/DTLS/SCT typ relay raddr 05.0.0.2 rport 4000

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dc7831e8f258b30bbcdf186508c2b73611a167bbc8bc188c1d45f22834dd714b # shrinks to line = "candidate:1 1 udp 7 ::100:0 0 typ relay raddr 0.0.0.0 rport 1 "
