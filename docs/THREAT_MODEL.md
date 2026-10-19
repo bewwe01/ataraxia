@@ -67,7 +67,7 @@ Status: **Phase 1 draft, awaiting approval.** Every "protected" claim below poin
 | **Contact** learns your online/typing/read state | Delivery receipts: yes (timing). Read/typing: only if both opted in | Yes, during the call | Yes, during the call |
 | **Relay** learns your IP | Yes, while connected (not stored by design) | Yes (TURN allocation) | Yes for signaling; media may bypass TURN |
 | **Relay** learns who you talk to | Not directly. Sees mailbox IDs (rotating) and deposits with unlinkable tokens; **timing correlation possible** | Same as messaging; TURN sees both allocations' IPs and timing (**can link the two parties of a call**) | Sees signaling envelopes only; may see nothing of media |
-| **Relay** learns message sizes | Bucket only (1/4/16/64 KiB); attachments padded (Padmé) | Media bitrate via TURN | — |
+| **Relay** learns message sizes | Bucket only (1/4/16/64 KiB); nothing inside a bucket depends on content length (INV-META-3). A session's first (PreKey) messages never fit 1 KiB, so a short first message shows as 4 KiB. Attachments padded (Padmé) | Media bitrate via TURN | — |
 | **Relay** learns number of contacts | ≈, rounded up to a multiple of 8 (delivery-token count) | — | — |
 | **Relay** learns identity keys / names | **No** (prekey bundles are opaque and only served to token/invite holders; sealed sender) | No | No |
 | **Network observer** | TLS to relay; timing and volume | TLS/DTLS to TURN; timing and bitrate | DTLS between peers: **both IPs visible to the observer** |

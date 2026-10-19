@@ -2,7 +2,83 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
-## Phase 2: crypto core `veil-core` (2026-10-15)
+## Phase 2: after review round 1 fixes (2026-10-19)
+
+Review round 1 returned **FAIL** (3 High, 5 Medium, 8 Low; see [`REVIEW_REPORT.md`](REVIEW_REPORT.md)). Every finding was fixed with a regression test, or documented below where it is out of Phase 2's reach. Local: Ubuntu 24.04, rustc 1.97.0.
+
+### Format, lint, tests
+
+```
+$ cargo fmt --all --check                                   # no output, exit 0
+$ cargo clippy --workspace --all-targets -- -D warnings     # no warnings
+$ cargo test --workspace --locked
+test result: ok. 72 passed; 0 failed; ...   # unit (src/), was 59
+test result: ok. 3 passed; 0 failed; ...    # tests/secrets.rs
+test result: ok. 21 passed; 0 failed; ...   # tests/session.rs, was 14
+test result: ok. 0 passed; 0 failed; ...    # doctests
+```
+
+96 tests, up from 76. Regression tests per finding:
+
+| Finding | Test(s) |
+|---|---|
+| H1 envelope size leak | `relay_learns_only_the_bucket`; `every_bit_flip_rejected_and_state_unchanged` now also covers the sealed-sender version byte |
+| H2 non-atomic commit | `failed_commit_changes_nothing_and_retry_succeeds` (also asserts one backend batch per transaction) |
+| H3 / M1 / L2 / L3 ICE filter | `relay_only_sdp_never_leaks` (proptest over whole SDPs; also run with `PROPTEST_CASES=20000`), `addresses_outside_candidates_removed`, `candidate_case_and_extensions_canonicalised`, `relay_candidates_must_be_public`, `direct_drops_private_and_mdns`, `dtls_validation`, `realistic_offer_passes` |
+| M2 Debug leaks | `debug_output_never_contains_content_or_secrets` |
+| M3 untested downgrade / certificate claims | `downgraded_messages_refused`, `certificate_key_must_match_sealing_key` |
+| M4 rollback after decrypt | `account::rollback_tests::*`. **Mutation check:** with `transact` changed to commit on error, both tests fail; restored afterwards |
+| M5 fuzzing depth | new fuzz targets `contact_inner`, `contact_plaintext` (below) |
+| L1 vault KDF cost | `tampered_cost_parameters_refused_before_kdf` |
+| L4 chunk re-encryption | `encrypt_chunk` made private; `every_encryption_uses_a_fresh_key` |
+| L5 sealed-sender v2 | exact `0x11` version byte required (bit-flip test) |
+| L6 silent invite deletion | `delete_invite` now fails the transaction |
+| L7 weak tests | `every_body_variant_roundtrips`, `strangers_and_self_addressed_envelopes_dropped`, `pairing_tests::package_with_swapped_identity_or_signature_refused`, `pairing_tests::one_time_prekeys_deleted`, `safety::tests::known_answer`, `attachment::tests::known_answer_multi_chunk` |
+| L8 CI | gitleaks pinned by SHA-256; fuzz lockfile `--locked` check; crash inputs printed on failure; nightly 1 h fuzz workflow |
+
+The new known-answer vectors come from `crates/core/tests/vectors/gen.py`. Its fingerprint code reproduces libsignal's own published vector (`300354477692869396892869876765458257569162576843440918079131`) before emitting Veil's.
+
+### Fuzzing (cargo-fuzz 0.13.2, nightly-2026-10-01, `-O`)
+
+| Target | Duration | Runs | Final coverage (cov / ft) | Crashes |
+|---|---|---|---|---|
+| contact_inner (new) | 600 s | 172,491 | 8391 / 10661 | 0 |
+| contact_plaintext (new) | 600 s | 9,427 | 4325 / 6193 | 0 |
+| ice_sdp (new output check) | 300 s | 3,800,321 | — | 0 after the fix below |
+| envelope_unframe (framing v2) | 20 s | 9,438,043 | — | 0 |
+
+- **Fuzzing found a real bug.** The strengthened `ice_sdp` check found that the `m=` line tail was passed through unvalidated (`m=application 9 UDP/DTLS/SCT typ relay raddr 05.0.0.2 …`). This is fixed and seeded into the corpus.
+- **Coverage.** The old `account_open` target peaked at 794 edges because random input never passes the sealed-sender MAC. The two new targets act as an authenticated contact.
+- **Throughput is low.** `contact_plaintext` manages about 16 inputs per second, since every input does real sealing and decryption.
+- **No 1-hour runs yet.** The ≥ 1 h runs (`fuzz-nightly.yml`) are scheduled but have not run yet. INV-MSG-5 therefore stays *partial*.
+
+### Miri (pure modules, after the envelope and ICE rewrites)
+
+```
+$ PROPTEST_CASES=4 MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly-2026-10-01 miri test -p veil-core --lib -- padding:: envelope:: ice:: trust:: content::
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 41 filtered out; finished in 219.41s
+```
+
+### Supply chain
+
+```
+$ cargo deny --locked check
+advisories ok, bans ok, licenses ok, sources ok
+$ cargo audit --deny warnings     # 1338 advisories, 203 crates; exit 0 with the one documented ignore
+$ cargo vet --locked
+Vetting Succeeded (36 fully audited, 3 partially audited, 158 exempted)
+```
+
+`inout 0.2.3` was yanked upstream on 2026-10-16, which turned CI red (run 39252191570). The lockfile now uses 0.2.4. Its delta audit in `supply-chain/audits.toml` was written by the AI agent and is marked as **not yet confirmed by a human**.
+
+### Known limits that remain
+
+- libsignal's `IdentityKeyPair` / `PrivateKey` are `Copy` and are not zeroized.
+- A PreKey (first) message never fits the 1 KiB bucket, so the relay can tell a session's first messages by their 4 KiB size.
+- 158 crates are only exempted in cargo vet, libsignal among them.
+- There has been **no independent audit.** An independent security audit is required before real-world sensitive use.
+
+## Phase 2: crypto core `veil-core` (2026-10-15), before review
 
 Local: Ubuntu 24.04, rustc 1.97.0, libsignal v0.105.0 @ 4beb029d. CI: run [38761908514](https://github.com/bewwe01/ataraxia/actions/runs/38761908514) on commit cfa8d58.
 
