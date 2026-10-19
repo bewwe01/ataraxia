@@ -72,9 +72,12 @@ pub fn filter_candidate(line: &str, mode: Mode) -> Option<String> {
         tokens.get(6)?.to_ascii_lowercase(),
         tokens.get(7)?.to_ascii_lowercase(),
     );
+    // Numbers are parsed and re-emitted canonically (`+1`, `007` become `1`, `7`; nits from
+    // review round 2).
+    let component = component.parse::<u16>().ok()?;
     if typ != "typ"
         || !is_ice_token(foundation, 1, 32)
-        || !(1..=256).contains(&component.parse::<u16>().ok()?)
+        || !(1..=256).contains(&component)
         || (transport != "udp" && transport != "tcp")
     {
         return None;
@@ -98,28 +101,30 @@ pub fn filter_candidate(line: &str, mode: Mode) -> Option<String> {
         out.push_str(" raddr 0.0.0.0 rport 0");
     }
     let mut ext = tokens.get(8..).unwrap_or_default().iter();
+    let mut seen: Vec<String> = Vec::new();
     while let Some(name) = ext.next() {
         let name = name.to_ascii_lowercase();
         let Some(value) = ext.next() else { break };
-        let keep = match name.as_str() {
+        // Each extension at most once (the first wins).
+        if seen.contains(&name) {
+            continue;
+        }
+        let canonical = match name.as_str() {
             "tcptype" => {
-                transport == "tcp"
-                    && matches!(value.to_ascii_lowercase().as_str(), "active" | "passive" | "so")
+                let v = value.to_ascii_lowercase();
+                (transport == "tcp" && matches!(v.as_str(), "active" | "passive" | "so")).then_some(v)
             }
-            "generation" | "network-id" | "network-cost" => value.parse::<u32>().is_ok(),
-            "ufrag" => is_ice_token(value, 4, 256),
-            _ => false,
+            "generation" | "network-id" | "network-cost" => value.parse::<u32>().ok().map(|n| n.to_string()),
+            // `ufrag` is case-sensitive (RFC 8445).
+            "ufrag" => is_ice_token(value, 4, 256).then(|| (*value).to_owned()),
+            _ => None,
         };
-        if keep {
+        if let Some(v) = canonical {
             out.push(' ');
             out.push_str(&name);
             out.push(' ');
-            // `ufrag` is case-sensitive (RFC 8445); the other values are numbers or keywords.
-            if name == "tcptype" {
-                out.push_str(&value.to_ascii_lowercase());
-            } else {
-                out.push_str(value);
-            }
+            out.push_str(&v);
+            seen.push(name);
         }
     }
     Some(out)
@@ -626,8 +631,15 @@ mod tests {
         }
         let ok = sdp("actpass", &[]) + "b=AS:30\r\nb=TIAS:64000\r\n";
         assert!(filter_sdp(&ok, Mode::RelayOnly, SdpRole::Offer).is_ok());
-        let unspecified = sdp("actpass", &[]) + "a=ssrc:1 cname:::\r\n";
-        assert!(filter_sdp(&unspecified, Mode::RelayOnly, SdpRole::Offer).is_err());
+        // Review round 3, R3-3: `::` alone (unspecified IPv6) counts as an address. `a=mid:x::`
+        // has no `hexdigit.digit` and no other literal, so only that rule rejects it.
+        for unspecified in ["a=mid:x::", "a=ssrc:1 cname:::"] {
+            let s = sdp("actpass", &[]) + unspecified + "\r\n";
+            assert!(
+                filter_sdp(&s, Mode::RelayOnly, SdpRole::Offer).is_err(),
+                "{unspecified}"
+            );
+        }
         // The `m=` tail is validated, not passed through (found by fuzzing).
         let tail =
             sdp("actpass", &[]) + "m=application 9 UDP/DTLS/SCT typ relay raddr 05.0.0.2 rport 4000\r\n";

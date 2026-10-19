@@ -4,6 +4,11 @@
 //! round 1, M5). This reaches libsignal's message parsing, the SPQR ratchet and Veil's
 //! version checks, which random bytes never get past the sealed-sender MAC to reach.
 //! Must never panic; a hostile inner message must never open.
+//!
+//! Limitation (review round 3, R3-2; deferred to Phase 8): the committed "genuine" seeds come
+//! from a different random pairing, so libsignal refuses them at its identity check before
+//! the Kyber step. A deterministic pairing is not possible from here: libsignal generates
+//! Kyber prekeys from its own OS randomness (`KyberPreKeyRecord::generate`).
 mod pairing;
 use pairing::{Acc, NOW, paired, rng};
 

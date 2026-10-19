@@ -2,6 +2,24 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Phase 2: after review round 3 conditions (2026-10-19)
+
+Review round 3 returned **PASS WITH CONDITIONS**: nothing Critical, High or Medium open, no regressions, and five new Lows (R3-1 to R3-5).
+
+| Finding | Outcome |
+|---|---|
+| R3-1 `contact_plaintext` coverage inflated; invite-proof branches unreachable | **Claim corrected; deeper reach deferred to Phase 8.** Re-measured over 300 s on a scratch corpus: `INITED cov 6275` → `6282` just before the re-pair at input #2001 → jump to `10171` (setup code that libFuzzer credits to that input) → `10356` at the end. **The gain driven by fuzz input is small; the earlier "4325 → 10 057" was mostly setup.** Pairing twice at start-up was tried and did *not* move the jump, so the change was reverted, not kept. The invite-proof branches need a live random invite id and proof, which no committed corpus can hold; they are covered by the mutation-checked unit test `known_contact_rekey_invite_paths`. |
+| R3-2 `contact_inner` seeds come from another pairing | **Deferred to Phase 8.** A deterministic pairing is impossible from the harness: libsignal's `KyberPreKeyRecord::generate` draws from its own OS RNG. Documented in the target. |
+| R3-3 the `::` rule was not pinned by a test | **Fixed.** `a=mid:x::` added. Mutation check: allowing unspecified addresses again fails `addresses_outside_candidates_removed` on that input. |
+| R3-4 STUN caveat missing in PROTOCOL §8 | **Fixed in the docs; the end-to-end check is Phase 6.** PROTOCOL §8 and INV-NET-1 now say the SDP filter cannot stop the WebRTC stack's own STUN checks; only `iceTransportPolicy: relay` (and the `webrtc-rs` configuration on Linux) can. |
+| R3-5 vectors job tied to Python 3.12 | **Fixed.** `requirements.txt` now also pins the CPython 3.13 `cffi` wheel. Verified: a fresh 3.13 venv installs with `--require-hashes` and regenerates byte-identical vectors. |
+| Round-2 nits | **Fixed.** Candidate numbers are re-emitted canonically (`+1` → `1`), each candidate extension is kept at most once (test added), and PROTOCOL §6 now states that a bucket with fewer than 2 bytes of slack is skipped. |
+
+```
+$ cargo clippy --workspace --all-targets -- -D warnings   # clean
+$ cargo test --workspace --locked                          # 73 (+1 ignored) / 3 / 22 (+1 ignored) / 0, all passed
+```
+
 ## Phase 2: after review round 2 conditions (2026-10-19)
 
 Review round 2 returned **PASS WITH CONDITIONS**: the round-1 Highs are confirmed fixed, there are no new Critical or High findings, one new Medium (N1) and eight new Lows (N2–N9). All of them were addressed. Local: Ubuntu 24.04, rustc 1.97.0.
@@ -22,7 +40,7 @@ $ cargo vet --locked             # Vetting Succeeded (36 fully audited, 2 partia
 
 | Finding | Change and evidence |
 |---|---|
-| N1 `contact_plaintext` never reached content handling | The hook pads its input like real content (raw mode is chosen by the first byte); 18 seeds, one per body variant, plus re-key intros; the pair is re-created every 2 000 inputs so the ratchet cannot wedge. 600 s: **54 824 runs, cov 4325 → 10 057 edges**, 0 crashes |
+| N1 `contact_plaintext` never reached content handling | The hook pads its input like real content (raw mode is chosen by the first byte); 18 seeds, one per body variant, plus re-key intros; the pair is re-created every 2 000 inputs so the ratchet cannot wedge. 600 s: 54 824 runs, 0 crashes. *Correction (review round 3, R3-1): the "cov 4325 → 10 057" stated here mostly came from the mid-run re-pairing at input #2001; see the round-3 section for the honest figure.* |
 | N2 INV-PAIR-1 test did not isolate the identity check | The attacker re-signs both prekeys. The test now **fails when the identity check is removed** (mutation-checked) |
 | N3 re-key path untested | `pairing_tests::known_contact_rekey_invite_paths`: valid proof consumes; bad, foreign-bound or expired proofs are refused with no state change; unknown id is ignored |
 | N4 docs | PROTOCOL §8 rewritten for the allowlist filter; mDNS is dropped in every mode (code, docs and `ice.rs` header now agree); ADR-0009 records the `groupId` filler composition, *Proposed, owner approval pending* |
