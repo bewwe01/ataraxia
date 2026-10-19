@@ -1,0 +1,13 @@
+# gitleaks configuration: the default rules, plus one narrow allowlist.
+[extend]
+useDefault = true
+
+# In Cargo.lock, a dependency list such as `"libcrux-secrets",` followed by `"libcrux-sha3",`
+# trips the generic-api-key heuristic: "secrets" reads as a key name and the next crate name as
+# its value. Both conditions must hold: a lockfile path AND a "secret" that is only a crate
+# name (lower-case letters, digits, `-`, `_`).
+[[allowlists]]
+description = "crate names in Cargo.lock"
+condition = "AND"
+paths = ['''(^|/)Cargo\.lock$''']
+regexes = ['''^[a-z0-9][a-z0-9_-]*$''']

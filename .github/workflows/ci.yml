@@ -162,6 +162,8 @@ jobs:
       - run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
+          # The test client links veil-core (libsignal), whose build scripts need protoc.
+          sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - name: Bring up deploy/ exactly as the README describes
         working-directory: deploy
         run: |
