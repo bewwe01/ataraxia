@@ -21,6 +21,7 @@ tauri = { version = "=2.12.4", features = [] }
 veil-client = { path = "../../crates/client", version = "=0.1.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 zeroize = { version = "=1.9.1", features = ["serde"] }
+base64 = "=0.23.1"
 
 [profile.release]
 overflow-checks = true

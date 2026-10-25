@@ -4,12 +4,22 @@
 //! content-free `Display` strings of [`veil_client::ClientError`].
 #![forbid(unsafe_code)]
 
+mod native;
+
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter as _, Manager as _, State};
+use tauri::{AppHandle, Emitter as _, Manager as _, State};
 use veil_client::ClientError;
 use veil_client::service::{
-    AppState, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, SafetyView, SetupInput,
+    AppState, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, SafetyView, SecurityView,
+    SetupInput, UnlockInfo, UnlockOutcome,
 };
+use veil_client::unlock::SecretKind;
+
+use native::NativeError;
+
+/// The Android package the native plugin lives in (checked by `app/android/harden.py`).
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+const ANDROID_PACKAGE: &str = "org.veil.app";
 use zeroize::Zeroizing;
 
 type Res<T> = Result<T, String>;
@@ -31,6 +41,7 @@ struct SetupForm {
     relay: String,
     pin: String,
     name: String,
+    kind: SecretKind,
     passphrase: Zeroizing<String>,
 }
 
@@ -41,13 +52,143 @@ async fn app_state(c: State<'_, Client>) -> Res<AppState> {
 
 #[tauri::command]
 async fn setup(c: State<'_, Client>, input: SetupForm) -> Res<()> {
-    let SetupForm { relay, pin, name, passphrase } = input;
-    c.setup(SetupInput { relay, pin, name, passphrase }).await.map_err(err)
+    let SetupForm {
+        relay,
+        pin,
+        name,
+        kind,
+        passphrase,
+    } = input;
+    c.setup(SetupInput {
+        relay,
+        pin,
+        name,
+        kind,
+        passphrase,
+    })
+    .await
+    .map_err(err)
+}
+
+/// Destroys what lives outside Veil's data directory after a Purge PIN: the Keystore key and
+/// the webview's storage (theme settings). The UI is told "wrong PIN or password" (ADR-0012).
+async fn finish_purge(app: &AppHandle) {
+    native::delete_key(app).await;
+    for w in app.webview_windows().values() {
+        let _ = w.clear_all_browsing_data();
+    }
 }
 
 #[tauri::command]
-async fn unlock(c: State<'_, Client>, passphrase: Zeroizing<String>) -> Res<()> {
-    c.unlock(passphrase).await.map_err(err)
+async fn unlock(app: AppHandle, c: State<'_, Client>, passphrase: Zeroizing<String>) -> Res<()> {
+    match c.unlock(passphrase).await.map_err(err)? {
+        UnlockOutcome::Unlocked => Ok(()),
+        UnlockOutcome::Purged => {
+            finish_purge(&app).await;
+            Err(err(ClientError::WrongPassphrase))
+        }
+    }
+}
+
+#[tauri::command]
+async fn unlock_info(c: State<'_, Client>) -> Res<UnlockInfo> {
+    let mut info = c.unlock_info().await.map_err(err)?;
+    info.biometric &= native::biometric_platform();
+    Ok(info)
+}
+
+#[tauri::command]
+async fn security(c: State<'_, Client>) -> Res<SecurityView> {
+    c.security().await.map_err(err)
+}
+
+#[tauri::command]
+async fn change_secret(
+    c: State<'_, Client>,
+    current: Zeroizing<String>,
+    kind: SecretKind,
+    next: Zeroizing<String>,
+) -> Res<()> {
+    c.change_secret(current, kind, next).await.map_err(err)
+}
+
+#[tauri::command]
+async fn set_purge(c: State<'_, Client>, current: Zeroizing<String>, purge: Zeroizing<String>) -> Res<()> {
+    c.set_purge(current, purge).await.map_err(err)
+}
+
+#[tauri::command]
+async fn clear_purge(c: State<'_, Client>, current: Zeroizing<String>) -> Res<()> {
+    c.clear_purge(current).await.map_err(err)
+}
+
+fn native_err(e: NativeError) -> String {
+    match e {
+        NativeError::Unavailable => "Biometric unlock is not available on this device".into(),
+        NativeError::Cancelled => "Cancelled".into(),
+        NativeError::KeyGone => {
+            "Your fingerprints or face data changed, so biometric unlock was turned off. Use your PIN or password, then turn it on again in Settings.".into()
+        }
+        NativeError::Failed => "Biometric unlock failed".into(),
+    }
+}
+
+#[tauri::command]
+async fn biometric_available(app: AppHandle) -> bool {
+    native::biometric_available(&app).await
+}
+
+/// Turns biometric unlock on: checks the PIN or password, then has the Keystore seal a fresh
+/// secret behind a biometric prompt. The secret never reaches the webview.
+#[tauri::command]
+async fn biometric_enable(app: AppHandle, c: State<'_, Client>, current: Zeroizing<String>) -> Res<()> {
+    let secret = c.biometric_prepare(current).await.map_err(err)?;
+    match native::seal(&app, &secret).await {
+        Ok(sealed) => c.biometric_commit(sealed).await.map_err(err),
+        Err(e) => {
+            let _ = c.biometric_disable().await;
+            Err(native_err(e))
+        }
+    }
+}
+
+#[tauri::command]
+async fn biometric_disable(app: AppHandle, c: State<'_, Client>) -> Res<()> {
+    c.biometric_disable().await.map_err(err)?;
+    native::delete_key(&app).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn unlock_biometric(app: AppHandle, c: State<'_, Client>) -> Res<()> {
+    let Some(blob) = c.biometric_sealed().await.map_err(err)? else {
+        return Err(native_err(NativeError::Unavailable));
+    };
+    match native::open(&app, &blob).await {
+        Ok(secret) => c.unlock_biometric(secret).await.map_err(err),
+        Err(NativeError::KeyGone) => {
+            let _ = c.biometric_disable().await;
+            Err(native_err(NativeError::KeyGone))
+        }
+        Err(e) => Err(native_err(e)),
+    }
+}
+
+#[tauri::command]
+async fn screenshots_allowed(app: AppHandle) -> bool {
+    native::screenshots_allowed(&app).await
+}
+
+#[tauri::command]
+async fn set_screenshots_allowed(app: AppHandle, allow: bool) -> Res<()> {
+    native::set_screenshots_allowed(&app, allow)
+        .await
+        .map_err(native_err)
+}
+
+#[tauri::command]
+async fn set_dark_bars(app: AppHandle, dark: bool) {
+    native::set_dark_bars(&app, dark).await;
 }
 
 #[tauri::command]
@@ -118,6 +259,7 @@ async fn rename_contact(c: State<'_, Client>, contact: i64, name: String) -> Res
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let result = tauri::Builder::default()
+        .plugin(native::plugin())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             let handle = app.handle().clone();
@@ -134,6 +276,18 @@ pub fn run() {
             setup,
             unlock,
             lock,
+            unlock_info,
+            security,
+            change_secret,
+            set_purge,
+            clear_purge,
+            biometric_available,
+            biometric_enable,
+            biometric_disable,
+            unlock_biometric,
+            screenshots_allowed,
+            set_screenshots_allowed,
+            set_dark_bars,
             touch,
             reset,
             me,
