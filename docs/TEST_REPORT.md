@@ -2,6 +2,25 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## PIN or password, biometric unlock, Purge PIN, phone layout (2026-10-25), before review
+
+Owner request after v0.1.0-preview.1 (ADR-0012).
+
+```text
+$ cargo fmt --all --check                                         # FMT_OK
+$ cargo clippy --workspace --all-targets --locked -- -D warnings  # exit 0
+$ cargo test --workspace --locked
+  veil_client unit 7 | lock_and_setup 3 | pair_and_message 1 | unlock_options 4
+  veil_core 76 | secrets 3 | session 22 (+1 ignored)
+  veil_relay lib 25 | logs 1 | relay 24 | smoke 0 (+2 ignored) | veil_wire 5
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build          # lint: 9 files clean; built
+$ (app/src-tauri) cargo clippy --all-targets --locked -- -D warnings   # exit 0 (desktop target)
+```
+
+Layout: every screen rendered with a mocked IPC in headless Chromium at 411×923 CSS px (Pixel 10a class), light and dark, 28 screenshots. An automated pass found no element past the screen edge and no page-level sideways scroll. By eye: fixed a doubled focus ring, a chat banner touching the edges, and double side padding on two screens.
+
+Not verified: the Android code (Kotlin plugin, Keystore, BiometricPrompt, inset padding) is compiled by CI but has not run on a device. The Android-only Rust in `app/src-tauri/src/native.rs` is compiled only by the CI Android build.
+
 ## Phase 4: final gate round 2 conditions (2026-10-19)
 
 Round 2 returned **PASS WITH CONDITIONS** (no Critical/High). Conditions:
