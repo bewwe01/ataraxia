@@ -27,7 +27,8 @@ mod imp {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
     use serde::{Deserialize, Serialize};
-    use tauri::plugin::{PluginHandle, PluginInvokeError};
+    use tauri::plugin::PluginHandle;
+    use tauri::plugin::mobile::PluginInvokeError;
     use tauri::{AppHandle, Manager as _, Runtime};
     use zeroize::Zeroizing;
 

@@ -30,7 +30,7 @@ async-trait = "=0.1.92"
 base64 = "=0.23.1"
 # relay (Phase 3). rustls uses the `ring` provider, not aws-lc-rs: aws-lc-sys carries
 # OpenSSL-licensed code that may not be AGPL-compatible (see ARCHITECTURE ADR-0010).
-tokio = { version = "=1.54.0", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal", "io-util"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal", "io-util"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "ring"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "logging"] }
