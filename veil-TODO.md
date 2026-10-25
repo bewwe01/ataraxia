@@ -23,6 +23,11 @@ What's in the preview release today.
 | ✅ | Text chat with delivery status | Failed sends retry when the relay is back. | — | — |
 | ✅ | Auto-lock and Lock now | Locks after 5 min without you touching it. | — | — |
 | ✅ | Start over | Wipes the device after a forgotten passphrase. | — | — |
+| 🟡 | PIN or password | Choose at setup, change in Settings. Delays after 5 wrong tries. Built and tested; not yet tried on your phone. | — | — |
+| 🟡 | Fingerprint unlock (Android) | Keystore-backed, toggle in Settings. Built; not yet tried on a phone. | — | — |
+| 🟡 | Purge PIN | Typed at the lock screen, it wipes everything in Veil. Built and tested; not yet tried on a phone. | — | — |
+| 🟡 | Phone layout fixes | No more content under the status bar, gesture bar or keyboard. Checked at Pixel 10a size; not yet on the device. | — | — |
+| 🟡 | Screenshot switch | Settings can lift the screenshot block for a moment (Android). | — | — |
 | ✅ | Themes | Aurora Glass and Ink & Signal, dark/light, 3 accents, reduce motion. | — | — |
 | ✅ | Android hardening | No cloud backup of app data, screenshots blocked. | — | — |
 | ✅ | Relay server | TLS 1.3 with pin, quotas, rate limits, expiry, no IPs in logs. | — | — |
@@ -42,7 +47,6 @@ Small jobs with a big payoff.
 | ⬜ | Relay port as a setting | VEIL_PORT in .env, so git pull never clashes. | ●○○○○ | 15 min |
 | ⬜ | Build installers only on release | Saves most of the CI minutes. | ●○○○○ | 20 min |
 | ⬜ | Permanent Android signing key | Updates install without wiping chats. Needs 5 min from you. | ●○○○○ | 30 min |
-| ⬜ | Change passphrase | The core already supports re-wrapping the key. | ●○○○○ | 1–2 h |
 | ⬜ | Clean up unused invite tokens | Remove them from the relay when an invite expires. | ●○○○○ | 1 h |
 | ⬜ | Key-change warning | Tell you clearly when a known contact shows up with a new key. | ●●○○○ | 2 h |
 | ⬜ | Delete or block a contact |  | ●●○○○ | 2 h |
@@ -86,7 +90,7 @@ Phase 6 of the original plan.
 |---|---|---|---|---|
 | ⬜ | Android Keystore for the device secret | Hardware-backed instead of a file. | ●●●●○ | 1 session |
 | ⬜ | Encrypted backup and restore | Move to a new phone without losing chats. | ●●●●○ | 1–2 sessions |
-| ⬜ | Panic wipe | A fast way to destroy everything on the device. | ●●○○○ | 2–3 h |
+| ⬜ | Windows Hello unlock | Fingerprint/face unlock on Windows. | ●●●○○ | 3–4 h |
 | ⬜ | Independent security audit | Needs outside experts; I can't do this one. | — | external |
 
 ## Platforms
