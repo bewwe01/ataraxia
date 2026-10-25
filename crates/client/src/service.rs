@@ -585,7 +585,7 @@ impl Actor {
     fn state(&self) -> AppState {
         if self.session.is_some() {
             AppState::Unlocked
-        } else if self.dir.join(HEADER_FILE).exists() {
+        } else if self.decoy.is_some() || self.dir.join(HEADER_FILE).exists() {
             AppState::Locked
         } else {
             AppState::New
@@ -710,6 +710,7 @@ impl Actor {
             }
             Cmd::Reset(r) => {
                 self.lock_now();
+                self.decoy = None;
                 let _ = r.send(self.wipe());
             }
             Cmd::UnlockInfo(r) => {
@@ -785,14 +786,19 @@ impl Actor {
     /// Used by "Start over", by setup for debris, and by the Purge PIN.
     fn wipe(&self) -> Result<()> {
         let gone = |f: &str| !self.dir.join(f).exists();
-        for _ in 0..3 {
-            let _ = keystore::remove(&self.dir, &self.guard);
+        let mut keys_gone = false;
+        for attempt in 0..3 {
+            if attempt > 0 {
+                // A virus scanner or backup tool may hold the file for a moment.
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            keys_gone = keystore::remove(&self.dir, &self.guard).is_ok();
             let _ = std::fs::remove_file(self.dir.join(HEADER_FILE));
-            if gone(HEADER_FILE) && gone(keystore::FILE) {
+            if keys_gone && gone(HEADER_FILE) && gone(keystore::FILE) {
                 break;
             }
         }
-        let mut failed = !(gone(HEADER_FILE) && gone(keystore::FILE));
+        let mut failed = !(keys_gone && gone(HEADER_FILE) && gone(keystore::FILE));
         for f in DATA_FILES {
             for name in [(*f).to_owned(), format!("{f}.tmp")] {
                 if let Err(e) = std::fs::remove_file(self.dir.join(&name)) {
@@ -907,14 +913,25 @@ impl Actor {
             // The Purge PIN works even during a retry delay (review U-3); nothing else does.
             Ok(Unlocked::Purge) => {
                 let c = unlock::load_config(&self.dir);
-                let (failures, _) = unlock::load_attempts(&self.dir);
+                let (failures, last) = unlock::load_attempts(&self.dir);
                 self.lock_now();
                 let _ = self.wipe();
-                self.decoy = Some(Decoy {
-                    kind: c.kind,
-                    biometric: c.biometric,
-                    failures: failures.saturating_add(1),
-                    last: now,
+                // Answer like the attempt it replaces: during a delay a real attempt leaves
+                // the countdown alone; otherwise it counts as one more failure (UR2-3).
+                self.decoy = Some(if waiting {
+                    Decoy {
+                        kind: c.kind,
+                        biometric: c.biometric,
+                        failures,
+                        last,
+                    }
+                } else {
+                    Decoy {
+                        kind: c.kind,
+                        biometric: c.biometric,
+                        failures: failures.saturating_add(1),
+                        last: now,
+                    }
                 });
                 Ok(UnlockOutcome::Purged)
             }
@@ -1036,8 +1053,14 @@ impl Actor {
         // "set" with no live tag (review U-6).
         self.s()?.db.set_setting("purge_set", &[0])?;
         unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))?;
-        write_atomic(&self.dir, HEADER_FILE, &next.encode())?;
+        // A text keyboard can type both PINs and passwords, so the lock screen is usable at
+        // either crash point if the kind says "password" while the header changes (UR2-5).
         let mut c = unlock::load_config(&self.dir);
+        if c.kind != kind {
+            c.kind = SecretKind::Password;
+            unlock::store_config(&self.dir, c)?;
+        }
+        write_atomic(&self.dir, HEADER_FILE, &next.encode())?;
         c.kind = kind;
         unlock::store_config(&self.dir, c)
     }

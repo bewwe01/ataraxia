@@ -156,12 +156,14 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun deviceDestroy(invoke: Invoke) {
-    try {
-      keyStore().deleteEntry(DEVICE_ALIAS)
+    val gone = try {
+      val ks = keyStore()
+      ks.deleteEntry(DEVICE_ALIAS)
+      !ks.containsAlias(DEVICE_ALIAS)
     } catch (e: Exception) {
-      // Nothing to delete.
+      false
     }
-    invoke.resolve()
+    invoke.resolve(JSObject().put("value", gone))
   }
 
   private fun promptInfo(title: String) = BiometricPrompt.PromptInfo.Builder()
@@ -205,6 +207,7 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
     activity.runOnUiThread {
       val fa = activity as? FragmentActivity
       if (fa == null) {
+        onEnd()
         invoke.reject("Biometric unlock is not available", "UNAVAILABLE")
         return@runOnUiThread
       }

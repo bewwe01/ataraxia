@@ -102,7 +102,7 @@ function PurgeForm({ sec, native, remove, onDone, onCancel }: { sec: SecurityVie
           <SecretField id="pg-new" label={word} kind={sec.kind} value={purge} onChange={setPurge} autoComplete="new-password" />
           <SecretField id="pg-new2" label={`Repeat ${word}`} kind={sec.kind} value={purge2} onChange={setPurge2} autoComplete="new-password" />
           <Banner tone="danger" icon="alert-triangle">
-            <p><b>This deletes everything, instantly.</b> Typing the {word} at the lock screen erases your identity, contacts, messages and keys from this device without asking{native?.screenshotSetting ? ", and destroys the phone's hardware key that protects them, so even a copy of the phone's storage can't be opened" : ". On a computer, a forensic copy of the disk might still recover deleted files"}. It can't be undone. Anyone watching sees “Wrong {kindName(sec.kind)}”; after Veil restarts it looks newly installed.</p>
+            <p><b>This deletes everything, instantly.</b> Typing the {word} at the lock screen erases your identity, contacts, messages and keys from this device without asking{native === null ? "" : native.android ? ", and destroys the phone's hardware key that protects them, so even a copy of the phone's storage can't be opened" : ". On a computer, a forensic copy of the disk might still recover deleted files"}. It can't be undone. Anyone watching sees “Wrong {kindName(sec.kind)}”; after Veil restarts it looks newly installed.</p>
           </Banner>
           {native?.biometric ? <p className="hint">If you rely on the {word}, turn off fingerprint unlock: someone can force your finger onto the phone without ever seeing the {word} screen.</p> : null}
           <label className="check-row">

@@ -164,7 +164,8 @@ async fn purge_pin_wipes_everything() {
     assert_eq!(c.unlock(z("482913")).await.unwrap_err(), ClientError::RetryLater);
     assert_eq!(c.unlock(z("999999")).await.unwrap(), UnlockOutcome::Purged);
     assert_eq!(files(d.path()), vec!["app_webview".to_owned()]);
-    assert_eq!(c.state().await.unwrap(), AppState::New);
+    // Still "locked" to the UI, even if the page reloads (review UR2-2).
+    assert_eq!(c.state().await.unwrap(), AppState::Locked);
     // Until restart the lock screen behaves like the old vault: same keyboard, and the
     // delay that another wrong try causes (review U-4).
     let info = c.unlock_info().await.unwrap();
@@ -266,5 +267,33 @@ async fn biometric_unlock_round_trip() {
     assert_eq!(
         c.unlock_biometric(Zeroizing::new(opened)).await.unwrap_err(),
         ClientError::BiometricUnavailable
+    );
+}
+
+/// After a purge, "Start over" must give a working new vault, not the decoy (review UR2-2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_over_after_purge_gives_a_working_vault() {
+    let r = relay().await;
+    let d = tempfile::tempdir().unwrap();
+    let c = setup(&r, d.path(), SecretKind::Pin, "482913").await;
+    c.set_purge(z("482913"), z("999999")).await.unwrap();
+    c.lock().await.unwrap();
+    assert_eq!(c.unlock(z("999999")).await.unwrap(), UnlockOutcome::Purged);
+    c.reset().await.unwrap();
+    assert_eq!(c.state().await.unwrap(), AppState::New);
+    c.setup(SetupInput {
+        relay: r.addr.clone(),
+        pin: r.pin.clone(),
+        name: "Alice".into(),
+        kind: SecretKind::Password,
+        passphrase: z("a brand new start"),
+    })
+    .await
+    .unwrap();
+    c.lock().await.unwrap();
+    assert_eq!(c.unlock_info().await.unwrap().kind, SecretKind::Password);
+    assert_eq!(
+        c.unlock(z("a brand new start")).await.unwrap(),
+        UnlockOutcome::Unlocked
     );
 }

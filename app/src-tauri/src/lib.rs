@@ -138,6 +138,7 @@ fn native_err(e: NativeError) -> String {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeInfo {
+    android: bool,
     biometric: bool,
     screenshot_setting: bool,
     screenshots_allowed: bool,
@@ -146,6 +147,7 @@ struct NativeInfo {
 #[tauri::command]
 async fn native_info(app: AppHandle) -> NativeInfo {
     NativeInfo {
+        android: cfg!(target_os = "android"),
         biometric: native::biometric_available(&app).await,
         screenshot_setting: cfg!(target_os = "android"),
         screenshots_allowed: native::screenshots_allowed(&app).await,
@@ -278,12 +280,17 @@ async fn rename_contact(c: State<'_, Client>, contact: i64, name: String) -> Res
 fn data_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     let dir = base.join("vault");
     std::fs::create_dir_all(&dir)?;
-    if !dir.join("vault.hdr").exists() && base.join("vault.hdr").exists() {
-        for f in veil_client::service::DATA_FILES {
-            let from = base.join(f);
-            if from.exists() {
-                std::fs::rename(&from, dir.join(f))?;
-            }
+    // Idempotent, header last: an interrupted move is finished on the next start, and the
+    // vault only counts as moved once everything else is there (review UR2-4).
+    let header = "vault.hdr";
+    let files = veil_client::service::DATA_FILES
+        .iter()
+        .filter(|f| **f != header)
+        .chain([&header]);
+    for f in files {
+        let from = base.join(f);
+        if from.exists() && !dir.join(f).exists() {
+            std::fs::rename(&from, dir.join(f))?;
         }
     }
     Ok(dir)

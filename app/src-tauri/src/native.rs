@@ -87,25 +87,37 @@ mod imp {
     /// is fine (review U-2).
     pub struct KeystoreGuard<R: Runtime>(pub PluginHandle<R>);
 
+    /// Runs a blocking plugin call on its own thread with a timeout, so a lost response (for
+    /// example the activity being destroyed) cannot hang or kill the client actor (UR2-8).
+    fn call<R: Runtime, T: serde::de::DeserializeOwned + Send + 'static>(
+        h: &PluginHandle<R>,
+        cmd: &'static str,
+        arg: serde_json::Value,
+    ) -> Option<T> {
+        let h = h.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("veil-keystore".into())
+            .spawn(move || {
+                let _ = tx.send(h.run_mobile_plugin::<T>(cmd, arg).ok());
+            })
+            .ok()?;
+        rx.recv_timeout(std::time::Duration::from_secs(10)).ok().flatten()
+    }
+
     impl<R: Runtime> veil_client::keystore::DeviceGuard for KeystoreGuard<R> {
         fn seal(&self, secret: &[u8; 32]) -> Option<Vec<u8>> {
-            let arg = SealArg {
-                secret: Zeroizing::new(B64.encode(secret)),
-            };
-            let r: Sealed = self.0.run_mobile_plugin("deviceSeal", arg).ok()?;
+            let arg = serde_json::json!({ "secret": B64.encode(secret) });
+            let r: Sealed = call(&self.0, "deviceSeal", arg)?;
             B64.decode(r.blob).ok()
         }
 
         fn open(&self, blob: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
-            let r: Opened = self
-                .0
-                .run_mobile_plugin(
-                    "deviceOpen",
-                    OpenArg {
-                        blob: B64.encode(blob),
-                    },
-                )
-                .ok()?;
+            let r: Opened = call(
+                &self.0,
+                "deviceOpen",
+                serde_json::json!({ "blob": B64.encode(blob) }),
+            )?;
             let raw = Zeroizing::new(B64.decode(r.secret.as_bytes()).ok()?);
             let mut out = Zeroizing::new([0u8; 32]);
             if raw.len() != 32 {
@@ -115,8 +127,8 @@ mod imp {
             Some(out)
         }
 
-        fn destroy(&self) {
-            let _ = self.0.run_mobile_plugin::<Option<Empty>>("deviceDestroy", ());
+        fn destroy(&self) -> bool {
+            call::<R, Flag>(&self.0, "deviceDestroy", serde_json::Value::Null).is_some_and(|f| f.value)
         }
     }
 

@@ -28,8 +28,8 @@ pub trait DeviceGuard: Send + Sync {
     fn seal(&self, secret: &[u8; 32]) -> Option<Vec<u8>>;
     /// Opens a blob from [`DeviceGuard::seal`].
     fn open(&self, blob: &[u8]) -> Option<Zeroizing<[u8; 32]>>;
-    /// Deletes the platform key. Best effort.
-    fn destroy(&self);
+    /// Deletes the platform key. Returns false if it may still exist.
+    fn destroy(&self) -> bool;
 }
 
 pub type Guard = Option<Arc<dyn DeviceGuard>>;
@@ -52,6 +52,10 @@ pub fn store(dir: &Path, secret: &[u8; 32], guard: &Guard) -> Result<()> {
         let bytes = Zeroizing::new(match guard {
             Some(g) => {
                 let sealed = g.seal(secret).ok_or(ClientError::Storage)?;
+                // Never 31 bytes, so the file can never be 32 bytes and read as plain.
+                if sealed.len() == 31 || sealed.len() > MAX_SEALED {
+                    return Err(ClientError::Storage);
+                }
                 let mut b = vec![SEALED_V1];
                 b.extend_from_slice(&sealed);
                 b
@@ -81,10 +85,13 @@ fn write_private(dir: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, dir.join(FILE)).map_err(|_| ClientError::Storage)
 }
 
-/// Deletes the device secret and the platform key, if there are any.
+/// Deletes the device secret and the platform key, if there are any. Fails if either may
+/// still exist (review UR2-6).
 pub fn remove(dir: &Path, guard: &Guard) -> Result<()> {
-    if let Some(g) = guard {
-        g.destroy();
+    if let Some(g) = guard
+        && !g.destroy()
+    {
+        return Err(ClientError::Storage);
     }
     #[cfg(windows)]
     {
@@ -111,9 +118,14 @@ pub fn load(dir: &Path, guard: &Guard) -> Result<Zeroizing<[u8; 32]>> {
     };
     #[cfg(not(windows))]
     let raw = Zeroizing::new(std::fs::read(dir.join(FILE)).map_err(|_| ClientError::Storage)?);
+    // Decide by length first: a plain secret is exactly 32 bytes and may start with any
+    // byte, a sealed one is never 32 bytes long (review UR2-1).
     #[cfg(not(windows))]
-    if let Some((&SEALED_V1, sealed)) = raw.split_first() {
-        if sealed.len() > MAX_SEALED {
+    if raw.len() != 32 {
+        let Some((&SEALED_V1, sealed)) = raw.split_first() else {
+            return Err(ClientError::Storage);
+        };
+        if sealed.len() > MAX_SEALED || sealed.len() == 31 {
             return Err(ClientError::Storage);
         }
         let g = guard.as_ref().ok_or(ClientError::Storage)?;
@@ -153,8 +165,9 @@ mod tests {
             let v: Vec<u8> = blob.iter().zip(key).map(|(a, b)| a ^ b).collect();
             Some(Zeroizing::new(v.try_into().ok()?))
         }
-        fn destroy(&self) {
+        fn destroy(&self) -> bool {
             *self.0.lock().unwrap() = None;
+            true
         }
     }
 
@@ -183,5 +196,19 @@ mod tests {
         assert!(load(d.path(), &guard).is_err());
         // Without a guard a sealed file cannot be read either.
         assert!(load(d.path(), &None).is_err());
+    }
+
+    /// A plain secret starting with the sealed-format byte is still plain (review UR2-1).
+    #[cfg(not(windows))]
+    #[test]
+    fn plain_secret_starting_with_format_byte() {
+        let mut secret = [9u8; 32];
+        secret[0] = SEALED_V1;
+        let d = tempfile::tempdir().unwrap();
+        store(d.path(), &secret, &None).unwrap();
+        assert_eq!(*load(d.path(), &None).unwrap(), secret);
+        let guard: Guard = Some(Arc::new(FakeGuard(Mutex::new(None))));
+        assert_eq!(*load(d.path(), &guard).unwrap(), secret);
+        assert_eq!(*load(d.path(), &guard).unwrap(), secret);
     }
 }

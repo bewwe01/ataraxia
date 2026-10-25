@@ -206,7 +206,8 @@ export function Unlock({ onDone }: { onDone: () => void }) {
 
   async function submit(e: FormEvent) {
     e.preventDefault();
-    if (!pass || wait > 0) return;
+    // Submitting stays possible during a wait: the Purge PIN works then too (UR2-3).
+    if (!pass) return;
     setBusy(true);
     setError(null);
     try {
@@ -238,7 +239,7 @@ export function Unlock({ onDone }: { onDone: () => void }) {
             <Banner tone="warning" icon="clock"><p>Too many wrong attempts. Try again in {wait < 60 ? `${wait} s` : `${Math.ceil(wait / 60)} min`}.</p></Banner>
           ) : null}
           {error && wait <= 0 ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
-          <button className="btn btn-primary btn-block" type="submit" disabled={busy || wait > 0 || !pass}>{busy ? "Unlocking…" : "Unlock"}</button>
+          <button className="btn btn-primary btn-block" type="submit" disabled={busy || !pass}>{busy ? "Unlocking…" : "Unlock"}</button>
           {info?.biometric ? (
             <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => void biometric()}>
               <Icon name="fingerprint" />Use fingerprint

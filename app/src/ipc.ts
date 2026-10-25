@@ -75,6 +75,7 @@ export interface SecurityView {
 
 /** What this device offers. */
 export interface NativeInfo {
+  android: boolean;
   biometric: boolean;
   screenshotSetting: boolean;
   screenshotsAllowed: boolean;
