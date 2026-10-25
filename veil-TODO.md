@@ -23,11 +23,11 @@ What's in the preview release today.
 | ✅ | Text chat with delivery status | Failed sends retry when the relay is back. | — | — |
 | ✅ | Auto-lock and Lock now | Locks after 5 min without you touching it. | — | — |
 | ✅ | Start over | Wipes the device after a forgotten passphrase. | — | — |
-| 🟡 | PIN or password | Choose at setup, change in Settings. Delays after 5 wrong tries. Built and tested; not yet tried on your phone. | — | — |
-| 🟡 | Fingerprint unlock (Android) | Keystore-backed, toggle in Settings. Built; not yet tried on a phone. | — | — |
-| 🟡 | Purge PIN | Typed at the lock screen, it wipes everything in Veil. Built and tested; not yet tried on a phone. | — | — |
+| ✅ | PIN or password | Choose at setup, change in Settings. Delays after 5 wrong tries. Verified by you on a Pixel 10a. | — | — |
+| ✅ | Fingerprint unlock (Android) | Keystore-backed, toggle in Settings. Verified by you on a Pixel 10a. | — | — |
+| ✅ | Purge PIN | Typed at the lock screen, it wipes everything in Veil and destroys the phone's hardware key. Verified by you on a Pixel 10a. | — | — |
 | 🟡 | Phone layout fixes | No more content under the status bar, gesture bar or keyboard. Checked at Pixel 10a size; not yet on the device. | — | — |
-| 🟡 | Screenshot switch | Settings can lift the screenshot block for a moment (Android). | — | — |
+| ✅ | Screenshot switch | Settings can lift the screenshot block for a moment (Android). Verified by you on a Pixel 10a. | — | — |
 | ✅ | Themes | Aurora Glass and Ink & Signal, dark/light, 3 accents, reduce motion. | — | — |
 | ✅ | Android hardening | No cloud backup of app data, screenshots blocked. | — | — |
 | ✅ | Relay server | TLS 1.3 with pin, quotas, rate limits, expiry, no IPs in logs. | — | — |

@@ -15,7 +15,7 @@ $ (app) tsc --noEmit; lint; vite build; (app/src-tauri) cargo clippy (desktop)  
 CI release run for e21fee9: android job green (first full compile of VeilNativePlugin.kt and the Android Rust code; hardening check passed)
 ```
 
-Not verified: none of the Android code has run on a phone.
+Device test (owner, manual, v0.1.0-preview.2 on a Pixel 10a, 2026-10-25): PIN and password unlock, fingerprint unlock, the Purge PIN and the screenshot switch work. Not reported on: the layout fixes (status bar, cutout, keyboard). No automated device tests exist.
 
 ## PIN or password, biometric unlock, Purge PIN, phone layout (2026-10-25), before review
 
