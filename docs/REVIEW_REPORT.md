@@ -2834,3 +2834,85 @@ ADR-0012's crypto-erasure claim does not hold for 0.1-preview installs. The plai
 - `SecretField`: new PINs drop non-digits; existing secrets accept any characters with `maxLength` 1024.
 
 **Recommended action: B.** Fix UR2-1 (High) and UR2-2 to UR2-4 (Medium), then re-review. Lows can follow.
+
+## Unlock options gate, round 3 (2026-10-25)
+
+**Reviewer:** independent code-reviewer agent. Scope: `git diff HEAD~2..HEAD` at cb33be0.
+
+VERDICT: PASS WITH CONDITIONS
+
+**Scope:** `git diff HEAD~2..HEAD` (cb33be0), excluding docs/REVIEW_REPORT.md. I read the changed code in keystore.rs, service.rs (`state`, `handle`, `wipe`, `setup`, `unlock`, decoy, `change_secret`, bio functions), lib.rs (`data_dir`, `unlock`, `finish_purge`), native.rs, VeilNativePlugin.kt, Onboarding.tsx, Settings.tsx and the docs. `cargo test -p veil-client --locked --offline` passes: 9 / 3 / 1 / 5 / 0. I couldn't build the Android target (disk is 99% full), so the native.rs `call()` changes have not been compiled. I edited nothing.
+
+There are no Critical or High findings. The condition is UR3-1 (Medium): fix it before release, or record it as a known limitation in ADR-0012.
+
+### Status
+
+| # | Status | Evidence |
+|---|---|---|
+| UR2-1 | Fixed | `keystore.rs:124` checks `raw.len() != 32` first, and `store` refuses a 31-byte seal, so a sealed file is never 32 bytes. Android AES-GCM output is 1+60 = 61 bytes. New test `plain_secret_starting_with_format_byte` covers both with and without a guard. No other length is ambiguous. The `== 31` check in `load` can never trigger but does no harm. |
+| UR2-2 | Fixed | `state()` returns `Locked` while a decoy exists (`service.rs:588`). Reset clears the decoy (`:713`). Setup can't run while a decoy exists, because `state() != New` returns `AlreadySetUp`. Covered by `start_over_after_purge_gives_a_working_vault`. |
+| UR2-3 | Partially | Submitting during a wait now works (`Onboarding.tsx:209,242`), and the decoy keeps `(failures, last)`. But the error text is a tell after the wait ends; see UR3-1. |
+| UR2-4 | Fixed | `data_dir` is idempotent and moves the header last (`lib.rs:280-296`). An interrupted move is finished on the next start. |
+| UR2-5 | Fixed (different approach) | `change_secret` writes `kind = Password` before the header when the kind changes (`service.rs:1060-1064`). New PINs are still checked: `SecretField` with `kind={kind}` and `new-password`, plus `unlock::validate`. Residual risk is in UR3-3. |
+| UR2-6 | Fixed | `destroy() -> bool`, `remove` returns `Err` if it fails, `wipe` folds that into `keys_gone`, and there is a 200 ms sleep between retries. |
+| UR2-7 | Fixed | ADR-0012 and INV-REST-6 now say that preview upgrades may leave the old plain secret in flash. |
+| UR2-8 | Fixed | `call()` runs on a helper thread with a 10 s `recv_timeout`. A panic in the helper only drops `tx`, so the actor gets `None`. Residual risk is in UR3-4. |
+| Nit: platform proxy | Fixed | `NativeInfo.android` is used, and the null case shows no platform wording (`Settings.tsx:105`). |
+| Nit: Kotlin swallows StrongBox errors | Not fixed | `deviceKey()` is unchanged. This is acceptable. |
+| U-3 | Partially | Same as UR2-3. |
+| U-4 | Fixed | The decoy now covers `state`, `unlock`, `unlock_info`, `bio_sealed` and `bio_disable`. Lock and auto-lock don't touch it. `unlock_bio` can't be reached because the 60 zero bytes end in `KEY_GONE`. |
+| U-5 | Fixed | See UR2-5. |
+| U-10 | Fixed | The `fa == null` branch now calls `onEnd()`, and INV-REST-4 lists the base64 copies in the JVM and serde_json that can't be wiped. |
+| U-13 | Fixed | The retries have a delay, and Windows and Keystore delete failures now produce `Err`. Purge still ignores the result (`let _ = self.wipe()`). That is the right choice, because a visible error would tell a coercer something. |
+
+### Regression check (answers to task 2)
+
+- **keystore length-first parsing:** no ambiguity found. A 1-byte file (`[2]`) fails with `Storage`, which is correct.
+- **Decoy with setup, reset, lock, auto-lock and biometric:** consistent. `remaining()` gives the same value for the decoy and the real path, including the clock-backwards clamp.
+- **wipe and setup ("can setup become impossible forever?"):** only if `deviceDestroy` keeps returning false. I checked AOSP `KeyStore.delete`: it treats `KEY_NOT_FOUND` as success, so a fresh install is fine. A broken Keystore daemon would already make `deviceSeal` fail, so setup was impossible on such a device before this change too.
+- **data_dir:** partial runs are handled. Remaining edge case in UR3-5.
+- **Kotlin deviceDestroy:** correct. A missing alias counts as gone. Minor point in UR3-2.
+
+### New findings
+
+**UR3-1 Medium [HIGH]: a purge during a wait shows a different error than a wrong attempt during a wait.**
+`app/src-tauri/src/lib.rs:86-88` and `Onboarding.tsx:220,240`.
+- Scenario: a wait is running and the victim enters the Purge PIN. Rust returns `WrongPassphrase`, so the UI stores "Wrong PIN or password". The banner is hidden while `wait > 0` (`error && wait <= 0`), but appears once the countdown reaches 0.
+- Any other entry during the wait stores `RetryLater`, which shows "Too many attempts. Wait a moment and try again." after the countdown.
+- So a coercer who knows Veil can tell that a purge happened. This contradicts ADR-0012 / INV-REST-6 ("lock screen unchanged").
+- Fix: return the waiting state in the outcome, for example `UnlockOutcome::Purged { during_wait: bool }`, set from `waiting` in `service.rs` around line 921. Then in lib.rs: `Err(err(if during_wait { ClientError::RetryLater } else { ClientError::WrongPassphrase }))`.
+- Add an integration assertion that the error matches what a non-purge attempt during the wait gets.
+
+**UR3-2 Low [MEDIUM]: a failing Keystore makes purge slow, and that is visible.**
+`service.rs:790-800` with `native.rs` `call()`.
+- If `deviceDestroy` hangs, `wipe` takes 3 × 10 s plus 0.4 s, compared with about 1 s for a wrong attempt, and the actor is blocked for that time.
+- Also, `keystore::remove` returns before deleting `device.secret` when `destroy()` fails. The file is only deleted later, in the `DATA_FILES` loop, so the "device secret first" order is broken in this case.
+- Fix:
+  - In `remove`, delete the file first, then call `destroy()`, and combine the two results.
+  - In `wipe`, stop retrying `destroy` after a timeout. Only a `false` reply is worth retrying.
+
+**UR3-3 Low [HIGH]: if the header write fails, the kind stays "Password".**
+`service.rs:1060-1065`.
+- This is an `Err`, not a crash: `write_atomic(HEADER)` fails after the interim `store_config(Password)` succeeded.
+- The vault still opens with the old PIN, but Settings and the lock screen now say "Password". `set_purge` then requires a Purge PIN of 12 or more characters. This is safe but confusing, and it stays that way.
+- Fix: if the header write fails, put the original config back, for example `if let Err(e) = write_atomic(..) { c.kind = old_kind; let _ = unlock::store_config(&self.dir, c); return Err(e); }`.
+
+**UR3-4 Low [MEDIUM]: a lost plugin response leaks a thread, and the device secret is no longer in a `Zeroizing` buffer.**
+`native.rs:98-112`, `:120`.
+- After a timeout, the helper thread stays blocked in Tauri's `rx.recv()` for as long as the pending call is registered. That is one thread per lost call; the number is bounded by user actions.
+- `json!({"secret": B64.encode(secret)})` replaced `SealArg { secret: Zeroizing<String> }`, so the device secret now passes through a plain `String`. INV-REST-4 now lists these copies as not wipeable, but this one could easily be avoided.
+- Fix: keep `SealArg` and convert it with `serde_json::to_value(&arg)`. Even better, make `call` generic over `A: Serialize + Send + 'static` and pass the `Zeroizing` struct itself.
+
+**UR3-5 Low [MEDIUM]: old copies left in the base folder are never moved or deleted.**
+`lib.rs:292`.
+- If a file exists both in the base folder and in `vault/`, the base copy is left in place forever. Start over and Purge only clear `vault/`.
+- This can only happen after a partial migration by the unreleased round-2 build, followed by Start over and a new setup. Without a header those files can't be decrypted, but they are still debris.
+- Fix: once `vault/vault.hdr` exists, delete any remaining base copies of `DATA_FILES` (best effort), or have `wipe` also clear `dir.parent()/DATA_FILES`.
+
+### Good
+- The length-first parsing is simple and comes with a test for the exact 1/256 case.
+- Keeping the decoy's `(failures, last)` during a wait makes the countdown identical to a real attempt's.
+- The new test (Start over after a purge) reproduces UR2-2's data-loss loop from start to finish.
+- Moving the header last in `data_dir` makes the migration safe after a crash, and reruns are idempotent.
+
+**Recommended action: B.** Fix UR3-1, then merge. The Low findings can go into a follow-up.

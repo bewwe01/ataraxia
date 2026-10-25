@@ -145,7 +145,11 @@ pub struct SecurityView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnlockOutcome {
     Unlocked,
-    Purged,
+    /// `during_wait`: the attempt came during a retry delay, so the UI must answer "try again
+    /// later" like any other attempt then (review UR3-1).
+    Purged {
+        during_wait: bool,
+    },
 }
 
 /// What changed, for the UI to refetch. Never carries content.
@@ -787,7 +791,12 @@ impl Actor {
     fn wipe(&self) -> Result<()> {
         let gone = |f: &str| !self.dir.join(f).exists();
         let mut keys_gone = false;
+        let started = Instant::now();
         for attempt in 0..3 {
+            // A hanging platform keystore must not stretch a purge visibly (review UR3-2).
+            if attempt > 0 && started.elapsed() > Duration::from_secs(2) {
+                break;
+            }
             if attempt > 0 {
                 // A virus scanner or backup tool may hold the file for a moment.
                 std::thread::sleep(Duration::from_millis(200));
@@ -933,7 +942,7 @@ impl Actor {
                         last: now,
                     }
                 });
-                Ok(UnlockOutcome::Purged)
+                Ok(UnlockOutcome::Purged { during_wait: waiting })
             }
             _ if waiting => Err(ClientError::RetryLater),
             Ok(Unlocked::Key(key)) => {
@@ -1056,11 +1065,17 @@ impl Actor {
         // A text keyboard can type both PINs and passwords, so the lock screen is usable at
         // either crash point if the kind says "password" while the header changes (UR2-5).
         let mut c = unlock::load_config(&self.dir);
+        let old = c.kind;
         if c.kind != kind {
             c.kind = SecretKind::Password;
             unlock::store_config(&self.dir, c)?;
         }
-        write_atomic(&self.dir, HEADER_FILE, &next.encode())?;
+        if let Err(e) = write_atomic(&self.dir, HEADER_FILE, &next.encode()) {
+            // The old secret still opens the vault: show its kind again (review UR3-3).
+            c.kind = old;
+            let _ = unlock::store_config(&self.dir, c);
+            return Err(e);
+        }
         c.kind = kind;
         unlock::store_config(&self.dir, c)
     }

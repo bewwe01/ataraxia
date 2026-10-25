@@ -83,9 +83,14 @@ async fn finish_purge(app: &AppHandle) {
 async fn unlock(app: AppHandle, c: State<'_, Client>, passphrase: Zeroizing<String>) -> Res<()> {
     match c.unlock(passphrase).await.map_err(err)? {
         UnlockOutcome::Unlocked => Ok(()),
-        UnlockOutcome::Purged => {
+        UnlockOutcome::Purged { during_wait } => {
             finish_purge(&app).await;
-            Err(err(ClientError::WrongPassphrase))
+            // The same answer any other attempt would get at this moment (review UR3-1).
+            Err(err(if during_wait {
+                ClientError::RetryLater
+            } else {
+                ClientError::WrongPassphrase
+            }))
         }
     }
 }
@@ -291,6 +296,12 @@ fn data_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
         let from = base.join(f);
         if from.exists() && !dir.join(f).exists() {
             std::fs::rename(&from, dir.join(f))?;
+        }
+    }
+    // Once the vault has moved, top-level copies are debris (review UR3-5).
+    if dir.join(header).exists() {
+        for f in veil_client::service::DATA_FILES {
+            let _ = std::fs::remove_file(base.join(f));
         }
     }
     Ok(dir)

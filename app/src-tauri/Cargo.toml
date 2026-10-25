@@ -22,7 +22,6 @@ veil-client = { path = "../../crates/client", version = "=0.1.0" }
 serde = { version = "=1.0.229", features = ["derive"] }
 zeroize = { version = "=1.9.1", features = ["serde"] }
 base64 = "=0.23.1"
-serde_json = "=1.0.154"
 
 [profile.release]
 overflow-checks = true

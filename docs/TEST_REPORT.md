@@ -2,6 +2,21 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Unlock options: after review rounds 1–3 (2026-10-25)
+
+Gate rounds 1 and 2 returned FAIL (U-1/U-2 High, then UR2-1 High); round 3 returned **PASS WITH CONDITIONS** (no Critical/High). The condition, UR3-1, is fixed: a Purge PIN entered during a retry delay now gets the same "try again later" answer as any other attempt then. The round-3 Lows UR3-2 to UR3-5 are fixed too. All three reports are in REVIEW_REPORT.md.
+
+```text
+$ cargo clippy --workspace --all-targets --locked -- -D warnings   # exit 0
+$ cargo test -p veil-client
+  unit 9 | lock_and_setup 3 | pair_and_message 1 | unlock_options 5     all ok
+$ cargo deny check (both workspaces); cargo audit (both); cargo vet --locked   # ok after upgrading tokio 1.54.1, rustls-webpki 0.103.16, ctutils 0.4.5
+$ (app) tsc --noEmit; lint; vite build; (app/src-tauri) cargo clippy (desktop)  # clean
+CI release run for e21fee9: android job green (first full compile of VeilNativePlugin.kt and the Android Rust code; hardening check passed)
+```
+
+Not verified: none of the Android code has run on a phone.
+
 ## PIN or password, biometric unlock, Purge PIN, phone layout (2026-10-25), before review
 
 Owner request after v0.1.0-preview.1 (ADR-0012).

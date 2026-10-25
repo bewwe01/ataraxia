@@ -162,7 +162,10 @@ async fn purge_pin_wipes_everything() {
         );
     }
     assert_eq!(c.unlock(z("482913")).await.unwrap_err(), ClientError::RetryLater);
-    assert_eq!(c.unlock(z("999999")).await.unwrap(), UnlockOutcome::Purged);
+    assert_eq!(
+        c.unlock(z("999999")).await.unwrap(),
+        UnlockOutcome::Purged { during_wait: true }
+    );
     assert_eq!(files(d.path()), vec!["app_webview".to_owned()]);
     // Still "locked" to the UI, even if the page reloads (review UR2-2).
     assert_eq!(c.state().await.unwrap(), AppState::Locked);
@@ -278,7 +281,10 @@ async fn start_over_after_purge_gives_a_working_vault() {
     let c = setup(&r, d.path(), SecretKind::Pin, "482913").await;
     c.set_purge(z("482913"), z("999999")).await.unwrap();
     c.lock().await.unwrap();
-    assert_eq!(c.unlock(z("999999")).await.unwrap(), UnlockOutcome::Purged);
+    assert_eq!(
+        c.unlock(z("999999")).await.unwrap(),
+        UnlockOutcome::Purged { during_wait: false }
+    );
     c.reset().await.unwrap();
     assert_eq!(c.state().await.unwrap(), AppState::New);
     c.setup(SetupInput {

@@ -89,10 +89,10 @@ mod imp {
 
     /// Runs a blocking plugin call on its own thread with a timeout, so a lost response (for
     /// example the activity being destroyed) cannot hang or kill the client actor (UR2-8).
-    fn call<R: Runtime, T: serde::de::DeserializeOwned + Send + 'static>(
+    fn call<R: Runtime, A: Serialize + Send + 'static, T: serde::de::DeserializeOwned + Send + 'static>(
         h: &PluginHandle<R>,
         cmd: &'static str,
-        arg: serde_json::Value,
+        arg: A,
     ) -> Option<T> {
         let h = h.clone();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -107,7 +107,10 @@ mod imp {
 
     impl<R: Runtime> veil_client::keystore::DeviceGuard for KeystoreGuard<R> {
         fn seal(&self, secret: &[u8; 32]) -> Option<Vec<u8>> {
-            let arg = serde_json::json!({ "secret": B64.encode(secret) });
+            // The base64 copy stays in a Zeroizing buffer on our side (review UR3-4).
+            let arg = SealArg {
+                secret: Zeroizing::new(B64.encode(secret)),
+            };
             let r: Sealed = call(&self.0, "deviceSeal", arg)?;
             B64.decode(r.blob).ok()
         }
@@ -116,7 +119,9 @@ mod imp {
             let r: Opened = call(
                 &self.0,
                 "deviceOpen",
-                serde_json::json!({ "blob": B64.encode(blob) }),
+                OpenArg {
+                    blob: B64.encode(blob),
+                },
             )?;
             let raw = Zeroizing::new(B64.decode(r.secret.as_bytes()).ok()?);
             let mut out = Zeroizing::new([0u8; 32]);
@@ -128,7 +133,7 @@ mod imp {
         }
 
         fn destroy(&self) -> bool {
-            call::<R, Flag>(&self.0, "deviceDestroy", serde_json::Value::Null).is_some_and(|f| f.value)
+            call::<R, (), Flag>(&self.0, "deviceDestroy", ()).is_some_and(|f| f.value)
         }
     }
 

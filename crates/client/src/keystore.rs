@@ -88,25 +88,28 @@ fn write_private(dir: &Path, bytes: &[u8]) -> Result<()> {
 /// Deletes the device secret and the platform key, if there are any. Fails if either may
 /// still exist (review UR2-6).
 pub fn remove(dir: &Path, guard: &Guard) -> Result<()> {
-    if let Some(g) = guard
-        && !g.destroy()
-    {
-        return Err(ClientError::Storage);
-    }
+    // The file first, then the platform key, so a failing key delete cannot keep the file
+    // around (review UR3-2).
     #[cfg(windows)]
-    {
+    let file = {
         let _ = dir;
         match entry()?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(_) => Err(ClientError::Storage),
         }
-    }
+    };
     #[cfg(not(windows))]
-    match std::fs::remove_file(dir.join(FILE)) {
+    let file = match std::fs::remove_file(dir.join(FILE)) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(ClientError::Storage),
-    }
+    };
+    let key_gone = guard.as_ref().is_none_or(|g| g.destroy());
+    file.and(if key_gone {
+        Ok(())
+    } else {
+        Err(ClientError::Storage)
+    })
 }
 
 /// Loads the device secret. A plain (pre-guard) file is sealed in place when a guard is present.
