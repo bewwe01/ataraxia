@@ -304,6 +304,11 @@ jobs:
           if sudo systemctl restart docker; then echo "Docker started without the rule"; exit 1; fi
           sudo mv /etc/veil-turn.nft.aside /etc/veil-turn.nft
           sudo systemctl start veil-turn-firewall
-          sudo systemctl restart docker
+          # The refused start above leaves docker in "failed"; clear it before starting again.
+          sudo systemctl reset-failed docker.service docker.socket || true
+          if ! sudo systemctl restart docker; then
+            sudo journalctl -u docker.service -n 40 --no-pager
+            exit 1
+          fi
           systemctl is-active docker
           sudo nft list table inet veil_turn
