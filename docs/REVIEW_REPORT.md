@@ -2609,3 +2609,131 @@ THREAT_MODEL, INVARIANTS (REST-2, UI-1, SUP-2, STATE-1) and ADR-0011 now match t
 3. Confirm and document the P4R2-3 repository settings before the first `v*` tag.
 
 Before the first release, also confirm the first CI runs of the `aapt2` manifest check and of `app-supply-chain`, and check the APK's alignment (P4R2-4).
+
+## Unlock options gate, round 1: PIN or password, biometric unlock, Purge PIN (2026-10-25)
+
+**Reviewer:** independent code-reviewer agent. Scope: `git diff 9a4da71..dc4a7a6`.
+
+VERDICT: FAIL
+
+Scope: `git diff 9a4da71..dc4a7a6`, 23 files. I read every changed source file. I also checked the vendored Tauri 2.12.4 source: the IPC ACL check in `webview/mod.rs` L2051-2110, and `path/{mod,android}.rs` with Tauri's Android `PathPlugin.kt` for `app_data_dir`. `cargo test -p veil-client -p veil-core --locked` passed: client 7 / 3 / 1 / 4, core 76 / 3 / 22 (+1 ignored). I edited nothing. The gate fails because of two High findings (U-1, U-2).
+
+### Findings
+
+**U-1 High [HIGH on scope, MEDIUM on runtime effect]: on Android, `wipe()` now deletes the whole app sandbox, and setup calls it.**
+`crates/client/src/service.rs:746` (wipe), `:799` (`self.wipe()?` in setup), `:870` (purge).
+- `dir` is `app.path().app_data_dir()`. On Android, Tauri resolves that to `activity.dataDir` (`/data/user/0/org.veil.app`), because there is no `<bundle id>` suffix without an override.
+- The new `read_dir` + `remove_dir_all` therefore deletes `app_webview/` (the running WebView's profile), `shared_prefs/`, `cache/`, `code_cache/`, `files/`, `no_backup/` and any `lib` link. Before this change, wipe removed five named files.
+- Scenario 1: first-run setup on Android. Chromium is writing into `app_webview/` at the same moment, so `remove_dir_all` hits ENOTEMPTY or EBUSY. `failed` is set, setup returns `Storage`, and setup can fail on every attempt.
+- Scenario 2: Start over or Purge. The running WebView's storage is deleted from under it, which can leave a blank or crashed WebView. That is visible to an observer.
+- The integration tests use a tempdir, so they cannot catch either case.
+- Fix: delete an explicit list of Veil's own files (header, `veil.db{,-wal,-shm,-journal}`, `device.secret`, `unlock.cfg`, `attempts`, `purge.tag`, `bio.wrap`, `bio.sealed`, plus their `.tmp` files). Leave WebView and system state to `finish_purge`. Longer term, move the vault into its own subdirectory with a migration.
+
+**U-2 High: the crypto-erasure claim is false on Android.**
+`docs/ARCHITECTURE.md:227`, INV-REST-6, and the Settings banner (`Settings.tsx:105`).
+- The ADR says deleting the device secret and the header makes "leftover flash blocks unreadable".
+- On Android, `device.secret` is a plain file; `keystore.rs` itself says "Not hardware-backed".
+- Unlinking a file does not erase flash, and file-based encryption keys outlive the file. A physical image of a phone in the after-first-unlock state can recover the old `device.secret`, header and database blocks. A 6-digit PIN then falls to an offline search of 10^6 Argon2id runs, which parallelises easily.
+- Only the biometric Keystore key really gets destroyed.
+- Fix:
+  - Now: correct the ADR, INV-REST-6 and the UI text ("deletes Veil's files; a forensic copy of the phone's storage may still recover them, especially with a PIN").
+  - Proper fix: wrap the device secret with a non-biometric Android Keystore key and delete that key on purge (the existing follow-up for INV-REST-2).
+
+**U-3 Medium: the Purge PIN is ignored during an attempt delay.**
+`service.rs:850`, and `Onboarding.tsx` (`disabled={busy || wait > 0 ...}`).
+- `unlock` returns `RetryLater` before it evaluates the purge tag, and the UI disables the field.
+- Scenario: a coercer makes the owner enter six wrong codes. The duress code then cannot be used for 30 s, and up to 1 h after more failures.
+- Fix: while a delay is active, still run Argon2id and check only the purge tag. Throw away the KEK result and answer `RetryLater` either way. This tells the caller nothing about the passphrase.
+
+**U-4 Medium: after a purge, the device does not behave like a wrong attempt, and the docs overclaim.**
+`service.rs:923` (unlock_info), `lib.rs` `finish_purge`, `Onboarding.tsx` Unlock.
+1. If the fingerprint button is showing, pressing it returns "Biometric unlock is not available on this device", and the button then disappears. `unlock.cfg` is gone, so `bio_sealed` returns `None`.
+2. `attempts` is deleted, so the wait banner a real wrong attempt would trigger never appears.
+3. The next app start shows Setup with the default theme.
+4. On Android, see U-1.
+5. The purge path does a disk wipe, a Keystore deletion and `clear_all_browsing_data` before it answers. A wrong attempt instead does two fsyncs. Small timing difference.
+
+The UI's "Anyone watching sees only 'Wrong PIN'" holds only for that one moment. Fix:
+- Have the actor keep the last `UnlockInfo` in memory after a purge and serve it until the process exits.
+- Make `unlock_biometric` after a purge fail with the same `Cancelled` or `Failed` result a real failure gives.
+- Optionally keep a decoy `attempts` count.
+- Document that Veil looks newly installed from the next launch.
+
+**U-5 Medium: a crash during `change_secret` can lock the owner out.**
+`service.rs:976` and after (header written before `unlock.cfg`), `ui.tsx:127`.
+- Scenario: the owner switches from PIN to password. The process dies after the header write but before `store_config`.
+- On restart, the config still says PIN, so `SecretField` strips every non-digit. The new password cannot be typed and the only way out is "Start over".
+- Neither write order is safe in both directions.
+- Fix: on the lock screen, do not filter characters (keep `inputMode="numeric"` only as a hint), and/or add a "Use keyboard" switch. Alternatively, keep `kind` in the same atomic write as the header.
+
+**U-6 Low: `purge_set` and `purge.tag` can disagree after a crash.**
+`service.rs:974` and `:994` (random tag written, then the database flag).
+- A crash between the two writes leaves Settings saying "Purge PIN is set" while no tag is live, so the owner relies on a duress code that does nothing.
+- Fix: in `clear_purge` and `change_secret`, write `purge_set=0` first and then replace the tag. In `set_purge`, keep tag first, then flag.
+
+**U-7 Low: the attempt delay depends on the wall clock.**
+`unlock.rs:113`.
+- Setting the clock forward skips the delay.
+- A failure recorded while the clock was far ahead (wrong RTC date, user correction) gives a wait of `last + delay - now`. That can be days or years, and only biometrics or Start over get the owner back in.
+- Fix: `if last > now { last = now }`, and cap the result at `delay_for(n)`. Mention the clock bypass in INV-REST-8.
+
+**U-8 Low: off-by-one in the delay docs.**
+`unlock.rs:102`. `delay_for(6)=30`, so six wrong tries are free, not five. The test loops `0..6`. The ADR, INV-REST-8 and the doc comment say 5. Fix: use `checked_sub(FREE_ATTEMPTS)`, or change the docs to 6.
+
+**U-9 Low: biometric repair after a failed re-enable.**
+`lib.rs` `biometric_enable`, `service.rs:998`.
+- `bio_prepare` overwrites `bio.wrap`, and Kotlin `newKey()` deletes the old Keystore key before the prompt.
+- If `biometric_commit` then fails, the config still says biometric is on. The old `bio.sealed` decrypts to `FAILED` (not `KEY_GONE`), so biometrics never auto-disable.
+- A failed seal also leaves the new Keystore key behind.
+- Fix: on any error after prepare, call `biometric_disable()` and `native::delete_key()`. In `bio_prepare`, set `biometric=false` and remove `bio.sealed` first.
+
+**U-10 Low: Kotlin secret handling and errors.**
+`VeilNativePlugin.kt:126`, `:136-154`.
+- `secret` is not zeroed when the prompt fails or is cancelled.
+- The base64 `String`s (`SealArgs.secret`, the resolved `secret`) and the serde_json copies on the Rust side cannot be wiped.
+- Every `onAuthenticationError` is mapped to `CANCELLED`, so biometric lockout shows nothing (the UI hides "Cancelled").
+- Fix: zero `secret` in `onAuthenticationError`. Map `ERROR_LOCKOUT` and `ERROR_LOCKOUT_PERMANENT` to `FAILED` with a message. Note the unwipeable copies under INV-REST-4.
+- The Kotlin code has not run on a device; TEST_REPORT says so honestly.
+
+**U-11 Low: the screenshot toggle was not requested and is not documented.**
+`lib.rs` `set_screenshots_allowed`, Kotlin `ALLOW_SCREENSHOTS`.
+- It lifts `FLAG_SECURE`, which exposes the app to screenshots and the recent-apps thumbnail. It is not in ADR-0012 or INVARIANTS.
+- The command also works while Veil is locked.
+- Fix: get owner sign-off, record it in ADR-0012, and require an unlocked session in Rust.
+
+**U-12 Low: biometrics weaken the duress model, and this is not documented.**
+- The lock screen prompts for a fingerprint as soon as it opens, and a coercer can force a finger without ever meeting the Purge PIN.
+- Fix: state this in ADR-0012 and in the Purge PIN banner ("turn off fingerprint unlock if you rely on the Purge PIN").
+
+**U-13 Low: the purge path ignores wipe errors.**
+`service.rs:870`. It reports `Purged` even if both the header unlink and the device-secret removal failed (for example a Windows file lock or AV handle). The vault would then still open, while the UI says "wrong PIN". Fix: delete the device secret and header first and retry, then the rest. Write an error-free log marker only if nothing else is possible.
+
+**Nit:** `vault.rs` around L628. The doc comment "Known-answer test against an independent Python oracle" is now attached to `purge_tag_one_kdf_run_decides` instead of `known_answer_unlock`.
+
+### Verified good
+- **Purge tag:**
+  - It uses the same `Argon2id || device_secret` input as the KEK, with a separate HKDF label (`veil/v1/purge-tag`), so offline it is no weaker an oracle than the header.
+  - It is compared in constant time (`subtle`), and the passphrase is always checked first.
+  - `purge_tag` refuses an input that opens the vault.
+  - Changing the PIN or password re-salts the header; the old tag is replaced before the new header is written, so a crash cannot leave a live tag that matches the new secret.
+  - A random tag is stored when no Purge PIN is set.
+  - The `Debug` output is redacted.
+- **Secret wrap:**
+  - 24-byte random nonce; AAD binds the label and the vault id.
+  - Exact length check before parsing, version byte checked, `split_at_checked`, no indexing.
+  - Errors are mapped so they say nothing; the bit-flip test covers the whole blob.
+- **Where Purge can trigger:** only from the lock screen. Settings checks use `vault::unlock`, and `unlock` returns early while a session is open.
+- **Delay paths:** `verify_current` counts failures, so Settings cannot be used to guess faster. The actor runs one command at a time, so there is no counter race.
+- **Webview cannot reach the native plugin:**
+  - Tauri 2.12.4 rejects any `plugin:` IPC call without an ACL entry (`webview/mod.rs` L2080-2109).
+  - `capabilities/default.json` grants only `core:event:default`, and the runtime-built `veil-native` plugin has no permission manifest.
+  - The biometric secret and sealed blob stay in Rust; IPC returns only `()`, flags and content-free error strings.
+- **Keystore key settings:**
+  - AES-256-GCM key requiring user authentication on every use (timeout 0 with `AUTH_BIOMETRIC_STRONG`, or `-1` before Android 11).
+  - Invalidated when new biometrics are enrolled; `BIOMETRIC_STRONG` with a `CryptoObject`.
+  - `KeyPermanentlyInvalidatedException` deletes the key and returns `KEY_GONE`, after which Rust turns biometrics off.
+- **Rust zeroization:** the secret, the decoded base64 and the IPC string fields are `Zeroizing`.
+- **UI:**
+  - Biometric auto-prompt is guarded by a ref, the countdown timer is cleaned up, and the password field is cleared on failure.
+  - Labelled inputs, native radios in `Segmented`, `role="switch"` with the description linked, and 44 px targets via `--tap-min`.
+- **Docs:** TEST_REPORT and INV-REST-7 honestly say the Kotlin code has not run on a device.
