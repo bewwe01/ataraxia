@@ -59,7 +59,7 @@ function ChangeSecret({ sec, onDone, onCancel }: { sec: SecurityView; onDone: (m
 }
 
 /** Set, replace or remove the Purge PIN. */
-function PurgeForm({ sec, remove, onDone, onCancel }: { sec: SecurityView; remove: boolean; onDone: (msg: string) => void; onCancel: () => void }) {
+function PurgeForm({ sec, native, remove, onDone, onCancel }: { sec: SecurityView; native: NativeInfo | null; remove: boolean; onDone: (msg: string) => void; onCancel: () => void }) {
   const [current, setCurrent] = useState("");
   const [purge, setPurge] = useState("");
   const [purge2, setPurge2] = useState("");
@@ -102,8 +102,9 @@ function PurgeForm({ sec, remove, onDone, onCancel }: { sec: SecurityView; remov
           <SecretField id="pg-new" label={word} kind={sec.kind} value={purge} onChange={setPurge} autoComplete="new-password" />
           <SecretField id="pg-new2" label={`Repeat ${word}`} kind={sec.kind} value={purge2} onChange={setPurge2} autoComplete="new-password" />
           <Banner tone="danger" icon="alert-triangle">
-            <p><b>This deletes everything, instantly.</b> Typing the {word} at the lock screen erases your identity, contacts, messages and keys from this device without asking. It can't be undone. Anyone watching sees only “Wrong {kindName(sec.kind)}”, and Veil then looks newly installed.</p>
+            <p><b>This deletes everything, instantly.</b> Typing the {word} at the lock screen erases your identity, contacts, messages and keys from this device without asking{native?.screenshotSetting ? ", and destroys the phone's hardware key that protects them, so even a copy of the phone's storage can't be opened" : ". On a computer, a forensic copy of the disk might still recover deleted files"}. It can't be undone. Anyone watching sees “Wrong {kindName(sec.kind)}”; after Veil restarts it looks newly installed.</p>
           </Banner>
+          {native?.biometric ? <p className="hint">If you rely on the {word}, turn off fingerprint unlock: someone can force your finger onto the phone without ever seeing the {word} screen.</p> : null}
           <label className="check-row">
             <input type="checkbox" checked={understood} onChange={(e) => setUnderstood(e.target.checked)} />
             <span>I understand that the {word} permanently deletes Veil's data.</span>
@@ -274,7 +275,7 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
                 </button>
               )}
             </div>
-            {panel === "purge" || panel === "purge-remove" ? <PurgeForm sec={sec} remove={panel === "purge-remove"} onDone={done} onCancel={() => setPanel(null)} /> : null}
+            {panel === "purge" || panel === "purge-remove" ? <PurgeForm sec={sec} native={native} remove={panel === "purge-remove"} onDone={done} onCancel={() => setPanel(null)} /> : null}
           </>
         ) : null}
 

@@ -16,9 +16,9 @@ use veil_core::vault::PurgeTag;
 
 use crate::{ClientError, Result};
 
-const CONFIG_FILE: &str = "unlock.cfg";
-const ATTEMPTS_FILE: &str = "attempts";
-const PURGE_FILE: &str = "purge.tag";
+pub(crate) const CONFIG_FILE: &str = "unlock.cfg";
+pub(crate) const ATTEMPTS_FILE: &str = "attempts";
+pub(crate) const PURGE_FILE: &str = "purge.tag";
 pub(crate) const BIO_WRAP_FILE: &str = "bio.wrap";
 pub(crate) const BIO_SEALED_FILE: &str = "bio.sealed";
 /// Largest keystore-sealed blob accepted from the platform.
@@ -85,7 +85,7 @@ pub fn store_config(dir: &Path, c: Config) -> Result<()> {
 }
 
 /// (failed attempts, unix time of the last failure)
-fn load_attempts(dir: &Path) -> (u32, u64) {
+pub(crate) fn load_attempts(dir: &Path) -> (u32, u64) {
     let Ok(raw) = std::fs::read(dir.join(ATTEMPTS_FILE)) else {
         return (0, 0);
     };
@@ -98,9 +98,9 @@ fn load_attempts(dir: &Path) -> (u32, u64) {
     )
 }
 
-/// Delay after `failures` failed attempts: none for the first five, then 30 s doubling to 1 h.
+/// Delay after `failures` failed attempts: five free tries, then 30 s doubling to 1 h.
 pub fn delay_for(failures: u32) -> u64 {
-    let Some(extra) = failures.checked_sub(FREE_ATTEMPTS + 1) else {
+    let Some(extra) = failures.checked_sub(FREE_ATTEMPTS) else {
         return 0;
     };
     FIRST_DELAY_SECS
@@ -112,7 +112,15 @@ pub fn delay_for(failures: u32) -> u64 {
 /// Seconds until the next attempt is allowed.
 pub fn wait_secs(dir: &Path, now: u64) -> u64 {
     let (n, last) = load_attempts(dir);
-    last.saturating_add(delay_for(n)).saturating_sub(now)
+    remaining(n, last, now)
+}
+
+/// The wait never exceeds the delay itself, even if the clock went backwards since the last
+/// failure (review U-7). Setting the clock forward skips it: the counter is a speed bump for
+/// someone at the lock screen, not protection against a copy of the files.
+pub fn remaining(failures: u32, last: u64, now: u64) -> u64 {
+    let last = last.min(now);
+    last.saturating_add(delay_for(failures)).saturating_sub(now)
 }
 
 pub fn record_failure(dir: &Path, now: u64) -> Result<()> {
@@ -150,11 +158,13 @@ mod tests {
         }
         assert!(validate(SecretKind::Password, "twelve chars").is_ok());
         assert!(validate(SecretKind::Password, "eleven char").is_err());
-        assert_eq!((1..=5).map(delay_for).max(), Some(0));
-        assert_eq!(delay_for(6), 30);
-        assert_eq!(delay_for(7), 60);
-        assert_eq!(delay_for(12), 1920);
-        assert_eq!(delay_for(13), 3600);
+        assert_eq!((1..=4).map(delay_for).max(), Some(0));
+        assert_eq!(delay_for(5), 30);
+        assert_eq!(delay_for(6), 60);
+        assert_eq!(delay_for(11), 1920);
+        assert_eq!(delay_for(12), 3600);
+        // A failure "in the future" (clock moved back) never means more than the delay.
+        assert_eq!(remaining(5, 10_000_000, 100), 30);
         assert_eq!(delay_for(u32::MAX), 3600);
     }
 
@@ -168,7 +178,7 @@ mod tests {
         };
         store_config(d.path(), c).unwrap();
         assert_eq!(load_config(d.path()), c);
-        for _ in 0..6 {
+        for _ in 0..5 {
             record_failure(d.path(), 1000).unwrap();
         }
         assert_eq!(wait_secs(d.path(), 1000), 30);

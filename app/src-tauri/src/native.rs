@@ -17,6 +17,8 @@ pub enum NativeError {
     Cancelled,
     /// The Keystore key was invalidated (e.g. a fingerprint was added) or deleted.
     KeyGone,
+    /// Too many failed biometric tries; the system locked biometrics for a while.
+    Lockout,
     Failed,
 }
 
@@ -72,10 +74,54 @@ mod imp {
                 Some("CANCELLED") => NativeError::Cancelled,
                 Some("KEY_GONE") => NativeError::KeyGone,
                 Some("UNAVAILABLE") => NativeError::Unavailable,
+                Some("LOCKOUT") => NativeError::Lockout,
                 _ => NativeError::Failed,
             },
             _ => NativeError::Failed,
         }
+    }
+
+    /// Seals the vault's device secret with a hardware Keystore key (no user authentication).
+    /// Called from the client actor's own thread, never the main thread, so the blocking call
+    /// is fine (review U-2).
+    pub struct KeystoreGuard<R: Runtime>(pub PluginHandle<R>);
+
+    impl<R: Runtime> veil_client::keystore::DeviceGuard for KeystoreGuard<R> {
+        fn seal(&self, secret: &[u8; 32]) -> Option<Vec<u8>> {
+            let arg = SealArg {
+                secret: Zeroizing::new(B64.encode(secret)),
+            };
+            let r: Sealed = self.0.run_mobile_plugin("deviceSeal", arg).ok()?;
+            B64.decode(r.blob).ok()
+        }
+
+        fn open(&self, blob: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
+            let r: Opened = self
+                .0
+                .run_mobile_plugin(
+                    "deviceOpen",
+                    OpenArg {
+                        blob: B64.encode(blob),
+                    },
+                )
+                .ok()?;
+            let raw = Zeroizing::new(B64.decode(r.secret.as_bytes()).ok()?);
+            let mut out = Zeroizing::new([0u8; 32]);
+            if raw.len() != 32 {
+                return None;
+            }
+            out.copy_from_slice(&raw);
+            Some(out)
+        }
+
+        fn destroy(&self) {
+            let _ = self.0.run_mobile_plugin::<Option<Empty>>("deviceDestroy", ());
+        }
+    }
+
+    pub fn guard<R: Runtime>(app: &AppHandle<R>) -> veil_client::keystore::Guard {
+        let h = handle(app).ok()?;
+        Some(std::sync::Arc::new(KeystoreGuard(h)))
     }
 
     pub async fn biometric_available<R: Runtime>(app: &AppHandle<R>) -> bool {
@@ -160,6 +206,9 @@ mod imp {
 
     use super::NativeError;
 
+    pub fn guard<R: Runtime>(_: &AppHandle<R>) -> veil_client::keystore::Guard {
+        None
+    }
     #[allow(clippy::unused_async)]
     pub async fn biometric_available<R: Runtime>(_: &AppHandle<R>) -> bool {
         false

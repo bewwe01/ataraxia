@@ -1,19 +1,38 @@
 //! The device secret: the second vault factor (INV-REST-2), kept outside the database.
 //!
 //! * **Windows:** the Windows Credential Manager (DPAPI-protected, per user) via `keyring`.
-//! * **Android and others (v1):** a file in the app's private data directory, protected by the
-//!   OS app sandbox and file-based encryption, and excluded from Android backups and device
-//!   transfer (`app/android/harden.py`). **Not** hardware-backed: moving it into the Android
-//!   Keystore is a documented follow-up (INV-REST-2 is partial on Android).
+//! * **Android:** the file `device.secret`, sealed by a hardware-backed Android Keystore key
+//!   through a [`DeviceGuard`] the app supplies (ADR-0012, review U-2). The key never leaves the
+//!   secure hardware, so a copy of the file is useless off the phone, and deleting the key (Start
+//!   over, Purge PIN) makes every old copy unreadable.
+//! * **Elsewhere, or without a guard:** the same file holds the secret itself (0600). Not
+//!   hardware-backed; INV-REST-2 is partial there.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
 use crate::{ClientError, Result};
 
+pub(crate) const FILE: &str = "device.secret";
+/// File format with a guard: this byte, then the guard's sealed blob.
 #[cfg(not(windows))]
-const FILE: &str = "device.secret";
+const SEALED_V1: u8 = 2;
+#[cfg(not(windows))]
+const MAX_SEALED: usize = 1024;
+
+/// Platform key protection for the device secret (the Android Keystore in the app).
+pub trait DeviceGuard: Send + Sync {
+    /// Seals the secret under a non-exportable platform key, creating the key if needed.
+    fn seal(&self, secret: &[u8; 32]) -> Option<Vec<u8>>;
+    /// Opens a blob from [`DeviceGuard::seal`].
+    fn open(&self, blob: &[u8]) -> Option<Zeroizing<[u8; 32]>>;
+    /// Deletes the platform key. Best effort.
+    fn destroy(&self);
+}
+
+pub type Guard = Option<Arc<dyn DeviceGuard>>;
 
 #[cfg(windows)]
 fn entry() -> Result<keyring::Entry> {
@@ -22,34 +41,51 @@ fn entry() -> Result<keyring::Entry> {
 
 /// Stores the device secret, replacing any earlier one. Only setup calls this, and only when
 /// no vault header exists, so whatever it replaces belongs to no usable vault (review P4-3).
-pub fn store(dir: &Path, secret: &[u8; 32]) -> Result<()> {
+pub fn store(dir: &Path, secret: &[u8; 32], guard: &Guard) -> Result<()> {
     #[cfg(windows)]
     {
-        let _ = dir;
+        let _ = (dir, guard);
         entry()?.set_secret(secret).map_err(|_| ClientError::Storage)
     }
     #[cfg(not(windows))]
     {
-        use std::io::Write as _;
-        let tmp = dir.join(format!("{FILE}.tmp"));
-        let _ = std::fs::remove_file(&tmp);
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp).map_err(|_| ClientError::Storage)?;
-        f.write_all(secret).map_err(|_| ClientError::Storage)?;
-        f.sync_all().map_err(|_| ClientError::Storage)?;
-        drop(f);
-        std::fs::rename(&tmp, dir.join(FILE)).map_err(|_| ClientError::Storage)
+        let bytes = Zeroizing::new(match guard {
+            Some(g) => {
+                let sealed = g.seal(secret).ok_or(ClientError::Storage)?;
+                let mut b = vec![SEALED_V1];
+                b.extend_from_slice(&sealed);
+                b
+            }
+            None => secret.to_vec(),
+        });
+        write_private(dir, &bytes)
     }
 }
 
-/// Deletes the device secret, if there is one.
-pub fn remove(dir: &Path) -> Result<()> {
+#[cfg(not(windows))]
+fn write_private(dir: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let tmp = dir.join(format!("{FILE}.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp).map_err(|_| ClientError::Storage)?;
+    f.write_all(bytes).map_err(|_| ClientError::Storage)?;
+    f.sync_all().map_err(|_| ClientError::Storage)?;
+    drop(f);
+    std::fs::rename(&tmp, dir.join(FILE)).map_err(|_| ClientError::Storage)
+}
+
+/// Deletes the device secret and the platform key, if there are any.
+pub fn remove(dir: &Path, guard: &Guard) -> Result<()> {
+    if let Some(g) = guard {
+        g.destroy();
+    }
     #[cfg(windows)]
     {
         let _ = dir;
@@ -66,19 +102,86 @@ pub fn remove(dir: &Path) -> Result<()> {
     }
 }
 
-/// Loads the device secret.
-pub fn load(dir: &Path) -> Result<Zeroizing<[u8; 32]>> {
+/// Loads the device secret. A plain (pre-guard) file is sealed in place when a guard is present.
+pub fn load(dir: &Path, guard: &Guard) -> Result<Zeroizing<[u8; 32]>> {
     #[cfg(windows)]
     let raw = {
-        let _ = dir;
+        let _ = guard;
         Zeroizing::new(entry()?.get_secret().map_err(|_| ClientError::Storage)?)
     };
     #[cfg(not(windows))]
     let raw = Zeroizing::new(std::fs::read(dir.join(FILE)).map_err(|_| ClientError::Storage)?);
+    #[cfg(not(windows))]
+    if let Some((&SEALED_V1, sealed)) = raw.split_first() {
+        if sealed.len() > MAX_SEALED {
+            return Err(ClientError::Storage);
+        }
+        let g = guard.as_ref().ok_or(ClientError::Storage)?;
+        return g.open(sealed).ok_or(ClientError::Storage);
+    }
     let mut out = Zeroizing::new([0u8; 32]);
     if raw.len() != 32 {
         return Err(ClientError::Storage);
     }
     out.copy_from_slice(&raw);
+    // Upgrade a plain file from before the guard existed. Best effort: the plain copy is
+    // replaced atomically, and on failure the old file still works.
+    #[cfg(not(windows))]
+    if guard.is_some() {
+        let _ = store(dir, &out, guard);
+    }
     Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Stand-in for the Android Keystore: XOR with a key that `destroy` forgets.
+    struct FakeGuard(Mutex<Option<[u8; 32]>>);
+
+    impl DeviceGuard for FakeGuard {
+        fn seal(&self, secret: &[u8; 32]) -> Option<Vec<u8>> {
+            let mut k = self.0.lock().unwrap();
+            let key = *k.get_or_insert([0x42; 32]);
+            Some(secret.iter().zip(key).map(|(a, b)| a ^ b).collect())
+        }
+        fn open(&self, blob: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
+            let key = (*self.0.lock().unwrap())?;
+            let v: Vec<u8> = blob.iter().zip(key).map(|(a, b)| a ^ b).collect();
+            Some(Zeroizing::new(v.try_into().ok()?))
+        }
+        fn destroy(&self) {
+            *self.0.lock().unwrap() = None;
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn guard_seals_upgrades_and_destroy_erases() {
+        let d = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeGuard(Mutex::new(None)));
+        let guard: Guard = Some(fake.clone());
+        let secret = [7u8; 32];
+
+        // A plain file from an older install is upgraded on first load.
+        store(d.path(), &secret, &None).unwrap();
+        assert_eq!(std::fs::read(d.path().join(FILE)).unwrap(), secret.to_vec());
+        assert_eq!(*load(d.path(), &guard).unwrap(), secret);
+        let on_disk = std::fs::read(d.path().join(FILE)).unwrap();
+        assert_eq!(on_disk.first(), Some(&SEALED_V1));
+        assert!(!on_disk.windows(32).any(|w| w == secret));
+        assert_eq!(*load(d.path(), &guard).unwrap(), secret);
+
+        // A copy of the file is useless once the platform key is gone.
+        let copy = std::fs::read(d.path().join(FILE)).unwrap();
+        remove(d.path(), &guard).unwrap();
+        assert!(!d.path().join(FILE).exists());
+        std::fs::write(d.path().join(FILE), &copy).unwrap();
+        assert!(load(d.path(), &guard).is_err());
+        // Without a guard a sealed file cannot be read either.
+        assert!(load(d.path(), &None).is_err());
+    }
 }

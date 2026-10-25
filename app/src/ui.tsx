@@ -99,7 +99,9 @@ export function timeLabel(ms: number | null): string {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
-/** PIN or password field. A PIN gets the number keyboard. */
+/** PIN or password field. A PIN gets the number keyboard. Only new PINs drop non-digits:
+ *  a field that checks an existing secret accepts anything, so a mismatch between the stored
+ *  kind and the real secret can never lock the owner out (review U-5). */
 export function SecretField({ id, label, kind, value, onChange, autoComplete, autoFocus = false }: {
   id: string;
   label: string;
@@ -110,6 +112,7 @@ export function SecretField({ id, label, kind, value, onChange, autoComplete, au
   autoFocus?: boolean;
 }) {
   const pin = kind === "pin";
+  const strict = pin && autoComplete === "new-password";
   return (
     <div className="field">
       <label htmlFor={id}>{label}</label>
@@ -119,12 +122,12 @@ export function SecretField({ id, label, kind, value, onChange, autoComplete, au
           type="password"
           inputMode={pin ? "numeric" : "text"}
           pattern={pin ? "[0-9]*" : undefined}
-          maxLength={pin ? 16 : 1024}
+          maxLength={strict ? 16 : 1024}
           autoComplete={autoComplete}
           autoFocus={autoFocus}
           spellCheck={false}
           value={value}
-          onChange={(e) => onChange(pin ? e.target.value.replace(/[^0-9]/g, "") : e.target.value)}
+          onChange={(e) => onChange(strict ? e.target.value.replace(/[^0-9]/g, "") : e.target.value)}
         />
       </div>
     </div>

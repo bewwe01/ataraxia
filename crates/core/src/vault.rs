@@ -625,7 +625,6 @@ mod tests {
         }
     }
 
-    /// Known-answer test against an independent Python oracle (argon2-cffi + HKDF + XChaCha20-Poly1305).
     #[test]
     fn purge_tag_one_kdf_run_decides() {
         let dev = [3u8; 32];
@@ -700,6 +699,7 @@ mod tests {
         );
     }
 
+    /// Known-answer test against an independent Python oracle (argon2-cffi + HKDF + XChaCha20-Poly1305).
     #[test]
     fn known_answer_unlock() {
         let header = VaultHeader::decode(&crate::test_vectors::VAULT_HEADER).unwrap();

@@ -129,6 +129,7 @@ fn native_err(e: NativeError) -> String {
         NativeError::KeyGone => {
             "Your fingerprints or face data changed, so biometric unlock was turned off. Use your PIN or password, then turn it on again in Settings.".into()
         }
+        NativeError::Lockout => "Too many fingerprint attempts. Use your PIN or password.".into(),
         NativeError::Failed => "Biometric unlock failed".into(),
     }
 }
@@ -156,13 +157,16 @@ async fn native_info(app: AppHandle) -> NativeInfo {
 #[tauri::command]
 async fn biometric_enable(app: AppHandle, c: State<'_, Client>, current: Zeroizing<String>) -> Res<()> {
     let secret = c.biometric_prepare(current).await.map_err(err)?;
-    match native::seal(&app, &secret).await {
+    let result = match native::seal(&app, &secret).await {
         Ok(sealed) => c.biometric_commit(sealed).await.map_err(err),
-        Err(e) => {
-            let _ = c.biometric_disable().await;
-            Err(native_err(e))
-        }
+        Err(e) => Err(native_err(e)),
+    };
+    if result.is_err() {
+        // Leave nothing half-enabled: no files, no Keystore key (review U-9).
+        let _ = c.biometric_disable().await;
+        native::delete_key(&app).await;
     }
+    result
 }
 
 #[tauri::command]
@@ -188,7 +192,11 @@ async fn unlock_biometric(app: AppHandle, c: State<'_, Client>) -> Res<()> {
 }
 
 #[tauri::command]
-async fn set_screenshots_allowed(app: AppHandle, allow: bool) -> Res<()> {
+async fn set_screenshots_allowed(app: AppHandle, c: State<'_, Client>, allow: bool) -> Res<()> {
+    // Only from Settings, while unlocked (review U-11).
+    if c.state().await.map_err(err)? != AppState::Unlocked {
+        return Err(err(ClientError::Locked));
+    }
     native::set_screenshots_allowed(&app, allow)
         .await
         .map_err(native_err)
@@ -264,18 +272,41 @@ async fn rename_contact(c: State<'_, Client>, contact: i64, name: String) -> Res
     c.rename(contact, name).await.map_err(err)
 }
 
+/// Veil's files live in their own folder inside the app data directory, which on Android and
+/// Windows also holds the WebView's data (review U-1). Files from 0.1 previews, which sat at
+/// the top level, are moved in once.
+fn data_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let dir = base.join("vault");
+    std::fs::create_dir_all(&dir)?;
+    if !dir.join("vault.hdr").exists() && base.join("vault.hdr").exists() {
+        for f in veil_client::service::DATA_FILES {
+            let from = base.join(f);
+            if from.exists() {
+                std::fs::rename(&from, dir.join(f))?;
+            }
+        }
+    }
+    Ok(dir)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let result = tauri::Builder::default()
         .plugin(native::plugin())
         .setup(|app| {
-            let dir = app.path().app_data_dir()?;
+            let dir = data_dir(&app.path().app_data_dir()?)?;
             let handle = app.handle().clone();
             let notify = std::sync::Arc::new(move |kind: ChangeKind, contact: Option<i64>| {
                 let _ = handle.emit("veil://changed", Changed { kind, contact });
             });
-            let client = Client::start(dir, veil_client::service::default_kdf(), notify)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+            let client = Client::start_with(
+                dir,
+                veil_client::service::default_kdf(),
+                notify,
+                veil_client::service::AUTO_LOCK,
+                native::guard(app.handle()),
+            )
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
             app.manage(client);
             Ok(())
         })

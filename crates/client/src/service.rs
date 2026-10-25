@@ -248,6 +248,17 @@ impl Client {
         notify: Notify,
         auto_lock: Duration,
     ) -> Result<Self> {
+        Self::start_with(dir, kdf, notify, auto_lock, None)
+    }
+
+    /// Starts with a platform guard for the device secret (the Android Keystore in the app).
+    pub fn start_with(
+        dir: PathBuf,
+        kdf: KdfParams,
+        notify: Notify,
+        auto_lock: Duration,
+        guard: keystore::Guard,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(32);
         let interrupt = Arc::new(Interrupt::default());
         let actor_interrupt = Arc::clone(&interrupt);
@@ -260,7 +271,7 @@ impl Client {
                 let local = tokio::task::LocalSet::new();
                 local.block_on(
                     &rt,
-                    Actor::new(dir, kdf, notify, actor_interrupt, auto_lock).run(rx),
+                    Actor::new(dir, kdf, notify, actor_interrupt, auto_lock, guard).run(rx),
                 );
             })
             .map_err(|_| ClientError::Storage)?;
@@ -395,7 +406,33 @@ struct Actor {
     last_activity: Instant,
     interrupt: Arc<Interrupt>,
     auto_lock: Duration,
+    guard: keystore::Guard,
+    /// Set after a Purge PIN: until Veil restarts, the lock screen keeps behaving like the
+    /// vault that is gone (review U-4).
+    decoy: Option<Decoy>,
 }
+
+struct Decoy {
+    kind: SecretKind,
+    biometric: bool,
+    failures: u32,
+    last: u64,
+}
+
+/// Every file Veil keeps in its data directory. Nothing else there is touched (review U-1).
+pub const DATA_FILES: &[&str] = &[
+    HEADER_FILE,
+    DB_FILE,
+    "veil.db-journal",
+    "veil.db-wal",
+    "veil.db-shm",
+    keystore::FILE,
+    unlock::CONFIG_FILE,
+    unlock::ATTEMPTS_FILE,
+    unlock::PURGE_FILE,
+    unlock::BIO_WRAP_FILE,
+    unlock::BIO_SEALED_FILE,
+];
 
 /// Characters that are invisible or reorder text, so a name could imitate another (P4-11).
 fn is_invisible(c: char) -> bool {
@@ -492,6 +529,7 @@ impl Actor {
         notify: Notify,
         interrupt: Arc<Interrupt>,
         auto_lock: Duration,
+        guard: keystore::Guard,
     ) -> Self {
         Self {
             dir,
@@ -501,6 +539,8 @@ impl Actor {
             last_activity: Instant::now(),
             interrupt,
             auto_lock,
+            guard,
+            decoy: None,
         }
     }
 
@@ -739,29 +779,28 @@ impl Actor {
         }
     }
 
-    /// Deletes everything Veil keeps on this device: every file and folder in its data
-    /// directory (vault header, database, device secret, unlock files) and the keystore entry.
-    /// Used by "Start over", by setup for debris, and by the Purge PIN. Removing the header and
-    /// the device secret destroys the keys, so no old copy on flash can be decrypted.
+    /// Deletes everything Veil keeps on this device: the files in [`DATA_FILES`] (and their
+    /// `.tmp` siblings), the device secret and its platform key. The header and the device
+    /// secret go first, and are retried, because without them nothing else can be decrypted.
+    /// Used by "Start over", by setup for debris, and by the Purge PIN.
     fn wipe(&self) -> Result<()> {
-        let mut failed = false;
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for e in entries.flatten() {
-                let p = e.path();
-                let r = if p.is_dir() {
-                    std::fs::remove_dir_all(&p)
-                } else {
-                    std::fs::remove_file(&p)
-                };
-                failed |= r.is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+        let gone = |f: &str| !self.dir.join(f).exists();
+        for _ in 0..3 {
+            let _ = keystore::remove(&self.dir, &self.guard);
+            let _ = std::fs::remove_file(self.dir.join(HEADER_FILE));
+            if gone(HEADER_FILE) && gone(keystore::FILE) {
+                break;
             }
         }
-        // The keystore entry goes even if some file could not be removed.
-        let ks = keystore::remove(&self.dir);
-        if failed {
-            return Err(ClientError::Storage);
+        let mut failed = !(gone(HEADER_FILE) && gone(keystore::FILE));
+        for f in DATA_FILES {
+            for name in [(*f).to_owned(), format!("{f}.tmp")] {
+                if let Err(e) = std::fs::remove_file(self.dir.join(&name)) {
+                    failed |= e.kind() != std::io::ErrorKind::NotFound;
+                }
+            }
         }
-        ks
+        if failed { Err(ClientError::Storage) } else { Ok(()) }
     }
 
     fn s(&self) -> Result<&Session> {
@@ -799,7 +838,7 @@ impl Actor {
         self.wipe()?;
         let mut device = Zeroizing::new([0u8; 32]);
         rand::Rng::fill(&mut rng(), &mut device[..]);
-        keystore::store(&self.dir, &device)?;
+        keystore::store(&self.dir, &device, &self.guard)?;
         let (header, key) = vault::create(&mut rng(), input.passphrase.as_bytes(), &device, self.kdf)?;
         let db = Db::open(&self.dir.join(DB_FILE), key.expose())?;
         let account = Account::create(SqlBackend(db.clone()), &mut rng())?;
@@ -847,28 +886,43 @@ impl Actor {
             return Ok(UnlockOutcome::Unlocked);
         }
         let now = now_secs();
-        if unlock::wait_secs(&self.dir, now) > 0 {
-            return Err(ClientError::RetryLater);
+        if let Some(d) = self.decoy.as_mut() {
+            // The vault is gone: spend the time a real attempt takes and answer like one.
+            let _ = vault::create(&mut rng(), passphrase.as_bytes(), &[0u8; 32], self.kdf);
+            if unlock::remaining(d.failures, d.last, now) > 0 {
+                return Err(ClientError::RetryLater);
+            }
+            d.failures = d.failures.saturating_add(1);
+            d.last = now;
+            return Err(ClientError::WrongPassphrase);
         }
         let Ok(header) = self.header() else {
-            // Nothing to unlock (for example right after a purge): take as long as a real
-            // attempt and answer like a wrong one.
             let _ = vault::create(&mut rng(), passphrase.as_bytes(), &[0u8; 32], self.kdf);
             return Err(ClientError::WrongPassphrase);
         };
-        let device = keystore::load(&self.dir)?;
+        let device = keystore::load(&self.dir, &self.guard)?;
         let purge = unlock::load_purge(&self.dir);
+        let waiting = unlock::wait_secs(&self.dir, now) > 0;
         match vault::unlock_checking(&header, passphrase.as_bytes(), &device, purge.as_ref()) {
+            // The Purge PIN works even during a retry delay (review U-3); nothing else does.
+            Ok(Unlocked::Purge) => {
+                let c = unlock::load_config(&self.dir);
+                let (failures, _) = unlock::load_attempts(&self.dir);
+                self.lock_now();
+                let _ = self.wipe();
+                self.decoy = Some(Decoy {
+                    kind: c.kind,
+                    biometric: c.biometric,
+                    failures: failures.saturating_add(1),
+                    last: now,
+                });
+                Ok(UnlockOutcome::Purged)
+            }
+            _ if waiting => Err(ClientError::RetryLater),
             Ok(Unlocked::Key(key)) => {
                 unlock::reset_attempts(&self.dir);
                 self.open_session(&key).await?;
                 Ok(UnlockOutcome::Unlocked)
-            }
-            Ok(Unlocked::Purge) => {
-                self.lock_now();
-                // Best effort: every file that can go, goes.
-                let _ = self.wipe();
-                Ok(UnlockOutcome::Purged)
             }
             Err(_) => {
                 unlock::record_failure(&self.dir, now)?;
@@ -882,7 +936,7 @@ impl Actor {
             return Ok(());
         }
         let header = self.header()?;
-        let device = keystore::load(&self.dir)?;
+        let device = keystore::load(&self.dir, &self.guard)?;
         let blob = std::fs::read(self.dir.join(unlock::BIO_WRAP_FILE))
             .map_err(|_| ClientError::BiometricUnavailable)?;
         let key = vault::unwrap_with_secret(&header, &blob, secret, &device)
@@ -921,6 +975,13 @@ impl Actor {
     // ---- security settings ----
 
     fn unlock_info(&self) -> UnlockInfo {
+        if let Some(d) = &self.decoy {
+            return UnlockInfo {
+                kind: d.kind,
+                biometric: d.biometric,
+                wait_secs: unlock::remaining(d.failures, d.last, now_secs()),
+            };
+        }
         let c = unlock::load_config(&self.dir);
         UnlockInfo {
             kind: c.kind,
@@ -948,7 +1009,7 @@ impl Actor {
             return Err(ClientError::RetryLater);
         }
         let header = self.header()?;
-        let device = keystore::load(&self.dir)?;
+        let device = keystore::load(&self.dir, &self.guard)?;
         if let Ok(key) = vault::unlock(&header, current.as_bytes(), &device) {
             unlock::reset_attempts(&self.dir);
             Ok((header, device, key))
@@ -971,8 +1032,10 @@ impl Actor {
         )?;
         // The new header re-salts the KDF, so the old Purge PIN tag can never match again;
         // replace it first so a crash cannot leave a live tag for the new salt's vault.
-        unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))?;
+        // Flag first, then the tag: a crash in between shows "not set" (true) rather than
+        // "set" with no live tag (review U-6).
         self.s()?.db.set_setting("purge_set", &[0])?;
+        unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))?;
         write_atomic(&self.dir, HEADER_FILE, &next.encode())?;
         let mut c = unlock::load_config(&self.dir);
         c.kind = kind;
@@ -991,12 +1054,14 @@ impl Actor {
 
     fn clear_purge(&self, current: &str) -> Result<()> {
         self.verify_current(current)?;
-        unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))?;
-        self.s()?.db.set_setting("purge_set", &[0])
+        self.s()?.db.set_setting("purge_set", &[0])?;
+        unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))
     }
 
     fn bio_prepare(&self, current: &str) -> Result<Zeroizing<[u8; 32]>> {
         let (header, device, key) = self.verify_current(current)?;
+        // Biometrics stay off until the new secret is sealed and committed (review U-9).
+        self.bio_files_off()?;
         let mut secret = Zeroizing::new([0u8; 32]);
         rand::Rng::fill(&mut rng(), &mut secret[..]);
         let blob = vault::wrap_with_secret(&mut rng(), &header, &key, &secret, &device)?;
@@ -1018,9 +1083,7 @@ impl Actor {
         unlock::store_config(&self.dir, c)
     }
 
-    /// Turns biometric unlock off and deletes its files. Allowed while locked too: the app
-    /// calls it when the platform reports the biometric key gone (e.g. new fingerprint added).
-    fn bio_disable(&self) -> Result<()> {
+    fn bio_files_off(&self) -> Result<()> {
         for f in [unlock::BIO_SEALED_FILE, unlock::BIO_WRAP_FILE] {
             match std::fs::remove_file(self.dir.join(f)) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(ClientError::Storage),
@@ -1035,7 +1098,22 @@ impl Actor {
         unlock::store_config(&self.dir, c)
     }
 
+    /// Turns biometric unlock off and deletes its files. Allowed while locked too: the app
+    /// calls it when the platform reports the biometric key gone (e.g. new fingerprint added).
+    fn bio_disable(&mut self) -> Result<()> {
+        if let Some(d) = self.decoy.as_mut() {
+            d.biometric = false;
+            return Ok(());
+        }
+        self.bio_files_off()
+    }
+
     fn bio_sealed(&self) -> Option<Vec<u8>> {
+        if let Some(d) = &self.decoy {
+            // The app then shows the normal prompt, and the missing key ends it the way a
+            // changed fingerprint set does (review U-4).
+            return d.biometric.then(|| vec![0u8; 60]);
+        }
         if !unlock::load_config(&self.dir).biometric {
             return None;
         }

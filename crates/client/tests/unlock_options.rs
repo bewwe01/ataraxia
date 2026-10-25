@@ -108,7 +108,7 @@ async fn pin_rules_and_attempt_delays() {
     assert_eq!(info.kind, SecretKind::Pin);
     assert!(!info.biometric);
 
-    for _ in 0..6 {
+    for _ in 0..5 {
         assert_eq!(
             c.unlock(z("000000")).await.unwrap_err(),
             ClientError::WrongPassphrase
@@ -149,16 +149,32 @@ async fn purge_pin_wipes_everything() {
     c.lock().await.unwrap();
     assert!(!files(d.path()).is_empty());
 
-    // The Purge PIN wipes the data directory.
+    // Something else in the same folder (on Android: the WebView's own data) is not Veil's
+    // to delete (review U-1).
+    std::fs::create_dir(d.path().join("app_webview")).unwrap();
+    std::fs::write(d.path().join("app_webview/state"), b"x").unwrap();
+
+    // Five wrong tries start a delay; the Purge PIN still works during it (review U-3).
+    for _ in 0..5 {
+        assert_eq!(
+            c.unlock(z("000000")).await.unwrap_err(),
+            ClientError::WrongPassphrase
+        );
+    }
+    assert_eq!(c.unlock(z("482913")).await.unwrap_err(), ClientError::RetryLater);
     assert_eq!(c.unlock(z("999999")).await.unwrap(), UnlockOutcome::Purged);
-    assert_eq!(files(d.path()), Vec::<String>::new());
+    assert_eq!(files(d.path()), vec!["app_webview".to_owned()]);
     assert_eq!(c.state().await.unwrap(), AppState::New);
-    // Afterwards every attempt, even the old PIN, looks like a wrong PIN.
-    assert_eq!(
-        c.unlock(z("482913")).await.unwrap_err(),
-        ClientError::WrongPassphrase
-    );
-    // And Veil can be set up from scratch.
+    // Until restart the lock screen behaves like the old vault: same keyboard, and the
+    // delay that another wrong try causes (review U-4).
+    let info = c.unlock_info().await.unwrap();
+    assert_eq!(info.kind, SecretKind::Pin);
+    assert!(info.wait_secs > 0);
+    assert_eq!(c.unlock(z("482913")).await.unwrap_err(), ClientError::RetryLater);
+    drop(c);
+    let c = Client::start(d.path().into(), KdfParams::FLOOR, Arc::new(|_, _| {})).unwrap();
+    assert_eq!(c.state().await.unwrap(), AppState::New);
+    // After a restart Veil looks newly installed and can be set up from scratch.
     let c2 = setup(&r, d.path(), SecretKind::Password, "a brand new start").await;
     assert_eq!(c2.state().await.unwrap(), AppState::Unlocked);
 }
