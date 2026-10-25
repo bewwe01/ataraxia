@@ -1,5 +1,6 @@
 // Appearance preferences (Settings → Appearance). Conveniences only, kept in localStorage and
 // wrapped in try/catch; nothing security-relevant lives here (DESIGN.md §8).
+import { ipc } from "./ipc";
 export type Style = "aurora" | "ink";
 export type Mode = "system" | "dark" | "light";
 export type Accent = "aurora" | "lagoon" | "ember";
@@ -38,6 +39,8 @@ export function applyAppearance(a: Appearance): void {
   root.dataset["accent"] = a.accent;
   const reduce = a.reduceMotion || window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   root.dataset["motion"] = reduce ? "reduced" : "full";
+  // Android: the status and navigation bar area follows the theme.
+  void ipc.setDarkBars(dark).catch(() => undefined);
   try {
     window.localStorage.setItem(KEY, JSON.stringify(a));
   } catch {

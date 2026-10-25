@@ -1,14 +1,35 @@
-import { useState, type FormEvent } from "react";
-import { ipc, IpcError } from "../ipc";
-import { Banner, Icon, Logo } from "../ui";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import { ipc, IpcError, type SecretKind, type UnlockInfo } from "../ipc";
+import { Banner, Icon, Logo, SecretField, Segmented } from "../ui";
 
-const MIN_PASSPHRASE = 12; // also enforced in Rust
+// Also enforced in Rust (crates/client/src/unlock.rs).
+const MIN_PIN = 6;
+const MAX_PIN = 16;
+const MIN_PASSWORD = 12;
+
+/** Returns an error message, or null if the PIN or password is acceptable. */
+export function checkSecret(kind: SecretKind, s: string): string | null {
+  if (kind === "pin") {
+    return /^[0-9]+$/.test(s) && s.length >= MIN_PIN && s.length <= MAX_PIN ? null : `Use ${MIN_PIN} to ${MAX_PIN} digits.`;
+  }
+  return [...s].length >= MIN_PASSWORD ? null : `Use at least ${MIN_PASSWORD} characters; four random words is good.`;
+}
+
+export const KIND_HINT: Record<SecretKind, string> = {
+  pin: "6 to 16 digits. Quick to type, but weaker: someone who copies this device's files could try every short PIN.",
+  password: "At least 12 characters. Four random words is strong and easy to remember.",
+};
+
+export function kindName(kind: SecretKind): string {
+  return kind === "pin" ? "PIN" : "password";
+}
 
 export function Setup({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<"welcome" | "form" | "honest">("welcome");
   const [relay, setRelay] = useState("");
   const [pin, setPin] = useState("");
   const [name, setName] = useState("");
+  const [kind, setKind] = useState<SecretKind>("pin");
   const [pass, setPass] = useState("");
   const [pass2, setPass2] = useState("");
   const [busy, setBusy] = useState(false);
@@ -67,11 +88,12 @@ export function Setup({ onDone }: { onDone: () => void }) {
   async function submit(e: FormEvent) {
     e.preventDefault();
     setError(null);
-    if (pass.length < MIN_PASSPHRASE) return setError(`Use at least ${MIN_PASSPHRASE} characters; four random words is good.`);
-    if (pass !== pass2) return setError("The passphrases do not match.");
+    const bad = checkSecret(kind, pass);
+    if (bad) return setError(bad);
+    if (pass !== pass2) return setError(`The two ${kindName(kind)}s do not match.`);
     setBusy(true);
     try {
-      await ipc.setup({ relay: relay.trim(), pin: pin.trim(), name: name.trim(), passphrase: pass });
+      await ipc.setup({ relay: relay.trim(), pin: pin.trim(), name: name.trim(), kind, passphrase: pass });
       setPass("");
       setPass2("");
       onDone();
@@ -102,13 +124,13 @@ export function Setup({ onDone }: { onDone: () => void }) {
           <div className="input"><input id="name" maxLength={64} value={name} onChange={(e) => setName(e.target.value)} /></div>
         </div>
         <div className="field">
-          <label htmlFor="pp">Passphrase</label>
-          <div className="input"><input id="pp" type="password" autoComplete="new-password" required value={pass} onChange={(e) => setPass(e.target.value)} /></div>
+          <span className="label" id="kind-l">Unlock Veil with</span>
+          <Segmented<SecretKind> name="kind" label="Unlock Veil with" value={kind} options={[["pin", "PIN"], ["password", "Password"]]} onChange={(k) => { setKind(k); setPass(""); setPass2(""); }} />
+          <p className="hint">{KIND_HINT[kind]}</p>
         </div>
-        <div className="field">
-          <label htmlFor="pp2">Repeat passphrase</label>
-          <div className="input"><input id="pp2" type="password" autoComplete="new-password" required value={pass2} onChange={(e) => setPass2(e.target.value)} /></div>
-        </div>
+        <SecretField id="pp" label={kind === "pin" ? "PIN" : "Password"} kind={kind} value={pass} onChange={setPass} autoComplete="new-password" />
+        <SecretField id="pp2" label={kind === "pin" ? "Repeat PIN" : "Repeat password"} kind={kind} value={pass2} onChange={setPass2} autoComplete="new-password" />
+        <p className="hint">You can turn on fingerprint unlock and set a Purge PIN later in Settings.</p>
         <Banner tone="warning" icon="alert-triangle">
           <p><b>No one can recover it for you.</b> Not us, not the relay.</p>
         </Banner>
@@ -124,10 +146,50 @@ export function Setup({ onDone }: { onDone: () => void }) {
 }
 
 export function Unlock({ onDone }: { onDone: () => void }) {
+  const [info, setInfo] = useState<UnlockInfo | null>(null);
+  const [wait, setWait] = useState(0);
   const [pass, setPass] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const prompted = useRef(false);
+
+  async function biometric() {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.unlockBiometric();
+      onDone();
+    } catch (err) {
+      const msg = err instanceof IpcError ? err.message : "Biometric unlock failed";
+      if (msg !== "Cancelled") setError(msg);
+      // A changed fingerprint set turns biometrics off: hide the button.
+      void ipc.unlockInfo().then((i) => setInfo((cur) => (cur ? { ...cur, biometric: i.biometric } : i)), () => undefined);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // The keyboard and the biometric button are fixed when the screen opens (ADR-0012).
+  useEffect(() => {
+    void ipc.unlockInfo().then((i) => {
+      setInfo(i);
+      setWait(i.waitSecs);
+    }, () => setInfo({ kind: "password", biometric: false, waitSecs: 0 }));
+  }, []);
+
+  useEffect(() => {
+    if (info?.biometric && !prompted.current) {
+      prompted.current = true;
+      void biometric();
+    }
+  }, [info]);
+
+  useEffect(() => {
+    if (wait <= 0) return;
+    const t = window.setTimeout(() => setWait((w) => w - 1), 1000);
+    return () => window.clearTimeout(t);
+  }, [wait]);
 
   async function reset() {
     setBusy(true);
@@ -144,6 +206,7 @@ export function Unlock({ onDone }: { onDone: () => void }) {
 
   async function submit(e: FormEvent) {
     e.preventDefault();
+    if (!pass || wait > 0) return;
     setBusy(true);
     setError(null);
     try {
@@ -151,12 +214,17 @@ export function Unlock({ onDone }: { onDone: () => void }) {
       setPass("");
       onDone();
     } catch (err) {
+      setPass("");
       setError(err instanceof IpcError ? err.message : "Unlock failed");
+      // Only the wait is refreshed; the kind stays as it was.
+      void ipc.unlockInfo().then((i) => setWait(i.waitSecs), () => undefined);
     } finally {
       setBusy(false);
     }
   }
 
+  const kind = info?.kind ?? "password";
+  const label = kind === "pin" ? "PIN" : "Password";
   return (
     <div className="m-screen full onb-screen">
       <form className="onb lock" autoComplete="off" onSubmit={(e) => void submit(e)}>
@@ -165,17 +233,20 @@ export function Unlock({ onDone }: { onDone: () => void }) {
           <h1 className="onb-title sm">Veil is locked</h1>
         </div>
         <div className="stack">
-          <div className="field">
-            <label htmlFor="unlock-pp" className="sr-only">Passphrase</label>
-            <div className="input"><span className="lead-icon"><Icon name="key" /></span>
-              <input id="unlock-pp" type="password" placeholder="Passphrase" autoComplete="current-password" value={pass} onChange={(e) => setPass(e.target.value)} />
-            </div>
-          </div>
-          {error ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
-          <button className="btn btn-primary btn-block" type="submit" disabled={busy}>{busy ? "Unlocking…" : "Unlock"}</button>
+          {info ? <SecretField id="unlock-pp" label={label} kind={kind} value={pass} onChange={setPass} autoComplete="current-password" autoFocus={!info.biometric} /> : null}
+          {wait > 0 ? (
+            <Banner tone="warning" icon="clock"><p>Too many wrong attempts. Try again in {wait < 60 ? `${wait} s` : `${Math.ceil(wait / 60)} min`}.</p></Banner>
+          ) : null}
+          {error && wait <= 0 ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
+          <button className="btn btn-primary btn-block" type="submit" disabled={busy || wait > 0 || !pass}>{busy ? "Unlocking…" : "Unlock"}</button>
+          {info?.biometric ? (
+            <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => void biometric()}>
+              <Icon name="fingerprint" />Use fingerprint
+            </button>
+          ) : null}
         </div>
         <details className="err-details forgot">
-          <summary>Forgot your passphrase?</summary>
+          <summary>Forgot your {kindName(kind)}?</summary>
           <p className="hint">It can't be reset or recovered, by anyone. Without it, start over with a new identity. This deletes all contacts and messages on this device.</p>
           {confirmReset ? (
             <div className="stack-sm">

@@ -133,9 +133,22 @@ fn native_err(e: NativeError) -> String {
     }
 }
 
+/// What this device offers, for showing or hiding settings.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeInfo {
+    biometric: bool,
+    screenshot_setting: bool,
+    screenshots_allowed: bool,
+}
+
 #[tauri::command]
-async fn biometric_available(app: AppHandle) -> bool {
-    native::biometric_available(&app).await
+async fn native_info(app: AppHandle) -> NativeInfo {
+    NativeInfo {
+        biometric: native::biometric_available(&app).await,
+        screenshot_setting: cfg!(target_os = "android"),
+        screenshots_allowed: native::screenshots_allowed(&app).await,
+    }
 }
 
 /// Turns biometric unlock on: checks the PIN or password, then has the Keystore seal a fresh
@@ -172,11 +185,6 @@ async fn unlock_biometric(app: AppHandle, c: State<'_, Client>) -> Res<()> {
         }
         Err(e) => Err(native_err(e)),
     }
-}
-
-#[tauri::command]
-async fn screenshots_allowed(app: AppHandle) -> bool {
-    native::screenshots_allowed(&app).await
 }
 
 #[tauri::command]
@@ -281,11 +289,10 @@ pub fn run() {
             change_secret,
             set_purge,
             clear_purge,
-            biometric_available,
+            native_info,
             biometric_enable,
             biometric_disable,
             unlock_biometric,
-            screenshots_allowed,
             set_screenshots_allowed,
             set_dark_bars,
             touch,

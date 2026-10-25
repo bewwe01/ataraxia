@@ -7,3 +7,36 @@
 .qr-svg { width: 100%; height: auto; display: block; background: #fff; border-radius: var(--radius-md, 12px); }
 .chat-scroll { flex: 1; overflow-y: auto; }
 .mono-wrap { font-family: var(--font-mono); overflow-wrap: anywhere; font-size: var(--fs-sm, 13px); }
+
+/* ---- Phone layout (review on a 411×923 viewport, Pixel 10a class) ----
+ * On Android the native shell pads the page by the system bars, cutout and keyboard
+ * (app/android/harden.py), so these insets are 0 there; they keep other platforms safe. */
+html, body { height: 100%; overflow: hidden; }
+.device { padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
+.m-screen { min-width: 0; }
+.m-body { padding-left: var(--space-4); padding-right: var(--space-4); display: flex; flex-direction: column; gap: var(--space-4); }
+.m-body > * { flex: none; min-width: 0; }
+.m-body .conv-list { margin: 0 calc(-1 * var(--space-2)); }
+.onb { padding-left: max(var(--space-5), 16px); padding-right: max(var(--space-5), 16px); }
+.onb .field input, .m-body .field input { min-width: 0; width: 100%; }
+.input { min-width: 0; }
+.mono-wrap, .hint, .row-sub { overflow-wrap: anywhere; }
+.segmented { width: 100%; }
+.segmented span { white-space: normal; text-align: center; line-height: 1.2; }
+.pin-input input { letter-spacing: 0.35em; font-variant-numeric: tabular-nums; font-size: var(--text-lg); }
+.btn-row { display: flex; gap: var(--space-3); flex-wrap: wrap; }
+.btn-row > .btn { flex: 1 1 8rem; }
+.check-row { display: flex; gap: var(--space-3); align-items: flex-start; font-size: var(--text-sm); color: var(--text-2); min-height: var(--tap-min); cursor: pointer; }
+.check-row input { width: 20px; height: 20px; margin-top: 2px; flex: none; accent-color: var(--accent); }
+.settings-page .group-title { padding: var(--space-2) var(--space-2) 0; margin: 0; }
+.settings-page .card h3, .settings-page .card h2 { margin: 0; }
+.settings-page .card { padding: var(--space-4); }
+.settings-page .group.card { padding: 0; }
+.qr-wrap { display: grid; place-items: center; }
+.qr-card { width: min(100%, 280px); }
+.composer { padding-left: var(--space-3); padding-right: var(--space-3); }
+.msg .bubble { max-width: min(80%, 34rem); overflow-wrap: anywhere; }
+/* The field container shows focus (border + ring); no second outline on the input itself. */
+.input input:focus-visible { outline: none; }
+.chat-screen > .banner { margin: var(--space-2) var(--space-3) 0; }
+.m-body .pairing, .m-body .safety, .m-screen .m-body .pairing { padding-left: 0; padding-right: 0; }

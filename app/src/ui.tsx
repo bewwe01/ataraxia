@@ -98,3 +98,81 @@ export function timeLabel(ms: number | null): string {
   }
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
+
+/** PIN or password field. A PIN gets the number keyboard. */
+export function SecretField({ id, label, kind, value, onChange, autoComplete, autoFocus = false }: {
+  id: string;
+  label: string;
+  kind: "pin" | "password";
+  value: string;
+  onChange: (v: string) => void;
+  autoComplete: "new-password" | "current-password";
+  autoFocus?: boolean;
+}) {
+  const pin = kind === "pin";
+  return (
+    <div className="field">
+      <label htmlFor={id}>{label}</label>
+      <div className={`input${pin ? " pin-input" : ""}`}>
+        <input
+          id={id}
+          type="password"
+          inputMode={pin ? "numeric" : "text"}
+          pattern={pin ? "[0-9]*" : undefined}
+          maxLength={pin ? 16 : 1024}
+          autoComplete={autoComplete}
+          autoFocus={autoFocus}
+          spellCheck={false}
+          value={value}
+          onChange={(e) => onChange(pin ? e.target.value.replace(/[^0-9]/g, "") : e.target.value)}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** Pill-shaped single choice (DESIGN.md §6 Segmented): native radios underneath. */
+export function Segmented<T extends string>({ name, label, value, options, onChange }: {
+  name: string;
+  label: string;
+  value: T;
+  options: [T, string][];
+  onChange: (v: T) => void;
+}) {
+  return (
+    <div className="segmented" role="radiogroup" aria-label={label}>
+      {options.map(([v, t]) => (
+        <label key={v}>
+          <input type="radio" name={name} value={v} checked={value === v} onChange={() => onChange(v)} />
+          <span>{t}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+/** A settings row with a switch (DESIGN.md §6 ToggleRow). */
+export function ToggleRow({ id, icon, tone = "", title, sub, checked, disabled = false, onChange }: {
+  id: string;
+  icon: string;
+  tone?: string;
+  title: string;
+  sub?: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="row">
+      <div className={`row-icon ${tone}`}><Icon name={icon} /></div>
+      <div className="row-main">
+        <label className="row-title" htmlFor={id}>{title}</label>
+        {sub ? <div className="row-sub" id={`${id}-d`}>{sub}</div> : null}
+      </div>
+      <span className="switch">
+        <input type="checkbox" role="switch" id={id} checked={checked} disabled={disabled} aria-describedby={sub ? `${id}-d` : undefined} onChange={(e) => onChange(e.target.checked)} />
+        <span className="track"><span className="thumb"></span></span>
+      </span>
+    </div>
+  );
+}

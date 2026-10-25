@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { ipc, IpcError, type ContactView, type InviteView, type SafetyView } from "../ipc";
-import { Banner, Icon, QrCode, TopBar } from "../ui";
+import { Banner, Icon, QrCode, Segmented, TopBar } from "../ui";
 import type { Nav } from "./Chats";
 
 export function AddContact({ nav }: { nav: Nav }) {
@@ -42,10 +42,7 @@ export function AddContact({ nav }: { nav: Nav }) {
       <TopBar title="Add contact" onBack={() => nav({ screen: "chats" })} />
       <div className="m-body">
         <div className="pairing">
-          <div className="segmented" role="radiogroup" aria-label="Add contact">
-            <button type="button" role="radio" aria-checked={tab === "mine"} onClick={() => setTab("mine")}><Icon name="qr" />My invite</button>
-            <button type="button" role="radio" aria-checked={tab === "theirs"} onClick={() => setTab("theirs")}><Icon name="link" />Their invite</button>
-          </div>
+          <Segmented<"mine" | "theirs"> name="add-tab" label="Add contact" value={tab} options={[["mine", "My invite"], ["theirs", "Their invite"]]} onChange={setTab} />
           {tab === "mine" ? (
             invite ? (
               <>

@@ -50,11 +50,34 @@ export interface SafetyView {
   name: string;
 }
 
+export type SecretKind = "pin" | "password";
+
 export interface SetupInput {
   relay: string;
   pin: string;
   name: string;
+  kind: SecretKind;
   passphrase: string;
+}
+
+/** What the locked screen needs. */
+export interface UnlockInfo {
+  kind: SecretKind;
+  biometric: boolean;
+  waitSecs: number;
+}
+
+export interface SecurityView {
+  kind: SecretKind;
+  biometric: boolean;
+  purgeSet: boolean;
+}
+
+/** What this device offers. */
+export interface NativeInfo {
+  biometric: boolean;
+  screenshotSetting: boolean;
+  screenshotsAllowed: boolean;
 }
 
 /** Errors from Rust are short, content-free strings (see `commands.rs`). */
@@ -73,6 +96,19 @@ export const ipc = {
   setup: (input: SetupInput) => call<void>("setup", { input }),
   unlock: (passphrase: string) => call<void>("unlock", { passphrase }),
   lock: () => call<void>("lock"),
+  unlockInfo: () => call<UnlockInfo>("unlock_info"),
+  unlockBiometric: () => call<void>("unlock_biometric"),
+  security: () => call<SecurityView>("security"),
+  changeSecret: (current: string, kind: SecretKind, next: string) => call<void>("change_secret", { current, kind, next }),
+  /** The Purge PIN: entered at the lock screen, it deletes everything in Veil. */
+  setPurge: (current: string, purge: string) => call<void>("set_purge", { current, purge }),
+  clearPurge: (current: string) => call<void>("clear_purge", { current }),
+  nativeInfo: () => call<NativeInfo>("native_info"),
+  biometricEnable: (current: string) => call<void>("biometric_enable", { current }),
+  biometricDisable: () => call<void>("biometric_disable"),
+  setScreenshotsAllowed: (allow: boolean) => call<void>("set_screenshots_allowed", { allow }),
+  /** Android: colours the status and navigation bars to match the theme. No-op elsewhere. */
+  setDarkBars: (dark: boolean) => call<void>("set_dark_bars", { dark }),
   /** The user did something; postpones auto-lock. Event-driven refreshes must not call it. */
   touch: () => call<void>("touch"),
   /** Deletes the identity, contacts, messages and device secret. Cannot be undone. */
