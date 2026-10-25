@@ -2737,3 +2737,100 @@ The UI's "Anyone watching sees only 'Wrong PIN'" holds only for that one moment.
   - Biometric auto-prompt is guarded by a ref, the countdown timer is cleaned up, and the password field is cleared on failure.
   - Labelled inputs, native radios in `Segmented`, `role="switch"` with the description linked, and 44 px targets via `--tap-min`.
 - **Docs:** TEST_REPORT and INV-REST-7 honestly say the Kotlin code has not run on a device.
+
+## Unlock options gate, round 2 (2026-10-25)
+
+**Reviewer:** independent code-reviewer agent. Scope: `git diff dc4a7a6..e21fee9`.
+
+VERDICT: FAIL
+
+**Scope:** `git diff dc4a7a6..e21fee9` (19 files). I read every changed source file and checked the vendored `tauri-2.12.4` (`app.rs` L2607/L2688, `plugin/mobile.rs` L332-358 and the Android `run_command`). `cargo test -p veil-client --locked --offline` passes: 8 / 3 / 1 / 4. I edited nothing. The gate fails on UR2-1, a High data-loss regression in the new device-secret file format.
+
+### Round 1 findings
+
+| # | Status | Evidence |
+|---|---|---|
+| U-1 | Fixed | `wipe()` deletes only `DATA_FILES` and their `.tmp` files (`service.rs:785-803`). The vault now lives in `vault/` (`lib.rs:278`). The test checks that `app_webview/` survives. |
+| U-2 | Fixed on Android, with a regression (UR2-1) | `DeviceGuard` seals the secret with `veil.device.v1` and `remove()` calls `destroy()`. Windows and Linux are documented honestly. Caveat: a 0.1-preview plain secret that was upgraded in place can still sit on flash (UR2-7). |
+| U-3 | Partially | Rust checks the purge tag before `_ if waiting`. But `Onboarding.tsx:209` (`if (!pass \|\| wait > 0) return;`) and `:241` (`disabled={... wait > 0}`) were not changed, so the Purge PIN still cannot be sent during a delay (UR2-3). |
+| U-4 | Partially | A `Decoy` serves `unlock`, `unlock_info`, `bio_sealed` and `bio_disable`. But `state()` ignores it, and setup and reset never clear it (UR2-2). |
+| U-5 | Partially | The lock-screen `SecretField` is non-strict (`strict` only for `new-password`). It still sets `inputMode="numeric"`, so Android shows a digits-only pad and the write order (header, then `unlock.cfg`) is unchanged (UR2-5). |
+| U-6 | Fixed | `clear_purge` and `change_secret` write the flag, then the tag. `set_purge` writes the tag, then the flag. |
+| U-7 | Fixed | `remaining()` clamps `last` to `now`. The test covers `remaining(5, 1e7, 100) == 30`. |
+| U-8 | Fixed | `checked_sub(FREE_ATTEMPTS)`. Tests and docs now say "5 free". |
+| U-9 | Fixed | `bio_prepare` calls `bio_files_off()` first, and `biometric_enable` runs `biometric_disable` + `delete_key` on any error. |
+| U-10 | Partially | Lockout maps to `LOCKOUT`, and `onEnd` zeroes the secret on error or cancel. Remaining: the `fa == null` branch of `prompt()` never calls `onEnd`; the unwipeable JVM/serde base64 copies are not noted under INV-REST-4, and the new `deviceSeal`/`deviceOpen` add more of them. |
+| U-11 | Fixed | `set_screenshots_allowed` requires `AppState::Unlocked`, and ADR-0012 records the owner request. |
+| U-12 | Fixed | ADR-0012 paragraph, plus a Settings hint when biometrics are available. |
+| U-13 | Partially | The header and device secret go first with 3 retries, but the retries are back-to-back (no use against an AV lock) and purge still ignores the result (`service.rs:912`). On Windows, `gone(keystore::FILE)` is always true and the `keystore::remove` error is dropped (`:789`), so a failed Credential Manager delete is never reported, for Reset either. |
+| Nit (vault doc comment) | Fixed | Moved to `known_answer_unlock`. |
+
+### New findings
+
+**UR2-1 High [HIGH]: a plain device secret whose first byte is 0x02 is read as a sealed blob, and the vault becomes unopenable.**
+`crates/client/src/keystore.rs:115`.
+- `if let Some((&SEALED_V1, sealed)) = raw.split_first()` runs before the 32-byte plain check. Plain secrets are 32 random bytes, so 1 in 256 start with 0x02.
+- What happens then: without a guard, `ok_or(Storage)` fails; with a guard, `open()` gets a 31-byte blob and fails.
+- Scenarios:
+  - Every Linux/macOS vault has a 1/256 chance of failing on its first unlock with `Storage`; only Start over gets the owner back in.
+  - 1/256 of Android 0.1-preview installs are bricked at the upgrade. The plain file is never resealed, and the user cannot repair a file in the sandbox.
+  - Integration tests (no guard) are flaky at about 0.4% per setup.
+- Windows is not affected.
+- Fix: decide by length first. `if raw.len() == 32 { plain path } else if let Some((&SEALED_V1, s)) = raw.split_first() { sealed path }`. An AES-GCM sealed file is 1+12+32+16 = 61 bytes, so it can never be 32. Add a test with `secret[0] = 2` for both `None` and a guard.
+
+**UR2-2 Medium [HIGH]: the decoy is out of step with `state()` and outlives a new vault.**
+`service.rs:585` (`state()`), `:711` (Reset), `:812` (setup).
+1. `state()` returns `New` while the decoy says "locked". Any webview reload (Android activity recreation, or anything after `clear_all_browsing_data`) calls `app_state` and shows the welcome screen while the coercer is watching.
+2. After a purge, "Start over…" leads to setup, and the decoy is still `Some`. As soon as the new vault locks, every `unlock` goes to the decoy branch. The owner's correct PIN is rejected, the old kind and fake delays are shown, and the only way out is another Start over, which wipes the new vault. That is a data-loss loop until the process restarts.
+- Fix:
+  - In `state()`: `else if self.decoy.is_some() { AppState::Locked }`.
+  - In the `Cmd::Reset` handler and in `setup()`: `self.decoy = None;`.
+  - Test: purge, reset, setup, lock, unlock with the new secret.
+
+**UR2-3 Medium [HIGH]: the U-3 fix cannot be reached, and the docs overclaim.**
+`Onboarding.tsx:209`, `:241`, plus ADR-0012 ("The Purge PIN is checked even during a retry delay") and INV-REST-6 ("works during a retry delay").
+- Only the Rust test exercises this path; the UI never submits while `wait > 0`.
+- Fix: allow submit during a wait (keep the banner), and treat `RetryLater` as "still waiting".
+- Related: the decoy starts at `failures+1, last=now`. A real attempt during a delay returns `RetryLater` and leaves the countdown alone, but a purge makes it jump (for example from 12 s to 60 s). When `waiting`, copy the stored `(failures, last)` unchanged.
+
+**UR2-4 Medium [HIGH]: a crash in the middle of the migration strands the vault.**
+`lib.rs:278-288`.
+- `DATA_FILES` puts `vault.hdr` first.
+- Scenario: the process is killed, or a rename fails, after the header has moved. On the next start `vault/vault.hdr` exists, so the migration is skipped. `device.secret`, `veil.db` and `unlock.cfg` stay in the old folder, and every unlock fails with `Storage`. Start over then wipes only `vault/`.
+- Fix:
+  - Move every file that is in `base` and missing in `dir` on each start (idempotent), and move `vault.hdr` last.
+  - Optionally fsync the directory.
+
+**UR2-5 Low [MEDIUM]: U-5 is still open on Android.**
+`ui.tsx`: `inputMode={pin ? "numeric" : "text"}` stays on the lock screen. On Android this shows Gboard's number pad, which has no letter keys.
+- Scenario: a crash between the header write and the config write (`service.rs` `change_secret`) while switching from PIN to password leaves a password that cannot be typed.
+- Fix: in `change_secret`, write the config with `kind = Password` before the header, then write the final kind after it. A text keyboard can type both kinds, so either crash point is safe.
+
+**UR2-6 Low [MEDIUM]: a Keystore destroy failure is silent.**
+`DeviceGuard::destroy` returns `()`.
+- If `deleteEntry` fails while unlinking the file succeeds, the key stays on the phone, and flash remnants plus the phone are exactly the coercion case.
+- Fix: return `bool` and fold it into `failed` in `wipe()`.
+- Also add a short sleep between the U-13 retries.
+
+**UR2-7 Low (docs): preview upgrades leave the old plain secret on flash.**
+ADR-0012's crypto-erasure claim does not hold for 0.1-preview installs. The plain `device.secret` inode is replaced on the first unlock, but its blocks may persist. State this in ADR-0012 and INV-REST-6.
+
+**UR2-8 Low: the actor can hang or die inside Tauri's blocking call.**
+`native.rs` `KeystoreGuard`.
+- No deadlock: plugins are initialised in `build()` (`app.rs:2607`) before the setup closure runs (`:2688`), so `native::guard` gets a handle. Keystore calls happen only from webview-triggered actor commands. No main-thread code waits on the actor, and the Kotlin `device*` handlers resolve synchronously on the UI thread.
+- Residual risk: `run_mobile_plugin` does `rx.recv().unwrap()` (`mobile.rs:349`). If the `run_on_android_context` closure is dropped (activity destroyed), the actor thread panics and the client is dead until restart. If the handler is never called, the actor hangs.
+- Fix: use `run_mobile_plugin_async` with a timeout from a dedicated small runtime, or document the risk.
+
+**Nits**
+- `PurgeForm` uses `native?.screenshotSetting` as an "is Android" proxy, and shows the desktop wording while `native` is still `null`. Use an explicit `platform` field.
+- Kotlin: `deviceKey()` swallows every exception from the StrongBox attempt, which is acceptable, but log nothing.
+
+### Verified good
+- Guard trait: `MAX_SEALED` is checked before calling into the platform, the sealed file is useless without the key, an upgrade failure leaves the old file working, and Windows ignores the guard.
+- Device key: no user authentication, StrongBox with TEE fallback, and `deviceOpen` maps a missing key to `KEY_GONE`, which Rust turns into `Storage` (no wipe).
+- During a delay the response carries no passphrase signal. Both paths run one Argon2id, and the remaining HKDF/AEAD difference is microseconds.
+- Purge decoy biometrics: 60 zero bytes, then `promptWithoutKey`, then `KEY_GONE`, so biometrics turn off just as after a changed fingerprint set. This is documented.
+- `bio_files_off` before prepare and `biometric_enable` cleanup close U-9 completely.
+- `SecretField`: new PINs drop non-digits; existing secrets accept any characters with `maxLength` 1024.
+
+**Recommended action: B.** Fix UR2-1 (High) and UR2-2 to UR2-4 (Medium), then re-review. Lows can follow.
