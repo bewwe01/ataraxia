@@ -66,6 +66,7 @@ fn input(r: &Relay, name: &str, pass: &str) -> SetupInput {
         relay: r.addr.clone(),
         pin: r.pin.clone(),
         name: name.into(),
+        kind: veil_client::unlock::SecretKind::Password,
         passphrase: Zeroizing::new(pass.into()),
     }
 }

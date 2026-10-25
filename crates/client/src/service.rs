@@ -25,13 +25,14 @@ use tokio::sync::{mpsc, oneshot};
 use veil_core::account::{Account, IntroFields, Opened, random_id};
 use veil_core::content::{Body, Content, Text};
 use veil_core::invite::{Invite, InviteMode};
-use veil_core::vault::{self, KdfParams, VaultHeader};
+use veil_core::vault::{self, KdfParams, PurgeTag, Unlocked, VaultHeader};
 use veil_wire::{ENVELOPE_BUCKETS, ErrorCode, Request, Response, ServerFrame};
 use zeroize::Zeroizing;
 
 use crate::db::{Db, SqlBackend};
 use crate::relay::{Relay, split_host_port};
-use crate::{ClientError, Result, keystore, now_ms, now_secs, qr};
+use crate::unlock::{self, SecretKind};
+use crate::{ClientError, Result, keystore, now_ms, now_secs, qr, write_atomic};
 
 /// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
@@ -42,7 +43,6 @@ const FETCH_LIMIT: u32 = 8;
 const MAX_ATTEMPTS: i64 = 20;
 const TICK: Duration = Duration::from_secs(5);
 const INVITE_TTL_SECS: u64 = 24 * 3600;
-const MIN_PASSPHRASE: usize = 12;
 const MAX_NAME: usize = 64;
 /// Delivery tokens registered with the relay per batch.
 const TOKEN_BATCH: usize = 8;
@@ -122,6 +122,32 @@ pub struct SafetyView {
     pub name: String,
 }
 
+/// What the locked screen needs: which keyboard, whether to offer biometrics, any wait.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlockInfo {
+    pub kind: SecretKind,
+    pub biometric: bool,
+    pub wait_secs: u64,
+}
+
+/// The security settings, shown while unlocked.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecurityView {
+    pub kind: SecretKind,
+    pub biometric: bool,
+    pub purge_set: bool,
+}
+
+/// How an unlock attempt ended. `Purged` is for the app shell only (to clear the webview's
+/// storage and the platform key); the UI is told "wrong PIN or password" (ADR-0012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockOutcome {
+    Unlocked,
+    Purged,
+}
+
 /// What changed, for the UI to refetch. Never carries content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -138,6 +164,7 @@ pub struct SetupInput {
     pub relay: String,
     pub pin: String,
     pub name: String,
+    pub kind: SecretKind,
     pub passphrase: Zeroizing<String>,
 }
 
@@ -154,7 +181,17 @@ type Reply<T> = oneshot::Sender<Result<T>>;
 enum Cmd {
     State(Reply<AppState>),
     Setup(SetupInput, Reply<()>),
-    Unlock(Zeroizing<String>, Reply<()>),
+    Unlock(Zeroizing<String>, Reply<UnlockOutcome>),
+    UnlockInfo(Reply<UnlockInfo>),
+    Security(Reply<SecurityView>),
+    ChangeSecret(Zeroizing<String>, SecretKind, Zeroizing<String>, Reply<()>),
+    SetPurge(Zeroizing<String>, Zeroizing<String>, Reply<()>),
+    ClearPurge(Zeroizing<String>, Reply<()>),
+    BioPrepare(Zeroizing<String>, Reply<Zeroizing<[u8; 32]>>),
+    BioCommit(Vec<u8>, Reply<()>),
+    BioDisable(Reply<()>),
+    BioSealed(Reply<Option<Vec<u8>>>),
+    UnlockBio(Zeroizing<[u8; 32]>, Reply<()>),
     Lock(Reply<()>),
     Me(Reply<MeView>),
     Contacts(Reply<Vec<ContactView>>),
@@ -236,8 +273,52 @@ impl Client {
     pub async fn setup(&self, input: SetupInput) -> Result<()> {
         ask!(self, Setup, input)
     }
-    pub async fn unlock(&self, passphrase: Zeroizing<String>) -> Result<()> {
+    /// Unlocks with the PIN or password. Entering the Purge PIN wipes Veil and returns
+    /// [`UnlockOutcome::Purged`].
+    pub async fn unlock(&self, passphrase: Zeroizing<String>) -> Result<UnlockOutcome> {
         ask!(self, Unlock, passphrase)
+    }
+    pub async fn unlock_info(&self) -> Result<UnlockInfo> {
+        ask!(self, UnlockInfo)
+    }
+    pub async fn security(&self) -> Result<SecurityView> {
+        ask!(self, Security)
+    }
+    /// Changes the PIN or password (and possibly its kind). Clears the Purge PIN, which must be
+    /// set again (ADR-0012).
+    pub async fn change_secret(
+        &self,
+        current: Zeroizing<String>,
+        kind: SecretKind,
+        new: Zeroizing<String>,
+    ) -> Result<()> {
+        ask!(self, ChangeSecret, current, kind, new)
+    }
+    pub async fn set_purge(&self, current: Zeroizing<String>, purge: Zeroizing<String>) -> Result<()> {
+        ask!(self, SetPurge, current, purge)
+    }
+    pub async fn clear_purge(&self, current: Zeroizing<String>) -> Result<()> {
+        ask!(self, ClearPurge, current)
+    }
+    /// Step 1 of turning on biometric unlock: checks the current PIN or password and returns a
+    /// fresh secret for the platform keystore to seal. **Key material:** for the app shell's
+    /// native code only, never for the webview.
+    pub async fn biometric_prepare(&self, current: Zeroizing<String>) -> Result<Zeroizing<[u8; 32]>> {
+        ask!(self, BioPrepare, current)
+    }
+    /// Step 2: stores the keystore-sealed secret and turns biometric unlock on.
+    pub async fn biometric_commit(&self, sealed: Vec<u8>) -> Result<()> {
+        ask!(self, BioCommit, sealed)
+    }
+    pub async fn biometric_disable(&self) -> Result<()> {
+        ask!(self, BioDisable)
+    }
+    /// The sealed secret, for the platform keystore to open behind a biometric prompt.
+    pub async fn biometric_sealed(&self) -> Result<Option<Vec<u8>>> {
+        ask!(self, BioSealed)
+    }
+    pub async fn unlock_biometric(&self, secret: Zeroizing<[u8; 32]>) -> Result<()> {
+        ask!(self, UnlockBio, secret)
     }
     /// Locks now: relay I/O in progress is cancelled first, so the relay cannot delay this.
     pub async fn lock(&self) -> Result<()> {
@@ -363,23 +444,6 @@ fn token_hash(token: &[u8; 32]) -> Vec<u8> {
 
 fn arr32(v: &[u8]) -> Result<[u8; 32]> {
     v.try_into().map_err(|_| ClientError::Storage)
-}
-
-/// Writes `name` in `dir` so that a crash leaves either the old file or the complete new one.
-fn write_atomic(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    let tmp = dir.join(format!("{name}.tmp"));
-    let mut f = std::fs::File::create(&tmp).map_err(|_| ClientError::Storage)?;
-    f.write_all(bytes).map_err(|_| ClientError::Storage)?;
-    f.sync_all().map_err(|_| ClientError::Storage)?;
-    drop(f);
-    std::fs::rename(&tmp, dir.join(name)).map_err(|_| ClientError::Storage)?;
-    // Persist the rename itself (not possible on Windows, where rename is already durable).
-    #[cfg(unix)]
-    std::fs::File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|_| ClientError::Storage)?;
-    Ok(())
 }
 
 fn initials(name: &str) -> String {
@@ -561,6 +625,8 @@ impl Actor {
         }
     }
 
+    // One arm per command; splitting the dispatch would only hide it.
+    #[allow(clippy::too_many_lines)]
     async fn handle(&mut self, cmd: Cmd) {
         // Only what the user does keeps Veil unlocked; UI refreshes caused by incoming
         // messages or connection changes must not (P4-2).
@@ -568,6 +634,12 @@ impl Actor {
             cmd,
             Cmd::Setup(..)
                 | Cmd::Unlock(..)
+                | Cmd::UnlockBio(..)
+                | Cmd::ChangeSecret(..)
+                | Cmd::SetPurge(..)
+                | Cmd::ClearPurge(..)
+                | Cmd::BioPrepare(..)
+                | Cmd::BioCommit(..)
                 | Cmd::Touch(_)
                 | Cmd::Send(..)
                 | Cmd::CreateInvite(_)
@@ -599,6 +671,37 @@ impl Actor {
             Cmd::Reset(r) => {
                 self.lock_now();
                 let _ = r.send(self.wipe());
+            }
+            Cmd::UnlockInfo(r) => {
+                let _ = r.send(Ok(self.unlock_info()));
+            }
+            Cmd::Security(r) => {
+                let _ = r.send(self.security());
+            }
+            Cmd::ChangeSecret(cur, kind, new, r) => {
+                let _ = r.send(self.change_secret(&cur, kind, &new));
+            }
+            Cmd::SetPurge(cur, purge, r) => {
+                let _ = r.send(self.set_purge(&cur, &purge));
+            }
+            Cmd::ClearPurge(cur, r) => {
+                let _ = r.send(self.clear_purge(&cur));
+            }
+            Cmd::BioPrepare(cur, r) => {
+                let _ = r.send(self.bio_prepare(&cur));
+            }
+            Cmd::BioCommit(sealed, r) => {
+                let _ = r.send(self.bio_commit(&sealed));
+            }
+            Cmd::BioDisable(r) => {
+                let _ = r.send(self.bio_disable());
+            }
+            Cmd::BioSealed(r) => {
+                let _ = r.send(Ok(self.bio_sealed()));
+            }
+            Cmd::UnlockBio(secret, r) => {
+                let res = self.unlock_bio(&secret).await;
+                let _ = r.send(res);
             }
             Cmd::Me(r) => {
                 let _ = r.send(self.me());
@@ -636,21 +739,29 @@ impl Actor {
         }
     }
 
-    /// Removes the vault header, the database and the device secret.
+    /// Deletes everything Veil keeps on this device: every file and folder in its data
+    /// directory (vault header, database, device secret, unlock files) and the keystore entry.
+    /// Used by "Start over", by setup for debris, and by the Purge PIN. Removing the header and
+    /// the device secret destroys the keys, so no old copy on flash can be decrypted.
     fn wipe(&self) -> Result<()> {
-        for f in [
-            HEADER_FILE,
-            DB_FILE,
-            "veil.db-journal",
-            "veil.db-wal",
-            "veil.db-shm",
-        ] {
-            match std::fs::remove_file(self.dir.join(f)) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(ClientError::Storage),
-                _ => {}
+        let mut failed = false;
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                let r = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+                failed |= r.is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
             }
         }
-        keystore::remove(&self.dir)
+        // The keystore entry goes even if some file could not be removed.
+        let ks = keystore::remove(&self.dir);
+        if failed {
+            return Err(ClientError::Storage);
+        }
+        ks
     }
 
     fn s(&self) -> Result<&Session> {
@@ -665,9 +776,7 @@ impl Actor {
         }
         split_host_port(input.relay.trim())?;
         let pin = parse_pin(&input.pin)?;
-        if input.passphrase.chars().count() < MIN_PASSPHRASE {
-            return Err(ClientError::BadInput);
-        }
+        unlock::validate(input.kind, &input.passphrase)?;
         let name = clean_name(&input.name);
         let relay_addr = input.relay.trim().to_owned();
 
@@ -699,6 +808,14 @@ impl Actor {
         db.set_setting("name", name.as_bytes())?;
         db.set_setting("mailbox", &mailbox)?;
         db.set_setting("mailbox_key", mbox_key.as_bytes())?;
+        unlock::store_config(
+            &self.dir,
+            unlock::Config {
+                kind: input.kind,
+                biometric: false,
+            },
+        )?;
+        unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))?;
         // The header is written last: its presence is what marks setup as complete.
         write_atomic(&self.dir, HEADER_FILE, &header.encode())?;
 
@@ -720,14 +837,61 @@ impl Actor {
         Ok(())
     }
 
-    async fn unlock(&mut self, passphrase: &str) -> Result<()> {
+    fn header(&self) -> Result<VaultHeader> {
+        let raw = std::fs::read(self.dir.join(HEADER_FILE)).map_err(|_| ClientError::Storage)?;
+        VaultHeader::decode(&raw).map_err(|_| ClientError::Storage)
+    }
+
+    async fn unlock(&mut self, passphrase: &str) -> Result<UnlockOutcome> {
+        if self.session.is_some() {
+            return Ok(UnlockOutcome::Unlocked);
+        }
+        let now = now_secs();
+        if unlock::wait_secs(&self.dir, now) > 0 {
+            return Err(ClientError::RetryLater);
+        }
+        let Ok(header) = self.header() else {
+            // Nothing to unlock (for example right after a purge): take as long as a real
+            // attempt and answer like a wrong one.
+            let _ = vault::create(&mut rng(), passphrase.as_bytes(), &[0u8; 32], self.kdf);
+            return Err(ClientError::WrongPassphrase);
+        };
+        let device = keystore::load(&self.dir)?;
+        let purge = unlock::load_purge(&self.dir);
+        match vault::unlock_checking(&header, passphrase.as_bytes(), &device, purge.as_ref()) {
+            Ok(Unlocked::Key(key)) => {
+                unlock::reset_attempts(&self.dir);
+                self.open_session(&key).await?;
+                Ok(UnlockOutcome::Unlocked)
+            }
+            Ok(Unlocked::Purge) => {
+                self.lock_now();
+                // Best effort: every file that can go, goes.
+                let _ = self.wipe();
+                Ok(UnlockOutcome::Purged)
+            }
+            Err(_) => {
+                unlock::record_failure(&self.dir, now)?;
+                Err(ClientError::WrongPassphrase)
+            }
+        }
+    }
+
+    async fn unlock_bio(&mut self, secret: &[u8; 32]) -> Result<()> {
         if self.session.is_some() {
             return Ok(());
         }
-        let raw = std::fs::read(self.dir.join(HEADER_FILE)).map_err(|_| ClientError::Storage)?;
-        let header = VaultHeader::decode(&raw).map_err(|_| ClientError::Storage)?;
+        let header = self.header()?;
         let device = keystore::load(&self.dir)?;
-        let key = vault::unlock(&header, passphrase.as_bytes(), &device)?;
+        let blob = std::fs::read(self.dir.join(unlock::BIO_WRAP_FILE))
+            .map_err(|_| ClientError::BiometricUnavailable)?;
+        let key = vault::unwrap_with_secret(&header, &blob, secret, &device)
+            .map_err(|_| ClientError::BiometricUnavailable)?;
+        unlock::reset_attempts(&self.dir);
+        self.open_session(&key).await
+    }
+
+    async fn open_session(&mut self, key: &vault::DbKey) -> Result<()> {
         let db = Db::open(&self.dir.join(DB_FILE), key.expose())?;
         let get = |k: &str| db.setting(k)?.ok_or(ClientError::Storage);
         let relay_addr = String::from_utf8(get("relay")?.to_vec()).map_err(|_| ClientError::Storage)?;
@@ -752,6 +916,132 @@ impl Actor {
         }));
         self.connect().await;
         Ok(())
+    }
+
+    // ---- security settings ----
+
+    fn unlock_info(&self) -> UnlockInfo {
+        let c = unlock::load_config(&self.dir);
+        UnlockInfo {
+            kind: c.kind,
+            biometric: c.biometric && self.dir.join(unlock::BIO_SEALED_FILE).exists(),
+            wait_secs: unlock::wait_secs(&self.dir, now_secs()),
+        }
+    }
+
+    fn security(&self) -> Result<SecurityView> {
+        let s = self.s()?;
+        let c = unlock::load_config(&self.dir);
+        Ok(SecurityView {
+            kind: c.kind,
+            biometric: c.biometric,
+            purge_set: s.db.setting("purge_set")?.is_some_and(|v| v.as_slice() == [1]),
+        })
+    }
+
+    /// Checks the current PIN or password while unlocked. Wrong answers count as failed
+    /// attempts, so settings cannot be used to guess faster than the unlock screen.
+    fn verify_current(&self, current: &str) -> Result<(VaultHeader, Zeroizing<[u8; 32]>, vault::DbKey)> {
+        self.s()?;
+        let now = now_secs();
+        if unlock::wait_secs(&self.dir, now) > 0 {
+            return Err(ClientError::RetryLater);
+        }
+        let header = self.header()?;
+        let device = keystore::load(&self.dir)?;
+        if let Ok(key) = vault::unlock(&header, current.as_bytes(), &device) {
+            unlock::reset_attempts(&self.dir);
+            Ok((header, device, key))
+        } else {
+            unlock::record_failure(&self.dir, now)?;
+            Err(ClientError::WrongPassphrase)
+        }
+    }
+
+    fn change_secret(&self, current: &str, kind: SecretKind, new: &str) -> Result<()> {
+        unlock::validate(kind, new)?;
+        let (header, device, _) = self.verify_current(current)?;
+        let next = vault::rewrap(
+            &mut rng(),
+            &header,
+            current.as_bytes(),
+            new.as_bytes(),
+            &device,
+            header.params,
+        )?;
+        // The new header re-salts the KDF, so the old Purge PIN tag can never match again;
+        // replace it first so a crash cannot leave a live tag for the new salt's vault.
+        unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))?;
+        self.s()?.db.set_setting("purge_set", &[0])?;
+        write_atomic(&self.dir, HEADER_FILE, &next.encode())?;
+        let mut c = unlock::load_config(&self.dir);
+        c.kind = kind;
+        unlock::store_config(&self.dir, c)
+    }
+
+    fn set_purge(&self, current: &str, purge: &str) -> Result<()> {
+        let kind = unlock::load_config(&self.dir).kind;
+        unlock::validate(kind, purge)?;
+        let (header, device, _) = self.verify_current(current)?;
+        let tag = vault::purge_tag(&header, purge.as_bytes(), &device)
+            .map_err(|_| ClientError::PurgeSameAsUnlock)?;
+        unlock::store_purge(&self.dir, &tag)?;
+        self.s()?.db.set_setting("purge_set", &[1])
+    }
+
+    fn clear_purge(&self, current: &str) -> Result<()> {
+        self.verify_current(current)?;
+        unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))?;
+        self.s()?.db.set_setting("purge_set", &[0])
+    }
+
+    fn bio_prepare(&self, current: &str) -> Result<Zeroizing<[u8; 32]>> {
+        let (header, device, key) = self.verify_current(current)?;
+        let mut secret = Zeroizing::new([0u8; 32]);
+        rand::Rng::fill(&mut rng(), &mut secret[..]);
+        let blob = vault::wrap_with_secret(&mut rng(), &header, &key, &secret, &device)?;
+        write_atomic(&self.dir, unlock::BIO_WRAP_FILE, &blob)?;
+        Ok(secret)
+    }
+
+    fn bio_commit(&self, sealed: &[u8]) -> Result<()> {
+        self.s()?;
+        if sealed.is_empty()
+            || sealed.len() > unlock::MAX_SEALED
+            || !self.dir.join(unlock::BIO_WRAP_FILE).exists()
+        {
+            return Err(ClientError::BadInput);
+        }
+        write_atomic(&self.dir, unlock::BIO_SEALED_FILE, sealed)?;
+        let mut c = unlock::load_config(&self.dir);
+        c.biometric = true;
+        unlock::store_config(&self.dir, c)
+    }
+
+    /// Turns biometric unlock off and deletes its files. Allowed while locked too: the app
+    /// calls it when the platform reports the biometric key gone (e.g. new fingerprint added).
+    fn bio_disable(&self) -> Result<()> {
+        for f in [unlock::BIO_SEALED_FILE, unlock::BIO_WRAP_FILE] {
+            match std::fs::remove_file(self.dir.join(f)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(ClientError::Storage),
+                _ => {}
+            }
+        }
+        if !self.dir.join(HEADER_FILE).exists() {
+            return Ok(());
+        }
+        let mut c = unlock::load_config(&self.dir);
+        c.biometric = false;
+        unlock::store_config(&self.dir, c)
+    }
+
+    fn bio_sealed(&self) -> Option<Vec<u8>> {
+        if !unlock::load_config(&self.dir).biometric {
+            return None;
+        }
+        std::fs::read(self.dir.join(unlock::BIO_SEALED_FILE))
+            .ok()
+            .filter(|b| !b.is_empty() && b.len() <= unlock::MAX_SEALED)
     }
 
     // ---- queries ----

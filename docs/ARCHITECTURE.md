@@ -217,6 +217,17 @@ The owner asked to finish the mandatory parts and ship installers within a limit
 
 Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in v1 the relay can link sender and recipient mailboxes; THREAT_MODEL updated), attachments, voice notes, disappearing messages, calls (Phase 6), backup, panic wipe, notifications, camera QR scanning, multi-relay, Android Keystore, a key-change warning UI, Linux/macOS packages. Unused invites keep their delivery token registered at the relay until the mailbox is gone.
 
+### ADR-0012: PIN or password, biometric unlock, Purge PIN. **Accepted (owner request, 2026-10-25).**
+**Context.** The owner asked for a choice between a PIN and a password, biometric unlock with a settings toggle, and an optional duress code (the "Purge PIN") that wipes Veil when it is entered at the unlock screen.
+
+**Decision.** No new primitive; two HKDF/XChaCha20-Poly1305 compositions in `crates/core/src/vault.rs`, beside the existing KEK:
+- *Purge tag* = HKDF-SHA-256(`Argon2id(input) || device_secret`, salt = vault id, info `veil/v1/purge-tag`). The client stores it in `purge.tag` (a random tag when no Purge PIN is set, so the file exists either way). Unlock runs Argon2id once and derives both the KEK and the tag: passphrase → open; tag match (constant time) → purge; otherwise wrong. The tag needs the device secret, so offline it is the same guessing oracle as the header, no weaker. A Purge PIN equal to the passphrase is refused. Changing the PIN/password re-salts the header, so the Purge PIN is cleared and must be set again.
+- *Secret wrap* = XChaCha20-Poly1305 of the DB key under HKDF(`secret || device_secret`, salt = vault id, info `veil/v1/secret-kek`), AAD `veil/v1/secret-wrap || vault id`. `secret` is 32 random bytes that only the Android Keystore releases, after a BiometricPrompt, from a key created with user authentication required (BIOMETRIC_STRONG, every use) and invalidated by new enrolments. The webview never sees it: the Rust side calls the Kotlin code directly, and Tauri 2.12 rejects every `plugin:` IPC call that has no capability entry (`tauri/src/webview/mod.rs`, ACL check); our capability grants none for this plugin.
+- PIN: 6 to 16 digits. Password: at least 12 characters. A PIN has far less entropy, so it relies on the device secret and on failed-attempt delays (5 free tries, then 30 s doubling to 1 h, stored in a plain counter file). Someone holding a copy of the app's files bypasses those delays: the UI says a PIN is weaker.
+- Purge: on a match the client deletes every file in Veil's data directory (vault header, database, device secret, keystore entry, biometric files), the app deletes the Keystore key and clears the webview's storage, and the unlock screen shows the usual "Wrong passphrase". Deleting the device secret and header destroys the keys (crypto-erasure), so leftover flash blocks are unreadable. Not covered: ciphertext already at the relay (it expires there), and copies made before the purge.
+
+**Not done.** Windows Hello (biometrics are Android-only for now). A Purge PIN does not tell contacts anything.
+
 ## 7. Distribution (recorded owner request)
 
 The final step, after all phases pass the code-reviewer gate, is a GitHub Actions workflow that builds the Android **APK** and publishes it to this repository's **GitHub Releases**. Details:

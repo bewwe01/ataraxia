@@ -12,6 +12,7 @@ pub mod keystore;
 pub mod qr;
 pub mod relay;
 pub mod service;
+pub mod unlock;
 
 /// Client errors. Display strings are short, user-facing and never contain content, keys or
 /// addresses.
@@ -27,8 +28,14 @@ pub enum ClientError {
     Relay,
     #[error("The relay refused the request")]
     Rejected(veil_wire::ErrorCode),
-    #[error("Wrong passphrase")]
+    #[error("Wrong PIN or password")]
     WrongPassphrase,
+    #[error("Too many attempts. Wait a moment and try again.")]
+    RetryLater,
+    #[error("The Purge PIN must be different from your PIN or password")]
+    PurgeSameAsUnlock,
+    #[error("Biometric unlock is not available")]
+    BiometricUnavailable,
     #[error("Local storage failed")]
     Storage,
     #[error("Veil is locked")]
@@ -78,4 +85,21 @@ pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Writes `name` in `dir` so that a crash leaves either the old file or the complete new one.
+pub(crate) fn write_atomic(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut f = std::fs::File::create(&tmp).map_err(|_| ClientError::Storage)?;
+    f.write_all(bytes).map_err(|_| ClientError::Storage)?;
+    f.sync_all().map_err(|_| ClientError::Storage)?;
+    drop(f);
+    std::fs::rename(&tmp, dir.join(name)).map_err(|_| ClientError::Storage)?;
+    // Persist the rename itself (not possible on Windows, where rename is already durable).
+    #[cfg(unix)]
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|_| ClientError::Storage)?;
+    Ok(())
 }

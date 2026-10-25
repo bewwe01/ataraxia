@@ -88,6 +88,7 @@ fn input(addr: &str, pin: &str, name: &str) -> SetupInput {
         relay: addr.into(),
         pin: pin.into(),
         name: name.into(),
+        kind: veil_client::unlock::SecretKind::Password,
         passphrase: Zeroizing::new("correct horse battery".into()),
     }
 }
