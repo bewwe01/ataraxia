@@ -87,6 +87,10 @@ const MIGRATIONS: &[&str] = &[
        state TEXT NOT NULL,
        upload_token BLOB,
        attempts INTEGER NOT NULL DEFAULT 0,
+       -- Backoff: a failing transfer waits and does not hold up the others (review M3-4).
+       next_attempt_ms INTEGER NOT NULL DEFAULT 0,
+       -- Automatic fresh re-uploads after the relay refused the upload token (review M3-7).
+       restarts INTEGER NOT NULL DEFAULT 0,
        timer_secs INTEGER,
        data BLOB
      );

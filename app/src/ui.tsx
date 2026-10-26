@@ -1,6 +1,6 @@
 // UI primitives ported from design/proto/ui.js (DESIGN.md §6). All text is rendered as React
 // text nodes; nothing is ever inserted as HTML.
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode, type RefObject } from "react";
 
 export function Icon({ name, className = "" }: { name: string; className?: string }) {
   return (
@@ -178,4 +178,35 @@ export function ToggleRow({ id, icon, tone = "", title, sub, checked, disabled =
       </span>
     </div>
   );
+}
+
+/**
+ * Keys for a modal dialog: Escape closes it from anywhere and Tab stays inside `box`
+ * (DESIGN.md §6, reviews M2-4 and M3-11).
+ */
+export function useDialogKeys(box: RefObject<HTMLElement | null>, onClose: () => void): void {
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab" || !box.current) return;
+      const items = Array.from(box.current.querySelectorAll<HTMLElement>("button:not([disabled])"));
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (!first || !last) return;
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || !box.current.contains(active))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (active === last || !box.current.contains(active))) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [box, onClose]);
 }

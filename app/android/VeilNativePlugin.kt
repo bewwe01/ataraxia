@@ -499,6 +499,12 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
    *  from Rust when the user taps Save; the bytes are written to that place only. */
   @Command
   fun saveFile(invoke: Invoke) {
+    // One at a time: a second save would otherwise write its bytes where the user chose to
+    // put the first file (review M3-10).
+    if (pendingSave != null) {
+      invoke.reject("Another save is still open", "FAILED")
+      return
+    }
     val args = invoke.parseArgs(SaveArgs::class.java)
     val bytes = try {
       Base64.decode(args.data, Base64.NO_WRAP)
@@ -506,7 +512,6 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
       invoke.reject("Bad file", "FAILED")
       return
     }
-    pendingSave?.let { Arrays.fill(it, 0) }
     pendingSave = bytes
     val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
       addCategory(Intent.CATEGORY_OPENABLE)

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, Manager as _, State};
 use veil_client::ClientError;
 use veil_client::service::{
-    AppState, AttachmentInput, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, NotifyView,
-    PrivacyView, SafetyView, SearchHit, SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
+    AppState, AttachmentInput, ChangeKind, Client, ContactView, InviteView, MAX_FILE, MeView, MessageView,
+    NotifyView, PrivacyView, SafetyView, SearchHit, SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
 };
 use veil_client::unlock::SecretKind;
 
@@ -297,34 +297,108 @@ struct AttachmentMeta {
     thumbnail: Option<Vec<u8>>,
 }
 
-/// Body: 4-byte big-endian length of a JSON [`AttachmentMeta`], the JSON, then the file. One
-/// binary IPC call, so a 25 MB file does not go through JSON.
-#[tauri::command]
-async fn send_attachment(c: State<'_, Client>, request: tauri::ipc::Request<'_>) -> Res<MessageView> {
-    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
-        return Err(err(ClientError::BadInput));
-    };
-    let (len, rest) = body
-        .split_at_checked(4)
-        .ok_or_else(|| err(ClientError::BadInput))?;
-    let len = usize::try_from(u32::from_be_bytes(
-        len.try_into().map_err(|_| err(ClientError::BadInput))?,
-    ))
-    .map_err(|_| err(ClientError::BadInput))?;
-    if len > 64 * 1024 {
-        return Err(err(ClientError::BadInput));
+/// A file on its way from the UI, sent in base64 parts: Android's IPC carries JSON only
+/// (no raw bodies), and one 33 MB string per send would be worse. One at a time; the bytes
+/// are wiped when the upload is sent, replaced, aborted, or Veil locks.
+struct Upload {
+    id: u64,
+    meta: AttachmentMeta,
+    data: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct Uploads(std::sync::Mutex<Option<Upload>>);
+
+impl Uploads {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<Upload>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    let (meta, data) = rest
-        .split_at_checked(len)
-        .ok_or_else(|| err(ClientError::BadInput))?;
-    let meta: AttachmentMeta = serde_json::from_slice(meta).map_err(|_| err(ClientError::BadInput))?;
+
+    fn begin(&self, meta: AttachmentMeta) -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        // Tells a stale part (from an upload since replaced) from the current one.
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.slot() = Some(Upload {
+            id,
+            meta,
+            data: Zeroizing::new(Vec::new()),
+        });
+        id
+    }
+
+    fn part(&self, upload: u64, part: &str) -> Result<(), ClientError> {
+        use base64::Engine as _;
+        let mut slot = self.slot();
+        let u = slot
+            .as_mut()
+            .filter(|u| u.id == upload)
+            .ok_or(ClientError::BadInput)?;
+        if part.len() > MAX_PART_CHARS {
+            return Err(ClientError::BadInput);
+        }
+        let bytes = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(part.as_bytes())
+                .map_err(|_| ClientError::BadInput)?,
+        );
+        let len = u.data.len().saturating_add(bytes.len());
+        if len > MAX_FILE {
+            *slot = None;
+            return Err(ClientError::BadInput);
+        }
+        // Grow by hand so no reallocation leaves an unwiped copy behind.
+        if u.data.capacity() < len {
+            let mut bigger = Zeroizing::new(Vec::with_capacity(
+                len.max(u.data.capacity().saturating_mul(2)).min(MAX_FILE),
+            ));
+            bigger.extend_from_slice(&u.data);
+            u.data = bigger;
+        }
+        u.data.extend_from_slice(&bytes);
+        Ok(())
+    }
+
+    fn take(&self, upload: u64) -> Option<Upload> {
+        let mut slot = self.slot();
+        if slot.as_ref().is_some_and(|u| u.id == upload) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    fn clear(&self) {
+        *self.slot() = None;
+    }
+}
+
+/// Largest base64 part accepted; the UI sends 1 MiB of file per part.
+const MAX_PART_CHARS: usize = 2 * 1024 * 1024;
+
+#[tauri::command]
+fn attachment_begin(uploads: State<'_, Uploads>, meta: AttachmentMeta) -> u64 {
+    uploads.begin(meta)
+}
+
+#[tauri::command]
+fn attachment_part(uploads: State<'_, Uploads>, upload: u64, part: Zeroizing<String>) -> Res<()> {
+    uploads.part(upload, &part).map_err(err)
+}
+
+#[tauri::command]
+async fn attachment_commit(
+    c: State<'_, Client>,
+    uploads: State<'_, Uploads>,
+    upload: u64,
+) -> Res<MessageView> {
+    let Upload { meta, data, .. } = uploads.take(upload).ok_or_else(|| err(ClientError::BadInput))?;
     c.send_attachment(
         meta.contact,
         AttachmentInput {
             kind: meta.kind,
             mime: meta.mime,
             name: meta.name,
-            data: Zeroizing::new(data.to_vec()),
+            data,
             thumbnail: meta.thumbnail,
             duration_ms: meta.duration_ms,
             waveform: meta.waveform,
@@ -332,6 +406,11 @@ async fn send_attachment(c: State<'_, Client>, request: tauri::ipc::Request<'_>)
     )
     .await
     .map_err(err)
+}
+
+#[tauri::command]
+fn attachment_abort(uploads: State<'_, Uploads>) {
+    uploads.clear();
 }
 
 /// The file of an attachment, as raw bytes for the UI to show or play. Display data: it is
@@ -512,10 +591,15 @@ async fn set_background(app: AppHandle, c: State<'_, Client>, on: bool) -> Res<(
 pub fn run() {
     let result = tauri::Builder::default()
         .plugin(native::plugin())
+        .manage(Uploads::default())
         .setup(|app| {
             let dir = data_dir(&app.path().app_data_dir()?)?;
             let handle = app.handle().clone();
             let notify = std::sync::Arc::new(move |kind: ChangeKind, contact: Option<i64>| {
+                if kind == ChangeKind::Locked {
+                    // A file half-way through `attachment_part` is not kept across a lock.
+                    handle.state::<Uploads>().clear();
+                }
                 if kind == ChangeKind::Incoming {
                     alert(&handle, contact.is_some());
                 }
@@ -574,7 +658,10 @@ pub fn run() {
             delete_for_me,
             search,
             verify_scanned,
-            send_attachment,
+            attachment_begin,
+            attachment_part,
+            attachment_commit,
+            attachment_abort,
             attachment_data,
             save_attachment,
             retry_attachment,
@@ -585,5 +672,74 @@ pub fn run() {
         .run(tauri::generate_context!());
     if result.is_err() {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use base64::Engine as _;
+
+    use super::*;
+
+    /// The JSON the UI sends to `attachment_begin` (`ipc.sendAttachment`).
+    fn meta() -> AttachmentMeta {
+        serde_json::from_str(
+            r#"{"contact":3,"kind":"voice","mime":"audio/webm","name":null,"durationMs":1500,
+                "waveform":[1,2,3],"thumbnail":null}"#,
+        )
+        .unwrap()
+    }
+
+    fn b64(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
+    }
+
+    #[test]
+    fn a_file_arrives_in_parts() {
+        let u = Uploads::default();
+        let id = u.begin(meta());
+        u.part(id, &b64(b"hello ")).unwrap();
+        u.part(id, &b64(b"world")).unwrap();
+        let up = u.take(id).unwrap();
+        assert_eq!(up.data.as_slice(), b"hello world");
+        assert_eq!(up.meta.contact, 3);
+        assert_eq!(up.meta.duration_ms, Some(1500));
+        assert!(u.take(id).is_none(), "taken once");
+    }
+
+    #[test]
+    fn unknown_fields_and_stale_parts_are_refused() {
+        assert!(
+            serde_json::from_str::<AttachmentMeta>(
+                r#"{"contact":1,"kind":"file","mime":"x/y","path":"/etc"}"#
+            )
+            .is_err()
+        );
+        let u = Uploads::default();
+        let old = u.begin(meta());
+        let new = u.begin(meta());
+        assert_eq!(u.part(old, &b64(b"x")), Err(ClientError::BadInput));
+        assert!(u.take(old).is_none());
+        assert_eq!(u.part(new, "not base64!"), Err(ClientError::BadInput));
+        u.clear();
+        assert!(u.take(new).is_none(), "a lock drops the upload");
+    }
+
+    #[test]
+    fn too_large_drops_the_upload() {
+        let u = Uploads::default();
+        let id = u.begin(meta());
+        let mib = b64(&vec![7u8; 1024 * 1024]);
+        for _ in 0..MAX_FILE / (1024 * 1024) {
+            u.part(id, &mib).unwrap();
+        }
+        assert_eq!(u.part(id, &b64(b"!")), Err(ClientError::BadInput));
+        assert!(u.take(id).is_none());
+        let id = u.begin(meta());
+        assert_eq!(
+            u.part(id, &"A".repeat(MAX_PART_CHARS + 4)),
+            Err(ClientError::BadInput)
+        );
     }
 }

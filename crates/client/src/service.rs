@@ -39,7 +39,7 @@ mod watcher;
 use crate::relay::{Relay, split_host_port};
 use crate::unlock::{self, SecretKind};
 use crate::{ClientError, Result, keystore, now_ms, now_secs, qr, write_atomic};
-pub use attachments::{AttachmentInput, AttachmentView, MAX_FILE, MAX_VOICE_MS};
+pub use attachments::{AUTO_DOWNLOAD_PER_DAY, AttachmentInput, AttachmentView, MAX_FILE, MAX_VOICE_MS};
 
 /// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
@@ -342,6 +342,8 @@ enum Cmd {
     Backdate(i64, i64, Reply<()>),
     #[cfg(feature = "test-hooks")]
     HiddenRows(i64, Reply<i64>),
+    #[cfg(feature = "test-hooks")]
+    RawUpload(Vec<u8>, Reply<Vec<u8>>),
     MarkRead(i64, Reply<()>),
     CreateInvite(Reply<InviteView>),
     AcceptInvite(String, Reply<ContactView>),
@@ -617,6 +619,12 @@ impl Client {
     #[cfg(feature = "test-hooks")]
     pub async fn hidden_rows(&self, contact: i64) -> Result<i64> {
         ask!(self, HiddenRows, contact)
+    }
+    /// Tests only: uploads any bytes as a blob (full-size chunks but the last) and returns its
+    /// id, for crafting `Attachment` messages a hostile contact could send.
+    #[cfg(feature = "test-hooks")]
+    pub async fn raw_upload(&self, ciphertext: Vec<u8>) -> Result<Vec<u8>> {
+        ask!(self, RawUpload, ciphertext)
     }
     pub async fn mark_read(&self, contact: i64) -> Result<()> {
         ask!(self, MarkRead, contact)
@@ -1280,6 +1288,11 @@ impl Actor {
             #[cfg(feature = "test-hooks")]
             Cmd::RawSend(c, id, body, r) => {
                 let res = self.raw_send(c, id, body).await;
+                let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::RawUpload(ct, r) => {
+                let res = self.raw_upload(&ct).await;
                 let _ = r.send(res);
             }
             #[cfg(feature = "test-hooks")]

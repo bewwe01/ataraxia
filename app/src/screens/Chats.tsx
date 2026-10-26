@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type Key
 import { AttachmentBody, PhotoViewer } from "../components/Attachment";
 import { formatDuration, MAX_VOICE_MS, prepareFile, startRecording, TooLarge, type Recording } from "../media";
 import { EDIT_WINDOW_MS, ipc, IpcError, timerName, timerShort, type ContactView, type Me, type MessageView } from "../ipc";
-import { Avatar, Banner, Icon, TopBar, VerifiedMark, timeLabel } from "../ui";
+import { Avatar, Banner, Icon, TopBar, VerifiedMark, timeLabel, useDialogKeys } from "../ui";
 
 export type Nav = (to: Route) => void;
 export type Route =
@@ -180,30 +180,7 @@ function MessageActions({ m, name, blocked, onClose, onReply, onEdit, onDone }: 
   const mineEmoji = m.reactions.find((r) => r.mine)?.emoji ?? null;
 
   // Escape closes from anywhere; Tab stays inside the dialog (DESIGN.md §6, review M2-4).
-  useEffect(() => {
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onClose();
-        return;
-      }
-      if (e.key !== "Tab" || !box.current) return;
-      const items = Array.from(box.current.querySelectorAll<HTMLElement>("button:not([disabled])"));
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (!first || !last) return;
-      const active = document.activeElement;
-      if (e.shiftKey && (active === first || !box.current.contains(active))) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && (active === last || !box.current.contains(active))) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  useDialogKeys(box, onClose);
   const canChange = withinEditWindow(m) && !blocked;
 
   async function run(f: () => Promise<void>, fallback: string, removed = false) {
@@ -263,6 +240,10 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
   const [messages, setMessages] = useState<MessageView[]>([]);
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  /** How the last file was sent, when the user should know (see `Prepared.note`). */
+  const [notice, setNotice] = useState<string | null>(null);
+  /** The recording stopped itself at MAX_VOICE_MS and waits for Send or Discard. */
+  const [atLimit, setAtLimit] = useState(false);
   const [sending, setSending] = useState(false);
   const [actionsFor, setActionsFor] = useState<MessageView | null>(null);
   const [replyTo, setReplyTo] = useState<MessageView | null>(null);
@@ -408,10 +389,13 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
     e.target.value = "";
     if (!file) return;
     setError(null);
+    setNotice(null);
     setSending(true);
     try {
-      const m = await ipc.sendAttachment(contact.id, await prepareFile(file));
+      const prepared = await prepareFile(file);
+      const m = await ipc.sendAttachment(contact.id, prepared);
       setMessages((prev) => [...prev, m]);
+      setNotice(prepared.note);
     } catch (err) {
       setError(err instanceof TooLarge ? "Files can be up to 25 MB." : err instanceof IpcError ? err.message : "Could not send this file");
     } finally {
@@ -421,8 +405,10 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
 
   async function startVoice() {
     setError(null);
+    setNotice(null);
+    setAtLimit(false);
     try {
-      setRecording(await startRecording());
+      setRecording(await startRecording(() => setAtLimit(true)));
     } catch {
       setError("Veil could not use the microphone. Allow it for Veil in your device's settings.");
     }
@@ -445,6 +431,7 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
     const r = recording;
     setRecording(null);
     setRecMs(0);
+    setAtLimit(false);
     if (!r) return;
     if (!send) {
       r.cancel();
@@ -581,6 +568,7 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
       </div>
       {tooOld ? <Banner tone="info" icon="info"><p>That message is older than the ones shown here.</p></Banner> : null}
       {error ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
+      {notice && !error ? <Banner tone="info" icon="info"><p>{notice}</p></Banner> : null}
       {contact.blocked ? (
         <div className="composer blocked-bar">
           <Banner tone="neutral" icon="ban">
@@ -602,10 +590,12 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
             </div>
           ) : null}
           {recording ? (
-            <div className="composer recording-bar" role="status" aria-live="polite">
+            <div className="composer recording-bar">
+              {/* Announced once per state; the running timer stays out of the live region. */}
+              <span className="sr-only" role="status">{atLimit ? "Recording stopped at the 5 minute limit" : "Recording"}</span>
               <button className="icon-btn" type="button" aria-label="Discard voice message" onClick={() => void finishVoice(false)}><Icon name="trash" /></button>
-              <span className="rec-dot" aria-hidden="true" />
-              <span className="rec-time">Recording · {formatDuration(recMs)} / {formatDuration(MAX_VOICE_MS)}</span>
+              {atLimit ? null : <span className="rec-dot" aria-hidden="true" />}
+              <span className="rec-time">{atLimit ? "Stopped" : "Recording"} · {formatDuration(recMs)} / {formatDuration(MAX_VOICE_MS)}</span>
               <button className="icon-btn accent send-btn" type="button" aria-label="Send voice message" onClick={() => void finishVoice(true)}><Icon name="send" /></button>
             </div>
           ) : (

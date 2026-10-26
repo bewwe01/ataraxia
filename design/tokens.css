@@ -458,6 +458,11 @@
 }
 
 :root {
+  /* Full-screen photo viewer: the same in every theme, like a darkroom. */
+  --media-backdrop: #000;
+  --on-media: #fff;
+  /* QR codes need a white quiet zone to scan, whatever the theme. */
+  --qr-paper: #fff;
   --sent-gradient: linear-gradient(135deg, var(--sent-a) 0%, var(--sent-b) 58%, var(--sent-c) 100%);
   --sent-bg: var(--sent-gradient);
   --sent-text: var(--text-on-accent);

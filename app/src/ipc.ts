@@ -62,7 +62,8 @@ export interface AttachmentView {
   mime: string;
   name: string | null;
   size: number;
-  state: "uploading" | "sent" | "downloading" | "ready" | "failed" | "too_large";
+  /** `available`: past the daily automatic-download allowance; the user taps to download. */
+  state: "uploading" | "sent" | "downloading" | "ready" | "failed" | "too_large" | "available";
   /** 0 to 1 while uploading or downloading. */
   progress: number;
   durationMs: number | null;
@@ -169,10 +170,23 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   }
 }
 
-/** One binary call: 4-byte length, JSON metadata, then the file (see `send_attachment`). */
-function attachmentBody(contact: number, a: OutgoingAttachment): Uint8Array {
-  const meta = new TextEncoder().encode(
-    JSON.stringify({
+const PART_BYTES = 1024 * 1024;
+
+function base64(bytes: Uint8Array): string {
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+/**
+ * A file goes to Rust in 1 MiB base64 parts: Android's IPC carries JSON only, so one raw body
+ * is not an option there (see `attachment_begin` in `lib.rs`).
+ */
+async function sendAttachment(contact: number, a: OutgoingAttachment): Promise<MessageView> {
+  const upload = await call<number>("attachment_begin", {
+    meta: {
       contact,
       kind: a.kind,
       mime: a.mime,
@@ -180,21 +194,17 @@ function attachmentBody(contact: number, a: OutgoingAttachment): Uint8Array {
       durationMs: a.durationMs,
       waveform: a.waveform ? Array.from(a.waveform) : null,
       thumbnail: a.thumbnail ? Array.from(a.thumbnail) : null,
-    }),
-  );
-  const body = new Uint8Array(4 + meta.byteLength + a.data.byteLength);
-  new DataView(body.buffer).setUint32(0, meta.byteLength);
-  body.set(meta, 4);
-  body.set(a.data, 4 + meta.byteLength);
-  return body;
-}
-
-async function callRaw<T>(cmd: string, body: Uint8Array): Promise<T> {
+    },
+  });
   try {
-    return await invoke<T>(cmd, body);
+    for (let at = 0; at < a.data.byteLength; at += PART_BYTES) {
+      await call<void>("attachment_part", { upload, part: base64(a.data.subarray(at, at + PART_BYTES)) });
+    }
   } catch (e) {
-    throw new IpcError(typeof e === "string" ? e : "Something went wrong");
+    await call<void>("attachment_abort").catch(() => undefined);
+    throw e;
   }
+  return call<MessageView>("attachment_commit", { upload });
 }
 
 export const ipc = {
@@ -234,7 +244,7 @@ export const ipc = {
   /** Checks a code scanned from the contact's phone; `true` means it matched and they are now verified. */
   verifyScanned: (contact: number, code: string) => call<boolean>("verify_scanned", { contact, code }),
   /** Encrypts and uploads a photo, file or voice note; the message goes out when it is uploaded. */
-  sendAttachment: (contact: number, a: OutgoingAttachment) => callRaw<MessageView>("send_attachment", attachmentBody(contact, a)),
+  sendAttachment,
   /** The file of an attachment that is here, to show, play or save. */
   attachmentData: (message: number) => call<ArrayBuffer>("attachment_data", { message }),
   /** Android: the system "save as" screen. Elsewhere this fails with "Unsupported". */

@@ -3503,3 +3503,202 @@ Fix (either one):
 
 ### Action options
 Recommended: **D. Review only**, or **C. Fix specific findings** for M2R2-2 (before milestone 3 adds the microphone) and M2R2-1. The remaining findings can be tracked in `veil-TODO.md`.
+
+## Milestone 3 review, round 1
+
+**Scope:** `git diff 5ae4a29 53e4f76` (commits 009ef1d and 53e4f76), plus `app/src/media.ts` and `app/android/VeilNativePlugin.kt` `saveFile` (from e6118f1). I checked the code against ADR-0015, PROTOCOL §9, INV-ATT-1..4 and CLAUDE.md's non-negotiables. I also read the code these changes depend on: the relay blob store (`crates/relay/src/store.rs` `put_chunk`/`get_chunk`, `server.rs` blob handlers), core `attachment.rs` and `content.rs` validation, and Tauri 2.12.4's IPC transport (`~/.cargo/registry/src/*/tauri-2.12.4/scripts/ipc-protocol.js`, `src/ipc/mod.rs`, `src/ipc/protocol.rs`).
+
+**Verdict: FAIL.** 1 Critical, 1 High, 3 Medium, 7 Low, 1 Info. The crypto and the hostile-relay and hostile-contact handling in Rust are sound. The blocking problems are on the app side:
+- Sending any attachment fails on Android, which is the shipped target (M3-1).
+- The webview probably writes plaintext photos to disk (M3-2).
+
+**Commands run** (on a temporary detached worktree of 53e4f76 with its own target dir; both removed afterwards):
+- `cargo test -p veil-client --locked --test attachments --test messaging`: attachments 4 passed, messaging 7 passed.
+- `cargo test -p veil-client --lib --locked`: 12 passed.
+- `cargo clippy -p veil-client --all-targets --locked -- -D warnings`: clean.
+- `cargo clippy -p veil-client --lib --locked -- -D warnings` (without `test-hooks`): clean.
+- `cargo fmt --all --check`: clean.
+- `pnpm typecheck`: clean. `pnpm lint`: "13 files clean".
+- Not run: `app/src-tauri` clippy (needs the webkit system libraries), the release workflow on a real APK, and anything on an Android device.
+
+### Milestone 2 round-2 fixes (in 009ef1d)
+
+| ID | Status |
+|---|---|
+| M2R2-1 | **Fixed.** In `receive` `Body::Text`, a repeated id with a new body updates only `mine = 0 AND kind = 'text' AND deleted = 0 AND at_ms > now-48h` rows and never adds a row. Tested in `crafted_content_from_a_contact_stays_in_its_lane`: their repeat edits, a repeat of our id does nothing. `Body::Attachment` repeats are dropped and never treated as edits. |
+| M2R2-2 | **Fixed.** `aapt2 dump permissions` plus the `sed` covers `uses-permission-sdk-23` and every namespace. The allowlist contains exactly what is declared (INTERNET, CAMERA, RECORD_AUDIO and MODIFY_AUDIO_SETTINGS from `harden.py`, the AndroidX biometric permissions, and `org.veil.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`, which matches `identifier: org.veil.app`). If aapt2 fails, `perms.txt` is empty and the trailing `grep -qx android.permission.CAMERA` fails the job, so it fails closed. I could not run it against a real APK. |
+| M2R2-3 | **Fixed.** "Delete for me" passes `removed = true`, and `closeActions(true)` focuses the composer. |
+| M2R2-4 | **Fixed.** `edit_and_delete_time_windows` uses the `backdate` hook to cover both windows (24 h for ours, 48 h for theirs). |
+| M2R2-5 | **Fixed.** `hidden_rows` asserts that the queued edit is gone after expiry. `edit_message`'s pending branch now returns `Blocked`. |
+
+### Findings
+
+**M3-1 Critical [HIGH]: sending a photo, file or voice note always fails on Android**
+`app/src-tauri/src/lib.rs:304` (`send_attachment`), `app/src/ipc.ts` (`callRaw`).
+
+The command only accepts `tauri::ipc::InvokeBody::Raw`. Tauri 2.12.4 never delivers a raw body on Android:
+- `ipc-protocol.js:20` says `canUseCustomProtocol = osName !== 'android'`, so every call goes through `postMessage`.
+- `process-ipc-message-fn.js` turns the `Uint8Array` into a JSON array.
+- `protocol.rs` `handle_ipc_message` builds `body: message.payload.into()`, which is `InvokeBody::Json`.
+- The Tauri docs at `src/ipc/mod.rs:55` say: "On Android, InvokeBody::Raw is not supported. The enum will always contain InvokeBody::Json."
+
+Failure scenario: on the release APK, every pick, photo or voice note returns `BadInput` ("Could not send…"). No test runs this path on Android. Desktop works.
+
+The reverse direction is fine: `attachment_data` returns a raw `Response`, which goes through a Channel fetch that Android allows.
+
+Fix:
+- Use a transport that works on Android. Preferred: chunked commands such as `attachment_begin(meta) -> handle`, `attachment_part(handle, base64 ≤ 1 MiB)` and `attachment_commit(handle)`. Bound the total at `MAX_FILE`, and wipe partial buffers on abort and on lock.
+- Alternatively, on Android only, send one JSON body with the file as a base64 string. This is what Tauri recommends, but it means a ~33 MB string per send.
+- Do not accept the JSON number-array form: that is about 100 MB of JSON for a 25 MB file.
+- Add an e2e or unit test that drives `send_attachment` with the JSON body shape Android produces.
+
+**M3-2 High [MEDIUM confidence: needs on-device confirmation]: the Android WebView can write plaintext photos and files to disk through Blob storage**
+`app/src/components/Attachment.tsx:20-43` (`useFileUrl`), `:116` (every `ImageAttachment` requests the full file), `:68-69` (`saveFile` desktop path).
+
+Chromium's `BlobMemoryController` keeps blobs in memory only up to `max_blob_in_memory_space`. On Android that is 1 % of RAM (about 30–80 MB). Above `memory_limit_before_paging`, it moves blob data into files under the profile's `blob_storage/` directory, here `app_webview/Default/blob_storage`. Large new blobs may also use the FILE transport directly. WebView profiles are not off-the-record, so file paging is enabled.
+
+Failure scenario:
+- A conversation with dozens of photos mounts one full-resolution `new Blob([buf])` per image. On a 3–4 GB phone, the live blob bytes go over the limit, especially with a 25 MB GIF (GIFs are inline images and are not re-encoded).
+- Chromium then writes the decrypted photos in plaintext to the app's data directory, outside SQLCipher.
+- This breaks non-negotiable 6 and INV-ATT-4 ("stored only inside SQLCipher").
+- M3-3 makes it worse, because every refresh creates a new set of blobs.
+
+Fix:
+- In the list, render only the inline thumbnail (≤ 8 KiB). Fetch the full image only in `PhotoViewer`, and keep at most one full-size blob alive at a time.
+- For voice notes, create the blob on Play and revoke it on pause, end or unmount.
+- Cap inline images at a few MB; larger GIFs show as a file.
+- Add a device test or written argument in INVARIANTS (INV-REST-1, INV-ATT-4): open a chat with many large images, then scan `app_webview/` for a canary.
+- Clear `blob_storage` at lock as defence in depth.
+
+**M3-3 Medium [HIGH]: any message event re-downloads every shown file and restarts a playing voice note**
+`app/src/components/Attachment.tsx:41` (`[m.id, ok, a]`), `:159-173` (VoiceNote effect), `app/src/App.tsx:84-87`.
+
+- Every `messages` change event, for any contact, bumps `version`. That includes progress events every 16 chunks of any transfer, receipts and new messages.
+- `Chat` then reloads, and every `AttachmentView` is a new object. The `a` dependency changes, so the effect revokes the URL, sets it to null (the thumbnail flashes) and calls `attachment_data` again.
+- Each call is an actor command that reads up to 25 MB from SQLCipher and copies it over IPC.
+- In `VoiceNote`, the new `url` creates a new `Audio` and calls `play()` from the start.
+
+Failure scenario: while you listen to a voice note, a message arrives or another transfer reports progress, and playback jumps back to 0:00. A chat with 20 photos re-reads all 20 full files about every 1 MB of any background transfer, which delays the user's own commands behind them.
+
+Fix:
+- Depend on primitives only: `[m.id, ok, a?.mime]`.
+- Keep the `Audio` element across URL changes. Call `play()` only from `toggle()`, never in the effect.
+- Combine with M3-2: fetch only on view or play.
+
+**M3-4 Medium [HIGH]: one failing transfer blocks all others for minutes, and a contact can stall the user's uploads**
+`crates/client/src/service/attachments.rs:246` (`ORDER BY message LIMIT 1`), `:285`, `:290-317` (`transfer_failed`), `service.rs:1038` (`wake_transfers` every 5 s tick).
+
+- `transfer_step` always picks the oldest pending transfer.
+- A failed request (for example `BlobGet` → `NotFound` for a blob id that does not exist) sets `transfers = false`. The next tick (5 s) picks the same row again. Only after 30 attempts does the row become `failed`.
+- So each bad transfer holds the queue for at least 150 s, and the `Attachment` message is sealed only after its upload.
+
+Failure scenario: a hostile (or just buggy) contact sends 50 `Attachment` messages with random blob ids. Their rows come before any later upload of ours. Every photo the user sends to anyone sits in "Encrypting and uploading · 0%" for about 2 hours. Expired blobs (30 days) cause the same stall by accident.
+
+Fix:
+- Treat `Rejected(NotFound)` on download as final: mark it `failed` at once.
+- Add a `next_attempt_ms` column with backoff, and select `WHERE next_attempt_ms <= now ORDER BY state = 'download', attempts, message`, so uploads go first and a failing row does not hold the head of the queue.
+- Test: a crafted `Attachment` with a missing blob, followed by an upload that must finish promptly.
+
+**M3-5 Medium [HIGH]: the client checks against a hostile relay or contact are untested, and two invariants over-claim**
+`crates/client/tests/attachments.rs`, `docs/INVARIANTS.md:49-50`.
+
+These checks have no test:
+- `download_step`: `total_chunks` mismatch, short non-last chunk, oversize chunk (`attachments.rs:509-513`).
+- `receive_attachment`: `padded_size` mismatch (`:602`) and `too_large`.
+- The path where a forged hash ends in `failed` and is never shown.
+- Repeated attachment ids.
+
+Mutating any of these lines would leave the suite green. Also:
+- INV-ATT-3 says "uploads/downloads" are tested, but only an upload resume is.
+- INV-ATT-4 says files are "stored only inside SQLCipher", but no test scans the data dir for an attachment canary (`pair_and_message.rs` scans only for text).
+
+Fix:
+- Use `raw_send` to send crafted `Attachment`s: wrong sha, `padded_size ≠ padded_size(size)`, `size > MAX_FILE`, a repeated id. Assert there is no row, or `failed`/`too_large`, and that `attachment_data` returns an error.
+- Add a `Proxy` mode that rewrites `BlobChunk` frames (total, length, bytes).
+- Add a download-resume test (cut the connection mid-download).
+- After the round trip, scan the data and temp dirs for the file's canary bytes.
+- Either add these or reduce the claims to match.
+
+**M3-6 Low [HIGH]: transfer bookkeeping is not atomic, and a download at `next == total` asks for a chunk that does not exist**
+`attachments.rs:386-393` (upload: delete chunk, then update `next_chunk`), `:516-527` and `:564-570` (download: delete chunks, then update state), `:497-500`.
+
+Failure scenario:
+- A crash or `SQLITE_FULL` between the two statements in `upload_step` leaves `next_chunk` pointing at a chunk that was deleted. Every later step fails, and after 30 attempts the upload is `failed`.
+- In download, if `finish_download` errors after `next_chunk = total`, the next step sends `BlobGet(chunk_index = total)`, gets `NotFound` 30 times, and then fails.
+
+Neither path leaks anything, but both waste attempts and leave the transfer for a manual retry.
+
+Fix:
+- Do each step's writes in one savepoint (no relay I/O inside), or update `next_chunk` before deleting the chunk.
+- In `download_step`, if `t.next >= t.total`, call `finish_download` directly.
+
+**M3-7 Low [HIGH]: a dead upload token is retried 30 times**
+`attachments.rs:341-359`, `:381-384`, relay `store.rs` `put_chunk` (`MAX_EXTRA_PUTS = 16`, 24 h token TTL, an incomplete blob expires with its token).
+
+Failure scenario: the phone stays locked or offline for more than 24 h with an upload pending, or 16 replies are lost. Every remaining `BlobPut` then returns `Unauthorized` or `Quota`. The client reuses the stored token for 30 attempts (about 2.5 min) and then shows "Not sent". A new token cannot finish the old blob id either (`Conflict`).
+
+Fix: on `Unauthorized` or `Quota` for a non-final chunk, call the existing `retry_attachment` path once automatically (fresh key, blob id and token; no nonce reuse) instead of counting attempts.
+
+**M3-8 Low [MEDIUM]: photo metadata stripping covers fewer formats than users will expect, and the WebP fallback mislabels the type**
+`app/src/media.ts:60-75`.
+
+- Only JPEG, PNG and WebP are re-encoded.
+- HEIC/HEIF (the default on many Samsung phones and on iPhone), AVIF, TIFF, and any photo whose `File.type` is empty are sent unchanged as files, with EXIF and GPS.
+- GIF is sent unchanged as an image.
+
+ADR-0015 does say "other files are sent unchanged", but the UI gives no hint. Separately, WebKit (Linux/macOS desktop) falls back from `toBlob("image/webp")` to PNG, yet the mime is hard-coded as `image/webp`.
+
+Fix:
+- Re-encode every `image/*` that `createImageBitmap` can decode, except SVG and animated GIF.
+- Use `out.type` as the mime.
+- When an image is sent as a file, say so: "Sent as a file; its location data is kept".
+
+**M3-9 Low [HIGH]: the microphone stays on after the 5-minute limit, and on setup errors**
+`app/src/media.ts:97-131`.
+
+- `autoStop` stops the `MediaRecorder` only. The stream tracks, the `AudioContext` and the 100 ms sampler keep running, and the bar shows times past "5:00 / 5:00", until the user taps.
+- If `new MediaRecorder(...)` or `new AudioContext()` throws after `getUserMedia`, the stream is never stopped, and the mic indicator stays on until the page reloads.
+
+Fix:
+- In `autoStop`, call `release()` and notify the UI so it shows the stopped state with Send/Discard.
+- Wrap everything after `getUserMedia` in `try { … } catch (e) { for (const t of stream.getTracks()) t.stop(); throw e; }`.
+
+**M3-10 Low [HIGH]: Android save keeps one global `pendingSave`, so a double tap can save the wrong file**
+`app/android/VeilNativePlugin.kt:346-367`, `Attachment.tsx:215` and `:262` (no in-flight guard).
+
+Failure scenario: the user taps Save on file A, then quickly on file B. The second call replaces `pendingSave`. The first picker's result writes B's bytes under the location and name the user chose for A. The second call then gets "Cancelled".
+
+Fix:
+- Reject `saveFile` while a save is pending (`invoke.reject("Busy", "FAILED")`), or key the bytes by invoke.
+- Disable the Save buttons while a save is in flight.
+
+**M3-11 Low: accessibility and design issues in the new UI**
+- `Attachment.tsx:248-268`: `PhotoViewer` is `aria-modal` but does not trap Tab and does not return focus to the photo button on close. The `MessageActions` dialog already does both; reuse that pattern.
+- `Chats.tsx:605`: the recording bar is `role="status" aria-live="polite"` and contains the running timer, so screen readers announce it every second. Put the live region on a static "Recording" label and keep the timer outside it, or use `aria-live="off"`.
+- `app.css:78-84`: raw `#000`/`#fff` break "only design tokens" in CLAUDE.md. Add viewer tokens to `tokens.css`.
+
+**M3-12 Low [HIGH]: no total storage limit for automatic downloads**
+`attachments.rs:599-631`.
+
+Every attachment of 25 MB or less from any contact is downloaded automatically and stored in full. Only the relay's per-mailbox upload-token rate limits how fast a contact can do this.
+
+Failure scenario: a hostile contact sends many 25 MB files over a few days. The vault grows by gigabytes, and the phone runs out of storage, which also breaks writes to the database.
+
+Fix: add a per-contact (or total) quota for files not yet opened. Above it, store the row as "tap to download" (state `available`, started by a command) instead of `download`.
+
+**M3-13 Info**
+- **Plaintext copies in memory are not wiped:** the Tauri request body, `data.to_vec()` in `send_attachment`, the `Response` vec in `attachment_data`, the JSON serialisation of `SaveArg`, and the Kotlin `String`/args. This is memory only and not at rest; note it in the threat model.
+- **Desktop save** depends on the webview's default download handling, because there is no `on_download` handler. WebView2 and WebKitGTK save to Downloads without a dialog. WKWebView may ignore the click. A Rust save dialog would make it explicit.
+- **Speed:** a transfer sends one 64 KiB chunk and waits for the reply before the next. At 300 ms RTT, 25 MB takes about 2 min, and auto-lock pauses it, as documented.
+- **`blob:` in the CSP is safe:** blob URLs can only be created by same-origin scripts, `script-src 'self'` still blocks inline script in any blob document, and no code navigates to a blob.
+
+### Good
+- **Hostile-relay handling on download is right:** the chunk count must equal the authenticated `total_chunks`, every non-final chunk must be full-size, the last one is bounded, the SHA-256 is checked before decrypting (constant-time, in the core), and a failure ends in `failed` and is never shown. A replayed or swapped blob cannot pass the hash.
+- **No nonce or key reuse:** a resumed upload re-sends stored ciphertext, and a retry re-encrypts under a fresh key, nonce prefix and blob id. Relay I/O is never inside `atomically`. The seal and the `state = 'sent'` update commit together.
+- **The run loop is designed well:** a `biased` select with commands first, transfers only when nothing else is ready, `wants_transfer` respects `idle_expired`, and every chunk request goes through `interruptible`, so lock and auto-lock pre-empt transfers.
+- **Contact input is cleaned at the boundary:** the core validates sizes, key lengths, mime and name, and the client re-checks `padded_size(size)`, cleans names (no paths, no control or bidi characters), keeps SVG out of inline images, and clamps voice duration.
+- **Deletion removes the file:** delete-for-everyone, a received delete, expiry and contact deletion all remove it (cascade with `foreign_keys = ON`, `secure_delete = ON`).
+- **The M2 round-2 fixes are clean and tested.** The release permission allowlist is now exact and fails closed.
+
+### Action options
+Recommended: **A. Fix all**, or at minimum **B. Fix blocking only** (M3-1, M3-2, then M3-3 to M3-5), then re-review.

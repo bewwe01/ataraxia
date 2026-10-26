@@ -67,7 +67,7 @@ pub type Events = Arc<Mutex<Vec<(ChangeKind, Option<i64>)>>>;
 pub struct User {
     pub client: Client,
     pub events: Events,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 /// A TCP hop between a client and the relay that can be cut, to take the client offline.
@@ -117,6 +117,25 @@ impl Proxy {
     }
 }
 
+impl User {
+    /// The user's data folder (database, keystore, everything Veil writes).
+    pub fn dir(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+/// Whether any file under `dir` (recursively) contains `needle`.
+pub fn tree_contains(dir: &Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(dir).unwrap().flatten().any(|e| {
+        let p = e.path();
+        if p.is_dir() {
+            tree_contains(&p, needle)
+        } else {
+            std::fs::read(&p).is_ok_and(|b| b.windows(needle.len()).any(|w| w == needle))
+        }
+    })
+}
+
 pub async fn user(r: &Relay, name: &str) -> User {
     user_at(r, &r.addr, name, None).await
 }
@@ -146,11 +165,7 @@ pub async fn user_at(r: &Relay, addr: &str, name: &str, invite_ttl: Option<Durat
         })
         .await
         .unwrap();
-    User {
-        client,
-        events,
-        _dir: dir,
-    }
+    User { client, events, dir }
 }
 
 pub fn start(dir: &Path, events: Events) -> Client {
