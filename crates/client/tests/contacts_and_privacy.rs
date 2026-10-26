@@ -535,3 +535,41 @@ async fn expired_invites_release_their_tokens() {
     }
     panic!("expired invites never gave their tokens back");
 }
+
+/// An unblock update that waited while offline must not reach them after a newer one: it
+/// names a token that was withdrawn since (review M1R2-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_unblock_update_is_never_delivered() {
+    let r = relay().await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    alice.client.set_blocked(a_bob.id, true).await.unwrap();
+
+    // Offline: unblock (token from the local spare pool, update queued), then block again.
+    hop.cut();
+    online(&alice.client, false).await;
+    alice.client.set_blocked(a_bob.id, false).await.unwrap();
+    let c = alice.client.contacts().await.unwrap();
+    assert!(c[0].unblock_pending, "the update is still waiting");
+    alice.client.set_blocked(a_bob.id, true).await.unwrap();
+
+    // Online: unblock for real, then reconnect so anything pending is retried.
+    hop.restore();
+    online(&alice.client, true).await;
+    alice.client.set_blocked(a_bob.id, false).await.unwrap();
+    hop.cut();
+    online(&alice.client, false).await;
+    hop.restore();
+    online(&alice.client, true).await;
+    assert!(!alice.client.contacts().await.unwrap()[0].unblock_pending);
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    within(Duration::from_secs(20), || async {
+        let m = bob.client.send(b_alice.id, "can you hear me".into()).await.ok()?;
+        (m.status == "sent").then_some(())
+    })
+    .await;
+    arrives(&alice.client, a_bob.id, "can you hear me").await;
+}

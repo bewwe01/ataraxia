@@ -197,7 +197,13 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
             ) : (
               <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => void act(() => ipc.setBlocked(contact.id, true), "Could not block")}><Icon name="ban" />Block {contact.name}</button>
             )}
-            <p className="hint">{contact.blocked ? "Unblocking needs the relay: Veil sends them a new address to write to." : "The relay will refuse their messages. They are not told, but they can notice that their messages fail."}</p>
+            <p className="hint">
+              {contact.blocked
+                ? "Unblocking needs the relay: Veil sends them a new address to write to."
+                : contact.unblockPending
+                  ? "Unblocked. Veil is still trying to send them their new address; until it arrives, their messages cannot reach you."
+                  : "The relay will refuse their messages. They are not told, but they can notice that their messages fail."}
+            </p>
             {confirmDelete ? (
               <div role="alertdialog" aria-labelledby="del-t" aria-describedby="del-d">
                 <Banner tone="danger" icon="trash">

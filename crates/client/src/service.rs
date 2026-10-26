@@ -59,6 +59,8 @@ const TOKEN_REMOVALS: usize = 64;
 const TYPING_RESEND: Duration = Duration::from_secs(4);
 /// A typing message older than this (by its sender's clock) is stale and not shown.
 const TYPING_STALE_MS: i64 = 15_000;
+/// While connected, retry failed messages and updates this often (not only on reconnect).
+const RETRY_EVERY: Duration = Duration::from_mins(1);
 const RECEIPTS: &str = "receipts";
 const TYPING: &str = "typing";
 const HEADER_FILE: &str = "vault.hdr";
@@ -116,6 +118,8 @@ pub struct ContactView {
     /// reinstalled Veil, possibly an impostor. Shown until the safety number is verified or
     /// the user dismisses it (INV-ID-2).
     pub key_warning: bool,
+    /// Unblocked, but the update with their new token has not reached them yet.
+    pub unblock_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -509,6 +513,7 @@ struct Session {
     more: bool,
     /// When we last told each contact "typing" (in memory only).
     typing_sent: HashMap<i64, Instant>,
+    last_retry: Instant,
 }
 
 struct Actor {
@@ -774,10 +779,16 @@ impl Actor {
         if s.relay.is_none() && Instant::now() >= s.next_attempt {
             self.connect().await;
         } else if s.relay.as_ref().is_some_and(Relay::is_open) {
+            let retry = s.last_retry.elapsed() >= RETRY_EVERY;
             if s.more {
                 self.sync().await;
             }
             self.flush_token_removals().await;
+            // A failed message or mailbox update is not left until the next reconnect
+            // (review M1R2-4).
+            if retry {
+                self.retry_failed().await;
+            }
         }
     }
 
@@ -1065,6 +1076,7 @@ impl Actor {
             backoff: Duration::from_secs(2),
             more: true,
             typing_sent: HashMap::new(),
+            last_retry: Instant::now(),
         }));
         self.emit(ChangeKind::Connection, None);
         Ok(())
@@ -1173,6 +1185,7 @@ impl Actor {
             backoff: Duration::from_secs(2),
             more: true,
             typing_sent: HashMap::new(),
+            last_retry: Instant::now(),
         }));
         self.expire_messages();
         let _ = self.cleanup_invites().await;
@@ -1391,13 +1404,19 @@ impl Actor {
             blocked,
             timer_secs,
             key_warning,
+            unblock_pending: conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE contact = ?1 AND mine = 1 AND kind = 'mailbox'
+                 AND envelope IS NOT NULL)",
+                [id],
+                |r| r.get(0),
+            )?,
         })
     }
 
     fn contacts(&self) -> Result<Vec<ContactView>> {
         let s = self.s()?;
         let mut stmt = s.db.conn().prepare(
-            "SELECT c.id FROM contacts c LEFT JOIN messages m ON m.contact = c.id
+            "SELECT c.id FROM contacts c LEFT JOIN messages m ON m.contact = c.id AND m.kind IN ('text', 'timer')
              GROUP BY c.id ORDER BY max(coalesce(m.at_ms, c.added_ms)) DESC",
         )?;
         let ids = stmt
@@ -1822,6 +1841,9 @@ impl Actor {
     }
 
     async fn retry_failed(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            s.last_retry = Instant::now();
+        }
         let Ok(s) = self.s() else { return };
         let ids: Vec<i64> =
             s.db.conn()
@@ -2092,10 +2114,17 @@ impl Actor {
             }
             // A new delivery token for this contact (they unblocked us). Moving to another
             // relay is not supported, so such an update is ignored.
+            // Only a newer one (by their clock) counts, as for timers (review M1R2-1).
             Body::MailboxUpdate(m) if m.relay_url.is_none() => {
                 conn.execute(
-                    "UPDATE contacts SET mailbox = ?2, token = ?3 WHERE id = ?1",
-                    params![contact, m.new_mailbox_id, m.new_delivery_token],
+                    "UPDATE contacts SET mailbox = ?2, token = ?3, mailbox_peer_ms = ?4
+                     WHERE id = ?1 AND mailbox_peer_ms < ?4",
+                    params![
+                        contact,
+                        m.new_mailbox_id,
+                        m.new_delivery_token,
+                        i64::try_from(sent_at_ms).unwrap_or(i64::MAX)
+                    ],
                 )?;
             }
             _ => {}
@@ -2267,9 +2296,11 @@ impl Actor {
         // The notice is stored like a message, so it is retried until it gets through.
         let id = self
             .atomically(async {
+                // Our change counts in the ordering too, so the later of two simultaneous
+                // changes (by wall clock) wins on both sides (review M1R2-2).
                 s.db.conn().execute(
-                    "UPDATE contacts SET timer_secs = ?2 WHERE id = ?1",
-                    params![contact, secs],
+                    "UPDATE contacts SET timer_secs = ?2, timer_peer_ms = max(timer_peer_ms, ?3) WHERE id = ?1",
+                    params![contact, secs, now_ms()],
                 )?;
                 // An older change still waiting to go out must not arrive after this one.
                 s.db.conn().execute(
@@ -2304,6 +2335,17 @@ impl Actor {
         if contacts.is_empty() {
             return;
         }
+        // Unread rows are the newest incoming ones: take the expired ones among them off the
+        // count before they go (review M1-11, M1R2-3).
+        for c in &contacts {
+            let _ = s.db.conn().execute(
+                "UPDATE contacts SET unread = max(0, unread - (SELECT count(*) FROM (
+                   SELECT expires_at_ms FROM messages WHERE contact = ?1 AND mine = 0 AND kind = 'text'
+                   ORDER BY id DESC LIMIT (SELECT unread FROM contacts WHERE id = ?1))
+                 WHERE expires_at_ms <= ?2)) WHERE id = ?1",
+                params![c, now],
+            );
+        }
         if s.db
             .conn()
             .execute("DELETE FROM messages WHERE expires_at_ms <= ?1", [now])
@@ -2311,12 +2353,7 @@ impl Actor {
         {
             return;
         }
-        // An unread count cannot outlive the messages it counts (review M1-11).
-        let _ = s.db.conn().execute(
-            "UPDATE contacts SET unread = min(unread, (SELECT count(*) FROM messages m
-             WHERE m.contact = contacts.id AND m.mine = 0 AND m.kind = 'text'))",
-            [],
-        );
+
         for c in contacts {
             self.emit(ChangeKind::Messages, Some(c));
         }
@@ -2324,6 +2361,15 @@ impl Actor {
     }
 
     // ---- contacts: delete, block ----
+
+    fn drop_pending_mailbox_updates(db: &Db, contact: i64) -> Result<()> {
+        db.conn().execute(
+            "UPDATE messages SET envelope = NULL WHERE contact = ?1 AND mine = 1 AND kind = 'mailbox'
+             AND envelope IS NOT NULL",
+            [contact],
+        )?;
+        Ok(())
+    }
 
     fn queue_token_removal(db: &Db, token: &[u8]) -> Result<()> {
         db.conn().execute(
@@ -2442,6 +2488,8 @@ impl Actor {
                 s.db.conn()
                     .execute("UPDATE contacts SET blocked = 1 WHERE id = ?1", [contact])?;
                 Self::queue_token_removal(&s.db, &my_token)?;
+                // An unblock update still waiting to go out names the token withdrawn here.
+                Self::drop_pending_mailbox_updates(&s.db, contact)?;
                 Ok(())
             })
             .await?;
@@ -2482,6 +2530,8 @@ impl Actor {
                     "UPDATE contacts SET blocked = 0, my_token = ?2 WHERE id = ?1",
                     params![contact, token.to_vec()],
                 )?;
+                // Only the newest update may reach them (review M1R2-1).
+                Self::drop_pending_mailbox_updates(&s.db, contact)?;
                 s.db.conn().execute(
                     "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope)
                      VALUES (?1, 1, 'mailbox', '', ?2, 'sending', ?3)",

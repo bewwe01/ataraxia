@@ -3090,3 +3090,158 @@ Fix M1-1. Fix M1-2 to M1-7, or record an accepted rationale for each in ADR-0013
 
 ### Action options
 Recommended: **B. Fix blocking only** (M1-1 to M1-8), then re-run the gate. Alternatives: A (everything, Low included), C (pick by id), D (report only).
+
+## Milestone 1 review, round 2
+
+**Scope:** commit 18fb4a6 (`git diff 66005d3 18fb4a6`, 8 files, +576/−94). Where the fixes touch other milestone code, I re-checked it against `git diff 900c68d 18fb4a6`. Every claim below was checked in the code, not the commit message.
+
+**Commands run:**
+- `cargo test -p veil-client --test contacts_and_privacy`: 7/7 passed in 12.5 s.
+- The same test binary, three copies at once plus two busy-loop CPU hogs on a 4-core machine: 3 × 7/7 passed, about 15.6 s each.
+- `cargo test -p veil-client --lib`: 10/10 passed.
+- `cargo clippy -p veil-client --all-targets -- -D warnings`: clean.
+- Release history (`gh run list --workflow release.yml`, `gh api …/releases`): see "Edited migration 1" below.
+
+**Verdict: PASS WITH CONDITIONS.** M1-1 (High) is fixed. M1-2 to M1-6, M1-8, M1-9, M1-12 and M1-13 are fixed. M1-10, M1-14 and M1-15 are documented. M1-7 and M1-11 are only partly fixed (M1R2-2, M1R2-3). There are no new Critical or High findings. The condition is one new Medium: M1R2-1, where an older stored `mailbox` update can be retried after a newer one and cut the contact off. Fix it, with a test, before the milestone is released.
+
+### Round-1 findings
+
+| ID | Sev. | Status | Checked against the code |
+|---|---|---|---|
+| M1-1 | High | **Fixed** | `Chats.tsx` clamps the delay to 2 147 483 647 ms and returns `prev` when nothing expired, so the effect does not re-run and the loop is gone. |
+| M1-2 | Med | **Fixed** | `deliver()` joins on `c.blocked = 0` (service.rs:1788). `retry_failed` filters both messages and intros on `blocked = 0`. `send_ephemeral` already did. `block_while_offline` covers this. |
+| M1-3 | Med | **Fixed**, new issue M1R2-1 | `unblock` stores the sealed `MailboxUpdate` as a hidden `kind='mailbox'` row and returns Ok. `messages()` shows only `text`/`timer`, `contact_view` shows only `text`, and receipts only match `kind='text'` or non-NULL `msg_id`. Retry has two gaps: older rows are not superseded (M1R2-1), and retries happen only on reconnect (M1R2-4). |
+| M1-4 | Med | **Fixed** | Turning receipts on sets `receipt = 2` for every incoming row. The test now asserts that "one" stays `sent`; the pre-fix code would have failed it. |
+| M1-5 | Med | **Fixed** (UI, untested) | `markRead` only runs when the window is visible and `hasFocus()`, and again on `visibilitychange`/`focus`. The listeners are removed on cleanup. Still to confirm on an Android device: `visibilityState` must turn `hidden` when the app goes to the background. |
+| M1-6 | Med | **Fixed** | A final `Rejected` (anything except `RateLimited`) marks the chunk as sent, so it is not sealed and sent again on every sync. `QuotaExceeded` (their mailbox is full) also counts as final, so those receipts are lost. That fits ADR-0013's "best effort". |
+| M1-7 | Med | **Partly fixed** | Fixed: a superseded retry. `set_timer` clears the envelopes of older `timer` rows, and receive only applies a change newer than `timer_peer_ms`. Not fixed: simultaneous changes still swap (M1R2-2). |
+| M1-8 | Med | **Fixed** | `messages()` no longer filters expired rows, so the expiry tests now see the sweeper. New tests: `expired_unsent_message_is_never_sent`, `block_while_offline` and `expired_invites_release_their_tokens`, plus a dismissal check. The core prekey sweep is covered by `account.rs:1389` and `session.rs:384`. |
+| M1-9 | Low | **Fixed** | `upsert_contact` queues the new token for removal when the contact is still blocked. `unblock` queues the old `my_token`. |
+| M1-10 | Low | **Documented** | INV-ID-2 and ADR-0013 now state the limits: the warning is name-based, only on the inviting side, and lookalike letters get past it. |
+| M1-11 | Low | **Partly fixed** | `unread = min(unread, remaining incoming texts)` only works once *all* incoming texts are gone (M1R2-3). |
+| M1-12 | Low | **Fixed** | `create_invite` queues the token for removal on any error after `take_token`. |
+| M1-13 | Low | **Fixed** | "Cancel" has `autoFocus`, and focus goes back to "Delete contact" through a ref. |
+| M1-14 | Info | **Documented** | Recorded as accepted in ADR-0013. |
+| M1-15 | Info | **Fixed and documented** | An incoming `Text` with no timer gets our local timer. |
+
+### Questions asked for this round
+
+**Edited migration 1.** It is unreleased.
+- The newest successful release run built 75a3baf (2026-10-26), whose `db.rs` has no `MIGRATIONS`. Releases v0.1.0-preview.1 to 3 are older still.
+- The one other recent run, d697de0 on branch `outsiders`, failed. That commit is not in this clone, so I could not inspect it.
+- So no released build has `user_version = 1`.
+- A developer database created by a local build of 66005d3 would be at version 1 without `timer_peer_ms`. Every incoming `TimerUpdate` would then fail with a storage error. Delete such databases; no code change is needed.
+
+**`Client::start_with_invite_ttl`.**
+- It is `#[doc(hidden)] pub`, like the existing `start_with_auto_lock`. Only the integration test calls it.
+- Rust code in the same process is trusted and the webview cannot reach it, so there is no realistic risk. Note that it passes `guard = None`, so it must never be used by the app.
+
+**Receipts treated as sent on a final rejection.** Correct. The hostile relay could drop them anyway, so it gains nothing.
+
+**The new tests.**
+- They prove what INVARIANTS.md now says. INV-CONT-1 is "removal flushed on reconnect after an offline block", not "across a restart", but the queue lives in the database, so the written argument covers restarts.
+- The proxy correctly cuts live connections (watch channel) and refuses new ones.
+- Timing margins:
+  - `online(…, 40 s)` covers reconnect backoff for offline periods up to about 30 s. These tests stay offline for at most about 10 s.
+  - `expired_invites_release_their_tokens` allows 24 s for a 4 s TTL, a 5 s tick and 1/s token updates.
+  - All passed under load.
+- One weakness: `block_while_offline` proves a negative ("queued before the block" never arrives) with a fixed 500 ms sleep. A mutation would be caught on an idle machine but could slip through on a slow one. Acceptable for now.
+
+---
+
+### M1R2-1 — Medium [HIGH] — `crates/client/src/service.rs:2458-2505` (`unblock`), `2095` (receive `MailboxUpdate`): an older pending `mailbox` row is retried after a newer one and points the contact at a withdrawn token
+
+**Description.**
+- Nothing supersedes earlier `kind='mailbox'` rows: not `unblock`, not `set_blocked(true)`. `retry_failed` re-sends every pending row once the contact is unblocked.
+- The receiving side applies each `MailboxUpdate` in arrival order, with no ordering check.
+- Each new unblock withdraws the token carried by the previous one (`queue_token_removal(old)`).
+
+**Failure scenario.**
+1. Alice unblocks Bob while her connection is down. The token comes from the local spare pool. Row A (token T1) stays pending.
+2. She blocks Bob again, which withdraws T1. She then unblocks him while online: row B (T2) is delivered at once.
+3. On her next reconnect, `retry_failed` delivers row A.
+4. Bob switches to the withdrawn T1. All his deposits to Alice now fail with `Unauthorized`. Alice's UI says "unblocked", and nothing repairs this short of another block and unblock or a new invite.
+
+**Fix.**
+1. In both the block and unblock `atomically` blocks, drop older pending updates:
+   ```rust
+   s.db.conn().execute(
+       "UPDATE messages SET envelope = NULL WHERE contact = ?1 AND mine = 1 AND kind = 'mailbox' AND envelope IS NOT NULL",
+       [contact],
+   )?;
+   ```
+   In `unblock`, run this before the `INSERT`.
+2. Optionally, order on receive as well: store `mailbox_peer_ms` and apply only when `sent_at_ms` is newer, as is done for `timer_peer_ms`.
+3. Add a test: proxy cut, unblock, block, restore, unblock, reconnect again; then Bob → Alice must still deliver.
+
+### M1R2-2 — Low [HIGH] — `crates/client/src/service.rs:2052` (receive `TimerUpdate`) and `set_timer`: simultaneous timer changes still swap (rest of M1-7)
+
+**Description.** `timer_peer_ms` only orders the *peer's* changes against each other. A local change does not update it, and an incoming change is not compared with it.
+
+**Failure scenario.** Alice sets 5 min and Bob sets 1 week within the same few seconds. Each applies the other's update, so Alice ends up on 1 week and Bob on 5 min. Each side's messages then carry a different timer.
+
+**Fix.**
+- In `set_timer`, also record the local change time: `UPDATE contacts SET timer_secs = ?2, timer_peer_ms = max(timer_peer_ms, ?3)` with `?3 = now_ms()`.
+- On receive, keep the `timer_peer_ms < sent` guard. The later change by wall clock then wins on both sides.
+- Mention the clock dependency in ADR-0013.
+
+### M1R2-3 — Low [HIGH] — `crates/client/src/service.rs:2314-2319` (`expire_messages`): the unread badge still outlives expired messages when older messages remain (rest of M1-11)
+
+**Description.** `min(unread, count of remaining incoming texts)` only shrinks the badge when fewer incoming texts are left than the count.
+
+**Failure scenario.**
+1. Alice and Bob have 20 old messages with no timer.
+2. Bob turns on a 5-minute timer and sends 3 messages while Alice is away. They expire.
+3. Alice's badge still shows 3 over an empty stretch of the chat. M1-11 is exactly this case.
+
+**Fix.** Before the `DELETE`, for each affected contact, compute how many of the newest `unread` incoming text rows are expired, and subtract that. Unread rows are always the newest incoming ones. For example, in Rust, per contact:
+```rust
+let n: i64 = conn.query_row(
+    "SELECT count(*) FROM (SELECT expires_at_ms FROM messages WHERE contact = ?1 AND mine = 0 AND kind = 'text'
+     ORDER BY id DESC LIMIT (SELECT unread FROM contacts WHERE id = ?1)) WHERE expires_at_ms <= ?2",
+    params![c, now], |r| r.get(0))?;
+conn.execute("UPDATE contacts SET unread = max(0, unread - ?2) WHERE id = ?1", params![c, n])?;
+```
+
+### M1R2-4 — Low [HIGH] — `crates/client/src/service.rs:810` (only `connect()` calls `retry_failed`): a failed `MailboxUpdate` waits for the next reconnect, and is silently abandoned after `MAX_ATTEMPTS`
+
+**Description.**
+- `unblock` returns Ok even when the immediate `deliver` failed.
+- The row is hidden, and it is retried only when the connection is re-established. On a stable desktop connection that can be days.
+- After 20 failed attempts it is never retried, and nothing tells the user.
+
+**Failure scenario.** Alice unblocks Bob while online, and the relay answers `RateLimited` (or Bob's mailbox is `QuotaExceeded`). Alice stays connected all day. Bob keeps using the withdrawn token and every message he sends fails, while Alice's UI says "unblocked".
+
+**Fix.**
+- Retry pending rows on `on_tick` while online, throttled (for example when the oldest pending row's last attempt is more than 60 s old). Alternatively, retry only `kind IN ('mailbox','timer')` on tick.
+- Expose a pending-unblock state in `ContactView`, for example `unblock_pending: bool` from `EXISTS(… kind='mailbox' AND envelope IS NOT NULL)`, so the UI can say "Unblocking…" or "Could not reach them".
+
+### M1R2-5 — Nit — `docs/ARCHITECTURE.md` ADR-0013 (disappearing messages), `crates/client/src/service.rs:1401`
+
+**Description.**
+- The ADR still says "queries also hide expired rows in between". `messages()` (service.rs:1413) no longer does: the webview hides them, and Rust deletes them within 5 s.
+- `contacts()` orders conversations by `max(m.at_ms)` over *all* rows. A hidden `mailbox` row therefore moves an unblocked contact to the top of the chat list, with an older last-message preview.
+
+**Fix.**
+- Change the ADR sentence to: "the message list hides them on time in the UI".
+- In `contacts()`, join `ON m.contact = c.id AND m.kind IN ('text','timer')`.
+
+---
+
+### Good
+- **Blocking is now airtight on the send side.** All four send paths check `blocked`: `deliver`, `retry_failed` messages, `retry_failed` intros and `send_ephemeral`. A mutation-checked test covers the offline case.
+- **Storing the unblock update reuses existing machinery.** The `mailbox` row follows the envelope and attempts logic already used for messages. It never reaches `messages()`, previews or receipts, and it carries no expiry, so the sweeper cannot drop it.
+- **`create_invite` is split cleanly** into `take_token` and `publish_invite`, with removal on any error, which closes the M1-12 gap without duplicating code.
+- **The expiry tests now observe the sweeper itself**, because the list no longer filters expired rows. The test harness (cuttable proxy, tunable relay quotas, invite-TTL hook) is reusable and held up under CPU contention.
+- **The UI fixes are minimal and correct.** The timer is clamped and the effect no longer loops, read state follows visibility and focus with clean listener teardown, and focus is handled correctly in the delete dialog.
+
+### Required before release
+- Fix M1R2-1 and add its test.
+- M1R2-2 to M1R2-5 can follow in a later change, or be recorded as accepted in ADR-0013.
+- Confirm M1-5 on an Android device: `visibilityState` must turn `hidden` in the background.
+
+### Action options
+Recommended: **B. Fix blocking only** (M1R2-1). Alternatives:
+- **A.** Fix everything, M1R2-1 to M1R2-5.
+- **C.** Pick findings by id.
+- **D.** Keep the report only, no fixes.

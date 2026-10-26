@@ -29,6 +29,8 @@ export interface ContactView {
   timerSecs: number;
   /** Arrived with the same name as an existing contact, under a different key. */
   keyWarning: boolean;
+  /** Unblocked, but they have not received their new address yet. */
+  unblockPending: boolean;
 }
 
 export type MessageStatus = "sending" | "sent" | "failed" | "delivered" | "read" | "received";

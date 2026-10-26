@@ -2,6 +2,34 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Milestone 1: contacts and conversation privacy (2026-10-26)
+
+ADR-0013: key-change warning, delete and block, disappearing messages, opt-in read receipts and typing indicators, invite token cleanup. Review gate: round 1 **FAIL** (M1-1 High, a render loop in the chat's expiry timer, and seven Mediums), all fixed in 18fb4a6; round 2 **PASS WITH CONDITIONS**. The condition, M1R2-1 (a stale unblock update could cut a contact off), is fixed with a mutation-checked test, and so are the round-2 Lows and the nit (M1R2-2 to M1R2-5). Both reports are in REVIEW_REPORT.md. No dependency changed, so the supply-chain checks were not re-run.
+
+```text
+$ cargo fmt --all --check                                          # FMT_OK
+$ cargo clippy --workspace --all-targets --locked -- -D warnings   # exit 0
+$ (app/src-tauri) cargo clippy --all-targets --locked -- -D warnings   # exit 0 (desktop target)
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build            # TSC_OK; lint: 9 files clean; built
+$ cargo test --workspace --locked
+  veil_client unit 10 | contacts_and_privacy 8 | lock_and_setup 3 | pair_and_message 2 | unlock_options 5
+  veil_core 76 | secrets 3 | session 23 (+1 ignored)
+  veil_relay lib 25 | logs 1 | relay 24 | smoke 0 (+2 ignored) | veil_wire 5     all ok
+```
+
+New tests: `contacts_and_privacy` (8, through a real relay; a cuttable TCP proxy takes a client offline), `session::forgotten_contact_is_a_stranger_until_a_new_invite`, `db::tests::migrates_an_old_database_once`. Mutation checks, each by editing the code, running the test and restoring:
+
+| Mutation | Test | Result |
+|---|---|---|
+| sweeper deletes nothing | `expired_unsent_message_is_never_sent` | fails |
+| expired invites never queued for removal | `expired_invites_release_their_tokens` | fails |
+| both blocked-contact send guards removed | `block_while_offline` | fails (either guard alone still stops the send) |
+| stale unblock updates neither dropped nor ordered | `stale_unblock_update_is_never_delivered` | fails |
+
+UI: the new screens were rendered with a mocked IPC in headless Chromium at 411×923 CSS px, light and dark (chat list, timer, key warning, blocked, contact page, delete confirmation, settings). There was no overflow and no target under 44 px. By eye this found and fixed chat rows that did not fill the list width (older than this milestone).
+
+Not verified: nothing here ran on a phone. In particular, "read only while visible" depends on Android reporting the app as hidden in the background (review M1-5). That is part of the preview.4 device checklist.
+
 ## Unlock options: after review rounds 1–3 (2026-10-25)
 
 Gate rounds 1 and 2 returned FAIL (U-1/U-2 High, then UR2-1 High); round 3 returned **PASS WITH CONDITIONS** (no Critical/High). The condition, UR3-1, is fixed: a Purge PIN entered during a retry delay now gets the same "try again later" answer as any other attempt then. The round-3 Lows UR3-2 to UR3-5 are fixed too. All three reports are in REVIEW_REPORT.md.
