@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
 import { Banner, Icon, QrCode, Segmented, TopBar } from "../ui";
 import { KeyWarning, type Nav } from "./Chats";
@@ -82,6 +82,16 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   const [name, setName] = useState(contact.name);
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const deleteBtn = useRef<HTMLButtonElement>(null);
+  const reopenFocus = useRef(false);
+
+  // Focus goes back to "Delete contact" when the confirmation closes (review M1-13).
+  useEffect(() => {
+    if (!confirmDelete && reopenFocus.current) {
+      reopenFocus.current = false;
+      deleteBtn.current?.focus();
+    }
+  }, [confirmDelete]);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -194,13 +204,13 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
                   <strong id="del-t">Delete {contact.name}?</strong>
                   <p id="del-d">The conversation and the encryption session are deleted from this device, and the relay refuses their messages. To talk again, one of you needs a new invite. This cannot be undone.</p>
                   <div className="banner-actions">
-                    <button className="btn btn-secondary" type="button" onClick={() => setConfirmDelete(false)}>Cancel</button>
+                    <button className="btn btn-secondary" type="button" autoFocus onClick={() => { reopenFocus.current = true; setConfirmDelete(false); }}>Cancel</button>
                     <button className="btn btn-danger" type="button" disabled={busy} onClick={() => void remove()}>Delete</button>
                   </div>
                 </Banner>
               </div>
             ) : (
-              <button className="btn btn-danger-ghost btn-block" type="button" disabled={busy} onClick={() => setConfirmDelete(true)}><Icon name="trash" />Delete contact</button>
+              <button ref={deleteBtn} className="btn btn-danger-ghost btn-block" type="button" disabled={busy} onClick={() => setConfirmDelete(true)}><Icon name="trash" />Delete contact</button>
             )}
           </div>
           {error ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}

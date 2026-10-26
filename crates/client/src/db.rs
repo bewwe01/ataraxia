@@ -46,6 +46,7 @@ const MIGRATIONS: &[&str] = &[
     // 1: blocking, disappearing messages, the key-change warning, receipts.
     "ALTER TABLE contacts ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE contacts ADD COLUMN timer_secs INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE contacts ADD COLUMN timer_peer_ms INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE contacts ADD COLUMN key_warning INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'text';
      ALTER TABLE messages ADD COLUMN msg_id BLOB;

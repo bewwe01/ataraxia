@@ -43,7 +43,7 @@ const FETCH_LIMIT: u32 = 8;
 /// Give up re-sending a message after this many failed deposits.
 const MAX_ATTEMPTS: i64 = 20;
 const TICK: Duration = Duration::from_secs(5);
-const INVITE_TTL_SECS: u64 = 24 * 3600;
+const INVITE_TTL: Duration = Duration::from_hours(24);
 const MAX_NAME: usize = 64;
 /// Delivery tokens registered with the relay per batch.
 const TOKEN_BATCH: usize = 8;
@@ -310,6 +310,28 @@ impl Client {
         auto_lock: Duration,
         guard: keystore::Guard,
     ) -> Result<Self> {
+        Self::start_inner(dir, kdf, notify, auto_lock, guard, INVITE_TTL)
+    }
+
+    /// [`Client::start`] with short-lived invites, so tests can watch them expire.
+    #[doc(hidden)]
+    pub fn start_with_invite_ttl(
+        dir: PathBuf,
+        kdf: KdfParams,
+        notify: Notify,
+        ttl: Duration,
+    ) -> Result<Self> {
+        Self::start_inner(dir, kdf, notify, AUTO_LOCK, None, ttl)
+    }
+
+    fn start_inner(
+        dir: PathBuf,
+        kdf: KdfParams,
+        notify: Notify,
+        auto_lock: Duration,
+        guard: keystore::Guard,
+        invite_ttl: Duration,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(32);
         let interrupt = Arc::new(Interrupt::default());
         let actor_interrupt = Arc::clone(&interrupt);
@@ -322,7 +344,16 @@ impl Client {
                 let local = tokio::task::LocalSet::new();
                 local.block_on(
                     &rt,
-                    Actor::new(dir, kdf, notify, actor_interrupt, auto_lock, guard).run(rx),
+                    Actor::new(
+                        dir,
+                        kdf,
+                        notify,
+                        actor_interrupt,
+                        auto_lock,
+                        guard,
+                        invite_ttl.as_secs(),
+                    )
+                    .run(rx),
                 );
             })
             .map_err(|_| ClientError::Storage)?;
@@ -492,6 +523,7 @@ struct Actor {
     /// Set after a Purge PIN: until Veil restarts, the lock screen keeps behaving like the
     /// vault that is gone (review U-4).
     decoy: Option<Decoy>,
+    invite_ttl_secs: u64,
 }
 
 struct Decoy {
@@ -637,6 +669,7 @@ impl Actor {
         interrupt: Arc<Interrupt>,
         auto_lock: Duration,
         guard: keystore::Guard,
+        invite_ttl_secs: u64,
     ) -> Self {
         Self {
             dir,
@@ -648,6 +681,7 @@ impl Actor {
             auto_lock,
             guard,
             decoy: None,
+            invite_ttl_secs,
         }
     }
 
@@ -1376,10 +1410,11 @@ impl Actor {
         let s = self.s()?;
         let mut stmt = s.db.conn().prepare(
             "SELECT id, mine, body, at_ms, status, kind, expires_at_ms FROM messages WHERE contact = ?1
-             AND (expires_at_ms IS NULL OR expires_at_ms > ?2) ORDER BY id DESC LIMIT 500",
+             AND kind IN ('text', 'timer') ORDER BY id DESC LIMIT 500",
         )?;
+        // Expired rows are deleted by the tick (at most 5 s late); the UI hides them on time.
         let mut out = stmt
-            .query_map(params![contact, now_ms()], message_row)?
+            .query_map([contact], message_row)?
             .collect::<core::result::Result<Vec<_>, _>>()?;
         out.reverse();
         Ok(out)
@@ -1484,8 +1519,20 @@ impl Actor {
     }
 
     async fn create_invite(&mut self) -> Result<InviteView> {
-        let s = self.s()?;
         let token = self.take_token().await?;
+        let r = self.publish_invite(token).await;
+        if r.is_err()
+            && let Ok(s) = self.s()
+        {
+            // The relay already accepts this token; no invite carries it (review M1-12).
+            let _ = Self::queue_token_removal(&s.db, &token);
+        }
+        r
+    }
+
+    async fn publish_invite(&self, token: [u8; 32]) -> Result<InviteView> {
+        let s = self.s()?;
+        let ttl = self.invite_ttl_secs;
         let now = now_secs();
         let created = s
             .account
@@ -1497,10 +1544,10 @@ impl Actor {
                 s.mailbox,
                 token,
                 now,
-                INVITE_TTL_SECS,
+                ttl,
             )
             .await?;
-        let expires = now.saturating_add(INVITE_TTL_SECS);
+        let expires = now.saturating_add(ttl);
         self.call(Request::PutInvite(veil_wire::PutInvite {
             mailbox_id: s.mailbox.to_vec(),
             invite_id: created.invite.id.to_vec(),
@@ -1664,11 +1711,16 @@ impl Actor {
              ON CONFLICT(address) DO UPDATE SET mailbox = excluded.mailbox, token = excluded.token, my_token = excluded.my_token",
             params![address, name, mailbox.to_vec(), token.to_vec(), my_token.to_vec(), now_ms()],
         )?;
-        Ok(db
-            .conn()
-            .query_row("SELECT id FROM contacts WHERE address = ?1", [address], |r| {
-                r.get(0)
-            })?)
+        let (id, blocked): (i64, bool) = db.conn().query_row(
+            "SELECT id, blocked FROM contacts WHERE address = ?1",
+            [address],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if blocked {
+            // Re-paired while blocked: they stay blocked, so the new token goes too (M1-9).
+            Self::queue_token_removal(db, my_token)?;
+        }
+        Ok(id)
     }
 
     async fn send(&mut self, contact: i64, text: &str) -> Result<MessageView> {
@@ -1733,7 +1785,7 @@ impl Actor {
                 .query_row(
                     "SELECT c.mailbox, c.token, m.envelope, c.id, c.intro IS NOT NULL
                  FROM messages m JOIN contacts c ON c.id = m.contact
-                 WHERE m.id = ?1 AND m.envelope IS NOT NULL",
+                 WHERE m.id = ?1 AND m.envelope IS NOT NULL AND c.blocked = 0",
                     [message],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
@@ -1774,14 +1826,15 @@ impl Actor {
         let ids: Vec<i64> =
             s.db.conn()
                 .prepare(
-                    "SELECT id FROM messages WHERE status IN ('failed', 'sending') AND envelope IS NOT NULL
-                 AND attempts < ?1 ORDER BY id",
+                    "SELECT m.id FROM messages m JOIN contacts c ON c.id = m.contact
+                     WHERE m.status IN ('failed', 'sending') AND m.envelope IS NOT NULL
+                     AND m.attempts < ?1 AND c.blocked = 0 ORDER BY m.id",
                 )
                 .and_then(|mut st| st.query_map([MAX_ATTEMPTS], |r| r.get(0))?.collect())
                 .unwrap_or_default();
         let intros: Vec<i64> =
             s.db.conn()
-                .prepare("SELECT id FROM contacts WHERE intro IS NOT NULL ORDER BY id")
+                .prepare("SELECT id FROM contacts WHERE intro IS NOT NULL AND blocked = 0 ORDER BY id")
                 .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
                 .unwrap_or_default();
         for id in intros {
@@ -1973,9 +2026,15 @@ impl Actor {
         let now = now_ms();
         match body {
             Body::Text(t) => {
+                // Their timer, or ours if they sent none (an older version that ignores timers).
+                let local: u32 =
+                    conn.query_row("SELECT timer_secs FROM contacts WHERE id = ?1", [contact], |r| {
+                        r.get(0)
+                    })?;
                 let expires = t
                     .expire_timer_secs
                     .filter(|t| *t > 0)
+                    .or((local > 0).then_some(local))
                     .map(|t| now.saturating_add(i64::from(t).saturating_mul(1000)));
                 conn.execute(
                     "INSERT INTO messages (contact, mine, body, at_ms, status, msg_id, expires_at_ms)
@@ -1986,10 +2045,16 @@ impl Actor {
                 self.emit(ChangeKind::Messages, Some(contact));
             }
             Body::TimerUpdate(t) => {
-                conn.execute(
-                    "UPDATE contacts SET timer_secs = ?2 WHERE id = ?1",
-                    params![contact, t.seconds],
+                // Only a newer change of theirs counts, so a retried older one cannot undo it
+                // (review M1-7). Their clock orders their own changes.
+                let sent = i64::try_from(sent_at_ms).unwrap_or(i64::MAX);
+                let n = conn.execute(
+                    "UPDATE contacts SET timer_secs = ?2, timer_peer_ms = ?3 WHERE id = ?1 AND timer_peer_ms < ?3",
+                    params![contact, t.seconds, sent],
                 )?;
+                if n == 0 {
+                    return Ok(());
+                }
                 conn.execute(
                     "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 0, 'timer', ?2, ?3, 'received')",
                     params![contact, t.seconds.to_string(), now],
@@ -2052,9 +2117,9 @@ impl Actor {
     fn set_privacy(&self, p: PrivacyView) -> Result<()> {
         let db = &self.s()?.db;
         if p.read_receipts && !self.privacy()?.read_receipts {
-            // No delivery receipts for what arrived while receipts were off.
+            // No receipts at all for what arrived or was read while receipts were off (M1-4).
             db.conn().execute(
-                "UPDATE messages SET receipt = 1 WHERE mine = 0 AND receipt = 0",
+                "UPDATE messages SET receipt = 2 WHERE mine = 0 AND receipt < 2",
                 [],
             )?;
         }
@@ -2116,12 +2181,12 @@ impl Actor {
                 kind: i32::from(kind),
                 ids: chunk.iter().map(|(_, m)| m.clone()).collect(),
             };
-            if self
-                .send_ephemeral(contact, Body::Receipt(receipt))
-                .await
-                .is_err()
-            {
-                return;
+            match self.send_ephemeral(contact, Body::Receipt(receipt)).await {
+                Ok(()) => {}
+                // Refused for good (they blocked or deleted us): counted as sent, or every sync
+                // would seal and try again (review M1-6).
+                Err(ClientError::Rejected(code)) if code != ErrorCode::RateLimited => {}
+                Err(_) => return,
             }
             for (id, _) in chunk {
                 let _ = s.db.conn().execute(
@@ -2206,6 +2271,12 @@ impl Actor {
                     "UPDATE contacts SET timer_secs = ?2 WHERE id = ?1",
                     params![contact, secs],
                 )?;
+                // An older change still waiting to go out must not arrive after this one.
+                s.db.conn().execute(
+                    "UPDATE messages SET envelope = NULL WHERE contact = ?1 AND mine = 1 AND kind = 'timer'
+                     AND envelope IS NOT NULL",
+                    [contact],
+                )?;
                 s.db.conn().execute(
                     "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope)
                      VALUES (?1, 1, 'timer', ?2, ?3, 'sending', ?4)",
@@ -2240,6 +2311,12 @@ impl Actor {
         {
             return;
         }
+        // An unread count cannot outlive the messages it counts (review M1-11).
+        let _ = s.db.conn().execute(
+            "UPDATE contacts SET unread = min(unread, (SELECT count(*) FROM messages m
+             WHERE m.contact = contacts.id AND m.mine = 0 AND m.kind = 'text'))",
+            [],
+        );
         for c in contacts {
             self.emit(ChangeKind::Messages, Some(c));
         }
@@ -2347,12 +2424,12 @@ impl Actor {
 
     async fn set_blocked(&mut self, contact: i64, blocked: bool) -> Result<()> {
         let s = self.s()?;
-        let (address, was, my_token, intro_pending): (String, bool, Vec<u8>, bool) =
+        let (address, was, my_token): (String, bool, Vec<u8>) =
             s.db.conn()
                 .query_row(
-                    "SELECT address, blocked, my_token, intro IS NOT NULL FROM contacts WHERE id = ?1",
+                    "SELECT address, blocked, my_token FROM contacts WHERE id = ?1",
                     [contact],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?
                 .ok_or(ClientError::UnknownContact)?;
@@ -2370,60 +2447,62 @@ impl Actor {
             .await?;
             self.flush_token_removals().await;
         } else {
-            self.unblock(contact, &address, intro_pending).await?;
+            self.unblock(contact, &address).await?;
         }
         self.emit(ChangeKind::Contacts, Some(contact));
         Ok(())
     }
 
-    /// Gives an unblocked contact a fresh delivery token in an encrypted mailbox update.
-    async fn unblock(&mut self, contact: i64, address: &str, intro_pending: bool) -> Result<()> {
-        if intro_pending && !self.deliver_intro(contact).await {
-            return Err(ClientError::Unreachable);
-        }
+    /// Gives an unblocked contact a fresh delivery token in an encrypted mailbox update. The
+    /// update is stored and retried like a message until it gets through (review M1-3).
+    async fn unblock(&mut self, contact: i64, address: &str) -> Result<()> {
         let token = self.take_token().await?;
         let s = self.s()?;
-        let addr = veil_core::identity::Address::parse(address).map_err(|_| ClientError::Storage)?;
-        let (mailbox, their_token): (Vec<u8>, Vec<u8>) = s.db.conn().query_row(
-            "SELECT mailbox, token FROM contacts WHERE id = ?1",
-            [contact],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        let content = Content {
-            id: random_id(&mut rng()),
-            sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
-            body: Some(Body::MailboxUpdate(MailboxUpdate {
-                new_mailbox_id: s.mailbox.to_vec(),
-                new_delivery_token: token.to_vec(),
-                relay_url: None,
-            })),
-        };
-        let sent = match s.account.seal(&mut rng(), &addr, &content, now_secs()).await {
-            Ok(envelope) => {
-                self.call(Request::Deposit(veil_wire::Deposit {
-                    mailbox_id: mailbox,
-                    token: their_token,
-                    envelope,
-                }))
-                .await
+        let r = async {
+            let addr = veil_core::identity::Address::parse(address).map_err(|_| ClientError::Storage)?;
+            let content = Content {
+                id: random_id(&mut rng()),
+                sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
+                body: Some(Body::MailboxUpdate(MailboxUpdate {
+                    new_mailbox_id: s.mailbox.to_vec(),
+                    new_delivery_token: token.to_vec(),
+                    relay_url: None,
+                })),
+            };
+            let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
+            self.atomically(async {
+                let old: Vec<u8> =
+                    s.db.conn()
+                        .query_row("SELECT my_token FROM contacts WHERE id = ?1", [contact], |r| {
+                            r.get(0)
+                        })?;
+                // Withdrawn at block time already; queued again in case a re-pair added one.
+                Self::queue_token_removal(&s.db, &old)?;
+                s.db.conn().execute(
+                    "UPDATE contacts SET blocked = 0, my_token = ?2 WHERE id = ?1",
+                    params![contact, token.to_vec()],
+                )?;
+                s.db.conn().execute(
+                    "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope)
+                     VALUES (?1, 1, 'mailbox', '', ?2, 'sending', ?3)",
+                    params![contact, now_ms(), envelope],
+                )?;
+                Ok(s.db.conn().last_insert_rowid())
+            })
+            .await
+        }
+        .await;
+        match r {
+            Ok(id) => {
+                // Delivered now if possible; otherwise retried with the other pending messages.
+                self.deliver(id).await;
+                Ok(())
             }
-            Err(e) => Err(e.into()),
-        };
-        match sent {
-            // Refused for good (for example they deleted us): nothing to tell them, but
-            // unblocked all the same.
-            Ok(_) => {}
-            Err(ClientError::Rejected(code)) if code != ErrorCode::RateLimited => {}
             Err(e) => {
-                Self::queue_token_removal(&s.db, &token)?;
-                return Err(e);
+                let _ = Self::queue_token_removal(&s.db, &token);
+                Err(e)
             }
         }
-        s.db.conn().execute(
-            "UPDATE contacts SET blocked = 0, my_token = ?2 WHERE id = ?1",
-            params![contact, token.to_vec()],
-        )?;
-        Ok(())
     }
 
     fn dismiss_key_warning(&self, contact: i64) -> Result<()> {

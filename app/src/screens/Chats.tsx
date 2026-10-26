@@ -157,9 +157,23 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
         if (live) setError("Could not load messages");
       },
     );
-    void ipc.markRead(contact.id).catch(() => undefined);
     return () => {
       live = false;
+    };
+  }, [contact.id, version]);
+
+  // Read means seen: only while the window is visible and focused, and again when the user
+  // comes back to it (review M1-5). markRead also sends read receipts if they are on.
+  useEffect(() => {
+    const seen = () => {
+      if (document.visibilityState === "visible" && document.hasFocus()) void ipc.markRead(contact.id).catch(() => undefined);
+    };
+    seen();
+    document.addEventListener("visibilitychange", seen);
+    window.addEventListener("focus", seen);
+    return () => {
+      document.removeEventListener("visibilitychange", seen);
+      window.removeEventListener("focus", seen);
     };
   }, [contact.id, version]);
 
@@ -174,10 +188,16 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
   useEffect(() => {
     const next = Math.min(...messages.map((m) => m.expiresAtMs ?? Infinity));
     if (!Number.isFinite(next)) return;
+    // Browsers fire at once for delays past 2^31-1 ms (about 24.8 days), so clamp; and keep
+    // the same array when nothing expired, or this effect would loop (review M1-1).
+    const delay = Math.min(Math.max(0, next - Date.now()) + 50, 2_147_483_647);
     const t = window.setTimeout(() => {
       const now = Date.now();
-      setMessages((prev) => prev.filter((m) => m.expiresAtMs === null || m.expiresAtMs > now));
-    }, Math.max(0, next - Date.now()) + 50);
+      setMessages((prev) => {
+        const kept = prev.filter((m) => m.expiresAtMs === null || m.expiresAtMs > now);
+        return kept.length === prev.length ? prev : kept;
+      });
+    }, delay);
     return () => window.clearTimeout(t);
   }, [messages]);
 

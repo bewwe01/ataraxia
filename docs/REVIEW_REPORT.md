@@ -2916,3 +2916,177 @@ There are no Critical or High findings. The condition is UR3-1 (Medium): fix it 
 - Moving the header last in `data_dir` makes the migration safe after a crash, and reruns are idempotent.
 
 **Recommended action: B.** Fix UR3-1, then merge. The Low findings can go into a follow-up.
+
+## Milestone 1 review, round 1
+
+**Scope:** commit 66005d3 (`git diff 900c68d 66005d3`), 16 files, +1561/−80. This round covers the client actor (`crates/client/src/service.rs`, `db.rs`), core `forget_contact`, the Tauri commands, `ipc.ts`, the Chats/Contacts/Settings screens, the docs, and the new tests. I checked each finding against the code, including the relay's `UpdateTokens`/`Deposit` paths, the core's `transact`/`Content::validate`, and the libsignal store keys.
+
+**Commands run:** `cargo test -p veil-client --test contacts_and_privacy` passed 4/4. `cargo test -p veil-client --lib db::` passed 3/3. `cargo clippy -p veil-client --all-targets -- -D warnings` is clean.
+
+**Verdict: FAIL.** There is one High finding (M1-1), and the gate rule is to fix every Critical/High and re-review. Several Medium findings break promises that ADR-0013 or the invariants state explicitly (M1-2, M1-3, M1-4, M1-5, M1-6, M1-7), and some invariants are marked "tested" when the tests do not prove them (M1-8).
+
+---
+
+### M1-1 — High — `app/src/screens/Chats.tsx:174-181`: the expiry timer overflows with the 4-week setting and spins the UI in a render loop
+
+**Description.** The effect calls `window.setTimeout(..., Math.max(0, next - Date.now()) + 50)`. With the "4 weeks" timer (`2_419_200 s`, one of the options the UI offers), the delay is about 2.419e9 ms. That is larger than the 2^31−1 ms (about 24.8 days) a WebIDL `long` can hold. All three webviews (WebView2, WebKitGTK, Android WebView) wrap or clamp that value, so the callback fires at once. The callback always returns a **new** array (`prev.filter(...)`), even when nothing expired. That changes `messages`, the effect runs again, and it schedules another immediate timeout, with no end.
+
+**Failure scenario.** Set a contact's timer to 4 weeks and send or receive one message, then keep the chat open. The webview re-renders continuously, about every 4 ms, for the first ~3 days of the message's life. This burns CPU and battery and makes the UI janky, especially on Android.
+
+**Fix.** Clamp the delay, and return the same state object when nothing expired:
+```ts
+const delay = Math.min(Math.max(0, next - Date.now()) + 50, 2_147_483_647);
+const t = window.setTimeout(() => {
+  const now = Date.now();
+  setMessages((prev) => {
+    const kept = prev.filter((m) => m.expiresAtMs === null || m.expiresAtMs > now);
+    return kept.length === prev.length ? prev : kept;
+  });
+}, delay);
+```
+
+### M1-2 — Medium — `crates/client/src/service.rs:1772-1803` (`retry_failed`), `1729` (`deliver`), `1784`: messages, timer updates and intros are still sent to a blocked contact
+
+**Description.** ADR-0013 says of a blocked contact that "we do not send to them", and `send`/`set_timer`/`send_ephemeral` do refuse. But `retry_failed` picks up every `failed`/`sending` row that still has an envelope, and every contact with `intro IS NOT NULL`. It never looks at `contacts.blocked`, and neither does `deliver()`.
+
+**Failure scenario.** While offline, Alice writes "where are you" to Bob (status `failed`, envelope kept). She then blocks Bob. When she reconnects, `connect()` → `retry_failed()` delivers the message to Bob. A pending `TimerUpdate` or a pending introduction goes out the same way.
+
+**Fix.**
+- Add `JOIN contacts c ON c.id = m.contact ... AND c.blocked = 0` to the `retry_failed` message query, and `AND blocked = 0` to the intro query.
+- Also check `blocked` inside `deliver()`: return `false` without counting an attempt.
+- Alternatively, clear `envelope` and set status `failed` on that contact's pending rows when blocking, inside the same `atomically` block.
+- Add a test: queue a message while the relay is down, block, reconnect, and assert the peer never receives it.
+
+### M1-3 — Medium — `crates/client/src/service.rs:2410-2420` (`unblock`): any rejection except `RateLimited` (including transient ones the relay can fake) still completes the unblock
+
+**Description.** `Err(ClientError::Rejected(code)) if code != ErrorCode::RateLimited => {}` treats `QuotaExceeded` (their mailbox is full), `Internal`, `Conflict` and `Unspecified` as permanent. The code then sets `blocked = 0, my_token = <new token>`. The `MailboxUpdate` is never stored or retried, so the contact never learns the new token. The old token was already withdrawn at block time.
+
+**Failure scenario.** Either the contact's mailbox is full, or the hostile relay answers `Internal`/`QuotaExceeded` to that one deposit. The UI then shows "unblocked", but the contact can never reach us again, and nothing tells either user. They have to work out that they need to re-invite.
+
+**Fix.**
+- Treat only `Unauthorized`/`NotFound` (token or mailbox gone) as final. For any other error, queue the token removal and return the error, so the contact stays blocked and the UI shows "Could not unblock".
+- Better: store the sealed `MailboxUpdate` like the `TimerUpdate` notice, as an outgoing row with an envelope (for example `kind = 'mailbox'`, hidden from `messages()`), so `retry_failed` re-delivers it until it gets through.
+
+### M1-4 — Medium — `crates/client/src/service.rs:2052-2063` (`set_privacy`), `2100-2133` (`send_receipts`): turning read receipts on sends "read" for messages read while receipts were off
+
+**Description.** When receipts are enabled, `set_privacy` sets `receipt = 1` on old incoming rows. That suppresses delivery receipts only. `send_receipts(Read)` selects `receipt < 2`, so the next `mark_read` sends read receipts for up to 256 old messages per call (4 envelopes). This includes messages the user read while receipts were off and messages that arrived before they were turned on. The integration test shows it: message "one" arrives with receipts off, and once both turn receipts on, Bob's "one" becomes `read`. The test just doesn't assert on "one".
+
+**Failure scenario.** A user keeps receipts off so that a contact doesn't learn which messages they read. They turn receipts on a month later and open the chat. The contact's whole backlog flips to "Read" at once. This is information the user chose to withhold, and it defeats the purpose of the setting (INV-CONT-2's spirit, and the ADR's "does not send … for older messages").
+
+**Fix.**
+- When enabling, run `UPDATE messages SET receipt = 2 WHERE mine = 0 AND receipt < 2`. Alternatively, while receipts are off, have `mark_read` set `receipt = 2` for that contact's rows.
+- Assert on message "one" in `receipts_and_typing_are_opt_in`: it must stay `sent`.
+
+### M1-5 — Medium — `app/src/screens/Chats.tsx:150-163` with `app/src/App.tsx:83-87`: read receipts go out for messages the user has not seen
+
+**Description.** `markRead(contact.id)` runs whenever `version` changes. `version` goes up on **any** `messages` event, for any contact. That includes incoming messages, the expiry sweeper's events and receipt-status changes. `mark_read` now sends read receipts (`service.rs:1385-1390`). The app never checks whether the window is visible or focused.
+
+**Failure scenario.** The desktop window is minimized, or the app is backgrounded on Android before auto-lock, with Bob's chat open. Bob's new message arrives and is immediately reported as "Read", although the user never saw it. This is a false "read" signal leaking presence.
+
+**Fix.**
+- In `Chat`, call `markRead` only when `document.visibilityState === "visible" && document.hasFocus()`.
+- Add a `visibilitychange`/`focus` listener that calls it when the user comes back.
+- Optionally pass `read: boolean` to `mark_read` so the unread count can still be cleared without sending a receipt.
+
+### M1-6 — Medium — `crates/client/src/service.rs:2100-2147` (`send_receipts`, `send_delivery_receipts`): when the peer's relay rejects us, every sync seals and sends a new receipt envelope, with no end
+
+**Description.** Receipts are marked as sent only when the deposit succeeds. When a contact has blocked or deleted us, their relay answers `Rejected` every time. The rows stay at `receipt = 0`, so after **every** sync (each push, each reconnect) `send_delivery_receipts` seals a new envelope and deposits it again. `mark_read` does the same for read receipts. `send_ephemeral` re-seals on each attempt (unlike `deliver`, which reuses one stored envelope and stops at `MAX_ATTEMPTS`). So every attempt also moves the Signal sending chain forward. This contradicts ADR-0013's "best effort, never stored or retried".
+
+**Failure scenario.** Bob blocks Alice while Alice has unreceipted messages from Bob (receipts on). From then on, every message anyone sends Alice triggers a sync, and with it another rejected deposit to Bob's mailbox. The relay sees a steady stream of failed deposits tied to Alice's syncs (metadata). Alice's chain toward Bob drifts forward without limit. Past libsignal's forward-jump limit, Bob could no longer decrypt Alice's messages after an unblock.
+
+**Fix.** Treat a final rejection like a send: on `Err(ClientError::Rejected(c)) if c != ErrorCode::RateLimited`, mark the chunk's `receipt = level` anyway. Only `Unreachable`/`Locked`/`RateLimited` should leave rows for a later attempt. Optionally also cap attempts per row.
+
+### M1-7 — Medium — `crates/client/src/service.rs:1988-1999` (`receive` `TimerUpdate`), `2178-2221` (`set_timer`): timer updates are applied in arrival order, so the two sides can end up with different timers
+
+**Description.** An incoming `TimerUpdate` overwrites `timer_secs` with no ordering check. Our own pending timer updates are retried in id order, and only on reconnect. There are two ways this goes wrong:
+- **Superseded update retried later.** A failed update is retried after a newer one already went through, so the peer ends up with the older value.
+- **Simultaneous changes.** Both users change the timer at the same time, and each side applies the other's value, so they swap.
+
+`Text.expire_timer_secs` from the peer does not repair the local setting either.
+
+**Failure scenario.** Alice sets 1 hour. The deposit fails (say, `RateLimited`) and the row stays `failed`. She immediately sets 5 minutes, which is delivered. Later a reconnect retries the 1-hour update. Bob now shows 1 hour and his messages carry 1 hour, while Alice's UI says 5 minutes. Bob's messages outlive the timer Alice chose on both phones.
+
+**Fix.**
+- In `set_timer`, clear the envelope of older pending `kind = 'timer'` rows for that contact, inside the same `atomically` block, so they are never retried.
+- On receive, apply a `TimerUpdate` only if its `sent_at_ms` is newer than the last one applied (store `timer_set_ms` on the contact). Equivalently, apply only when it is newer than our own last local change.
+
+### M1-8 — Medium — `crates/client/tests/contacts_and_privacy.rs`, `docs/INVARIANTS.md` (INV-REST-9, INV-CONT-1), ADR-0013 invite cleanup: the tests do not prove what the docs say they prove (CLAUDE.md rule 9)
+
+**Description.**
+- **INV-REST-9 ("deleted from the local database").** `disappearing_messages` checks expiry through `messages()`, and that query already hides expired rows (`expires_at_ms > now`). The test therefore passes even if `expire_messages()` never deletes anything. Nothing checks that the row is physically gone, nor the "unsent message that expires is deleted unsent" path.
+- **INV-CONT-1 ("their token removal survives going offline").** This is marked **tested**, but no test blocks or deletes while offline and then checks that the removal is flushed on reconnect.
+- **Expired-invite cleanup (feature 6).** There is no test that an expired invite's token is withdrawn at the relay, or that the core prekeys are swept.
+- **Key warning dismissal.** `lookalike_name_gets_a_key_warning` says "so does dismissing" but never calls `dismiss_key_warning`.
+
+**Failure scenario.** A regression that breaks the sweeper, the offline removal queue or invite cleanup would leave every test green while the invariants table still claims "tested".
+
+**Fix.** Add these tests:
+- **Expiry.** Make the expiry check raw. Add a `#[cfg(test)]`/`pub(crate)` row count, or open the DB in a unit test and assert `SELECT count(*) FROM messages WHERE ...` is 0 after a tick. Also cover a `failed` message with an envelope that expires.
+- **Offline removal.** Stop the relay, block, restart the relay on the same store, then assert a deposit with the old token is rejected.
+- **Invite cleanup.** Create an invite with a short TTL (inject the TTL or the clock), let it expire, then assert `Deposit` with its token is rejected and the core prekeys are gone.
+- **Dismiss.** Assert that `dismiss_key_warning` clears the flag.
+
+Mark INV-CONT-1 **partial** until the offline test exists.
+
+### M1-9 — Low — `crates/client/src/service.rs:2380-2427` (`unblock`) and `1653-1672` (`upsert_contact`): a blocked contact can get a live token back, and the unblock path loses track of the previous token
+
+**Description.** If a blocked contact is re-paired (they redeem a fresh invite of ours, or we accept theirs), the `ON CONFLICT ... DO UPDATE SET my_token = excluded.my_token` stores a newly registered token. The row stays `blocked = 1`. The relay then accepts their deposits again, and the client silently drops them, so they can fill our mailbox quota. `unblock` overwrites `my_token` without queueing the old value for removal. Nothing goes wrong in the normal block→unblock flow (the old token was withdrawn at block time), but it does after such a re-pair.
+
+**Fix.**
+- In `upsert_contact`, when the existing row is blocked, queue the new `my_token` for removal (or refuse the re-pair while blocked).
+- In `unblock`, call `queue_token_removal(old_my_token)` before overwriting it (removal is idempotent at the relay).
+
+### M1-10 — Low — `crates/client/src/service.rs:1529-1595` (`accept_invite`) vs `1939-1956`, `docs/INVARIANTS.md` INV-ID-2: the key-change warning only works for the side that created the invite
+
+**Description.** `key_warning` is computed only in `Opened::NewContact`, from the intro's display name. On the accepting side, the new contact is always named `Contact XXXX` (from the fingerprint), so it never clashes. In the common impostor case, the attacker sends *us* an invite link claiming to be Bob. We accept, get no warning, and typically rename the contact "Bob". Names are compared after case-folding and whitespace collapsing only, so lookalike letters from other scripts (for example a Cyrillic "о") also get past it. INV-ID-2 currently reads as if any new contact with an existing name is flagged.
+
+**Fix.**
+- Document the limitation in INV-ID-2 and ADR-0013.
+- Optionally run the same clash check in `rename()` when the user gives a recently paired, unverified contact an existing contact's name, and set `key_warning`.
+
+### M1-11 — Low — `crates/client/src/service.rs:1985` and `2225-2247` (`expire_messages`): the unread count survives expired messages
+
+**Description.** `unread` is incremented on receipt and only reset by `mark_read`. When unread messages expire, the badge stays. The list then shows "No messages yet" next to an unread count of, say, 3, which also hints that disappearing messages came and went.
+
+**Fix.** In `expire_messages`, decrement `unread` by the number of expired unread incoming rows. Alternatively, derive `unread` from the rows instead of storing a counter.
+
+### M1-12 — Low — `crates/client/src/service.rs:1486-1527` (`create_invite`) vs ADR-0013 "closes the gap noted in ADR-0011": a token whose `PutInvite` failed is never withdrawn
+
+**Description.** `take_token()` hands out an already registered token. If core `create_invite` or `PutInvite` then fails, no `invites` row is written, so `cleanup_invites` never queues that token. It stays registered at the relay until the mailbox is gone.
+
+**Fix.** On any error after `take_token()`, call `queue_token_removal(&token)`. Alternatively, insert the `invites` row first and delete it on failure.
+
+### M1-13 — Low — `app/src/screens/Contacts.tsx:186-205`: the delete confirmation `alertdialog` drops keyboard and screen-reader focus
+
+**Description.** Clicking "Delete contact" replaces that button with the `role="alertdialog"` banner. The focused element disappears and focus falls back to `<body>`. An `alertdialog` should move focus into itself. Keyboard and screen-reader users land at the top of the page.
+
+**Fix.** Add `autoFocus` to the "Cancel" button. When the dialog closes, return focus to the "Delete contact" button through a ref.
+
+### M1-14 — Info — `crates/client/src/service.rs:2028-2034` (`MailboxUpdate`): a contact can point our deposits at any mailbox
+
+**Description.** Any contact, at any time, can send a `MailboxUpdate` that sends our future envelopes (sealed to them) to a mailbox of their choice, using a token they hold for it (for example a third party's). Confidentiality is unaffected. The only effect is that the relay sees us depositing to that mailbox. The contact could already deposit there directly, so this is not a meaningful amplification.
+
+**Fix.** None required. Optionally accept a `MailboxUpdate` only after we sent one or after we were blocked. At minimum, document the behaviour in THREAT_MODEL §4.
+
+### M1-15 — Info — ADR-0013 / UI hint text: disappearing messages with a peer still on preview-2
+
+**Description.** A preview-2 peer ignores `TimerUpdate` and sends `Text` without `expire_timer_secs`. Its messages are kept forever on both sides, and our messages stay on its device. Meanwhile our UI shows the timer chip and the hint "They are deleted from both phones".
+
+**Fix.** Document this, and optionally apply the stricter local `timer_secs` to incoming `Text` that carries no timer.
+
+---
+
+### Good
+- **Deletion is atomic.** `delete_contact` runs `forget_contact`, the token-removal queue and the row delete in one `atomically` savepoint. The core `transact` nests correctly (no in-memory cache to diverge). `forgotten_contact_is_a_stranger_until_a_new_invite` really proves the core side.
+- **No relay I/O inside savepoints.** Every `atomically` block is local-only.
+- **Hostile-contact input is validated in the core.** Receipt ids must be 16 bytes and at most 256, timers at most 4 weeks, `MailboxUpdate` fields exactly 32 bytes. Receipts are scoped to `contact = ?1 AND mine = 1`, so a contact cannot mark other contacts' messages, nor timer notices (`msg_id` is NULL).
+- **Token removal is persisted and idempotent** at the relay (`update_tokens` ignores unknown hashes).
+- **The migration is sound for preview-2 databases.** It runs in one transaction with the `user_version` bump, the test covers an existing database and re-opening, and `secure_delete` is set on every open.
+- **Auto-lock accounting is correct.** Only user-initiated commands count (`MarkRead` and `Privacy` correctly do not), and the typing throttle and 15 s staleness work as described.
+- **UI rules are followed.** Read and delivered statuses use different icon shapes with sr-only labels. The typing dots respect `data-motion`/`prefers-reduced-motion`. The UI uses only tokens, and IPC goes only through `ipc.ts`.
+
+### Required before re-review
+Fix M1-1. Fix M1-2 to M1-7, or record an accepted rationale for each in ADR-0013. Fix M1-8, or downgrade the invariant statuses to **partial**. The Low findings can follow in a later change.
+
+### Action options
+Recommended: **B. Fix blocking only** (M1-1 to M1-8), then re-run the gate. Alternatives: A (everything, Low included), C (pick by id), D (report only).

@@ -11,6 +11,7 @@
 
 use std::future::Future;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,11 +30,16 @@ struct Relay {
 }
 
 async fn relay() -> Relay {
+    relay_with(|_| {}).await
+}
+
+async fn relay_with(tune: impl FnOnce(&mut Config)) -> Relay {
     let dir = tempfile::tempdir().unwrap();
     let pin = veil_relay::tls::generate(&dir.path().join("tls"), vec!["127.0.0.1".into()]).unwrap();
     let (tls, _) =
         veil_relay::tls::load(&dir.path().join("tls/cert.pem"), &dir.path().join("tls/key.pem")).unwrap();
-    let cfg = Config::default();
+    let mut cfg = Config::default();
+    tune(&mut cfg);
     let store = Store::open(&dir.path().join("relay.redb"), cfg.quotas).unwrap();
     let shared = Shared::new(store, cfg, pin, veil_relay::server::system_clock());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -64,14 +70,75 @@ struct User {
     _dir: tempfile::TempDir,
 }
 
+/// A TCP hop between a client and the relay that can be cut, to take the client offline.
+struct Proxy {
+    addr: String,
+    up: Arc<AtomicBool>,
+    cut: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Proxy {
+    async fn to(target: &str) -> Self {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let up = Arc::new(AtomicBool::new(true));
+        let cut = Arc::new(tokio::sync::watch::channel(0u64).0);
+        let (target, up2, cut2) = (target.to_owned(), Arc::clone(&up), Arc::clone(&cut));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = l.accept().await else {
+                    continue;
+                };
+                if !up2.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let (target, mut stop) = (target.clone(), cut2.subscribe());
+                tokio::spawn(async move {
+                    let Ok(mut out) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut inbound, &mut out) => {}
+                        _ = stop.changed() => {}
+                    }
+                });
+            }
+        });
+        Self { addr, up, cut }
+    }
+
+    fn cut(&self) {
+        self.up.store(false, Ordering::SeqCst);
+        self.cut.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    fn restore(&self) {
+        self.up.store(true, Ordering::SeqCst);
+    }
+}
+
 async fn user(r: &Relay, name: &str) -> User {
+    user_at(r, &r.addr, name, None).await
+}
+
+/// A user reaching the relay at `addr`, optionally with short-lived invites.
+async fn user_at(r: &Relay, addr: &str, name: &str, invite_ttl: Option<Duration>) -> User {
     let dir = tempfile::tempdir().unwrap();
     let events: Events = Arc::default();
     let sink = Arc::clone(&events);
-    let client = start(dir.path(), sink);
+    let client = match invite_ttl {
+        None => start(dir.path(), sink),
+        Some(ttl) => Client::start_with_invite_ttl(
+            dir.path().to_path_buf(),
+            KdfParams::FLOOR,
+            Arc::new(move |k, c| sink.lock().unwrap().push((k, c))),
+            ttl,
+        )
+        .unwrap(),
+    };
     client
         .setup(SetupInput {
-            relay: r.addr.clone(),
+            relay: addr.to_owned(),
             pin: r.pin.clone(),
             name: name.into(),
             kind: veil_client::unlock::SecretKind::Password,
@@ -95,14 +162,27 @@ fn start(dir: &Path, events: Events) -> Client {
     .unwrap()
 }
 
-async fn eventually<T, F: Future<Output = Option<T>>>(mut f: impl FnMut() -> F) -> T {
-    for _ in 0..200 {
+async fn eventually<T, F: Future<Output = Option<T>>>(f: impl FnMut() -> F) -> T {
+    within(Duration::from_secs(10), f).await
+}
+
+async fn within<T, F: Future<Output = Option<T>>>(limit: Duration, mut f: impl FnMut() -> F) -> T {
+    let end = tokio::time::Instant::now().checked_add(limit).unwrap();
+    while tokio::time::Instant::now() < end {
         if let Some(v) = f().await {
             return v;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("condition not reached in 10 s");
+    panic!("condition not reached in {limit:?}");
+}
+
+async fn online(c: &Client, want: bool) {
+    within(Duration::from_secs(40), || async {
+        let on = c.me().await.unwrap().connection == veil_client::service::Connection::Online;
+        (on == want).then_some(())
+    })
+    .await;
 }
 
 /// `inviter` invites, `joiner` accepts. Returns (inviter's contact, joiner's contact).
@@ -217,6 +297,16 @@ async fn lookalike_name_gets_a_key_warning() {
     alice.client.set_verified(a_imp.id, true).await.unwrap();
     let c = alice.client.contacts().await.unwrap();
     assert!(!c.iter().find(|c| c.id == a_imp.id).unwrap().key_warning);
+    let imposter2 = user(&r, "BOB").await;
+    let (a_imp2, _) = pair(&alice.client, &imposter2.client).await;
+    assert!(a_imp2.key_warning);
+    alice.client.dismiss_key_warning(a_imp2.id).await.unwrap();
+    let c = alice.client.contacts().await.unwrap();
+    assert!(!c.iter().find(|c| c.id == a_imp2.id).unwrap().key_warning);
+    assert!(
+        !c.iter().find(|c| c.id == a_imp2.id).unwrap().verified,
+        "dismissing is not verifying"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -320,6 +410,10 @@ async fn receipts_and_typing_are_opt_in() {
     status("delivered").await;
     alice.client.mark_read(a_bob.id).await.unwrap();
     status("read").await;
+    // "one" arrived and was read while Alice had receipts off: turning them on later does not
+    // report it (review M1-4).
+    let st = bob.client.messages(b_alice.id).await.unwrap();
+    assert_eq!(st.iter().find(|x| x.text == "one").unwrap().status, "sent");
 
     // Alice turns receipts off again: Bob's next message stays at "sent".
     alice
@@ -336,4 +430,108 @@ async fn receipts_and_typing_are_opt_in() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let st = bob.client.messages(b_alice.id).await.unwrap();
     assert_eq!(st.iter().find(|x| x.id == m3.id).unwrap().status, "sent");
+}
+
+/// Blocking while offline: queued messages to them are never sent, and their token is
+/// withdrawn once the relay is back (INV-CONT-1, review M1-2, M1-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn block_while_offline() {
+    let r = relay().await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    bob.client.send(b_alice.id, "hi".into()).await.unwrap();
+    arrives(&alice.client, a_bob.id, "hi").await;
+
+    hop.cut();
+    online(&alice.client, false).await;
+    let m = alice
+        .client
+        .send(a_bob.id, "queued before the block".into())
+        .await
+        .unwrap();
+    assert_eq!(m.status, "failed");
+    alice.client.set_blocked(a_bob.id, true).await.unwrap();
+    // The relay has not heard of the block yet.
+    let m = bob
+        .client
+        .send(b_alice.id, "still accepted".into())
+        .await
+        .unwrap();
+    assert_eq!(m.status, "sent");
+
+    hop.restore();
+    online(&alice.client, true).await;
+    within(Duration::from_secs(20), || async {
+        let m = bob.client.send(b_alice.id, "refused?".into()).await.unwrap();
+        (m.status == "failed").then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !texts(&bob.client, b_alice.id)
+            .await
+            .contains(&"queued before the block".to_owned())
+    );
+    let mine = alice.client.messages(a_bob.id).await.unwrap();
+    assert!(
+        !mine
+            .iter()
+            .any(|m| m.text == "still accepted" || m.text == "refused?")
+    );
+}
+
+/// An unsent message whose timer runs out is deleted unsent, from the database (the list
+/// does not filter expired rows, so this sees the sweeper) (INV-REST-9, review M1-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_unsent_message_is_never_sent() {
+    let r = relay().await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    alice.client.set_timer(a_bob.id, 1).await.unwrap();
+    eventually(|| async { (bob.client.contacts().await.unwrap()[0].timer_secs == 1).then_some(()) }).await;
+
+    hop.cut();
+    online(&alice.client, false).await;
+    let m = alice.client.send(a_bob.id, "too late".into()).await.unwrap();
+    assert_eq!(m.status, "failed");
+    eventually(|| async { texts(&alice.client, a_bob.id).await.is_empty().then_some(()) }).await;
+    hop.restore();
+    online(&alice.client, true).await;
+    alice.client.set_timer(a_bob.id, 0).await.unwrap();
+    alice.client.send(a_bob.id, "on time".into()).await.unwrap();
+    arrives(&bob.client, b_alice.id, "on time").await;
+    assert!(
+        !texts(&bob.client, b_alice.id)
+            .await
+            .contains(&"too late".to_owned())
+    );
+}
+
+/// Expired invites give their tokens back: with room for one batch of 8 tokens, a ninth
+/// invite only fits once the first eight have expired and been withdrawn (review M1-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_invites_release_their_tokens() {
+    let r = relay_with(|c| {
+        c.quotas.max_tokens_per_mailbox = 8;
+        c.quotas.token_floor_per_mailbox = 8;
+    })
+    .await;
+    let alice = user_at(&r, &r.addr, "Alice", Some(Duration::from_secs(4))).await;
+    for _ in 0..8 {
+        alice.client.create_invite().await.unwrap();
+    }
+    assert!(alice.client.create_invite().await.is_err(), "no token left");
+    // Each failed try costs one of the relay's token updates (1 per second), so try slowly
+    // and leave room for the withdrawal itself.
+    for _ in 0..12 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if alice.client.create_invite().await.is_ok() {
+            return;
+        }
+    }
+    panic!("expired invites never gave their tokens back");
 }
