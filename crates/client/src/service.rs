@@ -1380,9 +1380,10 @@ impl Actor {
     async fn accept_invite(&mut self, link: &str) -> Result<ContactView> {
         let invite = Invite::from_link(link.trim()).map_err(|_| ClientError::InviteInvalid)?;
         let s = self.s()?;
-        if invite.relay_url.strip_prefix("wss://") != Some(s.relay_addr.as_str())
-            || invite.relay_spki_sha256 != s.pin
-        {
+        // The pin, not the address, identifies the relay: one relay can be reached at several
+        // addresses (a tailnet IP for some contacts, a public name for others), and the pin
+        // proves it is the same server holding the same key.
+        if invite.relay_spki_sha256 != s.pin {
             return Err(ClientError::OtherRelay);
         }
         let now = now_secs();

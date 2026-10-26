@@ -216,3 +216,40 @@ async fn two_clients_pair_and_talk() {
         }
     }
 }
+
+/// One relay reached at two addresses (as over a tailnet IP and over a public name): an invite
+/// naming the other address is accepted, because the pin is what identifies the relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_from_another_address_of_the_same_relay() {
+    let r = relay().await;
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let alice = start(da.path());
+    let bob = start(db.path());
+    alice
+        .setup(input(&r, "Alice", "correct horse battery"))
+        .await
+        .unwrap();
+    let mut other = input(&r, "Bob", "tr0ub4dor and three");
+    other.relay = r.addr.replacen("127.0.0.1", "localhost", 1);
+    assert_ne!(other.relay, r.addr);
+    bob.setup(other).await.unwrap();
+
+    let inv = alice.create_invite().await.unwrap();
+    let b_contact = bob.accept_invite(inv.link.clone()).await.unwrap();
+    let a_contact = eventually(|| async { alice.contacts().await.unwrap().into_iter().next() }).await;
+    assert_eq!(a_contact.name, "Bob");
+
+    bob.send(b_contact.id, "hi from the other address".into())
+        .await
+        .unwrap();
+    let got = eventually(|| async {
+        alice
+            .messages(a_contact.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.text == "hi from the other address")
+    })
+    .await;
+    assert!(!got.mine);
+}
