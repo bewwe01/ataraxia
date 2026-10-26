@@ -539,13 +539,21 @@ fn data_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
 /// Tells the user something arrived, without saying who or what (INV-REST-5): an Android
 /// notification when Veil is not on screen, or a taskbar flash on the desktop.
 fn alert(app: &AppHandle, certain: bool) {
-    if cfg!(target_os = "android") {
+    // `#[cfg]`, not `cfg!`: window attention does not exist in Tauri's mobile API, so it
+    // must not even be compiled there.
+    #[cfg(target_os = "android")]
+    {
         let app = app.clone();
         tauri::async_runtime::spawn(async move { native::notify_message(&app, certain).await });
-    } else if let Some(w) = app.get_webview_window("main")
-        && !w.is_focused().unwrap_or(true)
+    }
+    #[cfg(not(target_os = "android"))]
     {
-        let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        let _ = certain;
+        if let Some(w) = app.get_webview_window("main")
+            && !w.is_focused().unwrap_or(true)
+        {
+            let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        }
     }
 }
 

@@ -330,8 +330,6 @@ mod imp {
     #[allow(clippy::unused_async)]
     pub async fn set_dark_bars<R: Runtime>(_: &AppHandle<R>, _: bool) {}
     #[allow(clippy::unused_async)]
-    pub async fn notify_message<R: Runtime>(_: &AppHandle<R>, _: bool) {}
-    #[allow(clippy::unused_async)]
     pub async fn notifications_allowed<R: Runtime>(_: &AppHandle<R>) -> bool {
         true
     }
