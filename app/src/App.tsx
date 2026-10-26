@@ -43,6 +43,12 @@ export function App() {
 
   useEffect(refreshState, [refreshState]);
 
+  // Notifications are on by default; Android asks for its permission the first time
+  // (review M4-3). Kotlin remembers that it asked.
+  useEffect(() => {
+    if (state === "unlocked") void ipc.notifyWelcome().catch(() => undefined);
+  }, [state]);
+
   // Auto-lock counts only real user input (review P4-2): report it, at most every 20 s.
   useEffect(() => {
     if (state !== "unlocked") return;

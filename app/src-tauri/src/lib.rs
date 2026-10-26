@@ -408,9 +408,10 @@ async fn attachment_commit(
     .map_err(err)
 }
 
+/// Drops this upload only; another one started since is left alone (review M3R2-1).
 #[tauri::command]
-fn attachment_abort(uploads: State<'_, Uploads>) {
-    uploads.clear();
+fn attachment_abort(uploads: State<'_, Uploads>, upload: u64) {
+    drop(uploads.take(upload));
 }
 
 /// The file of an attachment, as raw bytes for the UI to show or play. Display data: it is
@@ -576,6 +577,19 @@ async fn set_notify(app: AppHandle, c: State<'_, Client>, enabled: bool) -> Res<
     c.set_notify(NotifyView { enabled }).await.map_err(err)?;
     if enabled {
         native::request_notifications(&app).await;
+    } else {
+        // Nothing to stay connected for (review M4-2); not there on desktop.
+        let _ = native::set_background(&app, false).await;
+    }
+    Ok(())
+}
+
+/// Called once the vault is open: with notifications on (the default), asks Android for
+/// the permission the first time, so they work without a visit to Settings (review M4-3).
+#[tauri::command]
+async fn notify_welcome(app: AppHandle, c: State<'_, Client>) -> Res<()> {
+    if c.notify_settings().await.map_err(err)?.enabled {
+        native::ask_notifications_once(&app).await;
     }
     Ok(())
 }
@@ -662,6 +676,7 @@ pub fn run() {
             attachment_part,
             attachment_commit,
             attachment_abort,
+            notify_welcome,
             attachment_data,
             save_attachment,
             retry_attachment,
@@ -700,6 +715,8 @@ mod tests {
         let u = Uploads::default();
         let id = u.begin(meta());
         u.part(id, &b64(b"hello ")).unwrap();
+        // Aborting an older upload leaves this one alone.
+        drop(u.take(id.wrapping_sub(1)));
         u.part(id, &b64(b"world")).unwrap();
         let up = u.take(id).unwrap();
         assert_eq!(up.data.as_slice(), b"hello world");

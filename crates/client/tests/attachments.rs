@@ -16,7 +16,9 @@ use std::time::Duration;
 use common::*;
 use rand::TryRngCore as _;
 use veil_client::ClientError;
-use veil_client::service::{AUTO_DOWNLOAD_PER_DAY, AttachmentInput, Client, MAX_FILE, MessageView};
+use veil_client::service::{
+    AUTO_DOWNLOAD_PER_DAY, AttachmentInput, Client, MAX_FILE, MAX_VOICE_BYTES, MessageView,
+};
 use veil_core::attachment;
 use veil_core::content::{Attachment, Body};
 use zeroize::Zeroizing;
@@ -583,12 +585,12 @@ async fn download_resumes_after_the_connection_drops() {
 /// blob id and token, and arrives (review M3-7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_expired_upload_token_starts_a_fresh_upload() {
-    let r = relay_with(|c| c.quotas.upload_token_ttl_secs = 5).await;
+    let r = relay_with(|c| c.quotas.upload_token_ttl_secs = 8).await;
     let hop = Proxy::to(&r.addr).await;
     let alice = user_at(&r, &hop.addr, "Alice", None).await;
     let bob = user(&r, "Bob").await;
     let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
-    let file = pattern(1_000_000, 3);
+    let file = pattern(3_000_000, 3);
     let sent = alice
         .client
         .send_attachment(
@@ -597,6 +599,7 @@ async fn an_expired_upload_token_starts_a_fresh_upload() {
         )
         .await
         .unwrap();
+    let first_blob = alice.client.attachment_blob(sent.id).await.unwrap();
     within(Duration::from_secs(20), || async {
         let m = alice
             .client
@@ -610,7 +613,18 @@ async fn an_expired_upload_token_starts_a_fresh_upload() {
     .await;
     hop.cut();
     online(&alice.client, false).await;
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Cut part-way, so the old token is still needed (review M3R2-4).
+    let m = alice
+        .client
+        .messages(a_bob.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.id == sent.id)
+        .unwrap();
+    assert_eq!(m.status, "sending");
+    assert!(m.attachment.unwrap().progress < 1.0, "cut part-way");
+    tokio::time::sleep(Duration::from_secs(9)).await;
     hop.restore();
     let got = within(Duration::from_mins(1), || async {
         named(&bob.client, b_alice.id, "late.bin")
@@ -619,6 +633,53 @@ async fn an_expired_upload_token_starts_a_fresh_upload() {
     })
     .await;
     assert!(same(&bob.client.attachment_data(got.id).await.unwrap().2, &file));
+    // Started again under a new blob id (and so a fresh key and nonce prefix).
+    assert_ne!(alice.client.attachment_blob(sent.id).await.unwrap(), first_blob);
+}
+
+/// A "voice note" larger than any recording is a file, so it is never played from a large
+/// blob in the webview (review M3R2-2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_voice_note_is_a_file() {
+    let r = relay().await;
+    let (alice, bob) = (user(&r, "Alice").await, user(&r, "Bob").await);
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    let mut voice = input("voice", "audio/webm", None, pattern(MAX_VOICE_BYTES + 1, 2));
+    voice.duration_ms = Some(1_000);
+    assert_eq!(
+        alice.client.send_attachment(a_bob.id, voice).await.unwrap_err(),
+        ClientError::BadInput
+    );
+    let mut rng = rand::rngs::OsRng.unwrap_err();
+    let (key, enc) = attachment::encrypt(&mut rng, &pattern(10, 1)).unwrap();
+    for (size, name) in [(MAX_VOICE_BYTES + 1, "big-voice"), (100_000, "small-voice")] {
+        let size = u64::try_from(size).unwrap();
+        let Body::Attachment(mut a) = crafted(
+            &random_blob(),
+            &key,
+            &enc.ciphertext_sha256,
+            size,
+            attachment::padded_size(size).unwrap(),
+            name,
+        ) else {
+            unreachable!()
+        };
+        a.mime = "audio/webm".into();
+        a.voice_duration_ms = Some(1_000);
+        bob.client
+            .raw_send(b_alice.id, random_id(), Body::Attachment(a))
+            .await
+            .unwrap();
+    }
+    let kind = |name: &'static str| {
+        let c = &alice.client;
+        async move { Some(named(c, a_bob.id, name).await?.attachment?.kind) }
+    };
+    within(Duration::from_secs(20), || async {
+        kind("small-voice").await.filter(|k| k == "voice")
+    })
+    .await;
+    assert_eq!(kind("big-voice").await.as_deref(), Some("file"));
 }
 
 /// Past the daily allowance a contact's files wait for a tap (review M3-12).

@@ -236,6 +236,14 @@ mod imp {
         }
     }
 
+    pub async fn ask_notifications_once<R: Runtime>(app: &AppHandle<R>) {
+        if let Ok(h) = handle(app) {
+            let _ = h
+                .run_mobile_plugin_async::<Option<Empty>>("askNotificationsOnce", ())
+                .await;
+        }
+    }
+
     pub async fn background<R: Runtime>(app: &AppHandle<R>) -> bool {
         let Ok(h) = handle(app) else { return false };
         h.run_mobile_plugin_async::<Flag>("background", ())
@@ -329,6 +337,8 @@ mod imp {
     }
     #[allow(clippy::unused_async)]
     pub async fn request_notifications<R: Runtime>(_: &AppHandle<R>) {}
+    #[allow(clippy::unused_async)]
+    pub async fn ask_notifications_once<R: Runtime>(_: &AppHandle<R>) {}
     #[allow(clippy::unused_async)]
     pub async fn background<R: Runtime>(_: &AppHandle<R>) -> bool {
         false

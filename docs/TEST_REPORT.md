@@ -2,6 +2,58 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Milestones 2–4: everyday messaging, attachments, notifications (2026-10-26)
+
+ADR-0014 (replies, reactions, edit and delete, search, QR scanning, verify by scan), ADR-0015 (photos, files, voice notes), ADR-0016 (content-free notifications). Review gate, all reports in REVIEW_REPORT.md:
+- **M2:** round 1 PASS WITH CONDITIONS (four Mediums, fixed in 5ae4a29); round 2 PASS WITH CONDITIONS (Lows, fixed in 009ef1d).
+- **M3:** round 1 **FAIL**. M3-1 Critical: sending any file failed on Android, whose IPC carries JSON only. M3-2 High: decrypted photos could be paged to disk by the WebView. Both fixed in 4311055, along with the other eleven findings. Round 2 PASS WITH CONDITIONS (two Mediums, four Lows), all fixed in the commit after it.
+- **M4:** round 1 PASS WITH CONDITIONS (four Lows), all fixed in the same commit.
+
+New dependency: `jsqr` 1.4.0 (npm, exact version, for the scanner). `pnpm -C app audit --prod`: no known vulnerabilities.
+
+```text
+$ cargo fmt --all --check                                          # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings   # exit 0
+$ (app/src-tauri) cargo fmt --check; cargo clippy --all-targets --locked -- -D warnings   # exit 0 (desktop target)
+$ (app/src-tauri) cargo test --locked                              # 3 passed (chunked upload IPC)
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build            # 0 errors; lint: 13 files clean; built
+$ cargo test --workspace --locked                                  # exit 0
+  veil_client unit 14 | attachments 10 | contacts_and_privacy 8 | lock_and_setup 3 | messaging 7
+  notifications 4 | pair_and_message 2 | unlock_options 5
+  veil_core 76 | secrets 3 | session 23 (+1 ignored)
+  veil_relay lib 25 | logs 1 | relay 24 | smoke 0 (+2 ignored) | veil_wire 5     all ok
+```
+
+New tests:
+- `messaging` (7): replies, one reaction per person, the edit/delete windows, crafted content from a contact through the `test-hooks` feature, search with LIKE escaping, verify by scan.
+- `attachments` (10):
+  - a round trip of a file, photo and voice note, then a recursive plaintext scan of both data folders;
+  - limits and names;
+  - upload and download resume after the connection is cut;
+  - an expired upload token restarting under a new blob id;
+  - a hostile contact's crafted attachments (forged hash, sizes that do not fit, wrong chunk count, too large, a repeated id);
+  - missing blobs not holding up uploads;
+  - the daily download allowance;
+  - an oversized "voice note" becoming a file;
+  - delete and expiry removing the file.
+- `notifications` (4): the conversation named only while unlocked; a locked notice without a contact, rate-limited; nothing with notifications off; the locked-state key gone after unlock, Purge PIN and reset.
+- Unit tests: `chunk_fits` (hostile-relay chunk shapes), `backoff_ms`, `names_and_types_are_cleaned`, the migrations from preview.4 databases, and the Tauri upload buffer (parts, stale ids, the size limit).
+
+Mutation checks, each by editing the code, running the test and restoring:
+
+| Mutation | Test | Result |
+|---|---|---|
+| unlock keeps the locked-state watcher | `the_locked_state_key_goes_on_every_path` | fails |
+| a refused upload token gives up instead of starting afresh | `an_expired_upload_token_starts_a_fresh_upload` | fails |
+
+Flakiness: `pair_and_message` failed once while a reviewer's test run shared the machine; six runs alone and every later full run passed. CI run 60 (53e4f76) passed every test, then the attachments test binary crashed with SIGSEGV at exit. A client's actor thread was not waited for, so the process could exit while that thread was still inside SQLCipher. Dropping the last `Client` now waits (at most 5 s) for the actor to finish.
+
+Not verified, all for the preview.5 device checklist:
+- Nothing ran on a phone. The Kotlin (save dialog, notifications, background service, permission prompts) is compiled only by the release workflow.
+- INV-ATT-5, that the WebView does not page photo blobs to disk, is argued, not device-tested.
+- Voice recording and the camera scanner need real hardware.
+- No frontend unit tests exist (`pnpm -C app test` has no script); this is planned for milestone 8.
+
 ## Milestone 1: contacts and conversation privacy (2026-10-26)
 
 ADR-0013: key-change warning, delete and block, disappearing messages, opt-in read receipts and typing indicators, invite token cleanup. Review gate: round 1 **FAIL** (M1-1 High, a render loop in the chat's expiry timer, and seven Mediums), all fixed in 18fb4a6; round 2 **PASS WITH CONDITIONS**. The condition, M1R2-1 (a stale unblock update could cut a contact off), is fixed with a mutation-checked test, and so are the round-2 Lows and the nit (M1R2-2 to M1R2-5). Both reports are in REVIEW_REPORT.md. No dependency changed, so the supply-chain checks were not re-run.

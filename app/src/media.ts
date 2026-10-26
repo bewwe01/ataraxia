@@ -69,7 +69,8 @@ function reencodes(type: string): boolean {
  * so.
  */
 export async function prepareFile(file: File): Promise<Prepared> {
-  if (reencodes(file.type)) {
+  // Some file pickers give no type: try it as a photo before sending it as it is.
+  if (reencodes(file.type) || file.type === "") {
     const img = await loadImage(file).catch(() => null);
     if (img) {
       try {
@@ -86,6 +87,10 @@ export async function prepareFile(file: File): Promise<Prepared> {
   }
   if (file.size > MAX_SEND_BYTES) throw new TooLarge();
   const data = new Uint8Array(await file.arrayBuffer());
+  if (file.type === "image/gif") {
+    // Shown inline like a photo, but sent unchanged so it keeps its animation (M3R2-3).
+    return { kind: "image", mime: "image/gif", name: null, data, thumbnail: null, durationMs: null, waveform: null, note: "GIFs are sent unchanged, so any details stored in the file were kept." };
+  }
   const note = file.type.startsWith("image/") ? "Sent as a file, so any location or camera details in it were kept." : null;
   return { kind: "file", mime: file.type || "application/octet-stream", name: file.name || "file", data, thumbnail: null, durationMs: null, waveform: null, note };
 }

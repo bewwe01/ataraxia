@@ -184,7 +184,7 @@ function base64(bytes: Uint8Array): string {
  * A file goes to Rust in 1 MiB base64 parts: Android's IPC carries JSON only, so one raw body
  * is not an option there (see `attachment_begin` in `lib.rs`).
  */
-async function sendAttachment(contact: number, a: OutgoingAttachment): Promise<MessageView> {
+async function sendOne(contact: number, a: OutgoingAttachment): Promise<MessageView> {
   const upload = await call<number>("attachment_begin", {
     meta: {
       contact,
@@ -201,10 +201,18 @@ async function sendAttachment(contact: number, a: OutgoingAttachment): Promise<M
       await call<void>("attachment_part", { upload, part: base64(a.data.subarray(at, at + PART_BYTES)) });
     }
   } catch (e) {
-    await call<void>("attachment_abort").catch(() => undefined);
+    await call<void>("attachment_abort", { upload }).catch(() => undefined);
     throw e;
   }
   return call<MessageView>("attachment_commit", { upload });
+}
+
+/** Rust holds one upload at a time, so sends from any chat take turns (review M3R2-1). */
+let sending: Promise<unknown> = Promise.resolve();
+function sendAttachment(contact: number, a: OutgoingAttachment): Promise<MessageView> {
+  const run = sending.then(() => sendOne(contact, a), () => sendOne(contact, a));
+  sending = run.catch(() => undefined);
+  return run;
 }
 
 export const ipc = {
@@ -252,6 +260,8 @@ export const ipc = {
   retryAttachment: (message: number) => call<void>("retry_attachment", { message }),
   notifySettings: () => call<NotifySettings>("notify_settings"),
   /** On Android, turning it on also asks for the system permission if needed. */
+  /** Once after unlock: Android asks for the notification permission the first time. */
+  notifyWelcome: () => call<void>("notify_welcome"),
   setNotify: (enabled: boolean) => call<void>("set_notify", { enabled }),
   /** Android: keep Veil connected in the background (a foreground service). */
   setBackground: (on: boolean) => call<void>("set_background", { on }),

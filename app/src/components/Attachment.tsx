@@ -17,6 +17,8 @@ import { Icon, useDialogKeys } from "../ui";
 const INLINE_MAX = 2 * 1024 * 1024;
 /** Largest photo shown at all; bigger "photos" are offered as files to save. */
 const VIEW_MAX = 8 * 1024 * 1024;
+/** Largest voice note played here (Rust's `MAX_VOICE_BYTES`); bigger ones are files. */
+const VOICE_MAX = 4 * 1024 * 1024;
 
 let android: boolean | null = null;
 async function isAndroid(): Promise<boolean> {
@@ -330,7 +332,7 @@ export function AttachmentBody({ m, onOpenImage, onError }: { m: MessageView; on
       </>
     );
   }
-  if (a.kind === "voice") {
+  if (a.kind === "voice" && a.size <= VOICE_MAX) {
     return (
       <>
         <VoiceNote m={m} onError={onError} />

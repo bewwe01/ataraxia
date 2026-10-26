@@ -112,7 +112,7 @@ class VeilService : Service() {
     val n = NotificationCompat.Builder(this, VeilNotify.CONNECTION)
       .setSmallIcon(R.drawable.ic_stat_veil)
       .setContentTitle("Veil")
-      .setContentText("Connected, to tell you when something arrives")
+      .setContentText("Keeping Veil connected in the background")
       .setOngoing(true)
       .setSilent(true)
       .setContentIntent(VeilNotify.openApp(this))
@@ -122,7 +122,9 @@ class VeilService : Service() {
     } else {
       startForeground(VeilNotify.SERVICE_ID, n)
     }
-    return START_STICKY
+    // Not sticky: restarted alone after Android kills the app, the service would show this
+    // notice with no Veil running behind it (review M4-1).
+    return START_NOT_STICKY
   }
 }
 
@@ -143,6 +145,7 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
     const val PREFS = "veil_native"
     const val ALLOW_SCREENSHOTS = "allow_screenshots"
     const val BACKGROUND = "background"
+    const val ASKED_NOTIFY = "asked_notifications"
     const val IV_LEN = 12
   }
 
@@ -200,10 +203,39 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
   /** Asks for the notification permission (Android 13+). The answer is read again later. */
   @Command
   fun requestNotifications(invoke: Invoke) {
-    if (Build.VERSION.SDK_INT >= 33 && !VeilNotify.allowed(activity)) {
-      ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7301)
+    if (!VeilNotify.allowed(activity)) {
+      if (canAskForNotifications()) {
+        askForNotifications()
+      } else if (Build.VERSION.SDK_INT >= 26) {
+        // Android will not ask again (or never asks, before 13): the app's notification
+        // settings are the only way to turn them on (review M4-3).
+        activity.startActivity(
+          Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, activity.packageName)
+        )
+      }
     }
     invoke.resolve()
+  }
+
+  /** Asks for the notification permission once, the first time Veil is unlocked with
+   *  notifications on (the default), so they work without a visit to Settings. */
+  @Command
+  fun askNotificationsOnce(invoke: Invoke) {
+    if (!prefs().getBoolean(ASKED_NOTIFY, false) && !VeilNotify.allowed(activity) && canAskForNotifications()) {
+      askForNotifications()
+    }
+    invoke.resolve()
+  }
+
+  private fun canAskForNotifications(): Boolean =
+    Build.VERSION.SDK_INT >= 33 &&
+      (!prefs().getBoolean(ASKED_NOTIFY, false) ||
+        ActivityCompat.shouldShowRequestPermissionRationale(activity, Manifest.permission.POST_NOTIFICATIONS))
+
+  private fun askForNotifications() {
+    prefs().edit().putBoolean(ASKED_NOTIFY, true).apply()
+    ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7301)
   }
 
   @Command

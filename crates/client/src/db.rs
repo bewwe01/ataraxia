@@ -91,6 +91,8 @@ const MIGRATIONS: &[&str] = &[
        next_attempt_ms INTEGER NOT NULL DEFAULT 0,
        -- Automatic fresh re-uploads after the relay refused the upload token (review M3-7).
        restarts INTEGER NOT NULL DEFAULT 0,
+       -- Shown, played or saved at least once (review M3R2-5).
+       opened INTEGER NOT NULL DEFAULT 0,
        timer_secs INTEGER,
        data BLOB
      );

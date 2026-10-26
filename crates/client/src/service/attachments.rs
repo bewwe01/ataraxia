@@ -24,6 +24,10 @@ use crate::{ClientError, Result, now_ms, now_secs};
 pub const MAX_FILE: usize = 25 * 1024 * 1024;
 /// Longest voice note.
 pub const MAX_VOICE_MS: u32 = 5 * 60 * 1000;
+/// Largest voice note: 5 minutes of Opus at 32 kbit/s is about 1.2 MB. A larger "voice
+/// note" from a contact is a file, so the app never plays a large blob in the webview
+/// (review M3R2-2, INV-ATT-5).
+pub const MAX_VOICE_BYTES: usize = 4 * 1024 * 1024;
 /// Ciphertext per chunk: 64 KiB of plaintext plus the 16-byte tag.
 const CT_CHUNK: usize = attachment::CHUNK + 16;
 /// Give up a transfer after this many failed chunk requests in a row.
@@ -36,6 +40,9 @@ const MAX_RESTARTS: i64 = 2;
 /// Files a contact's messages may download by themselves per day; past it, the user taps to
 /// download, so a contact cannot fill the phone (review M3-12).
 pub const AUTO_DOWNLOAD_PER_DAY: i64 = 100 * 1024 * 1024;
+/// Received files downloaded by themselves and never opened, all contacts together; past
+/// it, new files wait for a tap, so the total stays bounded too (review M3R2-5).
+pub const AUTO_DOWNLOAD_UNOPENED: i64 = 500 * 1024 * 1024;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 /// Report progress to the UI every this many chunks.
 const PROGRESS_EVERY: i64 = 16;
@@ -148,7 +155,9 @@ impl Actor {
         let mime = clean_mime(&input.mime).ok_or(ClientError::BadInput)?;
         let voice = input.kind == "voice";
         if voice
-            && (input.duration_ms.is_none_or(|d| d == 0 || d > MAX_VOICE_MS) || !mime.starts_with("audio/"))
+            && (input.duration_ms.is_none_or(|d| d == 0 || d > MAX_VOICE_MS)
+                || !mime.starts_with("audio/")
+                || size > MAX_VOICE_BYTES)
         {
             return Err(ClientError::BadInput);
         }
@@ -643,7 +652,10 @@ impl Actor {
         let s = self.s()?;
         let conn = s.db.conn();
         let mime = clean_mime(&a.mime).unwrap_or_else(|| "application/octet-stream".into());
-        let kind = kind_for(&mime, a.voice_duration_ms.is_some() && mime.starts_with("audio/"));
+        let voice = a.voice_duration_ms.is_some()
+            && mime.starts_with("audio/")
+            && usize::try_from(a.size).is_ok_and(|n| n <= MAX_VOICE_BYTES);
+        let kind = kind_for(&mime, voice);
         let name = a.file_name.as_deref().and_then(clean_file_name);
         let too_large = usize::try_from(a.size).map_or(true, |n| n > MAX_FILE);
         let size = i64::try_from(a.size).unwrap_or(i64::MAX);
@@ -653,9 +665,17 @@ impl Actor {
             params![contact, now_ms().saturating_sub(DAY_MS)],
             |r| r.get(0),
         )?;
+        let unopened: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(a.size), 0) FROM attachments a JOIN messages m ON m.id = a.message
+             WHERE m.mine = 0 AND a.opened = 0 AND a.state IN ('download', 'ready')",
+            [],
+            |r| r.get(0),
+        )?;
         let state = if too_large {
             "too_large"
-        } else if today.saturating_add(size) > AUTO_DOWNLOAD_PER_DAY {
+        } else if today.saturating_add(size) > AUTO_DOWNLOAD_PER_DAY
+            || unopened.saturating_add(size) > AUTO_DOWNLOAD_UNOPENED
+        {
             "available"
         } else {
             "download"
@@ -757,7 +777,13 @@ impl Actor {
             )
             .optional()?
             .ok_or(ClientError::BadInput)?;
-        Ok((mime, name, Zeroizing::new(data.ok_or(ClientError::NotReady)?)))
+        let data = Zeroizing::new(data.ok_or(ClientError::NotReady)?);
+        // Shown, played or saved: it no longer counts against the automatic downloads.
+        self.s()?
+            .db
+            .conn()
+            .execute("UPDATE attachments SET opened = 1 WHERE message = ?1", [message])?;
+        Ok((mime, name, data))
     }
 
     /// Starts a failed transfer again, or a download the user tapped (`available`). A failed
@@ -854,6 +880,14 @@ impl Actor {
 
 #[cfg(feature = "test-hooks")]
 impl Actor {
+    pub(super) fn attachment_blob(&self, message: i64) -> Result<Vec<u8>> {
+        Ok(self.s()?.db.conn().query_row(
+            "SELECT blob_id FROM attachments WHERE message = ?1",
+            [message],
+            |r| r.get(0),
+        )?)
+    }
+
     pub(super) async fn raw_upload(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let mailbox = self.s()?.mailbox;
         let Response::UploadToken(u) = self

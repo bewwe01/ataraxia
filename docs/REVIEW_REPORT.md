@@ -3702,3 +3702,279 @@ Fix: add a per-contact (or total) quota for files not yet opened. Above it, stor
 
 ### Action options
 Recommended: **A. Fix all**, or at minimum **B. Fix blocking only** (M3-1, M3-2, then M3-3 to M3-5), then re-review.
+
+## Milestone 3 review, round 2
+
+**Scope:** fix commit 4311055 (`git show 4311055`), checked against the round-1 findings M3-1 to M3-13. I read these files in full at HEAD:
+- `app/src-tauri/src/lib.rs`: `Uploads` and the `attachment_*` commands
+- `app/src/ipc.ts`: `sendAttachment`
+- `app/src/components/Attachment.tsx`
+- `app/src/media.ts`
+- `crates/client/src/service/attachments.rs`
+- `crates/client/tests/attachments.rs`
+- `app/src/screens/Chats.tsx`: the send paths
+- `VeilNativePlugin.kt`: `saveFile`
+- the documentation changes: ADR-0015, INV-ATT-3/4/5, THREAT_MODEL §5.6
+
+I also read the relay's `put_chunk`/`get_chunk` and BlobUploadToken handling, to check the client's error classification.
+
+**Verdict: PASS WITH CONDITIONS.** 0 Critical, 0 High, 2 Medium, 4 Low, 3 Info. All 13 round-1 findings are fixed or partly fixed. The conditions before a release:
+- Fix M3R2-1 and M3R2-2.
+- Run the INV-ATT-5 device check, which is still owed.
+
+**Commands run** (in `/home/user/ataraxia` at HEAD 4311055, shared target dirs):
+- `cargo test -p veil-client --locked`: lib 14 passed; attachments 9; contacts_and_privacy 8; lock_and_setup 3; messaging 7; notifications 3; pair_and_message 2; unlock_options 5. All passed on the first run.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean.
+- `cargo fmt --all --check`: clean.
+- `(cd app/src-tauri && cargo test --locked)`: 3 passed (`a_file_arrives_in_parts`, `unknown_fields_and_stale_parts_are_refused`, `too_large_drops_the_upload`).
+- `(cd app/src-tauri && cargo clippy --all-targets --locked -- -D warnings)`: clean.
+- `pnpm -C app typecheck`: clean. `pnpm -C app lint`: "13 files clean".
+- Not run: anything on an Android device, the release workflow, and the design checks (they need `pnpm install` from the network).
+
+### Round-1 findings
+
+| ID | Status | Evidence |
+|---|---|---|
+| M3-1 | **Fixed** (new issue: M3R2-1) | The file now goes over in JSON-only base64 parts: `attachment_begin` / `attachment_part` / `attachment_commit` (`lib.rs:300-414`). Bounds: each part ≤ 2 MiB of base64 (`MAX_PART_CHARS`); the total is checked against `MAX_FILE` before growing, and an oversize upload is dropped. The buffer is `Zeroizing`, and it is grown by hand into a new `Zeroizing` vec, so no reallocation leaves an unwiped copy. Stale ids are refused (`filter(\|u\| u.id == upload)`, and `take` checks the id). The slot is cleared on `ChangeKind::Locked` (`lib.rs:598-601`), which also covers Reset and Purge while unlocked, because both go through `lock_now`. A mutex poisoned by a panic is recovered rather than unwrapped. Unit tests drive it with the JSON shape the UI sends. |
+| M3-2 | **Partly fixed** | The list fetches a photo only while it is on screen and only up to 2 MB. The viewer holds one photo of at most 8 MB. A voice note's blob lives from Play to its end. Android Save goes through the native plugin, with no blob. INV-ATT-5 records the argument honestly as "argued, not device-tested". It assumes voice notes are ~1.2 MB, but a contact can send a 25 MB one (M3R2-2). |
+| M3-3 | **Fixed** | `useFileUrl` depends on `[m.id, ok, mime]` only. `VoiceNote` creates its `Audio` only in `toggle()`, so a list refresh neither refetches nor restarts playback. |
+| M3-4 | **Fixed** | `next_attempt_ms` backoff (2 s doubling, at most 5 min). Selection is `ORDER BY state = 'download', attempts, message`, so uploads go first and a failing row cannot hold the head of the queue. `NotFound` on a download and `Protocol` (wrong chunk shape) give up at once. |
+| M3-6 | **Fixed** | Each upload and download step writes in one `atomically` block with no relay I/O inside. `download_step` with `next >= total` calls `finish_download` directly. |
+| M3-7 | **Fixed** (weak test: M3R2-4) | `Unauthorized`, `QuotaExceeded` or `Conflict` on an upload leads to `restart_upload(automatic)`. That re-encrypts under a fresh key, nonce prefix and blob id, clears the token, and is capped at `MAX_RESTARTS = 2`; a user retry resets the count. `RateLimited` on the token request is retried without counting, which is correct. The lost last-chunk reply is still recognised through `blob_complete`. |
+| M3-5 | **Fixed** | New tests: `crafted_attachments_never_show_a_wrong_file` (forged hash, bad padding, wrong chunk count, too large, repeated id), `missing_blobs_do_not_hold_up_uploads`, `download_resumes_after_the_connection_drops`, `an_expired_upload_token_starts_a_fresh_upload`, `a_contact_cannot_fill_the_phone`, and a recursive plaintext scan of both data folders after the round trip. The hostile-relay chunk shapes are unit-tested on `chunk_fits`, which is the exact predicate `download_step` applies. INV-ATT-4 now says exactly that, so it no longer over-claims. |
+| M3-8 | **Fixed** (residuals: M3R2-3) | Every `image/*` except SVG and GIF is decoded and re-encoded. The mime comes from `out.type`. Images sent unchanged get a note. |
+| M3-9 | **Fixed** | `autoStop` → `halt()` stops the recorder and releases the tracks, the `AudioContext` and the sampler, then runs `onLimit`. Everything after `getUserMedia` is wrapped in try/catch, which stops the tracks on error. `elapsed` is clamped. |
+| M3-10 | **Fixed** | Kotlin rejects `saveFile` while `pendingSave != null`. JS has a module-level `saving` guard, and the Save buttons are disabled while busy. |
+| M3-11 | **Fixed** | `useDialogKeys` is shared by the viewer and the action dialog. The viewer returns focus to its opener. The live region is a static "Recording" / "stopped at the limit" label, with the timer outside it. Viewer and QR colours are now `--media-backdrop`, `--on-media` and `--qr-paper` in both `tokens.css` files. |
+| M3-12 | **Partly fixed** (M3R2-5) | Per contact, files download by themselves up to 100 MB per rolling 24 h; above that they arrive as `available` and download on a tap. The retry path accepts `available` only for received rows (`m.mine = 0`) and resets attempts and backoff. This limits the rate, not the total. |
+| M3-13 | **Addressed** | THREAT_MODEL §5.6 now names the IPC, webview and plugin copies of files. Desktop save is unchanged: it still uses the webview's download handling, with no `on_download` handler. |
+
+**Migration 3 edited in place: acceptable.** No release contains it (v0.1.0-preview.4 predates M2), so no user's vault is at `user_version = 3` without the two new columns. The only exposure is a developer vault built from 009ef1d or 53e4f76. There, the selection query in `transfer_step` fails, and the `.ok().flatten()` hides the error, so transfers silently never run. Tell anyone testing M3 builds to recreate their vault. Do not edit migrations in place once anything has been tagged.
+
+### Findings
+
+**M3R2-1 Medium [HIGH]: two sends in flight wipe each other, and the first file is lost without a word**
+`app/src-tauri/src/lib.rs:412` (`attachment_abort` takes no id), `app/src/ipc.ts:187-208`, `app/src/screens/Chats.tsx:247`.
+
+The shell keeps one upload slot. `sending` is per-`Chat` state, and `Chat` is keyed by contact (`App.tsx:106`), so it does not serialise across chats.
+
+Failure scenario:
+1. The user sends a 20 MB file in chat A. That is about 20 parts, several seconds of base64 encoding on a phone.
+2. The user goes back and sends a photo in chat B. `attachment_begin` for B replaces A's upload.
+3. A's next part gets `BadInput`. A's `catch` calls `attachment_abort()`, which clears **B's** upload, so B fails too ("Could not send this file").
+4. A failed before `attachment_commit`, so no message row exists. Its `Chat` has unmounted, so no error is shown either. The user's first file simply never appears.
+
+Nothing leaks: the ids prevent mixing bytes from the two uploads.
+
+Fix:
+- Make `attachment_abort(upload: u64)` drop only its own upload:
+  ```rust
+  #[tauri::command]
+  fn attachment_abort(uploads: State<'_, Uploads>, upload: u64) { drop(uploads.take(upload)); }
+  ```
+  and in `ipc.ts` call `call("attachment_abort", { upload })`.
+- Serialise sends in `ipc.ts` with a module-level queue, so a second send waits instead of replacing the first:
+  ```ts
+  let queue: Promise<unknown> = Promise.resolve();
+  function sendAttachment(contact: number, a: OutgoingAttachment) {
+    const run = queue.then(() => sendOne(contact, a), () => sendOne(contact, a));
+    queue = run.catch(() => undefined);
+    return run;
+  }
+  ```
+- Add a unit test: begin(A), begin(B), abort(A), then B's parts and `take` still work.
+
+**M3R2-2 Medium [MEDIUM: Chromium limits per device not verified]: a contact's oversized "voice note" breaks the INV-ATT-5 argument**
+`crates/client/src/service/attachments.rs:646` (`kind_for(&mime, a.voice_duration_ms.is_some() && …)`, with no size bound for voice), `app/src/components/Attachment.tsx:255` and `:333`, `docs/INVARIANTS.md:51`.
+
+INV-ATT-5 counts "one playing voice note (≤ 5 min at 32 kbit/s, about 1.2 MB)". That bound comes from our own recorder, not from what we accept. On receive, any `audio/*` with `voice_duration_ms` set becomes `kind = voice`, up to `MAX_FILE`. The duration is clamped; the size is not.
+
+Failure scenario:
+1. A hostile contact, or a modified client, sends a 25 MB `audio/webm` with `voice_duration_ms = 1000`.
+2. It downloads by itself (it is within the 100 MB allowance).
+3. The user taps Play. `toggle()` makes `new Blob([25 MB])`.
+4. On a 2–3 GB phone (1 % of RAM is 20–30 MB, minus Chromium's 5 MB minimum page file), that blob is over the limit before paging. Chromium then pages it, or moves it by file, into `app_webview/…/blob_storage`. That is plaintext outside SQLCipher (rule 6, INV-ATT-4).
+
+A related caveat for the written argument: `URL.revokeObjectURL` does not free blob data. The browser keeps it until the renderer garbage-collects the `Blob`. Fast scrolling through many ≤ 2 MB photos can therefore hold more than the "on-screen" set for a while.
+
+Fix:
+- Bound voice by size where it is classified. In `receive_attachment` and `send_attachment`, a voice note larger than `MAX_VOICE_BYTES` (for example 4 MiB, generous for 5 min of Opus) is a `file`:
+  ```rust
+  const MAX_VOICE_BYTES: u64 = 4 * 1024 * 1024;
+  let voice = a.voice_duration_ms.is_some() && mime.starts_with("audio/") && a.size <= MAX_VOICE_BYTES;
+  ```
+  With that, the Android Save path takes it and no blob is made.
+- Mirror the bound in `AttachmentBody`: `a.kind === "voice" && a.size <= VOICE_MAX`.
+- Restate INV-ATT-5 in terms of what Veil accepts (claimed sizes, checked against the decrypted length), not what honest senders produce.
+- Add the GC caveat to the argument, and include a fast-scroll pass in the device check.
+
+**M3R2-3 Low [HIGH]: GIFs are told "Sent as a file" but show as photos, and images with an empty type get no note**
+`app/src/media.ts:61` and `:89`, `crates/client/src/service/attachments.rs:155`.
+
+- `prepareFile` sends a GIF unchanged with `kind: "file"` and the note "Sent as a file, so any location or camera details in it were kept". But `send_attachment` ignores the UI's kind except for voice: `kind_for("image/gif", false)` returns `"image"`. Both sides therefore show it inline (up to 2 MB) or in the viewer (up to 8 MB).
+- ADR-0015 says GIFs are sent as files, which is also wrong.
+- A picked image with an empty `File.type` (some file managers do this) is neither re-encoded nor given a note.
+
+Fix (pick one):
+- Make GIF a file: when `input.kind == "file"`, use `"file"` (`kind_for` only promotes when the UI asked for an image). Drop `image/gif` from `INLINE_IMAGES` if you want GIFs never inline on receive either.
+- Or keep GIFs inline and change the note to "Sent unchanged…" and correct the ADR.
+
+For the empty type, also try `createImageBitmap` when `file.type === ""`.
+
+**M3R2-4 Low [MEDIUM]: `an_expired_upload_token_starts_a_fresh_upload` can pass without testing a restart**
+`crates/client/tests/attachments.rs:585`.
+
+The test cuts the connection once `progress > 0` on a 1 MB file (16 chunks, polled every 50 ms). It never checks that the upload was still in progress at the cut, so a fast machine can finish the upload first and the test passes anyway. It also never checks that a fresh key or blob id was used, which INV-ATT-3 claims. Mutating the `Unauthorized | QuotaExceeded | Conflict` arm in `transfer_step` could leave the suite green.
+
+Fix:
+- Use a larger file (≥ 4 MB).
+- After `online(false)`, assert `status == "sending"` and `progress < 1.0`, as `download_resumes_after_the_connection_drops` does.
+- Add a test hook that reads `restarts` or `blob_id`, and assert that it changed.
+
+**M3R2-5 Low [HIGH]: the automatic-download allowance limits the rate, not the total**
+`attachments.rs:650-662`.
+
+A hostile contact stays under 100 MB per rolling 24 h indefinitely: about 3 GB a month per contact, never opened, with several hostile contacts adding up. That is slower than round 1's scenario but still fills a phone over weeks. ADR-0015's "a contact cannot fill the phone" over-claims.
+
+Fix: also cap the total of automatically downloaded, never-opened files. For example, `SUM(size) WHERE mine = 0 AND state = 'ready' AND opened = 0` at 500 MB across all contacts; above it the state is `available`. Or reword the ADR to "limits the rate".
+
+**M3R2-6 Info: the integration tests do not exercise ordering or backoff**
+`missing_blobs_do_not_hold_up_uploads` uses `NotFound`, which now gives up at once. Removing `next_attempt_ms <= ?1` or the `state = 'download'` ordering would still pass it. Only `backoff_ms` is unit-tested. Add a case where a download fails with a retryable error (a `Proxy` mode that drops `BlobGet` replies) and an upload started afterwards still finishes promptly.
+
+**M3R2-7 Info: plaintext copies outside the zeroizing buffer**
+Each part's JSON string and serde_json's intermediate `Value` are not wiped. Neither are the JS `bin` and base64 strings. This is memory only, and now covered by THREAT_MODEL §5.6.
+
+**M3R2-8 Info: the upload commands work while locked**
+`attachment_begin` and `attachment_part` do not check the lock state, so the webview can fill the 25 MB buffer while locked. This is harmless: commit fails while locked, and the next Locked event (or a new begin) drops the buffer. If a stuck `saveResult` ever left `pendingSave` set, Android Save would refuse until restart; this is not seen in practice.
+
+### What is good
+- **The upload buffer is careful.** Bounds are checked before growth, growth is by hand into zeroizing storage, stale ids are refused, the buffer is cleared on lock, and the Tauri unit tests use the exact JSON the UI sends.
+- **The transfer engine is now robust against both a hostile contact and a hostile relay.** Uploads go first. Failing rows back off and never hold the head of the queue. Permanent failures end at once. Steps are atomic. Restarts always use a fresh key, nonce prefix and blob id, never the old key.
+- **The new hostile-contact tests are real.** Forged hash, inconsistent sizes, more chunks claimed than the blob has, too large, and a repeated id each end without a wrong file. `attachment_data` refuses them. The plaintext scan covers both data folders.
+- **The documentation is honest.** INV-ATT-4 and INV-ATT-5 state exactly what is tested versus argued, and INV-ATT-5 lists the device check still owed.
+- **The media fixes are clean.** The microphone is released on every path, the photo mime comes from the encoder, and the recording live region is fixed.
+
+### Action options
+Recommended: **B. Fix blocking only**: M3R2-1 and M3R2-2, then run the INV-ATT-5 device check before tagging. M3R2-3 to M3R2-5 can follow in a later PR.
+
+## Milestone 4 review, round 1
+
+**Scope:** commit eaacb66 (`git show eaacb66`), checked against ADR-0016, INV-REST-4/5 and CLAUDE.md's rules 3, 6, 7 and 8. Files read:
+- `crates/client/src/service/watcher.rs`, in full
+- the watcher wiring in `crates/client/src/service.rs`: `lock_now`, `open_session`, `unlock` (Purge and Key paths), Reset, the `run` select, `on_tick`, `Notify`/`SetNotify`, and the `Incoming` emits in `process_inner` and `receive_attachment`
+- `crates/client/tests/notifications.rs`
+- `app/src-tauri/src/lib.rs`: `alert`, `notify_settings`, `set_notify`, `set_background`, and the notify callback
+- `app/src-tauri/src/native.rs`
+- `app/android/VeilNativePlugin.kt` (`VeilNotify`, `VeilService`, `notifyMessage`, the `resumed` flag)
+- `app/android/harden.py`
+- the permission allowlist in `.github/workflows/release.yml`
+- the notification group in `Settings.tsx`, and `App.tsx`
+
+I also read the relay's `Authenticate`, `subscribe` and `notify`, the client's `Relay::connect` reader task, and the Tauri 2.12.4 Android `Plugin` lifecycle hooks.
+
+**Verdict: PASS WITH CONDITIONS.** 0 Critical, 0 High, 0 Medium, 4 Low, 3 Info. The core security properties hold (details under "What is good"):
+- No name, contact-derived text or content reaches any notification or log.
+- The locked-state key is dropped and zeroized on every path.
+- The watcher cannot fetch or acknowledge.
+- A watcher and an unlocked session are never live at once.
+
+The conditions:
+- The Kotlin is compiled only by the release workflow and has not run on a device. Before release, check on a device the notification text, its lock-screen appearance, the denied-permission behaviour and the background service.
+- Fix M4-1 to M4-3, which are behaviour and UX problems on Android.
+
+**Commands run:** the same runs as Part A, at HEAD (which contains eaacb66). `notifications` 3 passed (`unlocked_incoming_names_the_conversation_only`, `locked_veil_hears_that_something_arrived`, `notifications_off_means_nothing_while_locked`). Workspace and `app/src-tauri` clippy clean, typecheck and lint clean. Kotlin was reviewed by reading only.
+
+### Checks asked for
+
+- **Content in notifications or logs: none.**
+  - The only data that crosses into Kotlin is `NotifyArg { certain: bool }` (`native.rs`).
+  - The texts are constants: "Veil" / "New message" / "You may have new messages", and for the service "Connected, to tell you when something arrives".
+  - `alert(&handle, contact.is_some())` passes a boolean. The contact id goes only to the webview's `veil://changed` event, as before, and `App.tsx` ignores `incoming`.
+  - No `tracing` call, `Log.*` or `println` was added in watcher.rs, lib.rs or the plugin.
+- **Key dropped and zeroized on every path: yes.**
+  - `Watcher` owns an `ed25519_dalek::SigningKey`; `ed25519-dalek` 3.0.0 has `zeroize` in its default features, so it zeroizes on drop.
+  - Unlock (password or biometric): `open_session` sets `self.watcher = None` first.
+  - Reset: `lock_now(); self.watcher = None`.
+  - Purge PIN: `lock_now(); self.watcher = None; wipe()`.
+  - Auto-lock and manual lock go through `lock_now`, which builds the watcher only if notifications are on.
+  - Failed unlock or `RetryLater`: the watcher is kept. That is correct, as Veil is still locked.
+  - Process exit drops the actor.
+  - The clone handed to the connect task is dropped when the task ends or is aborted; `Watcher::drop` aborts it.
+  - `pin` and `mailbox` (`[u8; 32]`) and `relay_addr` are not zeroized. They are not secrets, and ADR-0016 lists them.
+- **Watcher changes server state: only benignly.**
+  - It sends `Challenge` and `Authenticate`, then only reads pushes. It never sends `Fetch` or `Ack`.
+  - `notifications::locked_veil_hears_that_something_arrived` shows the messages are all there after unlock.
+  - The relay's `Authenticate` does `touch_mailbox`, which extends the mailbox's idle expiry, and subscribes the connection. Both are harmless.
+- **Watcher and session both live: no.** The watcher is created only inside `lock_now` from the session being dropped, and removed before a new session is built. The dropped `Relay` closes its socket, because its reader task ends when `out_tx` drops.
+- **Panic paths: none.**
+  - Untrusted pushes are only counted, and rate-limited to one notice a minute.
+  - `Instant` arithmetic uses `checked_add(..).unwrap_or_else(Instant::now)`.
+  - `spawn_local` runs inside the actor's `LocalSet` (`service.rs:447`).
+  - A completed `JoinHandle` cannot be polled twice: its `Ready` wins the `select!` round and `connecting` is cleared.
+- **Android:**
+  - `VeilService` is `exported="false"`.
+  - The PendingIntent is `FLAG_IMMUTABLE | FLAG_UPDATE_CURRENT` on the explicit launch intent.
+  - The service type is `remoteMessaging`, with `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_REMOTE_MESSAGING` declared, and API 34+ calls `startForeground` with the matching type.
+  - Channels: Messages at `IMPORTANCE_DEFAULT`, Connection at `IMPORTANCE_MIN` with no badge.
+  - With POST_NOTIFICATIONS denied, `allowed()` is false and nothing is posted; the service still runs with a hidden notification.
+  - The allowlist names exactly the three new permissions.
+
+### Findings
+
+**M4-1 Low [MEDIUM]: the background-connection notification can claim "Connected" when nothing is connected**
+`app/android/VeilNativePlugin.kt:125` (`START_STICKY`), and the `VeilService` class.
+
+The Rust core (the client actor and watcher) runs only once the Tauri activity has started. If Android kills the process and later restarts the sticky service on its own, only `VeilService` runs. ADR-0016 also says "After a restart nothing is in memory".
+
+Failure scenario: after a low-memory kill, the ongoing notification "Connected, to tell you when something arrives" is back, but no relay connection or watcher exists. The user trusts that they will be told about messages, and they will not be. The same can apply after the user swipes Veil away, depending on how wry tears down.
+
+Fix: return `START_NOT_STICKY`, so the service lives only while the app process that started it lives. Or reword the text so it promises nothing ("Veil is running in the background"). Have the plugin stop the service in `onDestroy` when the activity finishes.
+
+**M4-2 Low [HIGH]: turning notifications off leaves the background service running**
+`app/src/screens/Settings.tsx:314`, `app/src-tauri/src/lib.rs:575-581`.
+
+Turning "Message notifications" off only disables the background toggle. `set_notify(false)` does not stop `VeilService`.
+
+Failure scenario: the user turns notifications off. Veil keeps a foreground service, an ongoing notification and the battery cost. While unlocked it also keeps a relay connection, for no benefit.
+
+Fix: in `set_notify`, when `!enabled`, also call `native::set_background(&app, false).await` (ignoring `Unavailable` on desktop). Or reset the stored `background` preference in Kotlin.
+
+**M4-3 Low [HIGH]: notifications are on by default but the permission is never asked for, and "Allow notifications" can do nothing**
+`lib.rs:575-581`, `VeilNativePlugin.kt:202`.
+
+On Android 13+, notifications default to on, but `request_notifications` runs only from `set_notify(true)`. A new user who never opens Settings gets no notifications and sees no warning. ADR-0016 says "Android 13+ asks for the notification permission when notifications are turned on", which is not true for the default. Also, after the user denies twice, `requestPermissions` shows nothing, so the banner's "Allow notifications" button silently does nothing.
+
+Fix:
+- Ask once after setup or the first unlock if `enabled && !systemAllowed`.
+- In `requestNotifications`, when `!shouldShowRequestPermissionRationale` and the permission was already asked (keep a pref), open `Settings.ACTION_APP_NOTIFICATION_SETTINGS` with `EXTRA_APP_PACKAGE`.
+
+**M4-4 Low [HIGH]: no test that the locked-state watcher is gone after unlock, reset or purge**
+`crates/client/tests/notifications.rs`.
+
+The tests cover the locked notice and notifications off. Nothing checks that the watcher stops after the paths INV-REST-4 and ADR-0016 name. Deleting `self.watcher = None` from `open_session`, Reset or Purge would leave the suite green. That would leave a live signing key and connection, and "may have" notices after unlock or after a purge.
+
+Fix: add a `#[cfg(feature = "test-hooks")] watcher_live() -> bool` hook. Assert it is false after unlock, after `reset`, after a purge-PIN unlock, and with notifications off. Also assert that no `Incoming(None)` arrives after unlock while the contact keeps sending.
+
+**M4-5 Info: lock-screen visibility is PUBLIC**
+`VeilNativePlugin.kt:83` and `:183`.
+
+The notification carries no content, so this complies with rule 6 and matches ADR-0016 ("the same on the lock screen"). It does show anyone holding the locked phone that Veil is installed and got something. For at-risk users, consider a setting for `VISIBILITY_SECRET` (and the channel's `lockscreenVisibility`).
+
+**M4-6 Info: `Incoming` fires before the transaction commits**
+`Incoming` is emitted inside `process`'s transaction, before the commit (`service.rs` text branch, `attachments.rs:676`). A later failure that rolls back yields a notification for a message that is not stored. This is harmless, and `Messages` already behaved this way. Separately, `onPause` also fires behind Veil's own system dialogs (biometric prompt, save picker, permission request), so a "New message" can be posted while the user is in Veil.
+
+**M4-7 Info: costs ADR-0016 does not list**
+- While locked with notifications on, the relay sees an authenticated connection and keeps the mailbox alive (`touch_mailbox`). Before, a locked device was offline to the relay.
+- After a Purge PIN, the decoy state never shows "may have new messages", whereas a real locked vault with notifications on does. An observer who knew the earlier behaviour could tell the two apart.
+
+Add both to ADR-0016's costs.
+
+### What is good
+- **The design keeps the locked state minimal.** Only the relay sign-in is kept (no message keys, no database). The watcher never fetches or acknowledges, notices are rate-limited to one a minute, and the connect runs in a background task that the lock and the actor never wait on. The trade-off is written down in ADR-0016 and INV-REST-4.
+- **Key lifetime is handled at every state change.** Unlock, Reset, Purge and exit all drop it, and the watcher is never built while unlocked.
+- **The notification texts are fixed in Kotlin**, and the Rust→Kotlin interface carries only a boolean. That makes INV-REST-5 easy to argue.
+- **Android hygiene is right:** the service is not exported, the PendingIntent is immutable, the foreground-service type and permission are correct for API 34+, a revoked permission is caught as a `SecurityException`, the notification is posted only when not resumed and cleared on resume, and the release allowlist is updated in the same change.
+- **The tests cover the core cases:** typing and own sends do not notify, the locked notice carries no contact and is rate-limited, nothing is acknowledged while locked, and with notifications off nothing happens.
+
+### Action options
+Recommended: **B. Fix blocking only**: M4-1 to M4-3, plus M4-4 as the test for the key-lifetime claim. Then do the on-device check of the Kotlin before tagging.

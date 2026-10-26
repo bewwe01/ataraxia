@@ -39,7 +39,10 @@ mod watcher;
 use crate::relay::{Relay, split_host_port};
 use crate::unlock::{self, SecretKind};
 use crate::{ClientError, Result, keystore, now_ms, now_secs, qr, write_atomic};
-pub use attachments::{AUTO_DOWNLOAD_PER_DAY, AttachmentInput, AttachmentView, MAX_FILE, MAX_VOICE_MS};
+pub use attachments::{
+    AUTO_DOWNLOAD_PER_DAY, AUTO_DOWNLOAD_UNOPENED, AttachmentInput, AttachmentView, MAX_FILE,
+    MAX_VOICE_BYTES, MAX_VOICE_MS,
+};
 
 /// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
@@ -344,6 +347,10 @@ enum Cmd {
     HiddenRows(i64, Reply<i64>),
     #[cfg(feature = "test-hooks")]
     RawUpload(Vec<u8>, Reply<Vec<u8>>),
+    #[cfg(feature = "test-hooks")]
+    AttachmentBlob(i64, Reply<Vec<u8>>),
+    #[cfg(feature = "test-hooks")]
+    WatcherLive(Reply<bool>),
     MarkRead(i64, Reply<()>),
     CreateInvite(Reply<InviteView>),
     AcceptInvite(String, Reply<ContactView>),
@@ -373,6 +380,23 @@ struct Interrupt {
 pub struct Client {
     tx: mpsc::Sender<Cmd>,
     interrupt: Arc<Interrupt>,
+    /// Declared last, so it drops after `tx`: the last clone closes the channel, then waits.
+    _done: Arc<Finished>,
+}
+
+/// Waits, when the client is dropped, for the actor to close its database and connections
+/// before the process can exit: an exit while the actor thread is still inside `SQLCipher`
+/// crashed a test binary at teardown (CI run 60). Bounded, so a stuck relay call cannot hang
+/// the caller.
+struct Finished(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        if let Ok(rx) = self.0.lock() {
+            // Disconnected once the actor thread has returned (its sender dropped).
+            let _ = rx.recv_timeout(Duration::from_secs(5));
+        }
+    }
 }
 
 impl core::fmt::Debug for Client {
@@ -438,9 +462,11 @@ impl Client {
         let (tx, rx) = mpsc::channel(32);
         let interrupt = Arc::new(Interrupt::default());
         let actor_interrupt = Arc::clone(&interrupt);
+        let (finished, done) = std::sync::mpsc::channel::<()>();
         std::thread::Builder::new()
             .name("veil-client".into())
             .spawn(move || {
+                let _finished = finished;
                 let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
                     return;
                 };
@@ -460,7 +486,11 @@ impl Client {
                 );
             })
             .map_err(|_| ClientError::Storage)?;
-        Ok(Self { tx, interrupt })
+        Ok(Self {
+            tx,
+            interrupt,
+            _done: Arc::new(Finished(std::sync::Mutex::new(done))),
+        })
     }
 
     pub async fn state(&self) -> Result<AppState> {
@@ -622,6 +652,16 @@ impl Client {
     }
     /// Tests only: uploads any bytes as a blob (full-size chunks but the last) and returns its
     /// id, for crafting `Attachment` messages a hostile contact could send.
+    /// Tests only: the blob id an attachment is (being) uploaded under.
+    #[cfg(feature = "test-hooks")]
+    pub async fn attachment_blob(&self, message: i64) -> Result<Vec<u8>> {
+        ask!(self, AttachmentBlob, message)
+    }
+    /// Tests only: whether the locked-state watcher (and its key) exists.
+    #[cfg(feature = "test-hooks")]
+    pub async fn watcher_live(&self) -> Result<bool> {
+        ask!(self, WatcherLive)
+    }
     #[cfg(feature = "test-hooks")]
     pub async fn raw_upload(&self, ciphertext: Vec<u8>) -> Result<Vec<u8>> {
         ask!(self, RawUpload, ciphertext)
@@ -1289,6 +1329,14 @@ impl Actor {
             Cmd::RawSend(c, id, body, r) => {
                 let res = self.raw_send(c, id, body).await;
                 let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::AttachmentBlob(m, r) => {
+                let _ = r.send(self.attachment_blob(m));
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::WatcherLive(r) => {
+                let _ = r.send(Ok(self.watcher.is_some()));
             }
             #[cfg(feature = "test-hooks")]
             Cmd::RawUpload(ct, r) => {
