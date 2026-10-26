@@ -173,7 +173,34 @@ function MessageActions({ m, name, blocked, onClose, onReply, onEdit, onDone }: 
   onDone: (error?: string) => void;
 }) {
   const [confirm, setConfirm] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
   const mineEmoji = m.reactions.find((r) => r.mine)?.emoji ?? null;
+
+  // Escape closes from anywhere; Tab stays inside the dialog (DESIGN.md §6, review M2-4).
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab" || !box.current) return;
+      const items = Array.from(box.current.querySelectorAll<HTMLElement>("button:not([disabled])"));
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (!first || !last) return;
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || !box.current.contains(active))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (active === last || !box.current.contains(active))) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
   const canChange = withinEditWindow(m) && !blocked;
 
   async function run(f: () => Promise<void>, fallback: string) {
@@ -186,8 +213,8 @@ function MessageActions({ m, name, blocked, onClose, onReply, onEdit, onDone }: 
   }
 
   return (
-    <div className="scrim" onClick={onClose} onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}>
-      <div className="dialog glass-strong msg-dialog" role="dialog" aria-modal="true" aria-labelledby="ma-t" onClick={(e) => e.stopPropagation()}>
+    <div className="scrim" onClick={onClose}>
+      <div ref={box} className="dialog glass-strong msg-dialog" role="dialog" aria-modal="true" aria-labelledby="ma-t" onClick={(e) => e.stopPropagation()}>
         <h2 id="ma-t" className="sr-only">Message from {m.mine ? "you" : name}</h2>
         {m.actionable && !blocked ? (
           <div className="emoji-row" role="group" aria-label="React">
@@ -202,6 +229,7 @@ function MessageActions({ m, name, blocked, onClose, onReply, onEdit, onDone }: 
                 onClick={() => void run(() => ipc.react(m.id, mineEmoji === e ? null : e), "Could not react")}
               >
                 {e}
+                {mineEmoji === e ? <Icon name="check" className="mine-mark" /> : null}
               </button>
             ))}
           </div>
@@ -237,6 +265,9 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
   const [replyTo, setReplyTo] = useState<MessageView | null>(null);
   const [editing, setEditing] = useState<MessageView | null>(null);
   const [found, setFound] = useState<number | undefined>(focus);
+  const [loaded, setLoaded] = useState(false);
+  const [tooOld, setTooOld] = useState(false);
+  const opener = useRef<HTMLElement | null>(null);
   const end = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
 
@@ -244,7 +275,9 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
     let live = true;
     ipc.messages(contact.id).then(
       (m) => {
-        if (live) setMessages(m);
+        if (!live) return;
+        setMessages(m);
+        setLoaded(true);
       },
       () => {
         if (live) setError("Could not load messages");
@@ -279,10 +312,15 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
         const t = window.setTimeout(() => setFound(undefined), 2500);
         return () => window.clearTimeout(t);
       }
+      // Older than the messages shown here: say so, and go back to following new ones.
+      if (loaded) {
+        setTooOld(true);
+        setFound(undefined);
+      }
       return;
     }
     end.current?.scrollIntoView({ block: "end" });
-  }, [messages.length, typing, found]);
+  }, [messages.length, typing, found, loaded]);
 
   // Tell the contact we stopped typing when leaving the chat.
   useEffect(() => () => void ipc.typing(contact.id, false).catch(() => undefined), [contact.id]);
@@ -358,9 +396,21 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
     }
   }
 
-  function openActions(m: MessageView) {
+  function openActions(m: MessageView, from: HTMLElement) {
     setError(null);
+    opener.current = from;
     setActionsFor(m);
+  }
+
+  /** Closes the action dialog and puts focus back where it was, or on the composer. */
+  function closeActions(focusComposer = false) {
+    setActionsFor(null);
+    const back = opener.current;
+    opener.current = null;
+    window.setTimeout(() => {
+      if (!focusComposer && back && back.isConnected) back.focus();
+      else input.current?.focus();
+    }, 0);
   }
 
   return (
@@ -403,17 +453,17 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
                 role="button"
                 tabIndex={0}
                 aria-haspopup="dialog"
-                onClick={() => openActions(m)}
+                onClick={(e) => openActions(m, e.currentTarget)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    openActions(m);
+                    openActions(m, e.currentTarget);
                   }
                 }}
               >
                 {m.reply ? (
                   <span className="reply">
-                    <b>{m.reply.mine ? "You" : contact.name}</b>
+                    {m.reply.mine === null ? null : <b>{m.reply.mine ? "You" : contact.name}</b>}
                     <span>{m.reply.text || "Original message not available"}</span>
                   </span>
                 ) : null}
@@ -438,6 +488,7 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
                       onClick={() => void ipc.react(m.id, g.mine ? null : g.emoji).catch((err: unknown) => setError(err instanceof IpcError ? err.message : "Could not react"))}
                     >
                       {g.emoji}{g.n > 1 ? <b>{g.n}</b> : null}
+                      {g.mine ? <Icon name="check" className="mine-mark" /> : null}
                     </button>
                   ))}
                 </div>
@@ -448,6 +499,7 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
         {typing ? <div className="typing-bubble" role="status" aria-label={`${contact.name} is typing`}><Dots /></div> : null}
         <div ref={end} />
       </div>
+      {tooOld ? <Banner tone="info" icon="info"><p>That message is older than the ones shown here.</p></Banner> : null}
       {error ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
       {contact.blocked ? (
         <div className="composer blocked-bar">
@@ -483,22 +535,20 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
           m={actionsFor}
           name={contact.name}
           blocked={contact.blocked}
-          onClose={() => setActionsFor(null)}
+          onClose={closeActions}
           onReply={() => {
             setEditing(null);
             setReplyTo(actionsFor);
-            setActionsFor(null);
-            input.current?.focus();
+            closeActions(true);
           }}
           onEdit={() => {
             setReplyTo(null);
             setEditing(actionsFor);
             setText(actionsFor.text);
-            setActionsFor(null);
-            input.current?.focus();
+            closeActions(true);
           }}
           onDone={(err) => {
-            setActionsFor(null);
+            closeActions();
             if (err) setError(err);
           }}
         />

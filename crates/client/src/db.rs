@@ -292,6 +292,57 @@ mod tests {
         }
     }
 
+    /// A preview.4 database (version 1) gains the milestone 2 schema, and reactions go with
+    /// their message (review M2-9).
+    #[test]
+    fn migrates_a_version_1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("veil.db");
+        let key = [6u8; 32];
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex(&key).as_str()))
+                .unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute_batch(&format!(
+                "BEGIN; {} PRAGMA user_version = 1; COMMIT;",
+                MIGRATIONS[0]
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO contacts (address, name, mailbox, token, my_token, added_ms)
+                 VALUES ('a', 'Old', x'00', x'00', x'00', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (contact, mine, body, at_ms, status, msg_id) VALUES (1, 0, 'hi', 1, 'received', x'01')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path, &key).unwrap();
+        let c = db.conn();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(usize::try_from(v).unwrap(), MIGRATIONS.len());
+        let row: (String, bool, bool, Option<Vec<u8>>) = c
+            .query_row("SELECT body, edited, deleted, reply_to FROM messages", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("hi".into(), false, false, None));
+        c.execute(
+            "INSERT INTO reactions (message, mine, emoji) VALUES (1, 1, 'x')",
+            [],
+        )
+        .unwrap();
+        c.execute("DELETE FROM messages WHERE id = 1", []).unwrap();
+        let left: i64 = c
+            .query_row("SELECT count(*) FROM reactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "reactions cascade with their message");
+    }
+
     /// `apply` nests inside an outer savepoint: the outer rollback undoes it, the outer release
     /// commits it, and nothing is left open either way (review P4-6, P4R2-2).
     #[test]

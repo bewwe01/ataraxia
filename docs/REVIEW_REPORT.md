@@ -3245,3 +3245,162 @@ Recommended: **B. Fix blocking only** (M1R2-1). Alternatives:
 - **A.** Fix everything, M1R2-1 to M1R2-5.
 - **C.** Pick findings by id.
 - **D.** Keep the report only, no fixes.
+
+## Milestone 2 review, round 1
+
+**Scope:** `git diff 91135dd 6d0f275` (commit 6d0f275), 20 files excluding `veil-TODO.md`, about 1,600 changed lines.
+**Verdict:** PASS WITH CONDITIONS. There are no Critical or High findings. M2-1 to M2-4 (Medium) must be fixed before the next round; the Low findings may be fixed now or tracked.
+
+**Commands run:**
+- `cargo test -p veil-client --test messaging --test contacts_and_privacy`: 8 + 3 passed.
+- `pnpm -C app typecheck`: clean.
+- `pnpm -C app lint`: "12 files clean".
+
+**Attack paths checked and found closed:**
+- **Received edits and deletes:** they cannot touch our messages or another conversation. `receive` matches `contact = ?1 AND mine = 0 AND kind = 'text'` with a 48 h `at_ms` window.
+- **Received reactions:** they are scoped to the conversation, and `PRIMARY KEY (message, mine)` caps them at one per side.
+- **Size and character limits:** the core enforces 16-byte `reply_to`/target ids, the emoji limit of 8 characters / 32 bytes with no control or bidi characters, and `MAX_BODY_LEN`. `account.rs:392/414` validates every opened content.
+- **Blocked contacts:** content from them is dropped before `receive`. `queue_control` refuses to queue for them, and `deliver`/`retry_failed` filter on `c.blocked = 0`.
+- **Transactions:** there is no relay I/O inside `atomically`. Sealing happens inside the savepoint, so the ratchet state and the control row commit together, and `deliver` runs after.
+- **Cascades:** `PRAGMA foreign_keys = ON` (`db.rs:120`) makes reactions cascade on delete-for-me, expiry and contact deletion.
+- **Search:** `LIKE … ESCAPE '\'` escapes `%`, `_` and `\` correctly.
+- **Migration 2:** it is plain `ADD COLUMN … DEFAULT` plus a new table, applied in a transaction with the version bump, and it skips correctly on a `user_version = 1` database.
+- **Panics:** there are no panic paths on untrusted input. `parse_hex` caps input at 2,048 characters and returns `None` on a split UTF-8 sequence; `snippet` and `excerpt` do no indexing.
+- **Camera on Android:** permission is requested through wry's `onPermissionRequest` (`RESOURCE_VIDEO_CAPTURE` maps to `CAMERA`). Microphone is not declared, so it stays denied.
+- **jsQR 1.4.0:** Apache-2.0 (compatible with AGPL-3.0), no runtime dependencies, no install scripts, and the bundle has no `fetch`, `XMLHttpRequest`, `WebSocket`, `eval` or `new Function`. The lockfile pins its integrity hash.
+
+### Findings
+
+**M2-1 Medium: editing (or reacting to) one of our own messages that has not gone out yet leaves the two sides out of sync**
+`crates/client/src/service.rs:2171-2197` (`edit_message`), same pattern in `react` at 2123.
+
+`edit_message` rewrites only the local `body`. The stored `envelope` still holds the original text. It then queues an `Edit` control row and delivers it straight away.
+
+Failure scenario:
+1. A message ends up `failed` with its envelope still stored. This happens after a transient relay error, or permanently after `MAX_ATTEMPTS = 20`, when `retry_failed` stops picking it up.
+2. The UI still offers Edit, because `withinEditWindow` only checks `mine && actionable && < 24 h`.
+3. The `Edit` is deposited first. The receiver has no target yet, so it drops the edit silently.
+4. If the original is retried later, the receiver gets the old text. If it never is, the receiver gets nothing.
+5. Either way the sender sees "edited" with the new text, and the two sides disagree about what was said. A reaction on our own unsent message is lost the same way.
+
+Fix (`delete_for_everyone` already has the right shape):
+- In `edit_message`, if `envelope IS NOT NULL` on the target, re-seal the original `Text` with the new body, keeping the same `content.id`, `reply_to` and `expire_timer_secs`. Replace the row's `envelope` inside the same `atomically` block and do not queue an `Edit`.
+- Alternatively, refuse with a clear error ("not sent yet") until the original is out.
+- For `react`, refuse (or defer) when the target is ours and still has an envelope.
+- Add a test: send while the relay is down, edit, reconnect, and assert the receiver sees only the new text.
+
+**M2-2 Medium: a hostile contact can reuse message ids, which multiplies rows in the chat list**
+`crates/client/src/service.rs:1633` (`messages`) and `2059` (`message`); `receive` `Body::Text` at 2545.
+
+Incoming `Text` rows are inserted with the sender-chosen `content.id`, and nothing checks for uniqueness: `messages_by_msg_id` is not `UNIQUE`. The quote is resolved with `LEFT JOIN messages q ON q.contact = m.contact AND q.msg_id = m.reply_to`.
+
+Failure scenario:
+1. A malicious contact sends K texts all with id Y, then J texts with `reply_to = Y` (or reuses one of our own ids).
+2. Every reply row is returned K times, so the result has K×J rows. `ORDER BY m.id DESC LIMIT 500` counts joined rows, so 23 + 23 crafted messages fill the 500-row window. The real history disappears from the chat view.
+3. The list contains duplicate `m.id` values, so React keys collide and bubbles are mis-reconciled.
+4. `message()` (`query_row`) and the received-reaction lookup pick an arbitrary one of the matching rows.
+
+The damage stays inside that conversation, but it is attacker-controlled amplification. Legitimate retries cannot cause it, because libsignal rejects a duplicated envelope.
+
+Fix:
+- In `receive` `Body::Text`, drop the text (return `Ok(())`) when a row with `(contact, msg_id)` already exists.
+- Resolve the quote with one row: `LEFT JOIN messages q ON q.id = (SELECT id FROM messages WHERE contact = m.contact AND msg_id = m.reply_to AND kind = 'text' ORDER BY id LIMIT 1)`.
+- Optionally, in a migration 3, add a partial `UNIQUE INDEX … ON messages(contact, mine, msg_id) WHERE msg_id IS NOT NULL` once duplicates are cleaned up.
+- Add a test that injects crafted content (see M2-9).
+
+**M2-3 Medium: hidden control rows ignore disappearing timers and are never cleaned up**
+`crates/client/src/service.rs:2083-2106` (`queue_control`).
+
+Control rows are inserted without `expires_at_ms` and are never deleted after delivery.
+
+Failure scenario:
+1. In a chat with a 5-minute timer, the user edits a message while offline.
+2. The `Edit` envelope carries the full new text. The original message expires and is swept, but the control row survives the sweeper.
+3. The `Edit` is deposited at the relay after the timer ran out. The peer drops it, but the relay still receives it.
+
+This is the same class as the M1 guarantee `expired_unsent_message_is_never_sent` (INV-REST-9), now broken for edits.
+
+Separately, every reaction, edit and delete leaves a permanent `kind = 'control'` row with `at_ms`. That is unbounded growth and indefinite activity metadata, even in disappearing conversations.
+
+Fix:
+- Pass the target's `expires_at_ms` into `queue_control` and store it on the control row. The existing sweeper (`DELETE FROM messages WHERE expires_at_ms <= ?`) then removes it, with or without an envelope.
+- Delete control rows once delivered: in `deliver`, `DELETE FROM messages WHERE id = ?1 AND kind = 'control'` instead of marking them `sent`.
+- Extend `expired_unsent_message_is_never_sent` with an edit queued offline.
+
+**M2-4 Medium: the message action dialog has no focus trap and does not return focus**
+`app/src/screens/Chats.tsx:189-227` (`MessageActions`), close paths at 486-507.
+
+DESIGN.md §6 requires a focus trap for `.dialog`. The dialog sets `aria-modal="true"`, but:
+- Tab moves out into the chat behind it, which is not `inert`.
+- Escape only works while focus is inside the scrim.
+- On close, react, delete, Cancel or Escape, focus falls to `<body>`, because the bubble that opened the dialog is never refocused. The repo already does this for the contact delete confirm (`Contacts.tsx:105-111`).
+
+Failure scenario: a keyboard or screen-reader user reacts to a message and loses their position at the top of the document after every action. They can also tab into the composer while the "modal" is open.
+
+Fix:
+- Store the opener (`document.activeElement`) in `openActions`, and call `.focus()` on it in `onClose`/`onDone`. After a delete the bubble is gone, so focus the composer instead.
+- Mark the chat behind the dialog `inert` (or wrap Tab between the first and last focusable elements of the dialog).
+- Move the Escape handler to a `keydown` listener on `document` while the dialog is mounted.
+
+**M2-5 Low: the Android permission check in release.yml does not check "exactly"**
+`.github/workflows/release.yml:149-151`.
+
+The comment says "exactly the ones Veil uses, nothing a dependency slipped in", but the step only asserts that CAMERA is present. A dependency or Tauri template change that adds, for example, `RECORD_AUDIO`, `ACCESS_FINE_LOCATION` or `READ_CONTACTS` passes silently.
+
+Fix: compare against an allowlist, for example `printf '%s\n' android.permission.CAMERA android.permission.INTERNET | sort > want.txt && diff -u want.txt perms.txt`. Fill the list from the current build's output once.
+
+**M2-6 Low: a search hit outside the loaded 500 messages breaks auto-scroll for the rest of the chat session**
+`app/src/screens/Chats.tsx:273-285`.
+
+When `msg-${found}` is not in the DOM (older than the 500 rows `messages()` returns), `found` is never cleared. The effect returns before `end.current?.scrollIntoView`, so new messages no longer scroll into view, and the user gets no hint that the hit is not shown.
+
+Fix: once messages have loaded and the element is missing, call `setFound(undefined)` and show a hint ("This message is too old to show here"). Longer term, load a window around the hit.
+
+**M2-7 Low: the Scanner starts its interval after it has been torn down**
+`app/src/components/Scanner.tsx:62-63`.
+
+If the component unmounts while `await v.play()` is pending, `stop()` has already run and the tracks are stopped (good). The `setInterval` created afterwards is then never cleared: a no-op timer every 200 ms leaks for the life of the page.
+
+Fix: add `if (stopped) return;` after the `await`.
+
+**M2-8 Low: a missing quote is attributed to the contact**
+`crates/client/src/service.rs:761`; `Chats.tsx` quote rendering.
+
+When the quoted row is gone (for example, our own message deleted for me), `mine` defaults to `false`. The UI then shows "{contact name}: Original message not available", attributing the gone message to them.
+
+Fix: make `ReplyView.mine` an `Option<bool>` (`None` when `qid` is `None`), and render no author line in that case.
+
+**M2-9 Low: the tests do not fully back what INVARIANTS.md claims**
+`docs/INVARIANTS.md` rows INV-REST-10 and INV-MSG-8; `crates/client/src/db.rs:252`.
+- **INV-REST-10** is marked **tested** and says search "never returns … expired messages", but `messaging::local_search` never exercises an expired row. Either add a case (timer set, wait until expiry or set `expires_at_ms` in the past, assert no hit) or mark the row partial.
+- **INV-MSG-8** honestly relies on a written argument for crafted Edit/Delete/Reaction content. Add a harness helper that seals arbitrary `Content` from Bob's `Account` and asserts the following. The same helper covers M2-2.
+  - An `Edit`/`Delete` naming one of Alice's own msg_ids changes nothing.
+  - An `Edit`/`Delete` naming Bob's message from another conversation (Carol's) changes nothing.
+  - A `Reaction` targeting a Carol-conversation id is ignored.
+  - Duplicate ids do not multiply rows.
+- **Migration test:** `migrates_an_old_database_once` starts at version 0. Nothing covers the actual preview.4 path, a `user_version = 1` database with M1 rows upgrading to 2 (columns added, `reactions` table present, cascade works).
+
+**M2-10 Low: "my reaction" is shown by colour alone**
+`app/src/screens/Chats.tsx:197, 433`; `base.css:378`; `app.css:61`.
+
+The `.mine` state on reaction chips and the emoji row is shown only by the accent border and background. `aria-pressed` helps assistive technology, but sighted users who cannot tell the colours apart get no cue. This breaks CLAUDE.md's "no colour-only state".
+
+Fix: add a non-colour marker to the `.mine` state, such as a small check glyph or a heavier border style. Propose the token change in design/DESIGN.md as well.
+
+**M2-11 Info: notes, no action required**
+- The safety QR is acceptable under rule 2. It encodes libsignal's scannable fingerprint (hashes of public identity keys), not key material, and FLAG_SECURE covers it on screen. The `#[serde(skip)]` on `SafetyView.code` is only cosmetic, though: the same string is recoverable from `qrModules`. Reword the doc comment so it does not suggest a secrecy property.
+- `delete_for_everyone` decides "unsent" from `envelope IS NOT NULL`. If the relay accepted a deposit but the response was lost, the peer has the message and no `Delete` is sent. This is rare and covered by the "best effort" wording in ADR-0014.
+- A received `Edit` with an empty body is accepted by the core and blanks the sender's own bubble. It is harmless, but `receive` could ignore empty edits for consistency with `edit_message`.
+- SQLite `LIKE` folds case for ASCII only, so "Ä" does not find "ä". Worth one line in ADR-0014.
+
+### Good
+- The receive-side scoping is right and simple. Edits and deletes are limited to `mine = 0` within the same conversation and a 48 h window; reactions are limited to the conversation. Our messages cannot be changed remotely.
+- Reactions, edits and deletes are sealed inside the savepoint and delivered after commit. They reuse the M1 delivery, retry and block machinery, so blocking and offline behaviour carry over unchanged.
+- Delete-for-everyone handles the unsent case, overwrites the text, and drops reactions. Delete-for-me relies on the FK cascade together with `secure_delete`.
+- The search query is correct: wildcards and the escape character are escaped, it is bounded (2–100 characters, 100 hits), and deleted and expired rows are excluded. The excerpt is trimmed in Rust, so only a short snippet reaches the webview.
+- Verify-by-scanning delegates the comparison to libsignal's `ScannableFingerprint::compare`. A mismatch changes nothing and is shown as an alert, and the test covers another contact's code, a non-Veil code, a one-digit flip and the real code.
+- In the camera flow, frames are decoded on an off-DOM canvas, tracks are stopped as soon as a code is read and on unmount, there is no clipboard use, and the Android permission is declared as optional hardware. jsQR was a well-chosen, dependency-free addition.
+- All IPC goes through `ipc.ts`; all new text is rendered as React text nodes; the icon buttons have labels; and the emoji targets use `--tap-min`.
+
+### Action options
+Recommended: **B. Fix blocking only** (M2-1 to M2-4), then re-review. A, C and D (fix all, fix specific findings, or review only) are also available.

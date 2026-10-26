@@ -164,7 +164,8 @@ pub struct MessageView {
 pub struct ReplyView {
     /// The quoted message's row, if it is still here.
     pub id: Option<i64>,
-    pub mine: bool,
+    /// Who wrote the quoted message; unknown when it is gone from this device.
+    pub mine: Option<bool>,
     /// A short excerpt; empty when the quoted message is gone or deleted.
     pub text: String,
 }
@@ -214,8 +215,9 @@ pub struct SafetyView {
     /// QR code of the scannable safety number, for the other phone to scan.
     pub qr_modules: String,
     pub qr_size: usize,
-    /// The text in that QR code (public: it commits to both identity keys). Not sent to the
-    /// UI, which only draws the code; tests use it in place of a camera.
+    /// The text in that QR code. Public, like the code itself (it commits to both public
+    /// identity keys); left out of the UI data only because the UI draws the code. Tests use
+    /// it in place of a camera.
     #[serde(skip)]
     pub code: String,
 }
@@ -308,6 +310,10 @@ enum Cmd {
     DeleteForMe(i64, Reply<()>),
     Search(String, Reply<Vec<SearchHit>>),
     VerifyScanned(i64, String, Reply<bool>),
+    #[cfg(feature = "test-hooks")]
+    RawSend(i64, Vec<u8>, Body, Reply<()>),
+    #[cfg(feature = "test-hooks")]
+    MsgId(i64, Reply<Vec<u8>>),
     MarkRead(i64, Reply<()>),
     CreateInvite(Reply<InviteView>),
     AcceptInvite(String, Reply<ContactView>),
@@ -539,6 +545,16 @@ impl Client {
     pub async fn verify_scanned(&self, contact: i64, code: String) -> Result<bool> {
         ask!(self, VerifyScanned, contact, code)
     }
+    /// Tests only: sends arbitrary content with a chosen id, as a hostile contact could.
+    #[cfg(feature = "test-hooks")]
+    pub async fn raw_send(&self, contact: i64, id: Vec<u8>, body: Body) -> Result<()> {
+        ask!(self, RawSend, contact, id, body)
+    }
+    /// Tests only: the protocol id of a stored message.
+    #[cfg(feature = "test-hooks")]
+    pub async fn msg_id(&self, message: i64) -> Result<Vec<u8>> {
+        ask!(self, MsgId, message)
+    }
     pub async fn mark_read(&self, contact: i64) -> Result<()> {
         ask!(self, MarkRead, contact)
     }
@@ -758,7 +774,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         let qdeleted: Option<bool> = r.get(14)?;
         Some(ReplyView {
             id: qid,
-            mine: r.get::<_, Option<bool>>(12)?.unwrap_or(false),
+            mine: r.get::<_, Option<bool>>(12)?,
             text: match (qid, qdeleted) {
                 (Some(_), Some(false)) => excerpt(&r.get::<_, String>(13)?),
                 _ => String::new(),
@@ -1123,6 +1139,16 @@ impl Actor {
             }
             Cmd::VerifyScanned(c, code, r) => {
                 let _ = r.send(self.verify_scanned(c, &code));
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::RawSend(c, id, body, r) => {
+                let res = self.raw_send(c, id, body).await;
+                let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::MsgId(m, r) => {
+                let res = self.text_row(m).map(|row| row.2);
+                let _ = r.send(res);
             }
             Cmd::MarkRead(c, r) => {
                 let res = self.mark_read(c).await;
@@ -1630,7 +1656,8 @@ impl Actor {
         let conn = s.db.conn();
         let mut stmt = conn.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages m
-             LEFT JOIN messages q ON q.contact = m.contact AND q.msg_id = m.reply_to AND q.kind = 'text'
+             LEFT JOIN messages q ON q.id = (SELECT x.id FROM messages x WHERE x.contact = m.contact
+                 AND x.msg_id = m.reply_to AND x.kind = 'text' ORDER BY x.id LIMIT 1)
              WHERE m.contact = ?1 AND m.kind IN ('text', 'timer') ORDER BY m.id DESC LIMIT 500"
         ))?;
         // Expired rows are deleted by the tick (at most 5 s late); the UI hides them on time.
@@ -2056,7 +2083,8 @@ impl Actor {
         let mut m = conn.conn().query_row(
             &format!(
                 "SELECT {MESSAGE_COLUMNS} FROM messages m
-                 LEFT JOIN messages q ON q.contact = m.contact AND q.msg_id = m.reply_to AND q.kind = 'text'
+                 LEFT JOIN messages q ON q.id = (SELECT x.id FROM messages x WHERE x.contact = m.contact
+                 AND x.msg_id = m.reply_to AND x.kind = 'text' ORDER BY x.id LIMIT 1)
                  WHERE m.id = ?1"
             ),
             [id],
@@ -2080,7 +2108,7 @@ impl Actor {
     /// Seals `body` for a contact and stores it as a hidden outgoing row, delivered and
     /// retried like a message. Returns the row; the caller delivers it once its own
     /// transaction is committed (no relay I/O inside a savepoint).
-    async fn queue_control(&self, contact: i64, body: Body) -> Result<i64> {
+    async fn queue_control(&self, contact: i64, body: Body, expires_at_ms: Option<i64>) -> Result<i64> {
         let s = self.s()?;
         let (address, blocked): (String, bool) = s.db.conn().query_row(
             "SELECT address, blocked FROM contacts WHERE id = ?1",
@@ -2097,12 +2125,42 @@ impl Actor {
             body: Some(body),
         };
         let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
+        // It expires with the message it is about: an edit of a disappearing message must not
+        // go out after that message is gone (review M2-3).
+        s.db.conn().execute(
+            "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope, expires_at_ms)
+             VALUES (?1, 1, 'control', '', ?2, 'sending', ?3, ?4)",
+            params![contact, now_ms(), envelope, expires_at_ms],
+        )?;
+        Ok(s.db.conn().last_insert_rowid())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    async fn raw_send(&self, contact: i64, id: Vec<u8>, body: Body) -> Result<()> {
+        let s = self.s()?;
+        let address: String =
+            s.db.conn()
+                .query_row("SELECT address FROM contacts WHERE id = ?1", [contact], |r| {
+                    r.get(0)
+                })?;
+        let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
+        let content = Content {
+            id,
+            sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
+            body: Some(body),
+        };
+        let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
         s.db.conn().execute(
             "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope)
              VALUES (?1, 1, 'control', '', ?2, 'sending', ?3)",
             params![contact, now_ms(), envelope],
         )?;
-        Ok(s.db.conn().last_insert_rowid())
+        let row = s.db.conn().last_insert_rowid();
+        if self.deliver(row).await {
+            Ok(())
+        } else {
+            Err(ClientError::Unreachable)
+        }
     }
 
     /// A text message: (contact, mine, `msg_id`, sent or received at, deleted).
@@ -2120,10 +2178,24 @@ impl Actor {
             .ok_or(ClientError::BadInput)
     }
 
+    /// Whether our message is still waiting to go out, and when it expires.
+    fn pending_and_expiry(&self, message: i64) -> Result<(bool, Option<i64>)> {
+        Ok(self.s()?.db.conn().query_row(
+            "SELECT envelope IS NOT NULL, expires_at_ms FROM messages WHERE id = ?1",
+            [message],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
     async fn react(&mut self, message: i64, emoji: Option<String>) -> Result<()> {
-        let (contact, _, msg_id, _, deleted) = self.text_row(message)?;
+        let (contact, mine, msg_id, _, deleted) = self.text_row(message)?;
         if deleted {
             return Err(ClientError::BadInput);
+        }
+        let (pending, expires) = self.pending_and_expiry(message)?;
+        // They have not got it yet, so a reaction would arrive first and be lost (M2-1).
+        if mine && pending {
+            return Err(ClientError::NotSentYet);
         }
         let emoji = emoji.map(|e| e.trim().to_owned());
         let reaction = Reaction {
@@ -2151,7 +2223,8 @@ impl Actor {
                         .conn()
                         .execute("DELETE FROM reactions WHERE message = ?1 AND mine = 1", [message])?,
                 };
-                self.queue_control(contact, Body::Reaction(reaction)).await
+                self.queue_control(contact, Body::Reaction(reaction), expires)
+                    .await
             })
             .await?;
         self.deliver(row).await;
@@ -2174,7 +2247,16 @@ impl Actor {
             return Err(ClientError::BadInput);
         }
         let (contact, msg_id) = self.own_recent(message)?;
+        let (pending, expires) = self.pending_and_expiry(message)?;
         let db = self.s()?.db.clone();
+        if pending {
+            // Not sent yet: seal the message again with the new text, so they only ever get
+            // that version (review M2-1).
+            self.reseal_text(message, contact, msg_id, body).await?;
+            self.deliver(message).await;
+            self.emit(ChangeKind::Messages, Some(contact));
+            return Ok(());
+        }
         let row = self
             .atomically(async {
                 db.conn().execute(
@@ -2187,6 +2269,7 @@ impl Actor {
                         target_id: msg_id,
                         body: body.to_owned(),
                     }),
+                    expires,
                 )
                 .await
             })
@@ -2196,15 +2279,47 @@ impl Actor {
         Ok(())
     }
 
+    /// Replaces the stored envelope of an unsent text with one carrying `body`, same id,
+    /// quote and timer.
+    async fn reseal_text(&self, message: i64, contact: i64, msg_id: Vec<u8>, body: &str) -> Result<()> {
+        let s = self.s()?;
+        let (address, reply_to, at, expires): (String, Option<Vec<u8>>, i64, Option<i64>) =
+            s.db.conn().query_row(
+                "SELECT c.address, m.reply_to, m.at_ms, m.expires_at_ms FROM messages m
+                 JOIN contacts c ON c.id = m.contact WHERE m.id = ?1",
+                [message],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+        let timer = expires
+            .map(|e| u32::try_from(e.saturating_sub(at) / 1000).unwrap_or(0))
+            .filter(|t| *t > 0);
+        let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
+        let content = Content {
+            id: msg_id,
+            sent_at_ms: u64::try_from(at).unwrap_or(0),
+            body: Some(Body::Text(Text {
+                body: body.to_owned(),
+                reply_to,
+                expire_timer_secs: timer,
+            })),
+        };
+        self.atomically(async {
+            let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
+            let n = s.db.conn().execute(
+                "UPDATE messages SET body = ?2, envelope = ?3 WHERE id = ?1 AND contact = ?4 AND envelope IS NOT NULL",
+                params![message, body, envelope, contact],
+            )?;
+            // Sent meanwhile: nothing to replace.
+            if n == 0 { Err(ClientError::NotSentYet) } else { Ok(()) }
+        })
+        .await
+    }
+
     async fn delete_for_everyone(&mut self, message: i64) -> Result<()> {
         let (contact, msg_id) = self.own_recent(message)?;
         let db = self.s()?.db.clone();
         // Still waiting to go out: it never will, and there is nothing to tell them.
-        let unsent: bool = db.conn().query_row(
-            "SELECT envelope IS NOT NULL FROM messages WHERE id = ?1",
-            [message],
-            |r| r.get(0),
-        )?;
+        let (unsent, expires) = self.pending_and_expiry(message)?;
         let row = self
             .atomically(async {
                 db.conn().execute(
@@ -2216,7 +2331,7 @@ impl Actor {
                 if unsent {
                     return Ok(None);
                 }
-                self.queue_control(contact, Body::Delete(Delete { target_id: msg_id }))
+                self.queue_control(contact, Body::Delete(Delete { target_id: msg_id }), expires)
                     .await
                     .map(Some)
             })
@@ -2324,12 +2439,25 @@ impl Actor {
             }))
             .await
             .is_ok();
-        let sql = if ok {
-            "UPDATE messages SET status = 'sent', envelope = NULL WHERE id = ?1"
+        let conn = s.db.conn();
+        let _ = if ok {
+            // A delivered reaction, edit or delete leaves nothing behind (review M2-3).
+            conn.execute(
+                "UPDATE messages SET status = 'sent', envelope = NULL WHERE id = ?1",
+                [message],
+            )
+            .and_then(|_| {
+                conn.execute(
+                    "DELETE FROM messages WHERE id = ?1 AND kind = 'control'",
+                    [message],
+                )
+            })
         } else {
-            "UPDATE messages SET status = 'failed', attempts = attempts + 1 WHERE id = ?1"
+            conn.execute(
+                "UPDATE messages SET status = 'failed', attempts = attempts + 1 WHERE id = ?1",
+                [message],
+            )
         };
-        let _ = s.db.conn().execute(sql, [message]);
         ok
     }
 
@@ -2543,6 +2671,16 @@ impl Actor {
         let now = now_ms();
         match body {
             Body::Text(t) => {
+                // An id they already used: a crafted repeat (libsignal already drops replayed
+                // envelopes), which would duplicate rows and quotes (review M2-2).
+                let seen: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE contact = ?1 AND msg_id = ?2)",
+                    params![contact, msg_id],
+                    |r| r.get(0),
+                )?;
+                if seen {
+                    return Ok(());
+                }
                 // Their timer, or ours if they sent none (an older version that ignores timers).
                 let local: u32 =
                     conn.query_row("SELECT timer_secs FROM contacts WHERE id = ?1", [contact], |r| {
@@ -2617,7 +2755,7 @@ impl Actor {
                 self.emit(ChangeKind::Messages, Some(contact));
             }
             // Only their own recent messages: an edit or delete can never touch ours.
-            Body::Edit(e) => {
+            Body::Edit(e) if !e.body.trim().is_empty() => {
                 let n = conn.execute(
                     "UPDATE messages SET body = ?3, edited = 1 WHERE contact = ?1 AND mine = 0 AND msg_id = ?2
                      AND kind = 'text' AND deleted = 0 AND at_ms > ?4",

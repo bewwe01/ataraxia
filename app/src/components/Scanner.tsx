@@ -60,6 +60,8 @@ export function Scanner({ hint, onCode }: { hint: string; onCode: (text: string)
         if (!v) return;
         v.srcObject = s;
         await v.play().catch(() => undefined);
+        // Closed while starting: stop() already ran (review M2-7).
+        if (stopped) return;
         timer = window.setInterval(tick, EVERY_MS);
       })
       .catch(() => setError("Veil could not use the camera. Allow camera access for Veil in your device's settings, then try again."));

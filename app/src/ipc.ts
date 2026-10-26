@@ -46,7 +46,8 @@ export interface MessageView {
   timerSecs: number | null;
   expiresAtMs: number | null;
   /** The message this one answers. `text` is empty when that message is gone or deleted. */
-  reply: { id: number | null; mine: boolean; text: string } | null;
+  /** `mine` is null when the quoted message is gone from this device (author unknown). */
+  reply: { id: number | null; mine: boolean | null; text: string } | null;
   reactions: { emoji: string; mine: boolean }[];
   edited: boolean;
   /** Deleted for everyone: show a placeholder. */

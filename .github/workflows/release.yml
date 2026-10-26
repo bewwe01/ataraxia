@@ -146,8 +146,14 @@ jobs:
           echo "$M" | grep -E 'allowBackup|dataExtractionRules|fullBackupContent'
           echo "$M" | grep -E 'allowBackup.*=false'
           echo "$M" | grep -q dataExtractionRules
-          # Permissions: exactly the ones Veil uses, nothing a dependency slipped in.
+          # Permissions: only ones on this list, so nothing a dependency slips in goes unnoticed
+          # (review M2-5). INTERNET for the relay; CAMERA for QR codes; biometrics; the rest
+          # are reserved for voice notes and notifications (milestones 3 and 4).
           echo "$M" | grep -o 'android.permission.[A-Z_]*' | sort -u | tee perms.txt
+          printf '%s\n' INTERNET CAMERA USE_BIOMETRIC USE_FINGERPRINT RECORD_AUDIO MODIFY_AUDIO_SETTINGS \
+            POST_NOTIFICATIONS FOREGROUND_SERVICE FOREGROUND_SERVICE_DATA_SYNC FOREGROUND_SERVICE_REMOTE_MESSAGING \
+            WAKE_LOCK ACCESS_NETWORK_STATE RECEIVE_BOOT_COMPLETED | sed 's/^/android.permission./' | sort > allowed.txt
+          if comm -23 perms.txt allowed.txt | grep .; then echo "unexpected Android permission(s) above"; exit 1; fi
           grep -qx android.permission.CAMERA perms.txt
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -15,6 +15,7 @@ use std::time::Duration;
 use common::*;
 use veil_client::ClientError;
 use veil_client::service::{Client, MessageView};
+use veil_core::content::{Body, Delete, Edit, Reaction, Text};
 
 async fn find(c: &Client, contact: i64, text: &str) -> MessageView {
     eventually(|| async {
@@ -57,13 +58,13 @@ async fn replies_reactions_edits_and_deletes() {
     let reply = ans.reply.as_ref().unwrap();
     assert_eq!(
         (reply.id, reply.mine, reply.text.as_str()),
-        (Some(q_at_alice.id), false, "where do we meet?")
+        (Some(q_at_alice.id), Some(false), "where do we meet?")
     );
     let ans_at_bob = find(&bob.client, b_alice.id, "at the station").await;
     let reply = ans_at_bob.reply.unwrap();
     assert_eq!(
         (reply.id, reply.mine, reply.text.as_str()),
-        (Some(q.id), true, "where do we meet?")
+        (Some(q.id), Some(true), "where do we meet?")
     );
     // A quote must be in the same conversation.
     let carol = user(&r, "Carol").await;
@@ -266,4 +267,185 @@ async fn verify_by_scanning_their_code() {
     );
     let c = alice.client.contacts().await.unwrap();
     assert!(c.iter().find(|c| c.id == a_bob.id).unwrap().verified);
+}
+
+fn text(body: &str, reply_to: Option<Vec<u8>>) -> Body {
+    Body::Text(Text {
+        body: body.into(),
+        reply_to,
+        expire_timer_secs: None,
+    })
+}
+
+/// A hostile contact sends crafted content: edits, deletes and reactions naming messages that
+/// are not theirs, and repeated message ids (INV-MSG-8, review M2-2, M2-9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crafted_content_from_a_contact_stays_in_its_lane() {
+    let r = relay().await;
+    let (alice, mallory, carol) = (
+        user(&r, "Alice").await,
+        user(&r, "Mallory").await,
+        user(&r, "Carol").await,
+    );
+    let (a_mal, m_alice) = pair(&alice.client, &mallory.client).await;
+    let (a_carol, c_alice) = pair(&alice.client, &carol.client).await;
+    // Alice's own message to Mallory, and Carol's message to Alice.
+    let mine = alice.client.send(a_mal.id, "my words".into()).await.unwrap();
+    let my_id = alice.client.msg_id(mine.id).await.unwrap();
+    carol
+        .client
+        .send(c_alice.id, "carol's words".into())
+        .await
+        .unwrap();
+    let carols = find(&alice.client, a_carol.id, "carol's words").await;
+    let carol_id = alice.client.msg_id(carols.id).await.unwrap();
+
+    let id = |n: u8| vec![n; 16];
+    for (i, body) in [
+        Body::Edit(Edit {
+            target_id: my_id.clone(),
+            body: "hacked".into(),
+        }),
+        Body::Delete(Delete {
+            target_id: my_id.clone(),
+        }),
+        Body::Edit(Edit {
+            target_id: carol_id.clone(),
+            body: "hacked".into(),
+        }),
+        Body::Delete(Delete {
+            target_id: carol_id.clone(),
+        }),
+        Body::Reaction(Reaction {
+            target_id: carol_id.clone(),
+            emoji: "💩".into(),
+            remove: false,
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        mallory
+            .client
+            .raw_send(m_alice.id, id(u8::try_from(i).unwrap()), body)
+            .await
+            .unwrap();
+    }
+    // The same id three times, then replies quoting it.
+    for _ in 0..3 {
+        mallory
+            .client
+            .raw_send(m_alice.id, id(42), text("same id", None))
+            .await
+            .unwrap();
+    }
+    for n in 0..3 {
+        mallory
+            .client
+            .raw_send(m_alice.id, id(50 + n), text("quoting", Some(id(42))))
+            .await
+            .unwrap();
+    }
+    mallory
+        .client
+        .raw_send(m_alice.id, id(99), text("done", None))
+        .await
+        .unwrap();
+    find(&alice.client, a_mal.id, "done").await;
+
+    let with_mal = alice.client.messages(a_mal.id).await.unwrap();
+    let m = with_mal.iter().find(|m| m.id == mine.id).unwrap();
+    assert_eq!((m.text.as_str(), m.edited, m.deleted), ("my words", false, false));
+    let with_carol = alice.client.messages(a_carol.id).await.unwrap();
+    let c = with_carol.iter().find(|m| m.id == carols.id).unwrap();
+    assert_eq!(
+        (c.text.as_str(), c.edited, c.deleted),
+        ("carol's words", false, false)
+    );
+    assert!(c.reactions.is_empty());
+    assert_eq!(with_mal.iter().filter(|m| m.text == "same id").count(), 1);
+    let quotes: Vec<_> = with_mal.iter().filter(|m| m.text == "quoting").collect();
+    assert_eq!(quotes.len(), 3);
+    assert!(quotes.iter().all(|q| q.reply.as_ref().unwrap().text == "same id"));
+    let mut ids: Vec<i64> = with_mal.iter().map(|m| m.id).collect();
+    ids.dedup();
+    assert_eq!(ids.len(), with_mal.len(), "no row twice");
+}
+
+/// Editing a message that has not gone out yet changes what goes out; reacting to it waits
+/// (review M2-1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn editing_an_unsent_message() {
+    let r = relay().await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    hop.cut();
+    online(&alice.client, false).await;
+    let m = alice.client.send(a_bob.id, "first draft".into()).await.unwrap();
+    assert_eq!(m.status, "failed");
+    assert_eq!(
+        alice.client.react(m.id, Some("👍".into())).await.unwrap_err(),
+        ClientError::NotSentYet
+    );
+    alice
+        .client
+        .edit_message(m.id, "final words".into())
+        .await
+        .unwrap();
+    hop.restore();
+    online(&alice.client, true).await;
+    let got = find(&bob.client, b_alice.id, "final words").await;
+    assert!(!got.edited);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !bob.client
+            .messages(b_alice.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.text == "first draft")
+    );
+}
+
+/// An edit queued offline for a disappearing message is dropped with it, never sent
+/// (INV-REST-9, review M2-3); search never finds an expired message (INV-REST-10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edits_and_search_respect_disappearing_messages() {
+    let r = relay().await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    alice.client.set_timer(a_bob.id, 2).await.unwrap();
+    eventually(|| async { (bob.client.contacts().await.unwrap()[0].timer_secs == 2).then_some(()) }).await;
+    let m = alice.client.send(a_bob.id, "short lived".into()).await.unwrap();
+    find(&bob.client, b_alice.id, "short lived").await;
+    assert_eq!(alice.client.search("short".into()).await.unwrap().len(), 1);
+
+    hop.cut();
+    online(&alice.client, false).await;
+    alice
+        .client
+        .edit_message(m.id, "secret edit".into())
+        .await
+        .unwrap();
+    // Both copies expire; the queued edit goes with them.
+    eventually(|| async { texts(&alice.client, a_bob.id).await.is_empty().then_some(()) }).await;
+    assert!(alice.client.search("short".into()).await.unwrap().is_empty());
+    assert!(alice.client.search("secret".into()).await.unwrap().is_empty());
+    hop.restore();
+    online(&alice.client, true).await;
+    alice.client.set_timer(a_bob.id, 0).await.unwrap();
+    alice.client.send(a_bob.id, "after".into()).await.unwrap();
+    find(&bob.client, b_alice.id, "after").await;
+    assert!(
+        !bob.client
+            .messages(b_alice.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.text == "secret edit")
+    );
 }

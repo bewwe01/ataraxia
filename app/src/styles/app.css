@@ -62,3 +62,8 @@ html, body { height: 100%; overflow: hidden; }
 .emoji-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .msg-dialog .dialog-actions > div[role="alertdialog"] p { margin-top: 0; }
 .search-snippet { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+/* "My reaction" is marked by a check and a heavier border, not by colour alone (review M2-10). */
+.reaction.mine, .emoji-btn.mine { border-width: 2px; border-style: solid; }
+.mine-mark { width: 11px; height: 11px; stroke-width: 3; margin-left: 1px; }
+.emoji-btn { position: relative; display: inline-flex; align-items: center; justify-content: center; }
+.emoji-btn .mine-mark { position: absolute; right: 2px; bottom: 2px; }

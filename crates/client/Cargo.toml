@@ -29,7 +29,14 @@ serde.workspace = true
 [target.'cfg(windows)'.dependencies]
 keyring.workspace = true
 
+[features]
+# Hooks for this crate's own integration tests (crafted content from a "hostile" contact).
+# The app never enables it.
+test-hooks = []
+
 [dev-dependencies]
+# The integration tests use the test hooks above.
+veil-client = { path = ".", features = ["test-hooks"] }
 veil-relay.workspace = true
 tempfile.workspace = true
 
