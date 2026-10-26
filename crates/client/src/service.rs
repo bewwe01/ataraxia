@@ -9,6 +9,7 @@
 //! The relay can delay or flood us, so every relay round trip is cancelled by a lock request or
 //! by the auto-lock deadline, and each sync is bounded (review P4-1).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use veil_core::account::{Account, IntroFields, Opened, random_id};
-use veil_core::content::{Body, Content, Text};
+use veil_core::content::{Body, Content, MailboxUpdate, Receipt, ReceiptKind, Text, TimerUpdate, Typing};
 use veil_core::invite::{Invite, InviteMode};
 use veil_core::vault::{self, KdfParams, PurgeTag, Unlocked, VaultHeader};
 use veil_wire::{ENVELOPE_BUCKETS, ErrorCode, Request, Response, ServerFrame};
@@ -47,6 +48,19 @@ const MAX_NAME: usize = 64;
 /// Delivery tokens registered with the relay per batch.
 const TOKEN_BATCH: usize = 8;
 const SPARE_TOKENS: &str = "spare_tokens";
+/// Longest disappearing-message timer (the core's limit): 4 weeks. The UI offers off,
+/// 5 minutes, 1 hour, 1 day, 1 week and 4 weeks.
+pub const MAX_TIMER_SECS: u32 = 2_419_200;
+/// Message ids per receipt (the core's limit is 256).
+const RECEIPT_IDS: usize = 64;
+/// Token hashes per `UpdateTokens` request (the relay's limit).
+const TOKEN_REMOVALS: usize = 64;
+/// Resend "typing" at most this often while the user keeps typing.
+const TYPING_RESEND: Duration = Duration::from_secs(4);
+/// A typing message older than this (by its sender's clock) is stale and not shown.
+const TYPING_STALE_MS: i64 = 15_000;
+const RECEIPTS: &str = "receipts";
+const TYPING: &str = "typing";
 const HEADER_FILE: &str = "vault.hdr";
 const DB_FILE: &str = "veil.db";
 
@@ -81,6 +95,8 @@ pub struct MeView {
     pub connection: Connection,
 }
 
+// Display data: each flag is a separate fact the UI shows.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactView {
@@ -93,6 +109,13 @@ pub struct ContactView {
     pub last_mine: bool,
     pub last_at_ms: Option<i64>,
     pub unread: i64,
+    pub blocked: bool,
+    /// Disappearing-message timer in seconds; 0 is off.
+    pub timer_secs: u32,
+    /// This contact arrived with the same name as an existing one: possibly someone who
+    /// reinstalled Veil, possibly an impostor. Shown until the safety number is verified or
+    /// the user dismisses it (INV-ID-2).
+    pub key_warning: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -100,9 +123,23 @@ pub struct ContactView {
 pub struct MessageView {
     pub id: i64,
     pub mine: bool,
+    /// `text`, or `timer` for a "disappearing messages changed" notice.
+    pub kind: String,
     pub text: String,
     pub at_ms: i64,
+    /// `sending`, `sent`, `failed`, `delivered`, `read` (mine) or `received`.
     pub status: String,
+    /// For a `timer` notice: the new timer in seconds.
+    pub timer_secs: Option<u32>,
+    pub expires_at_ms: Option<i64>,
+}
+
+/// The privacy settings: both off unless the user turns them on.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrivacyView {
+    pub read_receipts: bool,
+    pub typing: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +197,9 @@ pub enum ChangeKind {
     Messages,
     Connection,
     Locked,
+    /// The contact started typing (only with typing indicators on).
+    Typing,
+    TypingStopped,
 }
 
 pub type Notify = Arc<dyn Fn(ChangeKind, Option<i64>) + Send + Sync>;
@@ -207,6 +247,13 @@ enum Cmd {
     Safety(i64, Reply<SafetyView>),
     SetVerified(i64, bool, Reply<()>),
     Rename(i64, String, Reply<()>),
+    DeleteContact(i64, Reply<()>),
+    SetBlocked(i64, bool, Reply<()>),
+    SetTimer(i64, u32, Reply<()>),
+    DismissKeyWarning(i64, Reply<()>),
+    Privacy(Reply<PrivacyView>),
+    SetPrivacy(PrivacyView, Reply<()>),
+    Typing(i64, bool, Reply<()>),
     Touch(Reply<()>),
     Reset(Reply<()>),
 }
@@ -382,6 +429,35 @@ impl Client {
     pub async fn rename(&self, contact: i64, name: String) -> Result<()> {
         ask!(self, Rename, contact, name)
     }
+    /// Deletes the contact, the conversation and the session; their delivery token is
+    /// withdrawn from the relay. They can only come back through a new invite.
+    pub async fn delete_contact(&self, contact: i64) -> Result<()> {
+        ask!(self, DeleteContact, contact)
+    }
+    /// Blocking withdraws their delivery token, so the relay refuses anything they send.
+    /// Unblocking gives them a new token in an encrypted mailbox update (needs the relay).
+    pub async fn set_blocked(&self, contact: i64, blocked: bool) -> Result<()> {
+        ask!(self, SetBlocked, contact, blocked)
+    }
+    /// Sets the disappearing-message timer for both sides, in seconds (0 is off, at most
+    /// [`MAX_TIMER_SECS`]).
+    pub async fn set_timer(&self, contact: i64, secs: u32) -> Result<()> {
+        ask!(self, SetTimer, contact, secs)
+    }
+    pub async fn dismiss_key_warning(&self, contact: i64) -> Result<()> {
+        ask!(self, DismissKeyWarning, contact)
+    }
+    pub async fn privacy(&self) -> Result<PrivacyView> {
+        ask!(self, Privacy)
+    }
+    pub async fn set_privacy(&self, p: PrivacyView) -> Result<()> {
+        ask!(self, SetPrivacy, p)
+    }
+    /// The user is typing (`true`) or stopped. Sent only with typing indicators on, and
+    /// throttled.
+    pub async fn typing(&self, contact: i64, started: bool) -> Result<()> {
+        ask!(self, Typing, contact, started)
+    }
 }
 
 // ---- the actor ---------------------------------------------------------------------------
@@ -400,6 +476,8 @@ struct Session {
     backoff: Duration,
     /// The last sync stopped early; continue on the next tick.
     more: bool,
+    /// When we last told each contact "typing" (in memory only).
+    typing_sent: HashMap<i64, Instant>,
 }
 
 struct Actor {
@@ -474,6 +552,31 @@ fn parse_pin(s: &str) -> Result<[u8; 32]> {
 
 /// mailbox, token, envelope, contact id, introduction pending.
 type DeliveryRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, bool);
+
+/// A name compared for the key-change warning: case and spacing do not make it different.
+fn name_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Columns: `id, mine, body, at_ms, status, kind, expires_at_ms`.
+fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
+    let kind: String = r.get(5)?;
+    let body: String = r.get(2)?;
+    let timer_secs = (kind == "timer").then(|| body.parse().unwrap_or(0));
+    Ok(MessageView {
+        id: r.get(0)?,
+        mine: r.get(1)?,
+        text: if kind == "text" { body } else { String::new() },
+        kind,
+        at_ms: r.get(3)?,
+        status: r.get(4)?,
+        timer_secs,
+        expires_at_ms: r.get(6)?,
+    })
+}
 
 fn token_hash(token: &[u8; 32]) -> Vec<u8> {
     Sha256::new()
@@ -628,11 +731,19 @@ impl Actor {
             self.lock_now();
             return;
         }
+        if self.session.is_none() {
+            return;
+        }
+        self.expire_messages();
+        let _ = self.cleanup_invites().await;
         let Some(s) = self.session.as_ref() else { return };
         if s.relay.is_none() && Instant::now() >= s.next_attempt {
             self.connect().await;
-        } else if s.relay.as_ref().is_some_and(Relay::is_open) && s.more {
-            self.sync().await;
+        } else if s.relay.as_ref().is_some_and(Relay::is_open) {
+            if s.more {
+                self.sync().await;
+            }
+            self.flush_token_removals().await;
         }
     }
 
@@ -663,6 +774,7 @@ impl Actor {
             self.emit(ChangeKind::Connection, None);
             self.sync().await;
             self.retry_failed().await;
+            self.flush_token_removals().await;
         } else {
             s.backoff = s.backoff.saturating_mul(2).min(Duration::from_mins(1));
             s.next_attempt = Instant::now().checked_add(s.backoff).unwrap_or_else(Instant::now);
@@ -690,6 +802,12 @@ impl Actor {
                 | Cmd::AcceptInvite(..)
                 | Cmd::SetVerified(..)
                 | Cmd::Rename(..)
+                | Cmd::DeleteContact(..)
+                | Cmd::SetBlocked(..)
+                | Cmd::SetTimer(..)
+                | Cmd::DismissKeyWarning(..)
+                | Cmd::SetPrivacy(..)
+                | Cmd::Typing(..)
         ) {
             self.last_activity = Instant::now();
         }
@@ -762,7 +880,8 @@ impl Actor {
                 let _ = r.send(res);
             }
             Cmd::MarkRead(c, r) => {
-                let _ = r.send(self.mark_read(c));
+                let res = self.mark_read(c).await;
+                let _ = r.send(res);
             }
             Cmd::CreateInvite(r) => {
                 let res = self.create_invite().await;
@@ -780,6 +899,31 @@ impl Actor {
             }
             Cmd::Rename(c, n, r) => {
                 let _ = r.send(self.rename(c, &n));
+            }
+            Cmd::DeleteContact(c, r) => {
+                let res = self.delete_contact(c).await;
+                let _ = r.send(res);
+            }
+            Cmd::SetBlocked(c, b, r) => {
+                let res = self.set_blocked(c, b).await;
+                let _ = r.send(res);
+            }
+            Cmd::SetTimer(c, t, r) => {
+                let res = self.set_timer(c, t).await;
+                let _ = r.send(res);
+            }
+            Cmd::DismissKeyWarning(c, r) => {
+                let _ = r.send(self.dismiss_key_warning(c));
+            }
+            Cmd::Privacy(r) => {
+                let _ = r.send(self.privacy());
+            }
+            Cmd::SetPrivacy(p, r) => {
+                let _ = r.send(self.set_privacy(p));
+            }
+            Cmd::Typing(c, started, r) => {
+                let res = self.typing(c, started).await;
+                let _ = r.send(res);
             }
         }
     }
@@ -886,6 +1030,7 @@ impl Actor {
             next_attempt: Instant::now(),
             backoff: Duration::from_secs(2),
             more: true,
+            typing_sent: HashMap::new(),
         }));
         self.emit(ChangeKind::Connection, None);
         Ok(())
@@ -993,7 +1138,10 @@ impl Actor {
             next_attempt: Instant::now(),
             backoff: Duration::from_secs(2),
             more: true,
+            typing_sent: HashMap::new(),
         }));
+        self.expire_messages();
+        let _ = self.cleanup_invites().await;
         self.connect().await;
         Ok(())
     }
@@ -1180,18 +1328,19 @@ impl Actor {
 
     fn contact_view(db: &Db, id: i64) -> Result<ContactView> {
         let conn = db.conn();
-        let (name, verified, unread): (String, bool, i64) = conn
-            .query_row(
-                "SELECT name, verified, unread FROM contacts WHERE id = ?1",
+        let (name, verified, unread, blocked, timer_secs, key_warning): (String, bool, i64, bool, u32, bool) =
+            conn.query_row(
+                "SELECT name, verified, unread, blocked, timer_secs, key_warning FROM contacts WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?
             .ok_or(ClientError::UnknownContact)?;
         let last: Option<(String, bool, i64)> = conn
             .query_row(
-                "SELECT body, mine, at_ms FROM messages WHERE contact = ?1 ORDER BY id DESC LIMIT 1",
-                [id],
+                "SELECT body, mine, at_ms FROM messages WHERE contact = ?1 AND kind = 'text'
+                 AND (expires_at_ms IS NULL OR expires_at_ms > ?2) ORDER BY id DESC LIMIT 1",
+                params![id, now_ms()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
@@ -1205,6 +1354,9 @@ impl Actor {
             last_mine: last.as_ref().is_some_and(|l| l.1),
             last_at_ms: last.map(|l| l.2),
             unread,
+            blocked,
+            timer_secs,
+            key_warning,
         })
     }
 
@@ -1223,28 +1375,24 @@ impl Actor {
     fn messages(&self, contact: i64) -> Result<Vec<MessageView>> {
         let s = self.s()?;
         let mut stmt = s.db.conn().prepare(
-            "SELECT id, mine, body, at_ms, status FROM messages WHERE contact = ?1 ORDER BY id DESC LIMIT 500",
+            "SELECT id, mine, body, at_ms, status, kind, expires_at_ms FROM messages WHERE contact = ?1
+             AND (expires_at_ms IS NULL OR expires_at_ms > ?2) ORDER BY id DESC LIMIT 500",
         )?;
         let mut out = stmt
-            .query_map([contact], |r| {
-                Ok(MessageView {
-                    id: r.get(0)?,
-                    mine: r.get(1)?,
-                    text: r.get(2)?,
-                    at_ms: r.get(3)?,
-                    status: r.get(4)?,
-                })
-            })?
+            .query_map(params![contact, now_ms()], message_row)?
             .collect::<core::result::Result<Vec<_>, _>>()?;
         out.reverse();
         Ok(out)
     }
 
-    fn mark_read(&self, contact: i64) -> Result<()> {
+    async fn mark_read(&self, contact: i64) -> Result<()> {
         self.s()?
             .db
             .conn()
             .execute("UPDATE contacts SET unread = 0 WHERE id = ?1", [contact])?;
+        if self.privacy()?.read_receipts {
+            self.send_receipts(contact, ReceiptKind::Read).await;
+        }
         Ok(())
     }
 
@@ -1270,7 +1418,8 @@ impl Actor {
 
     fn set_verified(&self, contact: i64, v: bool) -> Result<()> {
         let n = self.s()?.db.conn().execute(
-            "UPDATE contacts SET verified = ?2 WHERE id = ?1",
+            "UPDATE contacts SET verified = ?2, key_warning = CASE WHEN ?2 THEN 0 ELSE key_warning END
+             WHERE id = ?1",
             params![contact, v],
         )?;
         if n == 0 {
@@ -1527,37 +1676,52 @@ impl Actor {
         if body.is_empty() {
             return Err(ClientError::BadInput);
         }
+        if let Some(s) = self.session.as_mut() {
+            // The message itself ends "typing" on the other side.
+            s.typing_sent.remove(&contact);
+        }
         let s = self.s()?;
-        let address: String =
+        let (address, blocked, timer): (String, bool, u32) =
             s.db.conn()
-                .query_row("SELECT address FROM contacts WHERE id = ?1", [contact], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT address, blocked, timer_secs FROM contacts WHERE id = ?1",
+                    [contact],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
                 .optional()?
                 .ok_or(ClientError::UnknownContact)?;
+        if blocked {
+            return Err(ClientError::Blocked);
+        }
         let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
         let content = Content {
             id: random_id(&mut rng()),
             sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
             body: Some(Body::Text(Text {
                 body: body.to_owned(),
+                expire_timer_secs: (timer > 0).then_some(timer),
                 ..Default::default()
             })),
         };
         let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
         let at = now_ms();
+        let expires = (timer > 0).then(|| at.saturating_add(i64::from(timer).saturating_mul(1000)));
         s.db.conn().execute(
-            "INSERT INTO messages (contact, mine, body, at_ms, status, envelope) VALUES (?1, 1, ?2, ?3, 'sending', ?4)",
-            params![contact, body, at, envelope],
+            "INSERT INTO messages (contact, mine, body, at_ms, status, envelope, msg_id, expires_at_ms)
+             VALUES (?1, 1, ?2, ?3, 'sending', ?4, ?5, ?6)",
+            params![contact, body, at, envelope, content.id, expires],
         )?;
         let id = s.db.conn().last_insert_rowid();
         let status = if self.deliver(id).await { "sent" } else { "failed" };
         Ok(MessageView {
             id,
             mine: true,
+            kind: "text".into(),
             text: body.to_owned(),
             at_ms: at,
             status: status.to_owned(),
+            timer_secs: None,
+            expires_at_ms: expires,
         })
     }
 
@@ -1644,6 +1808,11 @@ impl Actor {
     /// [`MAX_BATCHES`] batches at a time. A relay that replays old sequence numbers or never
     /// runs dry cannot keep the actor busy (P4-1).
     async fn sync(&mut self) {
+        self.sync_batches().await;
+        self.send_delivery_receipts().await;
+    }
+
+    async fn sync_batches(&mut self) {
         if let Some(s) = self.session.as_mut() {
             s.more = false;
         }
@@ -1732,25 +1901,23 @@ impl Actor {
             })?;
         match opened {
             Opened::Message { from, content } => {
-                let Some(Body::Text(t)) = content.body else {
-                    return Ok(());
-                };
-                let id: Option<i64> =
+                let row: Option<(i64, bool)> =
                     s.db.conn()
                         .query_row(
-                            "SELECT id FROM contacts WHERE address = ?1",
+                            "SELECT id, blocked FROM contacts WHERE address = ?1",
                             [from.as_str()],
-                            |r| r.get(0),
+                            |r| Ok((r.get(0)?, r.get(1)?)),
                         )
                         .optional()?;
-                let Some(id) = id else { return Ok(()) };
-                s.db.conn().execute(
-                    "INSERT INTO messages (contact, mine, body, at_ms, status) VALUES (?1, 0, ?2, ?3, 'received')",
-                    params![id, t.body, now_ms()],
-                )?;
-                s.db.conn()
-                    .execute("UPDATE contacts SET unread = unread + 1 WHERE id = ?1", [id])?;
-                self.emit(ChangeKind::Messages, Some(id));
+                let Some((id, blocked)) = row else { return Ok(()) };
+                let (msg_id, sent_at_ms) = (content.id.clone(), content.sent_at_ms);
+                let Some(body) = content.body else { return Ok(()) };
+                // Whatever a blocked contact had queued before the block is dropped; only a
+                // mailbox update is kept, so unblocking later can still reach them.
+                if blocked && !matches!(body, Body::MailboxUpdate(_)) {
+                    return Ok(());
+                }
+                self.receive(id, &msg_id, sent_at_ms, body)?;
             }
             Opened::NewContact { from, intro, .. } => {
                 let invite_id = intro.invite_id.clone().unwrap_or_default();
@@ -1769,7 +1936,24 @@ impl Actor {
                     .map(clean_name)
                     .filter(|n| !n.is_empty())
                     .unwrap_or_else(|| "New contact".into());
+                // Addresses are key hashes, so a changed key arrives as a new contact. One that
+                // takes the name of an existing contact gets a warning, never their history
+                // (INV-ID-2).
+                let key = name_key(&name);
+                let clash = intro.display_name.is_some() && {
+                    let mut stmt =
+                        s.db.conn()
+                            .prepare("SELECT name FROM contacts WHERE address != ?1")?;
+                    let names = stmt
+                        .query_map([from.as_str()], |r| r.get::<_, String>(0))?
+                        .collect::<core::result::Result<Vec<_>, _>>()?;
+                    names.iter().any(|n| name_key(n) == key)
+                };
                 let id = self.upsert_contact(from.as_str(), &name, &mailbox, &token, &arr32(&my_token)?)?;
+                if clash {
+                    s.db.conn()
+                        .execute("UPDATE contacts SET key_warning = 1 WHERE id = ?1", [id])?;
+                }
                 self.s()?
                     .db
                     .conn()
@@ -1777,6 +1961,481 @@ impl Actor {
                 self.emit(ChangeKind::Contacts, Some(id));
             }
         }
+        Ok(())
+    }
+}
+
+impl Actor {
+    /// Stores one message from a known contact. Runs inside [`Self::process`]'s transaction.
+    fn receive(&self, contact: i64, msg_id: &[u8], sent_at_ms: u64, body: Body) -> Result<()> {
+        let s = self.s()?;
+        let conn = s.db.conn();
+        let now = now_ms();
+        match body {
+            Body::Text(t) => {
+                let expires = t
+                    .expire_timer_secs
+                    .filter(|t| *t > 0)
+                    .map(|t| now.saturating_add(i64::from(t).saturating_mul(1000)));
+                conn.execute(
+                    "INSERT INTO messages (contact, mine, body, at_ms, status, msg_id, expires_at_ms)
+                     VALUES (?1, 0, ?2, ?3, 'received', ?4, ?5)",
+                    params![contact, t.body, now, msg_id, expires],
+                )?;
+                conn.execute("UPDATE contacts SET unread = unread + 1 WHERE id = ?1", [contact])?;
+                self.emit(ChangeKind::Messages, Some(contact));
+            }
+            Body::TimerUpdate(t) => {
+                conn.execute(
+                    "UPDATE contacts SET timer_secs = ?2 WHERE id = ?1",
+                    params![contact, t.seconds],
+                )?;
+                conn.execute(
+                    "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 0, 'timer', ?2, ?3, 'received')",
+                    params![contact, t.seconds.to_string(), now],
+                )?;
+                self.emit(ChangeKind::Messages, Some(contact));
+                self.emit(ChangeKind::Contacts, Some(contact));
+            }
+            // Receipts only count while we send them too.
+            Body::Receipt(r) if self.privacy()?.read_receipts => {
+                let sql = if r.kind == i32::from(ReceiptKind::Read) {
+                    "UPDATE messages SET status = 'read', envelope = NULL
+                     WHERE contact = ?1 AND mine = 1 AND msg_id = ?2 AND status != 'read'"
+                } else {
+                    "UPDATE messages SET status = 'delivered', envelope = NULL
+                     WHERE contact = ?1 AND mine = 1 AND msg_id = ?2 AND status IN ('sending', 'failed', 'sent')"
+                };
+                let mut changed = 0usize;
+                for id in &r.ids {
+                    changed = changed.saturating_add(conn.execute(sql, params![contact, id])?);
+                }
+                if changed > 0 {
+                    self.emit(ChangeKind::Messages, Some(contact));
+                }
+            }
+            Body::Typing(t) if self.privacy()?.typing => {
+                let age = now.saturating_sub(i64::try_from(sent_at_ms).unwrap_or(0));
+                if age.abs() <= TYPING_STALE_MS {
+                    let kind = if t.started {
+                        ChangeKind::Typing
+                    } else {
+                        ChangeKind::TypingStopped
+                    };
+                    self.emit(kind, Some(contact));
+                }
+            }
+            // A new delivery token for this contact (they unblocked us). Moving to another
+            // relay is not supported, so such an update is ignored.
+            Body::MailboxUpdate(m) if m.relay_url.is_none() => {
+                conn.execute(
+                    "UPDATE contacts SET mailbox = ?2, token = ?3 WHERE id = ?1",
+                    params![contact, m.new_mailbox_id, m.new_delivery_token],
+                )?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ---- privacy settings ----
+
+    fn privacy(&self) -> Result<PrivacyView> {
+        let db = &self.s()?.db;
+        let on = |k: &str| -> Result<bool> { Ok(db.setting(k)?.is_some_and(|v| v.as_slice() == [1])) };
+        Ok(PrivacyView {
+            read_receipts: on(RECEIPTS)?,
+            typing: on(TYPING)?,
+        })
+    }
+
+    fn set_privacy(&self, p: PrivacyView) -> Result<()> {
+        let db = &self.s()?.db;
+        if p.read_receipts && !self.privacy()?.read_receipts {
+            // No delivery receipts for what arrived while receipts were off.
+            db.conn().execute(
+                "UPDATE messages SET receipt = 1 WHERE mine = 0 AND receipt = 0",
+                [],
+            )?;
+        }
+        db.set_setting(RECEIPTS, &[u8::from(p.read_receipts)])?;
+        db.set_setting(TYPING, &[u8::from(p.typing)])?;
+        Ok(())
+    }
+
+    /// Seals and deposits a message that is not stored (receipt, typing, mailbox update):
+    /// best effort, nothing is retried. Never to a blocked contact or ahead of our
+    /// introduction.
+    async fn send_ephemeral(&self, contact: i64, body: Body) -> Result<()> {
+        // Offline: do not advance the session for a message that cannot go out.
+        self.relay()?;
+        let s = self.s()?;
+        let (address, mailbox, token): (String, Vec<u8>, Vec<u8>) = s
+            .db
+            .conn()
+            .query_row(
+                "SELECT address, mailbox, token FROM contacts WHERE id = ?1 AND blocked = 0 AND intro IS NULL",
+                [contact],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or(ClientError::UnknownContact)?;
+        let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
+        let content = Content {
+            id: random_id(&mut rng()),
+            sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
+            body: Some(body),
+        };
+        let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
+        self.call(Request::Deposit(veil_wire::Deposit {
+            mailbox_id: mailbox,
+            token,
+            envelope,
+        }))
+        .await?;
+        Ok(())
+    }
+
+    /// Sends `kind` receipts for a contact's messages that have not had one yet.
+    async fn send_receipts(&self, contact: i64, kind: ReceiptKind) {
+        let level: i64 = if kind == ReceiptKind::Read { 2 } else { 1 };
+        let Ok(s) = self.s() else { return };
+        let rows: Vec<(i64, Vec<u8>)> =
+            s.db.conn()
+                .prepare(
+                    "SELECT id, msg_id FROM messages WHERE contact = ?1 AND mine = 0 AND kind = 'text'
+                 AND msg_id IS NOT NULL AND receipt < ?2 ORDER BY id LIMIT 256",
+                )
+                .and_then(|mut st| {
+                    st.query_map(params![contact, level], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect()
+                })
+                .unwrap_or_default();
+        for chunk in rows.chunks(RECEIPT_IDS) {
+            let receipt = Receipt {
+                kind: i32::from(kind),
+                ids: chunk.iter().map(|(_, m)| m.clone()).collect(),
+            };
+            if self
+                .send_ephemeral(contact, Body::Receipt(receipt))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            for (id, _) in chunk {
+                let _ = s.db.conn().execute(
+                    "UPDATE messages SET receipt = ?2 WHERE id = ?1 AND receipt < ?2",
+                    params![id, level],
+                );
+            }
+        }
+    }
+
+    async fn send_delivery_receipts(&self) {
+        if !self.privacy().is_ok_and(|p| p.read_receipts) {
+            return;
+        }
+        let Ok(s) = self.s() else { return };
+        let contacts: Vec<i64> =
+            s.db.conn()
+                .prepare(
+                    "SELECT DISTINCT m.contact FROM messages m JOIN contacts c ON c.id = m.contact
+                 WHERE m.mine = 0 AND m.kind = 'text' AND m.msg_id IS NOT NULL AND m.receipt = 0
+                 AND c.blocked = 0 AND c.intro IS NULL",
+                )
+                .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
+                .unwrap_or_default();
+        for c in contacts {
+            self.send_receipts(c, ReceiptKind::Delivered).await;
+        }
+    }
+
+    async fn typing(&mut self, contact: i64, started: bool) -> Result<()> {
+        if !self.privacy()?.typing {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let s = self.session.as_mut().ok_or(ClientError::Locked)?;
+        let last = s.typing_sent.get(&contact).copied();
+        if started {
+            if last.is_some_and(|t| now.duration_since(t) < TYPING_RESEND) {
+                return Ok(());
+            }
+            s.typing_sent.insert(contact, now);
+        } else if s.typing_sent.remove(&contact).is_none() {
+            return Ok(());
+        }
+        // Best effort: a lost typing message only means no indicator.
+        let _ = self
+            .send_ephemeral(contact, Body::Typing(Typing { started }))
+            .await;
+        Ok(())
+    }
+
+    // ---- disappearing messages ----
+
+    async fn set_timer(&mut self, contact: i64, secs: u32) -> Result<()> {
+        if secs > MAX_TIMER_SECS {
+            return Err(ClientError::BadInput);
+        }
+        let s = self.s()?;
+        let (address, blocked): (String, bool) =
+            s.db.conn()
+                .query_row(
+                    "SELECT address, blocked FROM contacts WHERE id = ?1",
+                    [contact],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .ok_or(ClientError::UnknownContact)?;
+        if blocked {
+            return Err(ClientError::Blocked);
+        }
+        let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
+        let content = Content {
+            id: random_id(&mut rng()),
+            sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
+            body: Some(Body::TimerUpdate(TimerUpdate { seconds: secs })),
+        };
+        let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
+        // The notice is stored like a message, so it is retried until it gets through.
+        let id = self
+            .atomically(async {
+                s.db.conn().execute(
+                    "UPDATE contacts SET timer_secs = ?2 WHERE id = ?1",
+                    params![contact, secs],
+                )?;
+                s.db.conn().execute(
+                    "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope)
+                     VALUES (?1, 1, 'timer', ?2, ?3, 'sending', ?4)",
+                    params![contact, secs.to_string(), now_ms(), envelope],
+                )?;
+                Ok(s.db.conn().last_insert_rowid())
+            })
+            .await?;
+        self.deliver(id).await;
+        self.emit(ChangeKind::Messages, Some(contact));
+        self.emit(ChangeKind::Contacts, Some(contact));
+        Ok(())
+    }
+
+    /// Deletes messages whose timer ran out. `secure_delete` overwrites their content in the
+    /// database file (INV-REST-9).
+    fn expire_messages(&self) {
+        let Ok(s) = self.s() else { return };
+        let now = now_ms();
+        let contacts: Vec<i64> =
+            s.db.conn()
+                .prepare("SELECT DISTINCT contact FROM messages WHERE expires_at_ms <= ?1")
+                .and_then(|mut st| st.query_map([now], |r| r.get(0))?.collect())
+                .unwrap_or_default();
+        if contacts.is_empty() {
+            return;
+        }
+        if s.db
+            .conn()
+            .execute("DELETE FROM messages WHERE expires_at_ms <= ?1", [now])
+            .is_err()
+        {
+            return;
+        }
+        for c in contacts {
+            self.emit(ChangeKind::Messages, Some(c));
+        }
+        self.emit(ChangeKind::Contacts, None);
+    }
+
+    // ---- contacts: delete, block ----
+
+    fn queue_token_removal(db: &Db, token: &[u8]) -> Result<()> {
+        db.conn().execute(
+            "INSERT OR IGNORE INTO token_removals (hash) VALUES (?1)",
+            [token_hash(&arr32(token)?)],
+        )?;
+        Ok(())
+    }
+
+    /// Withdraws queued delivery tokens from the relay. Kept in the database until the relay
+    /// confirms, so going offline only delays it.
+    async fn flush_token_removals(&self) {
+        let Ok(s) = self.s() else { return };
+        if self.relay().is_err() {
+            return;
+        }
+        for _ in 0..4 {
+            let hashes: Vec<Vec<u8>> =
+                s.db.conn()
+                    .prepare("SELECT hash FROM token_removals LIMIT ?1")
+                    .and_then(|mut st| {
+                        st.query_map([i64::try_from(TOKEN_REMOVALS).unwrap_or(64)], |r| r.get(0))?
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            if hashes.is_empty() {
+                return;
+            }
+            let req = Request::UpdateTokens(veil_wire::UpdateTokens {
+                mailbox_id: s.mailbox.to_vec(),
+                add: vec![],
+                remove: hashes.clone(),
+            });
+            if self.call(req).await.is_err() {
+                return;
+            }
+            for h in &hashes {
+                let _ =
+                    s.db.conn()
+                        .execute("DELETE FROM token_removals WHERE hash = ?1", [h]);
+            }
+        }
+    }
+
+    /// Expired invites: their prekeys are deleted and their tokens withdrawn from the relay.
+    async fn cleanup_invites(&self) -> Result<()> {
+        let s = self.s()?;
+        let now = now_secs();
+        let now_i = i64::try_from(now).unwrap_or(i64::MAX);
+        let tokens: Vec<Vec<u8>> =
+            s.db.conn()
+                .prepare("SELECT token FROM invites WHERE expires <= ?1")?
+                .query_map([now_i], |r| r.get(0))?
+                .collect::<core::result::Result<_, _>>()?;
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        self.atomically(async {
+            for t in &tokens {
+                Self::queue_token_removal(&s.db, t)?;
+            }
+            s.db.conn()
+                .execute("DELETE FROM invites WHERE expires <= ?1", [now_i])?;
+            s.account.sweep_expired_invites(now).await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_contact(&mut self, contact: i64) -> Result<()> {
+        let s = self.s()?;
+        let (address, my_token): (String, Vec<u8>) =
+            s.db.conn()
+                .query_row(
+                    "SELECT address, my_token FROM contacts WHERE id = ?1",
+                    [contact],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .ok_or(ClientError::UnknownContact)?;
+        let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
+        self.atomically(async {
+            s.account.forget_contact(&addr).await?;
+            Self::queue_token_removal(&s.db, &my_token)?;
+            // Messages go with the contact (ON DELETE CASCADE), overwritten by secure_delete.
+            s.db.conn()
+                .execute("DELETE FROM contacts WHERE id = ?1", [contact])?;
+            Ok(())
+        })
+        .await?;
+        if let Some(s) = self.session.as_mut() {
+            s.typing_sent.remove(&contact);
+        }
+        self.flush_token_removals().await;
+        self.emit(ChangeKind::Contacts, Some(contact));
+        Ok(())
+    }
+
+    async fn set_blocked(&mut self, contact: i64, blocked: bool) -> Result<()> {
+        let s = self.s()?;
+        let (address, was, my_token, intro_pending): (String, bool, Vec<u8>, bool) =
+            s.db.conn()
+                .query_row(
+                    "SELECT address, blocked, my_token, intro IS NOT NULL FROM contacts WHERE id = ?1",
+                    [contact],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?
+                .ok_or(ClientError::UnknownContact)?;
+        if was == blocked {
+            return Ok(());
+        }
+        if blocked {
+            // Their token is withdrawn: the relay refuses whatever they send from now on.
+            self.atomically(async {
+                s.db.conn()
+                    .execute("UPDATE contacts SET blocked = 1 WHERE id = ?1", [contact])?;
+                Self::queue_token_removal(&s.db, &my_token)?;
+                Ok(())
+            })
+            .await?;
+            self.flush_token_removals().await;
+        } else {
+            self.unblock(contact, &address, intro_pending).await?;
+        }
+        self.emit(ChangeKind::Contacts, Some(contact));
+        Ok(())
+    }
+
+    /// Gives an unblocked contact a fresh delivery token in an encrypted mailbox update.
+    async fn unblock(&mut self, contact: i64, address: &str, intro_pending: bool) -> Result<()> {
+        if intro_pending && !self.deliver_intro(contact).await {
+            return Err(ClientError::Unreachable);
+        }
+        let token = self.take_token().await?;
+        let s = self.s()?;
+        let addr = veil_core::identity::Address::parse(address).map_err(|_| ClientError::Storage)?;
+        let (mailbox, their_token): (Vec<u8>, Vec<u8>) = s.db.conn().query_row(
+            "SELECT mailbox, token FROM contacts WHERE id = ?1",
+            [contact],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let content = Content {
+            id: random_id(&mut rng()),
+            sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
+            body: Some(Body::MailboxUpdate(MailboxUpdate {
+                new_mailbox_id: s.mailbox.to_vec(),
+                new_delivery_token: token.to_vec(),
+                relay_url: None,
+            })),
+        };
+        let sent = match s.account.seal(&mut rng(), &addr, &content, now_secs()).await {
+            Ok(envelope) => {
+                self.call(Request::Deposit(veil_wire::Deposit {
+                    mailbox_id: mailbox,
+                    token: their_token,
+                    envelope,
+                }))
+                .await
+            }
+            Err(e) => Err(e.into()),
+        };
+        match sent {
+            // Refused for good (for example they deleted us): nothing to tell them, but
+            // unblocked all the same.
+            Ok(_) => {}
+            Err(ClientError::Rejected(code)) if code != ErrorCode::RateLimited => {}
+            Err(e) => {
+                Self::queue_token_removal(&s.db, &token)?;
+                return Err(e);
+            }
+        }
+        s.db.conn().execute(
+            "UPDATE contacts SET blocked = 0, my_token = ?2 WHERE id = ?1",
+            params![contact, token.to_vec()],
+        )?;
+        Ok(())
+    }
+
+    fn dismiss_key_warning(&self, contact: i64) -> Result<()> {
+        let n = self
+            .s()?
+            .db
+            .conn()
+            .execute("UPDATE contacts SET key_warning = 0 WHERE id = ?1", [contact])?;
+        if n == 0 {
+            return Err(ClientError::UnknownContact);
+        }
+        self.emit(ChangeKind::Contacts, Some(contact));
         Ok(())
     }
 }

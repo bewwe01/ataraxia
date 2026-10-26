@@ -3,8 +3,9 @@
 //! that returns **display data only** (CLAUDE.md non-negotiable 2): no keys, no ciphertext, no
 //! file paths ever leave this crate.
 //!
-//! Scope of v1 (see docs/ARCHITECTURE.md, "Phase 4 scope"): one relay, one mailbox, text
-//! messages, invites by link/QR, safety-number verification.
+//! Scope (see docs/ARCHITECTURE.md, "Phase 4 scope" and ADR-0013): one relay, one mailbox, text
+//! messages, invites by link/QR, safety-number verification, blocking and deleting contacts,
+//! disappearing messages, and opt-in read receipts and typing indicators.
 #![forbid(unsafe_code)]
 
 pub mod db;
@@ -46,6 +47,8 @@ pub enum ClientError {
     InviteInvalid,
     #[error("This invite is for a different relay; this version supports one relay")]
     OtherRelay,
+    #[error("This contact is blocked. Unblock them first.")]
+    Blocked,
     #[error("Unknown contact")]
     UnknownContact,
     #[error("Message failed")]

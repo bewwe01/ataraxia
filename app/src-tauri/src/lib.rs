@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, Manager as _, State};
 use veil_client::ClientError;
 use veil_client::service::{
-    AppState, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, SafetyView, SecurityView,
-    SetupInput, UnlockInfo, UnlockOutcome,
+    AppState, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, PrivacyView, SafetyView,
+    SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
 };
 use veil_client::unlock::SecretKind;
 
@@ -279,6 +279,41 @@ async fn rename_contact(c: State<'_, Client>, contact: i64, name: String) -> Res
     c.rename(contact, name).await.map_err(err)
 }
 
+#[tauri::command]
+async fn delete_contact(c: State<'_, Client>, contact: i64) -> Res<()> {
+    c.delete_contact(contact).await.map_err(err)
+}
+
+#[tauri::command]
+async fn set_blocked(c: State<'_, Client>, contact: i64, blocked: bool) -> Res<()> {
+    c.set_blocked(contact, blocked).await.map_err(err)
+}
+
+#[tauri::command]
+async fn set_timer(c: State<'_, Client>, contact: i64, secs: u32) -> Res<()> {
+    c.set_timer(contact, secs).await.map_err(err)
+}
+
+#[tauri::command]
+async fn dismiss_key_warning(c: State<'_, Client>, contact: i64) -> Res<()> {
+    c.dismiss_key_warning(contact).await.map_err(err)
+}
+
+#[tauri::command]
+async fn privacy(c: State<'_, Client>) -> Res<PrivacyView> {
+    c.privacy().await.map_err(err)
+}
+
+#[tauri::command]
+async fn set_privacy(c: State<'_, Client>, privacy: PrivacyView) -> Res<()> {
+    c.set_privacy(privacy).await.map_err(err)
+}
+
+#[tauri::command]
+async fn typing(c: State<'_, Client>, contact: i64, started: bool) -> Res<()> {
+    c.typing(contact, started).await.map_err(err)
+}
+
 /// Veil's files live in their own folder inside the app data directory, which on Android and
 /// Windows also holds the WebView's data (review U-1). Files from 0.1 previews, which sat at
 /// the top level, are moved in once.
@@ -355,7 +390,14 @@ pub fn run() {
             accept_invite,
             safety_number,
             set_verified,
-            rename_contact
+            rename_contact,
+            delete_contact,
+            set_blocked,
+            set_timer,
+            dismiss_key_warning,
+            privacy,
+            set_privacy,
+            typing
         ])
         .run(tauri::generate_context!());
     if result.is_err() {

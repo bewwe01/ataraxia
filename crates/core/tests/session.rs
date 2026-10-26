@@ -473,6 +473,46 @@ fn unknown_and_self_senders_refused() {
 }
 
 #[test]
+fn forgotten_contact_is_a_stranger_until_a_new_invite() {
+    let (alice, bob, _) = paired();
+    let before = send(&alice, &bob, "before");
+    block_on(bob.forget_contact(&alice.identity().address())).unwrap();
+    assert!(
+        bob.contact_identity(&alice.identity().address())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(recv(&bob, &before).unwrap_err(), CoreError::UnknownSender);
+    assert_eq!(
+        block_on(bob.seal(&mut rng(), &alice.identity().address(), &text("x"), NOW)).unwrap_err(),
+        CoreError::NoSession
+    );
+    // A new invite pairs them again, with a new session.
+    let created = block_on(bob.create_invite(
+        &mut rng(),
+        InviteMode::Remote,
+        "wss://relay.example.org",
+        [3; 32],
+        [1; 32],
+        [2; 32],
+        NOW,
+        3600,
+    ))
+    .unwrap();
+    let invite = Invite::from_link(&created.invite.to_link()).unwrap();
+    let red =
+        block_on(alice.redeem_invite(&mut rng(), &invite, &created.sealed_package, intro(10), NOW)).unwrap();
+    assert!(matches!(
+        block_on(bob.open(&mut rng(), &red.envelope, NOW)).unwrap(),
+        Opened::NewContact { .. }
+    ));
+    let (who, got) = recv(&bob, &send(&alice, &bob, "again")).unwrap();
+    assert_eq!((who, got.as_str()), (alice.identity().address(), "again"));
+    let (_, got) = recv(&alice, &send(&bob, &alice, "hi")).unwrap();
+    assert_eq!(got, "hi");
+}
+
+#[test]
 fn persistence_roundtrip() {
     let (alice, bob, _) = paired();
     let alice = Account::load(alice.into_backend()).unwrap();

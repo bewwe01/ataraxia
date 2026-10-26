@@ -64,7 +64,7 @@ Status: **Phase 1 draft, awaiting approval.** Every "protected" claim below poin
 | Who learns what | Messaging via relay mailbox | Call, relay-only (default) | Call, Direct (opt-in) |
 |---|---|---|---|
 | **Contact** learns your IP | No | No (sees TURN relay address only) | **Yes** |
-| **Contact** learns your online/typing/read state | Delivery receipts: yes (timing). Read/typing: only if both opted in | Yes, during the call | Yes, during the call |
+| **Contact** learns your online/typing/read state | Delivery and read receipts, typing: only while you have them on (off by default; ADR-0013) | Yes, during the call | Yes, during the call |
 | **Relay** learns your IP | Yes, while connected (not stored by design) | Yes (TURN allocation) | Yes for signaling; media may bypass TURN |
 | **Relay** learns who you talk to | **Yes, in v1 (Phase 4 build).** The client deposits over its own authenticated connection and mailboxes do not rotate, so the relay can link your mailbox (and IP) to each mailbox you send to. Not your names or keys. Rotation and unlinkable deposit connections are future work (ADR-0011) | Same as messaging; TURN sees both allocations' IPs and timing (**can link the two parties of a call**) | Sees signaling envelopes only; may see nothing of media |
 | **Relay** learns message sizes | Bucket only (1/4/16/64 KiB); nothing inside a bucket depends on content length (INV-META-3). A session's first (PreKey) messages never fit 1 KiB, so a short first message shows as 4 KiB. Attachments padded (Padmé) | Media bitrate via TURN | — |

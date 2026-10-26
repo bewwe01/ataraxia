@@ -40,3 +40,10 @@ html, body { height: 100%; overflow: hidden; }
 .input input:focus-visible { outline: none; }
 .chat-screen > .banner { margin: var(--space-2) var(--space-3) 0; }
 .m-body .pairing, .m-body .safety, .m-screen .m-body .pairing { padding-left: 0; padding-right: 0; }
+.link-btn { background: none; border: 0; padding: 0; font: inherit; font-weight: var(--weight-semibold); color: var(--accent); text-decoration: underline; cursor: pointer; }
+.composer.blocked-bar { display: block; padding-top: var(--space-2); padding-bottom: var(--space-2); }
+.banner > div { min-width: 0; }
+.input select.select { flex: 1; min-width: 0; height: 48px; font-size: var(--text-md); background: transparent; border: 0; appearance: auto; }
+.input select.select:focus-visible { outline: none; }
+/* Rows are buttons: fill the list, left-aligned, whatever their text length. */
+.conv { width: 100%; text-align: start; }

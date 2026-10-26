@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { ipc, IpcError, type Me, type NativeInfo, type SecretKind, type SecurityView } from "../ipc";
+import { ipc, IpcError, type Me, type NativeInfo, type PrivacyView, type SecretKind, type SecurityView } from "../ipc";
 import { applyAppearance, loadAppearance, type Accent, type Appearance, type Mode, type Style } from "../settings";
 import { Banner, Icon, SecretField, Segmented, ToggleRow, TopBar } from "../ui";
 import type { Nav } from "./Chats";
@@ -158,6 +158,7 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
   const [a, setA] = useState<Appearance>(loadAppearance());
   const [sec, setSec] = useState<SecurityView | null>(null);
   const [native, setNative] = useState<NativeInfo | null>(null);
+  const [privacy, setPrivacy] = useState<PrivacyView | null>(null);
   const [panel, setPanel] = useState<Panel>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -165,6 +166,17 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
   function refresh() {
     void ipc.security().then(setSec, () => undefined);
     void ipc.nativeInfo().then(setNative, () => undefined);
+    void ipc.privacy().then(setPrivacy, () => undefined);
+  }
+
+  async function changePrivacy(next: PrivacyView) {
+    setError(null);
+    try {
+      await ipc.setPrivacy(next);
+      setPrivacy(next);
+    } catch (err) {
+      setError(errText(err, "Could not change it"));
+    }
   }
   useEffect(refresh, []);
 
@@ -276,6 +288,16 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
               )}
             </div>
             {panel === "purge" || panel === "purge-remove" ? <PurgeForm sec={sec} native={native} remove={panel === "purge-remove"} onDone={done} onCancel={() => setPanel(null)} /> : null}
+          </>
+        ) : null}
+
+        {privacy ? (
+          <>
+            <h3 className="group-title">Privacy</h3>
+            <div className="group card">
+              <ToggleRow id="receipts" icon="check-double" title="Read receipts" sub="On: contacts see when their messages reached you and when you read them, and you see the same from contacts who have it on. Off: neither." checked={privacy.readReceipts} onChange={(v) => void changePrivacy({ ...privacy, readReceipts: v })} />
+              <ToggleRow id="typing" icon="keyboard" title="Typing indicators" sub="On: contacts see when you are typing, and you see the same from contacts who have it on." checked={privacy.typing} onChange={(v) => void changePrivacy({ ...privacy, typing: v })} />
+            </div>
           </>
         ) : null}
 

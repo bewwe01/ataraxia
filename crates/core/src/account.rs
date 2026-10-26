@@ -807,6 +807,22 @@ impl<B: KvBackend> Account<B> {
         .await
     }
 
+    /// Forgets a contact: their identity key and our session with them are deleted. Envelopes
+    /// from them are then refused as from a stranger ([`CoreError::UnknownSender`]), and they
+    /// can only come back through a new invite, which starts a new session. Their address is
+    /// their key's hash, so this cannot let a different key in under the same address
+    /// (INV-ID-2).
+    pub async fn forget_contact(&self, addr: &Address) -> Result<()> {
+        self.transact(async {
+            self.with_store(|s| {
+                s.delete(keys::with(keys::PEER, addr.as_str().as_bytes()));
+                s.delete(keys::with(keys::SESSION, addr.as_str().as_bytes()));
+                Ok(())
+            })
+        })
+        .await
+    }
+
     /// Deletes all expired invites and their prekeys. Returns how many were removed.
     pub async fn sweep_expired_invites(&self, now: u64) -> Result<usize> {
         self.transact(async {

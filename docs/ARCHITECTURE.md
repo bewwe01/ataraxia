@@ -215,7 +215,7 @@ The owner asked to finish the mandatory parts and ship installers within a limit
 - Device secret: Windows Credential Manager; Android/Linux a 0600 file in the app's private directory (INV-REST-2 is partial there). The APK excludes all app data from backup and device transfer and sets FLAG_SECURE.
 - Release builds: signing happens only for a version tag, in a separate job in the `release` environment that runs no project code.
 
-Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in v1 the relay can link sender and recipient mailboxes; THREAT_MODEL updated), attachments, voice notes, disappearing messages, calls (Phase 6), backup, panic wipe, notifications, camera QR scanning, multi-relay, Android Keystore, a key-change warning UI, Linux/macOS packages. Unused invites keep their delivery token registered at the relay until the mailbox is gone.
+Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in v1 the relay can link sender and recipient mailboxes; THREAT_MODEL updated), attachments, voice notes, disappearing messages, calls (Phase 6), backup, panic wipe, notifications, camera QR scanning, multi-relay, Android Keystore, a key-change warning UI, Linux/macOS packages. Unused invites keep their delivery token registered at the relay until the mailbox is gone (fixed in ADR-0013).
 
 ### ADR-0012: PIN or password, biometric unlock, Purge PIN. **Accepted (owner request, 2026-10-25).**
 **Context.** The owner asked for a choice between a PIN and a password, biometric unlock with a settings toggle, and an optional duress code (the "Purge PIN") that wipes Veil when it is entered at the unlock screen.
@@ -234,6 +234,19 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 - Screenshots (owner request after the preview, U-11): FLAG_SECURE is on by default; Settings can lift it, only while unlocked. That also lets the recent-apps screen show Veil.
 
 **Not done.** Windows Hello (biometrics are Android-only for now). A Purge PIN does not tell contacts anything.
+
+### ADR-0013: Contact management and conversation privacy (milestone 1). **Accepted (owner request, 2026-10-26).**
+**Context.** The owner asked for a key-change warning, deleting and blocking contacts, disappearing messages, read receipts and typing indicators (off by default), and cleanup of unused invite tokens at the relay. No new primitive or composition: everything is ordinary `Content` inside the existing sessions, and relay token changes the protocol already had.
+
+**Decision.**
+- *Key-change warning.* An address is the hash of the identity key, so a changed key always arrives as a new contact, through a new invite (INV-MSG-7). When its introduction carries the name of an existing contact (case and spacing ignored), the new contact gets `key_warning`: the chat and the contact page show "Is this really …?" with a link to the safety number. It is never merged with the old contact or given its history. Verifying the safety number or dismissing clears it. This is a heuristic: an impostor can pick another name, so verifying safety numbers stays the real check (INV-ID-2).
+- *Delete.* The contact row and its messages are deleted (with `PRAGMA secure_delete`), the core forgets the peer identity and the session (`Account::forget_contact`), and the delivery token we gave them is queued for removal at the relay. Only a new invite brings them back, with a new session.
+- *Block.* The delivery token we gave them is withdrawn at the relay, so the relay refuses their deposits; anything already queued from them is dropped on arrival, and we do not send to them. They are not told, but their messages fail, which they can notice. *Unblock* needs the relay: a fresh token is registered and sent to them in an encrypted `MailboxUpdate`. A `MailboxUpdate` that names another relay is ignored (one relay per install).
+- *Token removals* are kept in the encrypted database until the relay confirms them, so going offline only delays them. Expired invites are cleaned up on each tick: their prekeys are deleted from the core store and their tokens queued for removal (this closes the gap noted in ADR-0011).
+- *Disappearing messages.* A per-contact timer (off, 5 min, 1 h, 1 day, 1 week, 4 weeks) is set with a `TimerUpdate`, which is stored and retried like a message and shown as a notice on both sides. Text messages carry the sender's timer; each side deletes its copy that long after sending or receiving it (no "after reading" start). Expired rows are deleted every tick and on unlock, with `secure_delete` overwriting their content in the database file; queries also hide expired rows in between. An unsent message that expires is deleted unsent. The relay never sees the timer.
+- *Read receipts and typing indicators* are one setting each, both off. Receipts are reciprocal: with them off, Veil sends none and ignores incoming ones. Turning receipts on does not send delivery receipts for older messages. Delivery receipts go out after each sync, read receipts when the conversation is shown; each is one envelope per contact with up to 64 ids. Typing is sent at most every 4 s while typing, plus "stopped"; typing messages older than 15 s (by the sender's clock) are not shown. Receipts and typing are best effort, never stored or retried, never sent to a blocked contact or ahead of our introduction, and need the relay to be reachable (so the session is not advanced for a message that cannot go out).
+
+**Costs.** Receipts and typing add envelopes the relay can count and time (THREAT_MODEL §4). Database schema migrations now exist (`PRAGMA user_version`, `crates/client/src/db.rs`).
 
 ## 7. Distribution (recorded owner request)
 

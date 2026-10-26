@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { ipc, IpcError, type ContactView, type InviteView, type SafetyView } from "../ipc";
+import { ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
 import { Banner, Icon, QrCode, Segmented, TopBar } from "../ui";
-import type { Nav } from "./Chats";
+import { KeyWarning, type Nav } from "./Chats";
 
 export function AddContact({ nav }: { nav: Nav }) {
   const [tab, setTab] = useState<"mine" | "theirs">("mine");
@@ -81,10 +81,38 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   const [safety, setSafety] = useState<SafetyView | null>(null);
   const [name, setName] = useState(contact.name);
   const [error, setError] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     void ipc.safety(contact.id).then(setSafety, () => setError("Safety number unavailable"));
   }, [contact.id, contact.verified]);
+
+  async function act(f: () => Promise<void>, fallback: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await f();
+      onChanged();
+    } catch (err) {
+      setError(err instanceof IpcError ? err.message : fallback);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.deleteContact(contact.id);
+      onChanged();
+      nav({ screen: "chats" });
+    } catch (err) {
+      setError(err instanceof IpcError ? err.message : "Could not delete");
+      setBusy(false);
+    }
+  }
 
   async function verify(v: boolean) {
     try {
@@ -110,6 +138,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
       <TopBar title={contact.name} onBack={() => nav({ screen: "chat", contact: contact.id })} />
       <div className="m-body">
         <div className="safety">
+          <KeyWarning contact={contact} nav={nav} onChanged={onChanged} />
           {contact.verified ? (
             <Banner tone="neutral" icon="shield-check"><strong>Verified</strong><p>If this number ever changes, Veil treats them as a new, unverified contact and never sends to the old conversation silently.</p></Banner>
           ) : (
@@ -134,6 +163,46 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
             </div>
             <button className="btn btn-secondary btn-block" type="submit">Save name</button>
           </form>
+
+          <div className="field">
+            <span className="label">Disappearing messages</span>
+            <div className="input">
+            <select
+              className="select"
+              aria-label="Disappearing messages"
+              value={contact.timerSecs}
+              disabled={busy || contact.blocked}
+              onChange={(e) => void act(() => ipc.setTimer(contact.id, Number(e.target.value)), "Could not change the timer")}
+            >
+              {TIMERS.some(([s]) => s === contact.timerSecs) ? null : <option value={contact.timerSecs}>{timerName(contact.timerSecs)}</option>}
+              {TIMERS.map(([s, label]) => <option key={s} value={s}>{label}</option>)}
+            </select>
+            </div>
+            <p className="hint">Applies to both of you, for new messages. They are deleted from both phones that long after they arrive. Anyone can still copy or photograph them before that.</p>
+          </div>
+
+          <div className="stack-sm">
+            {contact.blocked ? (
+              <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => void act(() => ipc.setBlocked(contact.id, false), "Could not unblock")}>Unblock {contact.name}</button>
+            ) : (
+              <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => void act(() => ipc.setBlocked(contact.id, true), "Could not block")}><Icon name="ban" />Block {contact.name}</button>
+            )}
+            <p className="hint">{contact.blocked ? "Unblocking needs the relay: Veil sends them a new address to write to." : "The relay will refuse their messages. They are not told, but they can notice that their messages fail."}</p>
+            {confirmDelete ? (
+              <div role="alertdialog" aria-labelledby="del-t" aria-describedby="del-d">
+                <Banner tone="danger" icon="trash">
+                  <strong id="del-t">Delete {contact.name}?</strong>
+                  <p id="del-d">The conversation and the encryption session are deleted from this device, and the relay refuses their messages. To talk again, one of you needs a new invite. This cannot be undone.</p>
+                  <div className="banner-actions">
+                    <button className="btn btn-secondary" type="button" onClick={() => setConfirmDelete(false)}>Cancel</button>
+                    <button className="btn btn-danger" type="button" disabled={busy} onClick={() => void remove()}>Delete</button>
+                  </div>
+                </Banner>
+              </div>
+            ) : (
+              <button className="btn btn-danger-ghost btn-block" type="button" disabled={busy} onClick={() => setConfirmDelete(true)}><Icon name="trash" />Delete contact</button>
+            )}
+          </div>
           {error ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
           <p className="hint center">Safety numbers are derived from both identity keys. They never leave your devices.</p>
         </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ipc, onChange, type AppState, type ContactView, type Me } from "./ipc";
 import { Chat, ChatList, type Route } from "./screens/Chats";
 import { AddContact, ContactProfile } from "./screens/Contacts";
@@ -13,6 +13,23 @@ export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [version, setVersion] = useState(0);
   const [fatal, setFatal] = useState<string | null>(null);
+  // Contacts shown as typing; each entry clears itself if no "stopped" arrives.
+  const [typing, setTyping] = useState<ReadonlySet<number>>(new Set());
+  const typingTimers = useRef(new Map<number, number>());
+
+  const setTypingFor = useCallback((contact: number, on: boolean) => {
+    const old = typingTimers.current.get(contact);
+    if (old !== undefined) window.clearTimeout(old);
+    typingTimers.current.delete(contact);
+    if (on) typingTimers.current.set(contact, window.setTimeout(() => setTypingFor(contact, false), 8000));
+    setTyping((prev) => {
+      if (prev.has(contact) === on) return prev;
+      const next = new Set(prev);
+      if (on) next.add(contact);
+      else next.delete(contact);
+      return next;
+    });
+  }, []);
 
   const refreshState = useCallback(() => {
     void ipc.state().then(setState, () => setFatal("Veil could not start its secure storage."));
@@ -46,22 +63,33 @@ export function App() {
     if (state !== "unlocked") return;
     refresh();
     let off: (() => void) | undefined;
-    void onChange((kind) => {
+    void onChange((kind, contact) => {
       if (kind === "locked") {
         // Drop everything shown while unlocked, previews included.
         setContacts([]);
         setMe(null);
         setRoute({ screen: "chats" });
+        for (const t of typingTimers.current.values()) window.clearTimeout(t);
+        typingTimers.current.clear();
+        setTyping(new Set());
         refreshState();
         return;
       }
+      if (kind === "typing" || kind === "typingstopped") {
+        if (contact !== null) setTypingFor(contact, kind === "typing");
+        return;
+      }
       refresh();
-      if (kind === "messages") setVersion((v) => v + 1);
+      if (kind === "messages") {
+        // A new message ends "typing".
+        if (contact !== null) setTypingFor(contact, false);
+        setVersion((v) => v + 1);
+      }
     }).then((u) => {
       off = u;
     });
     return () => off?.();
-  }, [state, refresh, refreshState]);
+  }, [state, refresh, refreshState, setTypingFor]);
 
   if (fatal) return <div className="app-error"><Banner tone="danger" icon="alert-triangle"><p>{fatal}</p></Banner></div>;
   if (state === null) return null;
@@ -72,17 +100,17 @@ export function App() {
   switch (route.screen) {
     case "chat": {
       const c = byId(route.contact);
-      return c ? <Chat contact={c} me={me} nav={setRoute} version={version} /> : <ChatList contacts={contacts} me={me} nav={setRoute} />;
+      return c ? <Chat contact={c} me={me} nav={setRoute} version={version} typing={typing.has(c.id)} onChanged={refresh} /> : <ChatList contacts={contacts} me={me} nav={setRoute} typing={typing} />;
     }
     case "contact": {
       const c = byId(route.contact);
-      return c ? <ContactProfile contact={c} nav={setRoute} onChanged={refresh} /> : <ChatList contacts={contacts} me={me} nav={setRoute} />;
+      return c ? <ContactProfile contact={c} nav={setRoute} onChanged={refresh} /> : <ChatList contacts={contacts} me={me} nav={setRoute} typing={typing} />;
     }
     case "add":
       return <AddContact nav={(to) => { refresh(); setRoute(to); }} />;
     case "settings":
       return <Settings me={me} nav={setRoute} onLocked={() => { setContacts([]); setMe(null); refreshState(); }} />;
     case "chats":
-      return <ChatList contacts={contacts} me={me} nav={setRoute} />;
+      return <ChatList contacts={contacts} me={me} nav={setRoute} typing={typing} />;
   }
 }

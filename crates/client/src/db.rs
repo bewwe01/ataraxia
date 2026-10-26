@@ -40,6 +40,39 @@ CREATE INDEX IF NOT EXISTS messages_by_contact ON messages(contact, id);
 CREATE TABLE IF NOT EXISTS invites (id BLOB PRIMARY KEY, token BLOB NOT NULL, expires INTEGER NOT NULL) WITHOUT ROWID;
 ";
 
+/// Schema changes after the first release, in order. `PRAGMA user_version` counts how many
+/// have been applied; each runs once, in a transaction with the version bump.
+const MIGRATIONS: &[&str] = &[
+    // 1: blocking, disappearing messages, the key-change warning, receipts.
+    "ALTER TABLE contacts ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE contacts ADD COLUMN timer_secs INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE contacts ADD COLUMN key_warning INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'text';
+     ALTER TABLE messages ADD COLUMN msg_id BLOB;
+     ALTER TABLE messages ADD COLUMN expires_at_ms INTEGER;
+     ALTER TABLE messages ADD COLUMN receipt INTEGER NOT NULL DEFAULT 0;
+     CREATE INDEX messages_by_expiry ON messages(expires_at_ms) WHERE expires_at_ms IS NOT NULL;
+     CREATE INDEX messages_by_msg_id ON messages(contact, msg_id);
+     CREATE TABLE token_removals (hash BLOB PRIMARY KEY) WITHOUT ROWID;",
+];
+
+fn migrate(conn: &Connection) -> Result<()> {
+    let have: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    for (n, sql) in MIGRATIONS.iter().enumerate() {
+        let version = i64::try_from(n)
+            .map_err(|_| ClientError::Storage)?
+            .saturating_add(1);
+        if version <= have {
+            continue;
+        }
+        conn.execute_batch(&format!("BEGIN; {sql} PRAGMA user_version = {version}; COMMIT;"))
+            .inspect_err(|_| {
+                let _ = conn.execute_batch("ROLLBACK");
+            })?;
+    }
+    Ok(())
+}
+
 /// An open, unlocked database. Cheap to clone (shared connection; single-threaded actor).
 #[derive(Clone)]
 pub struct Db(Rc<Connection>);
@@ -72,11 +105,13 @@ impl Db {
         // Never spill decrypted pages to temp files; wipe freed memory (SQLCipher defaults
         // already zero pages, this makes it explicit).
         conn.execute_batch(
-            "PRAGMA temp_store = MEMORY; PRAGMA cipher_memory_security = ON; PRAGMA foreign_keys = ON;",
+            "PRAGMA temp_store = MEMORY; PRAGMA cipher_memory_security = ON; PRAGMA foreign_keys = ON;
+             PRAGMA secure_delete = ON;",
         )?;
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
             .map_err(|_| ClientError::WrongPassphrase)?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self(Rc::new(conn)))
     }
 
@@ -197,6 +232,52 @@ mod tests {
             b"plaintext-canary-7e11"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A database from before the migrations keeps its rows and gains the new columns; opening
+    /// again changes nothing.
+    #[test]
+    fn migrates_an_old_database_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("veil.db");
+        let key = [5u8; 32];
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex(&key).as_str()))
+                .unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.execute(
+                "INSERT INTO contacts (address, name, mailbox, token, my_token, added_ms)
+                 VALUES ('a', 'Old', x'00', x'00', x'00', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (contact, mine, body, at_ms, status) VALUES (1, 0, 'hi', 1, 'received')",
+                [],
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let db = Db::open(&path, &key).unwrap();
+            let c = db.conn();
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(usize::try_from(v).unwrap(), MIGRATIONS.len());
+            let row: (String, bool, u32, bool) = c
+                .query_row(
+                    "SELECT name, blocked, timer_secs, key_warning FROM contacts",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(row, ("Old".into(), false, 0, false));
+            let kind: String = c
+                .query_row("SELECT kind FROM messages", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(kind, "text");
+            let secure: i64 = c.query_row("PRAGMA secure_delete", [], |r| r.get(0)).unwrap();
+            assert_eq!(secure, 1);
+        }
     }
 
     /// `apply` nests inside an outer savepoint: the outer rollback undoes it, the outer release

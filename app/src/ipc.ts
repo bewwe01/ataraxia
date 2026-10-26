@@ -24,16 +24,31 @@ export interface ContactView {
   lastMine: boolean;
   lastAtMs: number | null;
   unread: number;
+  blocked: boolean;
+  /** Disappearing-message timer in seconds; 0 is off. */
+  timerSecs: number;
+  /** Arrived with the same name as an existing contact, under a different key. */
+  keyWarning: boolean;
 }
 
-export type MessageStatus = "sending" | "sent" | "failed" | "received";
+export type MessageStatus = "sending" | "sent" | "failed" | "delivered" | "read" | "received";
 
 export interface MessageView {
   id: number;
   mine: boolean;
+  /** "timer" is a notice that the disappearing-message timer changed. */
+  kind: "text" | "timer";
   text: string;
   atMs: number;
   status: MessageStatus;
+  timerSecs: number | null;
+  expiresAtMs: number | null;
+}
+
+/** Both off unless the user turns them on. */
+export interface PrivacyView {
+  readReceipts: boolean;
+  typing: boolean;
 }
 
 export interface InviteView {
@@ -124,10 +139,42 @@ export const ipc = {
   safety: (contact: number) => call<SafetyView>("safety_number", { contact }),
   setVerified: (contact: number, verified: boolean) => call<void>("set_verified", { contact, verified }),
   rename: (contact: number, name: string) => call<void>("rename_contact", { contact, name }),
+  /** Deletes the contact, the conversation and the session. Cannot be undone. */
+  deleteContact: (contact: number) => call<void>("delete_contact", { contact }),
+  setBlocked: (contact: number, blocked: boolean) => call<void>("set_blocked", { contact, blocked }),
+  setTimer: (contact: number, secs: number) => call<void>("set_timer", { contact, secs }),
+  dismissKeyWarning: (contact: number) => call<void>("dismiss_key_warning", { contact }),
+  privacy: () => call<PrivacyView>("privacy"),
+  setPrivacy: (privacy: PrivacyView) => call<void>("set_privacy", { privacy }),
+  /** The user is typing or stopped; Rust sends it only if typing indicators are on. */
+  typing: (contact: number, started: boolean) => call<void>("typing", { contact, started }),
 };
 
+/** The disappearing-message timers offered, in seconds. */
+export const TIMERS: [number, string, string][] = [
+  [0, "Off", "Off"],
+  [300, "5 minutes", "5m"],
+  [3600, "1 hour", "1h"],
+  [86400, "1 day", "1d"],
+  [604800, "1 week", "1w"],
+  [2419200, "4 weeks", "4w"],
+];
+
+export function timerName(secs: number): string {
+  const t = TIMERS.find(([s]) => s === secs);
+  if (t) return t[1];
+  if (secs % 86400 === 0) return `${secs / 86400} days`;
+  if (secs % 3600 === 0) return `${secs / 3600} hours`;
+  if (secs % 60 === 0) return `${secs / 60} minutes`;
+  return `${secs} seconds`;
+}
+
+export function timerShort(secs: number): string {
+  return TIMERS.find(([s]) => s === secs)?.[2] ?? timerName(secs);
+}
+
 /** Something changed on the Rust side; the payload names what, never content. */
-export type ChangeKind = "contacts" | "messages" | "connection" | "locked";
+export type ChangeKind = "contacts" | "messages" | "connection" | "locked" | "typing" | "typingstopped";
 
 export function onChange(handler: (kind: ChangeKind, contact: number | null) => void): Promise<UnlistenFn> {
   return listen<{ kind: ChangeKind; contact: number | null }>("veil://changed", (e) => {
