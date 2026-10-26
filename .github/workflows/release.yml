@@ -299,8 +299,8 @@ jobs:
           cat > notes.md <<EOF
           Preview build of Veil from commit $SHA. **Not independently audited.**
 
-          Scope: one relay, one-to-one text messaging, invites by link, safety-number verification.
-          Not in this build: attachments, voice notes, calls, disappearing messages, backup, notifications.
+          Scope: one relay, one-to-one messaging (replies, reactions, edit and delete, search), photos, files and voice notes, disappearing messages, content-free notifications, invites by link or QR code, safety-number verification (also by scanning).
+          Not in this build: calls, groups, backup, more than one relay.
 
           - Android (arm64): signed with a $SIGNING.
           - Windows (x64): not code-signed; SmartScreen will warn.
