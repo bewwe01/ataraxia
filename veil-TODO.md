@@ -1,6 +1,6 @@
 # Veil TODO
 
-Status of every feature, for v0.1.0-preview.3 (updated 2026-10-26).
+Status of every feature, for v0.1.0-preview.5 (updated 2026-10-26).
 
 ETA is my hands-on time, not including CI builds (about 20 min per release). One session is about 3–5 hours. Difficulty: 1 easy … 5 very hard. Estimates are rough.
 
@@ -35,7 +35,7 @@ What's in the preview release today.
 | ✅ | Android APK and Windows installer | Built by GitHub Actions, published with SHA-256. | — | — |
 | ✅ | CI and supply-chain checks | Tests, fuzzing, Miri, cargo deny/audit/vet, secret scan. | — | — |
 | ✅ | Review gate | Final gate passed with conditions; conditions met. | — | — |
-| 🟡 | Attachment encryption | Crypto done and tested in the core; not wired into the app. | — | — |
+| ✅ | Attachment encryption | Crypto in the core, now used for photos, files and voice notes (milestone 3). | — | — |
 | 🟡 | Relay-only call filter | ICE filter done in the core; calls themselves not built. | — | — |
 
 ## Working order
@@ -45,10 +45,10 @@ My recommended order, one milestone at a time. Each one: I build it, test it, ru
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
 | ✅ | Milestone 0: release setup | Builds only when you start a release, growing version numbers, permanent signing key, relay port in .env. | ●○○○○ | — |
-| 🟡 | Milestone 1: quick wins | Key-change warning, delete/block, disappearing messages, receipts and typing, invite cleanup. Built and reviewed; ships as preview.4, waiting for your Pixel test. | ●●○○○ | — |
-| ⬜ | Milestone 2: everyday messaging | Replies, reactions, edit and delete; message search; scan QR codes with the camera, and verify in person by scanning. Then preview.5. | ●●●○○ | 2 sessions |
-| ⬜ | Milestone 3: photos, files and voice notes | Encrypted uploads through the relay (the crypto exists already), then voice notes. Review gate. Then preview.6. | ●●●○○ | 2 sessions |
-| ⬜ | Milestone 4: notifications | Without sender or text. Android background delivery is the hard part. Then preview.7. | ●●●●○ | 1–2 sessions |
+| 🟡 | Milestone 1: quick wins | Key-change warning, delete/block, disappearing messages, receipts and typing, invite cleanup. In preview.4; waiting for your Pixel test. | ●●○○○ | — |
+| 🟡 | Milestone 2: everyday messaging | Replies, reactions, edit and delete; message search; scan QR codes with the camera, and verify in person by scanning. Built, two review rounds passed. Ships in preview.5 together with 3 and 4; waiting for your Pixel test. | ●●●○○ | — |
+| 🟡 | Milestone 3: photos, files and voice notes | Encrypted uploads through the relay, voice notes, save to phone. Review: round 1 found two serious problems (sending failed on Android; photos could reach disk), fixed; round 2 passed. In preview.5; waiting for your Pixel test. | ●●●○○ | — |
+| 🟡 | Milestone 4: notifications | Never the sender or text. Works while locked; optional "stay connected in the background" on Android. Review passed, findings fixed. In preview.5; waiting for your Pixel test. | ●●●●○ | — |
 | ⬜ | Milestone 5: metadata privacy | Mailbox rotation and unlinkable sending, then Tor or proxy support. Review gate. | ●●●●○ | 2–3 sessions |
 | ⬜ | Milestone 6: calls | Voice and video through your TURN server, then Direct mode per contact. Review gate (Phase 6 of the plan). | ●●●●● | 3–5 sessions |
 | ⬜ | Milestone 7: backup and more platforms | Encrypted backup and restore, Windows Hello, Linux AppImage/.deb. | ●●●●○ | 2–3 sessions |
@@ -74,13 +74,13 @@ Small jobs with a big payoff.
 
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
-| ⬜ | Photos and files | Upload/download encrypted chunks via the relay; crypto exists. | ●●●○○ | 4–6 h |
-| ⬜ | Voice notes | Mic permission, recording, playback. After attachments. | ●●●○○ | 3–4 h |
-| ⬜ | Replies, reactions, edit and delete |  | ●●○○○ | 3–4 h |
-| ⬜ | Search messages | Local only, inside the encrypted database. | ●●○○○ | 2–3 h |
-| ⬜ | Notifications | No sender or text shown. Android background delivery is the hard part. | ●●●●○ | 1–2 sessions |
-| ⬜ | Scan QR with the camera | Camera plugin and permissions on Android. | ●●●○○ | 3–4 h |
-| ⬜ | Verify in person by scanning | Scan each other's code to mark verified. After the scanner. | ●●○○○ | 2 h |
+| 🟡 | Photos and files | Encrypted, up to 25 MB, location data stripped from photos. In preview.5. | ●●●○○ | — |
+| 🟡 | Voice notes | Up to 5 minutes, with waveform. In preview.5. | ●●●○○ | — |
+| 🟡 | Replies, reactions, edit and delete | Edit or delete for everyone within 24 h. In preview.5. | ●●○○○ | — |
+| 🟡 | Search messages | Local only, inside the encrypted database. In preview.5. | ●●○○○ | — |
+| 🟡 | Notifications | No sender or text shown, also while locked. In preview.5. | ●●●●○ | — |
+| 🟡 | Scan QR with the camera | Invites by scanning. In preview.5. | ●●●○○ | — |
+| 🟡 | Verify in person by scanning | Scan each other's code to mark verified. In preview.5. | ●●○○○ | — |
 | ⬜ | Link previews | Off by default, made by the sender only. | ●●●○○ | 3 h |
 
 ## Calls
