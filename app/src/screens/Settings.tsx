@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { ipc, IpcError, type Me, type NativeInfo, type PrivacyView, type SecretKind, type SecurityView } from "../ipc";
+import { ipc, IpcError, type Me, type NativeInfo, type NotifySettings, type PrivacyView, type SecretKind, type SecurityView } from "../ipc";
 import { applyAppearance, loadAppearance, type Accent, type Appearance, type Mode, type Style } from "../settings";
 import { Banner, Icon, SecretField, Segmented, ToggleRow, TopBar } from "../ui";
 import type { Nav } from "./Chats";
@@ -159,6 +159,7 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
   const [sec, setSec] = useState<SecurityView | null>(null);
   const [native, setNative] = useState<NativeInfo | null>(null);
   const [privacy, setPrivacy] = useState<PrivacyView | null>(null);
+  const [notify, setNotify] = useState<NotifySettings | null>(null);
   const [panel, setPanel] = useState<Panel>(null);
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -167,6 +168,19 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
     void ipc.security().then(setSec, () => undefined);
     void ipc.nativeInfo().then(setNative, () => undefined);
     void ipc.privacy().then(setPrivacy, () => undefined);
+    void ipc.notifySettings().then(setNotify, () => undefined);
+  }
+
+  async function changeNotify(f: () => Promise<void>) {
+    setError(null);
+    try {
+      await f();
+    } catch (err) {
+      setError(errText(err, "Could not change it"));
+    }
+    // The system permission answer comes later; read everything again.
+    void ipc.notifySettings().then(setNotify, () => undefined);
+    window.setTimeout(() => void ipc.notifySettings().then(setNotify, () => undefined), 1500);
   }
 
   async function changePrivacy(next: PrivacyView) {
@@ -288,6 +302,26 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
               )}
             </div>
             {panel === "purge" || panel === "purge-remove" ? <PurgeForm sec={sec} native={native} remove={panel === "purge-remove"} onDone={done} onCancel={() => setPanel(null)} /> : null}
+          </>
+        ) : null}
+
+        {notify ? (
+          <>
+            <h3 className="group-title">Notifications</h3>
+            <div className="group card">
+              <ToggleRow id="notify" icon="bell" title="Message notifications" sub="Say only that something arrived: never who, never what. While Veil is locked it keeps its relay sign-in in memory to hear about new messages; it still cannot read them." checked={notify.enabled} onChange={(v) => void changeNotify(() => ipc.setNotify(v))} />
+              {notify.backgroundSetting ? (
+                <ToggleRow id="background" icon="wifi" title="Stay connected in the background" sub="Keeps Veil running when you leave it, so notifications still come. Shows a silent notification and uses some battery." checked={notify.background} disabled={!notify.enabled} onChange={(v) => void changeNotify(() => ipc.setBackground(v))} />
+              ) : null}
+            </div>
+            {notify.enabled && !notify.systemAllowed ? (
+              <Banner tone="warning" icon="bell-off">
+                <p>Your phone does not let Veil show notifications.</p>
+                <div className="banner-actions">
+                  <button className="btn btn-secondary" type="button" onClick={() => void changeNotify(() => ipc.setNotify(true))}>Allow notifications</button>
+                </div>
+              </Banner>
+            ) : null}
           </>
         ) : null}
 

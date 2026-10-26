@@ -76,6 +76,8 @@ export function App() {
         refreshState();
         return;
       }
+      // The shell already turned it into a notification; messages refresh on "messages".
+      if (kind === "incoming") return;
       if (kind === "typing" || kind === "typingstopped") {
         if (contact !== null) setTypingFor(contact, kind === "typing");
         return;

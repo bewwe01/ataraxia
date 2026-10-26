@@ -94,6 +94,16 @@ export interface SearchHit {
 /** Own messages can be edited or deleted for everyone this long after sending. */
 export const EDIT_WINDOW_MS = 24 * 3600 * 1000;
 
+/** Notifications never name the sender or show text. */
+export interface NotifySettings {
+  enabled: boolean;
+  /** Android: the system lets Veil post notifications. Always true elsewhere. */
+  systemAllowed: boolean;
+  /** Whether the background-connection option exists here (Android). */
+  backgroundSetting: boolean;
+  background: boolean;
+}
+
 /** Both off unless the user turns them on. */
 export interface PrivacyView {
   readReceipts: boolean;
@@ -230,6 +240,11 @@ export const ipc = {
   /** Android: the system "save as" screen. Elsewhere this fails with "Unsupported". */
   saveAttachment: (message: number) => call<void>("save_attachment", { message }),
   retryAttachment: (message: number) => call<void>("retry_attachment", { message }),
+  notifySettings: () => call<NotifySettings>("notify_settings"),
+  /** On Android, turning it on also asks for the system permission if needed. */
+  setNotify: (enabled: boolean) => call<void>("set_notify", { enabled }),
+  /** Android: keep Veil connected in the background (a foreground service). */
+  setBackground: (on: boolean) => call<void>("set_background", { on }),
   markRead: (contact: number) => call<void>("mark_read", { contact }),
   createInvite: () => call<InviteView>("create_invite"),
   acceptInvite: (link: string) => call<ContactView>("accept_invite", { link }),
@@ -271,7 +286,7 @@ export function timerShort(secs: number): string {
 }
 
 /** Something changed on the Rust side; the payload names what, never content. */
-export type ChangeKind = "contacts" | "messages" | "connection" | "locked" | "typing" | "typingstopped";
+export type ChangeKind = "contacts" | "messages" | "connection" | "locked" | "typing" | "typingstopped" | "incoming";
 
 export function onChange(handler: (kind: ChangeKind, contact: number | null) => void): Promise<UnlistenFn> {
   return listen<{ kind: ChangeKind; contact: number | null }>("veil://changed", (e) => {

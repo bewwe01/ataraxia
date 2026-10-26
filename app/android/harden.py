@@ -58,12 +58,34 @@ PERMS = [
     '<uses-permission android:name="android.permission.RECORD_AUDIO" />',
     '<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />',
     '<uses-feature android:name="android.hardware.microphone" android:required="false" />',
+    # Content-free notifications and the opt-in background connection (milestone 4).
+    '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
+    '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />',
     '<uses-feature android:name="android.hardware.camera" android:required="false" />',
 ]
 for line in PERMS:
     if line not in text:
         text = text.replace("<application", f"{line}\n    <application", 1)
+# The background-connection service (only started if the user turns it on).
+SERVICE = '<service android:name=".VeilService" android:exported="false" android:foregroundServiceType="remoteMessaging" />'
+if SERVICE not in text:
+    if "</application>" not in text:
+        sys.exit("harden: no </application> in AndroidManifest.xml")
+    text = text.replace("</application>", f"    {SERVICE}\n    </application>", 1)
 manifest.write_text(text)
+
+# Monochrome status-bar icon for notifications.
+drawable = main / "res" / "drawable"
+drawable.mkdir(parents=True, exist_ok=True)
+(drawable / "ic_stat_veil.xml").write_text(
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" '
+    'android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">\n'
+    '  <path android:fillColor="#FFFFFFFF" android:pathData="M12,2L4,5v6c0,5 3.4,9.7 8,11 '
+    '4.6,-1.3 8,-6 8,-11V5L12,2zM12,7a2.5,2.5 0,1 1,0 5a2.5,2.5 0,1 1,0 -5z"/>\n'
+    "</vector>\n"
+)
 
 acts = list(main.rglob("MainActivity.kt"))
 if len(acts) != 1:

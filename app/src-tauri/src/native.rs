@@ -209,6 +209,49 @@ mod imp {
     }
 
     #[derive(Serialize)]
+    struct NotifyArg {
+        certain: bool,
+    }
+
+    pub async fn notify_message<R: Runtime>(app: &AppHandle<R>, certain: bool) {
+        if let Ok(h) = handle(app) {
+            let _ = h
+                .run_mobile_plugin_async::<Option<Empty>>("notifyMessage", NotifyArg { certain })
+                .await;
+        }
+    }
+
+    pub async fn notifications_allowed<R: Runtime>(app: &AppHandle<R>) -> bool {
+        let Ok(h) = handle(app) else { return false };
+        h.run_mobile_plugin_async::<Flag>("notificationsAllowed", ())
+            .await
+            .is_ok_and(|f| f.value)
+    }
+
+    pub async fn request_notifications<R: Runtime>(app: &AppHandle<R>) {
+        if let Ok(h) = handle(app) {
+            let _ = h
+                .run_mobile_plugin_async::<Option<Empty>>("requestNotifications", ())
+                .await;
+        }
+    }
+
+    pub async fn background<R: Runtime>(app: &AppHandle<R>) -> bool {
+        let Ok(h) = handle(app) else { return false };
+        h.run_mobile_plugin_async::<Flag>("background", ())
+            .await
+            .is_ok_and(|f| f.value)
+    }
+
+    pub async fn set_background<R: Runtime>(app: &AppHandle<R>, on: bool) -> Result<(), NativeError> {
+        let h = handle(app)?;
+        h.run_mobile_plugin_async::<Option<Empty>>("setBackground", FlagArg { value: on })
+            .await
+            .map(|_| ())
+            .map_err(|e| map(&e))
+    }
+
+    #[derive(Serialize)]
     struct SaveArg {
         name: String,
         mime: String,
@@ -278,6 +321,22 @@ mod imp {
     }
     #[allow(clippy::unused_async)]
     pub async fn set_dark_bars<R: Runtime>(_: &AppHandle<R>, _: bool) {}
+    #[allow(clippy::unused_async)]
+    pub async fn notify_message<R: Runtime>(_: &AppHandle<R>, _: bool) {}
+    #[allow(clippy::unused_async)]
+    pub async fn notifications_allowed<R: Runtime>(_: &AppHandle<R>) -> bool {
+        true
+    }
+    #[allow(clippy::unused_async)]
+    pub async fn request_notifications<R: Runtime>(_: &AppHandle<R>) {}
+    #[allow(clippy::unused_async)]
+    pub async fn background<R: Runtime>(_: &AppHandle<R>) -> bool {
+        false
+    }
+    #[allow(clippy::unused_async)]
+    pub async fn set_background<R: Runtime>(_: &AppHandle<R>, _: bool) -> Result<(), NativeError> {
+        Err(NativeError::Unavailable)
+    }
     #[allow(clippy::unused_async)]
     pub async fn save_file<R: Runtime>(
         _: &AppHandle<R>,

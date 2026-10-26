@@ -35,6 +35,7 @@ use zeroize::Zeroizing;
 use crate::db::{Db, SqlBackend};
 
 mod attachments;
+mod watcher;
 use crate::relay::{Relay, split_host_port};
 use crate::unlock::{self, SecretKind};
 use crate::{ClientError, Result, keystore, now_ms, now_secs, qr, write_atomic};
@@ -76,6 +77,7 @@ const VERIFY_PREFIX: &str = "veil-verify:";
 /// While connected, retry failed messages and updates this often (not only on reconnect).
 const RETRY_EVERY: Duration = Duration::from_mins(1);
 const RECEIPTS: &str = "receipts";
+const NOTIFY: &str = "notify";
 const TYPING: &str = "typing";
 const HEADER_FILE: &str = "vault.hdr";
 const DB_FILE: &str = "veil.db";
@@ -268,6 +270,18 @@ pub enum ChangeKind {
     /// The contact started typing (only with typing indicators on).
     Typing,
     TypingStopped,
+    /// Something new arrived for the user to be told about: a message (with its contact)
+    /// while unlocked, or, while locked, a relay notice that something arrived (no contact).
+    /// The app shell turns it into a content-free notification (INV-REST-5).
+    Incoming,
+}
+
+/// The notification setting. On by default: the notice never names the sender or shows
+/// text (INV-REST-5).
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifyView {
+    pub enabled: bool,
 }
 
 pub type Notify = Arc<dyn Fn(ChangeKind, Option<i64>) + Send + Sync>;
@@ -316,6 +330,8 @@ enum Cmd {
     Search(String, Reply<Vec<SearchHit>>),
     VerifyScanned(i64, String, Reply<bool>),
     SendAttachment(i64, AttachmentInput, Reply<MessageView>),
+    Notify(Reply<NotifyView>),
+    SetNotify(NotifyView, Reply<()>),
     AttachmentData(i64, Reply<(String, Option<String>, Zeroizing<Vec<u8>>)>),
     RetryAttachment(i64, Reply<()>),
     #[cfg(feature = "test-hooks")]
@@ -569,6 +585,14 @@ impl Client {
     ) -> Result<(String, Option<String>, Zeroizing<Vec<u8>>)> {
         ask!(self, AttachmentData, message)
     }
+    pub async fn notify_settings(&self) -> Result<NotifyView> {
+        ask!(self, Notify)
+    }
+    /// Turns content-free notifications on or off. With them on, a locked Veil keeps its relay
+    /// sign-in (not its keys to messages) in memory to hear that something arrived.
+    pub async fn set_notify(&self, v: NotifyView) -> Result<()> {
+        ask!(self, SetNotify, v)
+    }
     /// Tries a failed upload or download again.
     pub async fn retry_attachment(&self, message: i64) -> Result<()> {
         ask!(self, RetryAttachment, message)
@@ -679,6 +703,8 @@ struct Actor {
     /// vault that is gone (review U-4).
     decoy: Option<Decoy>,
     invite_ttl_secs: u64,
+    /// While locked with notifications on: hears that something arrived (ADR-0016).
+    watcher: Option<watcher::Watcher>,
 }
 
 struct Decoy {
@@ -792,6 +818,14 @@ fn snippet(body: &str, q: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// Notifications are on unless the user turned them off.
+fn notify_enabled(db: &Db) -> bool {
+    db.setting(NOTIFY)
+        .ok()
+        .flatten()
+        .is_none_or(|v| v.as_slice() != [0])
 }
 
 /// A name compared for the key-change warning: case and spacing do not make it different.
@@ -929,11 +963,19 @@ impl Actor {
             guard,
             decoy: None,
             invite_ttl_secs,
+            watcher: None,
         }
     }
 
     fn lock_now(&mut self) {
-        let was_open = self.session.take().is_some();
+        let session = self.session.take();
+        let was_open = session.is_some();
+        if let Some(s) = session.as_deref()
+            && notify_enabled(&s.db)
+        {
+            self.watcher = Some(watcher::Watcher::from_session(s));
+        }
+        drop(session);
         self.interrupt.pending.store(false, Ordering::SeqCst);
         if was_open {
             self.emit(ChangeKind::Locked, None);
@@ -1006,6 +1048,12 @@ impl Actor {
                     }
                 }
                 _ = tick.tick() => self.on_tick().await,
+                event = async {
+                    match self.watcher.as_mut() {
+                        Some(w) => w.next_event().await,
+                        None => std::future::pending().await,
+                    }
+                } => self.watcher_event(event),
                 () = std::future::ready(()), if self.wants_transfer() => {
                     self.transfer_step().await;
                 }
@@ -1019,6 +1067,7 @@ impl Actor {
             return;
         }
         if self.session.is_none() {
+            self.watcher_tick();
             return;
         }
         self.expire_messages();
@@ -1100,6 +1149,7 @@ impl Actor {
                 | Cmd::Search(..)
                 | Cmd::VerifyScanned(..)
                 | Cmd::SendAttachment(..)
+                | Cmd::SetNotify(..)
                 | Cmd::RetryAttachment(..)
                 | Cmd::CreateInvite(_)
                 | Cmd::AcceptInvite(..)
@@ -1135,6 +1185,7 @@ impl Actor {
             }
             Cmd::Reset(r) => {
                 self.lock_now();
+                self.watcher = None;
                 self.decoy = None;
                 let _ = r.send(self.wipe());
             }
@@ -1202,6 +1253,18 @@ impl Actor {
             }
             Cmd::VerifyScanned(c, code, r) => {
                 let _ = r.send(self.verify_scanned(c, &code));
+            }
+            Cmd::Notify(r) => {
+                let res = self.s().map(|s| NotifyView {
+                    enabled: notify_enabled(&s.db),
+                });
+                let _ = r.send(res);
+            }
+            Cmd::SetNotify(v, r) => {
+                let res = self
+                    .s()
+                    .and_then(|s| s.db.set_setting(NOTIFY, &[u8::from(v.enabled)]));
+                let _ = r.send(res);
             }
             Cmd::SendAttachment(c, input, r) => {
                 let res = self.send_attachment(c, input).await;
@@ -1442,6 +1505,7 @@ impl Actor {
                 let c = unlock::load_config(&self.dir);
                 let (failures, last) = unlock::load_attempts(&self.dir);
                 self.lock_now();
+                self.watcher = None;
                 let _ = self.wipe();
                 // Answer like the attempt it replaces: during a delay a real attempt leaves
                 // the countdown alone; otherwise it counts as one more failure (UR2-3).
@@ -1490,6 +1554,8 @@ impl Actor {
     }
 
     async fn open_session(&mut self, key: &vault::DbKey) -> Result<()> {
+        // Unlocked: the session does the listening again; the locked-state key goes.
+        self.watcher = None;
         let db = Db::open(&self.dir.join(DB_FILE), key.expose())?;
         let get = |k: &str| db.setting(k)?.ok_or(ClientError::Storage);
         let relay_addr = String::from_utf8(get("relay")?.to_vec()).map_err(|_| ClientError::Storage)?;
@@ -2843,6 +2909,7 @@ impl Actor {
                 )?;
                 conn.execute("UPDATE contacts SET unread = unread + 1 WHERE id = ?1", [contact])?;
                 self.emit(ChangeKind::Messages, Some(contact));
+                self.emit(ChangeKind::Incoming, Some(contact));
             }
             Body::TimerUpdate(t) => {
                 // Only a newer change of theirs counts, so a retried older one cannot undo it

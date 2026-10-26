@@ -276,6 +276,19 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 
 **Costs.** The relay sees blob sizes (Padmé-padded) and timing, and that the uploading mailbox and the downloading connection handle the same blob id; with v1's mailbox linkability (THREAT_MODEL §5) this adds no new link between people. Blobs stay at the relay until they expire (30 days) even after a delete.
 
+### ADR-0016: Content-free notifications (milestone 4). **Accepted (owner request, 2026-10-26).**
+**Context.** The owner asked for notifications. The rules: no sender and no content in notifications (CLAUDE.md rule 6, INV-REST-5), no network requests except the relay (rule 8, so no Firebase Cloud Messaging or other push service), and a vault that locks after 5 minutes.
+
+**Decision.**
+- *What a notification says:* "New message" while Veil is unlocked, "You may have new messages" while it is locked. Never a name, never text, the same on the lock screen. Tapping it opens Veil; opening Veil clears it. On Windows the taskbar button flashes instead when the window is not focused.
+- *When:* the client reports `Incoming` for a new text or attachment from a contact (not for typing, receipts, edits or reactions). On Android the native plugin posts a notification only when Veil is not on screen.
+- *While locked:* when Veil locks with notifications on, the session (database, account, message keys) is dropped as always, but the relay address and pin, the mailbox id and the mailbox **signing** key stay in memory (`service/watcher.rs`). A connection authenticated with them hears the relay's push for new deposits; it never fetches or acknowledges, so it cannot learn what arrived or from whom, and the pushes for typing or receipts count the same ("may have"). At most one notice a minute. The key is zeroized on unlock, reset, purge and process exit. Someone who can read the memory of the locked process gets the ability to fetch and acknowledge (delete) ciphertext from the mailbox, not to read it; with notifications off nothing stays.
+- *After a restart* nothing is in memory, so there are no notifications until the first unlock.
+- *Android background:* without a push service, Android stops the network of an app in the background after a while. "Stay connected in the background" (off by default) runs a foreground service of type `remoteMessaging` with a silent, minimum-priority notification, which keeps the process and the relay connection alive. It costs some battery. Android 13+ asks for the notification permission when notifications are turned on.
+- *Permissions added:* POST_NOTIFICATIONS, FOREGROUND_SERVICE, FOREGROUND_SERVICE_REMOTE_MESSAGING; the release workflow's allowlist names them.
+
+**Not done.** Notifications on desktop beyond the taskbar flash; delivery after the user swipes Veil away without the background option (Android stops it); unread counts in the notification.
+
 ## 7. Distribution (recorded owner request)
 
 The final step, after all phases pass the code-reviewer gate, is a GitHub Actions workflow that builds the Android **APK** and publishes it to this repository's **GitHub Releases**. Details:

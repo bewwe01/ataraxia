@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, Manager as _, State};
 use veil_client::ClientError;
 use veil_client::service::{
-    AppState, AttachmentInput, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, PrivacyView,
-    SafetyView, SearchHit, SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
+    AppState, AttachmentInput, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, NotifyView,
+    PrivacyView, SafetyView, SearchHit, SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
 };
 use veil_client::unlock::SecretKind;
 
@@ -456,6 +456,58 @@ fn data_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
+/// Tells the user something arrived, without saying who or what (INV-REST-5): an Android
+/// notification when Veil is not on screen, or a taskbar flash on the desktop.
+fn alert(app: &AppHandle, certain: bool) {
+    if cfg!(target_os = "android") {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move { native::notify_message(&app, certain).await });
+    } else if let Some(w) = app.get_webview_window("main")
+        && !w.is_focused().unwrap_or(true)
+    {
+        let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
+}
+
+/// Notification settings: Veil's own switch, and on Android the system permission and the
+/// opt-in background connection.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NotifySettings {
+    enabled: bool,
+    system_allowed: bool,
+    background_setting: bool,
+    background: bool,
+}
+
+#[tauri::command]
+async fn notify_settings(app: AppHandle, c: State<'_, Client>) -> Res<NotifySettings> {
+    let v = c.notify_settings().await.map_err(err)?;
+    let android = cfg!(target_os = "android");
+    Ok(NotifySettings {
+        enabled: v.enabled,
+        system_allowed: !android || native::notifications_allowed(&app).await,
+        background_setting: android,
+        background: native::background(&app).await,
+    })
+}
+
+#[tauri::command]
+async fn set_notify(app: AppHandle, c: State<'_, Client>, enabled: bool) -> Res<()> {
+    c.set_notify(NotifyView { enabled }).await.map_err(err)?;
+    if enabled {
+        native::request_notifications(&app).await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_background(app: AppHandle, c: State<'_, Client>, on: bool) -> Res<()> {
+    // Only while unlocked, like the other settings.
+    c.notify_settings().await.map_err(err)?;
+    native::set_background(&app, on).await.map_err(native_err)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let result = tauri::Builder::default()
@@ -464,6 +516,9 @@ pub fn run() {
             let dir = data_dir(&app.path().app_data_dir()?)?;
             let handle = app.handle().clone();
             let notify = std::sync::Arc::new(move |kind: ChangeKind, contact: Option<i64>| {
+                if kind == ChangeKind::Incoming {
+                    alert(&handle, contact.is_some());
+                }
                 let _ = handle.emit("veil://changed", Changed { kind, contact });
             });
             let client = Client::start_with(
@@ -522,7 +577,10 @@ pub fn run() {
             send_attachment,
             attachment_data,
             save_attachment,
-            retry_attachment
+            retry_attachment,
+            notify_settings,
+            set_notify,
+            set_background
         ])
         .run(tauri::generate_context!());
     if result.is_err() {

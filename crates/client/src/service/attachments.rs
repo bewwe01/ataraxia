@@ -633,6 +633,7 @@ impl Actor {
         conn.execute("UPDATE contacts SET unread = unread + 1 WHERE id = ?1", [contact])?;
         self.emit(ChangeKind::Messages, Some(contact));
         self.emit(ChangeKind::Contacts, Some(contact));
+        self.emit(ChangeKind::Incoming, Some(contact));
         Ok(())
     }
 

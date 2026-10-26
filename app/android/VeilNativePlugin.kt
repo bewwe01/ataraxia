@@ -4,7 +4,15 @@ package __PACKAGE__
 // (app/src-tauri/src/native.rs): the app's capability file grants the webview no permission
 // for this plugin, and Tauri rejects every `plugin:` IPC call without one (ADR-0012).
 
+import android.Manifest
 import android.app.Activity
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.os.IBinder
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -18,6 +26,9 @@ import androidx.activity.result.ActivityResult
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import androidx.biometric.BiometricPrompt
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.fragment.app.FragmentActivity
@@ -51,6 +62,71 @@ class FlagArgs {
 }
 
 @InvokeArg
+class NotifyArgs {
+  /** True when Veil knows a message arrived (unlocked); false for "may have" (locked). */
+  var certain: Boolean = false
+}
+
+/** Content-free notifications (milestone 4, ADR-0016): never a sender, never text. */
+object VeilNotify {
+  const val MESSAGES = "veil.messages"
+  const val CONNECTION = "veil.connection"
+  const val MESSAGE_ID = 1
+  const val SERVICE_ID = 2
+
+  fun channels(ctx: Context) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+    val nm = ctx.getSystemService(NotificationManager::class.java) ?: return
+    nm.createNotificationChannel(
+      NotificationChannel(MESSAGES, "Messages", NotificationManager.IMPORTANCE_DEFAULT).apply {
+        description = "Says that something new arrived. Never who, never what."
+        lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+      }
+    )
+    nm.createNotificationChannel(
+      NotificationChannel(CONNECTION, "Background connection", NotificationManager.IMPORTANCE_MIN).apply {
+        description = "Shown while Veil stays connected in the background."
+        setShowBadge(false)
+      }
+    )
+  }
+
+  fun openApp(ctx: Context): PendingIntent? {
+    val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: return null
+    launch.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+    return PendingIntent.getActivity(ctx, 0, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+  }
+
+  fun allowed(ctx: Context): Boolean =
+    NotificationManagerCompat.from(ctx).areNotificationsEnabled() &&
+      (Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
+}
+
+/** Keeps the process, and with it the relay connection, alive in the background (opt-in). */
+class VeilService : Service() {
+  override fun onBind(intent: Intent?): IBinder? = null
+
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    VeilNotify.channels(this)
+    val n = NotificationCompat.Builder(this, VeilNotify.CONNECTION)
+      .setSmallIcon(R.drawable.ic_stat_veil)
+      .setContentTitle("Veil")
+      .setContentText("Connected, to tell you when something arrives")
+      .setOngoing(true)
+      .setSilent(true)
+      .setContentIntent(VeilNotify.openApp(this))
+      .build()
+    if (Build.VERSION.SDK_INT >= 34) {
+      startForeground(VeilNotify.SERVICE_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
+    } else {
+      startForeground(VeilNotify.SERVICE_ID, n)
+    }
+    return START_STICKY
+  }
+}
+
+@InvokeArg
 class SaveArgs {
   var name: String = ""
   var mime: String = ""
@@ -66,12 +142,86 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
     const val DEVICE_ALIAS = "veil.device.v1"
     const val PREFS = "veil_native"
     const val ALLOW_SCREENSHOTS = "allow_screenshots"
+    const val BACKGROUND = "background"
     const val IV_LEN = 12
   }
 
   private fun prefs() = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
+  /** Whether Veil is on screen; notifications are only posted when it is not. */
+  @Volatile private var resumed = true
+
+  override fun onResume() {
+    resumed = true
+    NotificationManagerCompat.from(activity).cancel(VeilNotify.MESSAGE_ID)
+  }
+
+  override fun onPause() {
+    resumed = false
+  }
+
+  private fun startService(on: Boolean) {
+    val i = Intent(activity, VeilService::class.java)
+    try {
+      if (on) ContextCompat.startForegroundService(activity, i) else activity.stopService(i)
+    } catch (e: Exception) {
+      // Not allowed right now (for example from the background); the next start retries.
+    }
+  }
+
+  @Command
+  fun notifyMessage(invoke: Invoke) {
+    val certain = invoke.parseArgs(NotifyArgs::class.java).certain
+    if (!resumed && VeilNotify.allowed(activity)) {
+      VeilNotify.channels(activity)
+      val n = NotificationCompat.Builder(activity, VeilNotify.MESSAGES)
+        .setSmallIcon(R.drawable.ic_stat_veil)
+        .setContentTitle("Veil")
+        .setContentText(if (certain) "New message" else "You may have new messages")
+        .setAutoCancel(true)
+        .setOnlyAlertOnce(false)
+        .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+        .setContentIntent(VeilNotify.openApp(activity))
+        .build()
+      try {
+        NotificationManagerCompat.from(activity).notify(VeilNotify.MESSAGE_ID, n)
+      } catch (e: SecurityException) {
+        // Permission withdrawn meanwhile: nothing to show.
+      }
+    }
+    invoke.resolve()
+  }
+
+  @Command
+  fun notificationsAllowed(invoke: Invoke) {
+    invoke.resolve(JSObject().put("value", VeilNotify.allowed(activity)))
+  }
+
+  /** Asks for the notification permission (Android 13+). The answer is read again later. */
+  @Command
+  fun requestNotifications(invoke: Invoke) {
+    if (Build.VERSION.SDK_INT >= 33 && !VeilNotify.allowed(activity)) {
+      ActivityCompat.requestPermissions(activity, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7301)
+    }
+    invoke.resolve()
+  }
+
+  @Command
+  fun background(invoke: Invoke) {
+    invoke.resolve(JSObject().put("value", prefs().getBoolean(BACKGROUND, false)))
+  }
+
+  @Command
+  fun setBackground(invoke: Invoke) {
+    val on = invoke.parseArgs(FlagArgs::class.java).value
+    prefs().edit().putBoolean(BACKGROUND, on).apply()
+    startService(on)
+    invoke.resolve()
+  }
+
   override fun load(webView: WebView) {
+    VeilNotify.channels(activity)
+    if (prefs().getBoolean(BACKGROUND, false)) startService(true)
     // MainActivity sets FLAG_SECURE before anything is drawn; lift it only if the user chose so.
     if (prefs().getBoolean(ALLOW_SCREENSHOTS, false)) {
       activity.runOnUiThread { activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }

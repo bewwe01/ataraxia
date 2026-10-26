@@ -149,13 +149,16 @@ jobs:
           # Permissions: exactly the ones Veil declares (any namespace), so nothing a dependency
           # slips in goes unnoticed (review M2-5, M2R2-2). Add an entry only in the change that
           # declares it. INTERNET: the relay. CAMERA: QR codes. RECORD_AUDIO and
-          # MODIFY_AUDIO_SETTINGS: voice notes. Biometrics: AndroidX. The last one is AndroidX's
-          # own signature permission for its receivers.
+          # MODIFY_AUDIO_SETTINGS: voice notes. POST_NOTIFICATIONS and FOREGROUND_SERVICE*:
+          # notifications and the opt-in background connection. Biometrics: AndroidX. The last
+          # one is AndroidX's own signature permission for its receivers.
           "$BT/aapt2" dump permissions out/Veil-android-arm64-unsigned.apk \
             | sed -n "s/^uses-permission[^:]*: name='\([^']*\)'.*/\1/p" | sort -u | tee perms.txt
           printf '%s\n' android.permission.INTERNET android.permission.CAMERA \
             android.permission.RECORD_AUDIO android.permission.MODIFY_AUDIO_SETTINGS \
             android.permission.USE_BIOMETRIC android.permission.USE_FINGERPRINT \
+            android.permission.POST_NOTIFICATIONS android.permission.FOREGROUND_SERVICE \
+            android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING \
             org.veil.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION | sort > allowed.txt
           if comm -23 perms.txt allowed.txt | grep .; then echo "unexpected Android permission(s) above"; exit 1; fi
           grep -qx android.permission.CAMERA perms.txt
