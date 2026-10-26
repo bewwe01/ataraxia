@@ -1,6 +1,6 @@
 # Veil TODO
 
-Status of every feature, for v0.1.0-preview.1 (updated 2026-10-25).
+Status of every feature, for v0.1.0-preview.3 (updated 2026-10-26).
 
 ETA is my hands-on time, not including CI builds (about 20 min per release). One session is about 3–5 hours. Difficulty: 1 easy … 5 very hard. Estimates are rough.
 
@@ -44,14 +44,14 @@ Small jobs with a big payoff.
 
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
-| ⬜ | Relay port as a setting | VEIL_PORT in .env, so git pull never clashes. | ●○○○○ | 15 min |
-| ⬜ | Build installers only on release | Saves most of the CI minutes. | ●○○○○ | 20 min |
-| ⬜ | Permanent Android signing key | Updates install without wiping chats. Needs 5 min from you. | ●○○○○ | 30 min |
-| ⬜ | Clean up unused invite tokens | Remove them from the relay when an invite expires. | ●○○○○ | 1 h |
-| ⬜ | Key-change warning | Tell you clearly when a known contact shows up with a new key. | ●●○○○ | 2 h |
-| ⬜ | Delete or block a contact |  | ●●○○○ | 2 h |
-| ⬜ | Disappearing messages | Per-chat timer, deleted on both sides. | ●●○○○ | 2–3 h |
-| ⬜ | Read receipts and typing | Off by default, both sides must opt in. | ●●○○○ | 2–3 h |
+| ✅ | Relay port as a setting | VEIL_PORT in deploy/.env (default 8443). | ●○○○○ | — |
+| ✅ | Build installers only on release | Ordinary pushes no longer build them; docs-only pushes skip CI. | ●○○○○ | — |
+| 🟡 | Permanent Android signing key | Release side done: each build gets a higher version number. Waiting for you to add the three secrets. | ●○○○○ | 10 min (you) |
+| 🟡 | Clean up unused invite tokens | Built and tested; ships in preview.4. | ●○○○○ | — |
+| 🟡 | Key-change warning | Built: a new contact with a known name gets a warning. Waiting for your Pixel test (preview.4). | ●●○○○ | — |
+| 🟡 | Delete or block a contact | Built and tested; waiting for your Pixel test (preview.4). | ●●○○○ | — |
+| 🟡 | Disappearing messages | Built: 5 min to 4 weeks per chat. Waiting for your Pixel test (preview.4). | ●●○○○ | — |
+| 🟡 | Read receipts and typing | Built, off by default. Waiting for your Pixel test (preview.4). | ●●○○○ | — |
 
 ## Messaging
 
