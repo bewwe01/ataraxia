@@ -346,6 +346,17 @@ async fn crafted_content_from_a_contact_stays_in_its_lane() {
             .await
             .unwrap();
     }
+    // A repeated id with a new body edits their own text (a lost-reply re-send), never ours.
+    mallory
+        .client
+        .raw_send(m_alice.id, id(42), text("same id, edited", None))
+        .await
+        .unwrap();
+    mallory
+        .client
+        .raw_send(m_alice.id, my_id.clone(), text("hacked via repeat", None))
+        .await
+        .unwrap();
     mallory
         .client
         .raw_send(m_alice.id, id(99), text("done", None))
@@ -363,10 +374,19 @@ async fn crafted_content_from_a_contact_stays_in_its_lane() {
         ("carol's words", false, false)
     );
     assert!(c.reactions.is_empty());
-    assert_eq!(with_mal.iter().filter(|m| m.text == "same id").count(), 1);
+    assert_eq!(
+        with_mal.iter().filter(|m| m.text.starts_with("same id")).count(),
+        1
+    );
+    assert!(with_mal.iter().any(|m| m.text == "same id, edited" && m.edited));
+    assert!(!with_mal.iter().any(|m| m.text == "hacked via repeat"));
     let quotes: Vec<_> = with_mal.iter().filter(|m| m.text == "quoting").collect();
     assert_eq!(quotes.len(), 3);
-    assert!(quotes.iter().all(|q| q.reply.as_ref().unwrap().text == "same id"));
+    assert!(
+        quotes
+            .iter()
+            .all(|q| q.reply.as_ref().unwrap().text == "same id, edited")
+    );
     let mut ids: Vec<i64> = with_mal.iter().map(|m| m.id).collect();
     ids.dedup();
     assert_eq!(ids.len(), with_mal.len(), "no row twice");
@@ -435,6 +455,8 @@ async fn edits_and_search_respect_disappearing_messages() {
     eventually(|| async { texts(&alice.client, a_bob.id).await.is_empty().then_some(()) }).await;
     assert!(alice.client.search("short".into()).await.unwrap().is_empty());
     assert!(alice.client.search("secret".into()).await.unwrap().is_empty());
+    // The queued edit went with its message (review M2-3, M2R2-5).
+    assert_eq!(alice.client.hidden_rows(a_bob.id).await.unwrap(), 0);
     hop.restore();
     online(&alice.client, true).await;
     alice.client.set_timer(a_bob.id, 0).await.unwrap();
@@ -447,5 +469,53 @@ async fn edits_and_search_respect_disappearing_messages() {
             .unwrap()
             .iter()
             .any(|m| m.text == "secret edit")
+    );
+}
+
+/// Edits and deletes have time limits: ours 24 h after sending, theirs applied only to their
+/// messages received in the last 48 h (INV-MSG-8, review M2R2-4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_and_delete_time_windows() {
+    let r = relay().await;
+    let (alice, bob) = (user(&r, "Alice").await, user(&r, "Bob").await);
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    let old = alice
+        .client
+        .send(a_bob.id, "yesterday's words".into())
+        .await
+        .unwrap();
+    alice.client.backdate(old.id, 25 * 3600 * 1000).await.unwrap();
+    assert_eq!(
+        alice.client.edit_message(old.id, "x".into()).await.unwrap_err(),
+        ClientError::TooLate
+    );
+    assert_eq!(
+        alice.client.delete_for_everyone(old.id).await.unwrap_err(),
+        ClientError::TooLate
+    );
+
+    // Bob's message is old on Alice's side: his edit and delete are ignored there.
+    let b = bob
+        .client
+        .send(b_alice.id, "older than two days".into())
+        .await
+        .unwrap();
+    let at_alice = find(&alice.client, a_bob.id, "older than two days").await;
+    alice
+        .client
+        .backdate(at_alice.id, 49 * 3600 * 1000)
+        .await
+        .unwrap();
+    bob.client
+        .edit_message(b.id, "rewritten history".into())
+        .await
+        .unwrap();
+    bob.client.delete_for_everyone(b.id).await.unwrap();
+    bob.client.send(b_alice.id, "marker".into()).await.unwrap();
+    find(&alice.client, a_bob.id, "marker").await;
+    let m = by_id(&alice.client, a_bob.id, at_alice.id).await.unwrap();
+    assert_eq!(
+        (m.text.as_str(), m.edited, m.deleted),
+        ("older than two days", false, false)
     );
 }

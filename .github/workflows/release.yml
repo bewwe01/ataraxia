@@ -146,13 +146,17 @@ jobs:
           echo "$M" | grep -E 'allowBackup|dataExtractionRules|fullBackupContent'
           echo "$M" | grep -E 'allowBackup.*=false'
           echo "$M" | grep -q dataExtractionRules
-          # Permissions: only ones on this list, so nothing a dependency slips in goes unnoticed
-          # (review M2-5). INTERNET for the relay; CAMERA for QR codes; biometrics; the rest
-          # are reserved for voice notes and notifications (milestones 3 and 4).
-          echo "$M" | grep -o 'android.permission.[A-Z_]*' | sort -u | tee perms.txt
-          printf '%s\n' INTERNET CAMERA USE_BIOMETRIC USE_FINGERPRINT RECORD_AUDIO MODIFY_AUDIO_SETTINGS \
-            POST_NOTIFICATIONS FOREGROUND_SERVICE FOREGROUND_SERVICE_DATA_SYNC FOREGROUND_SERVICE_REMOTE_MESSAGING \
-            WAKE_LOCK ACCESS_NETWORK_STATE RECEIVE_BOOT_COMPLETED | sed 's/^/android.permission./' | sort > allowed.txt
+          # Permissions: exactly the ones Veil declares (any namespace), so nothing a dependency
+          # slips in goes unnoticed (review M2-5, M2R2-2). Add an entry only in the change that
+          # declares it. INTERNET: the relay. CAMERA: QR codes. RECORD_AUDIO and
+          # MODIFY_AUDIO_SETTINGS: voice notes. Biometrics: AndroidX. The last one is AndroidX's
+          # own signature permission for its receivers.
+          "$BT/aapt2" dump permissions out/Veil-android-arm64-unsigned.apk \
+            | sed -n "s/^uses-permission[^:]*: name='\([^']*\)'.*/\1/p" | sort -u | tee perms.txt
+          printf '%s\n' android.permission.INTERNET android.permission.CAMERA \
+            android.permission.RECORD_AUDIO android.permission.MODIFY_AUDIO_SETTINGS \
+            android.permission.USE_BIOMETRIC android.permission.USE_FINGERPRINT \
+            org.veil.app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION | sort > allowed.txt
           if comm -23 perms.txt allowed.txt | grep .; then echo "unexpected Android permission(s) above"; exit 1; fi
           grep -qx android.permission.CAMERA perms.txt
 

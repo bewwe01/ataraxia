@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type KeyboardEvent } from "react";
+import { AttachmentBody, PhotoViewer } from "../components/Attachment";
+import { formatDuration, MAX_VOICE_MS, prepareFile, startRecording, TooLarge, type Recording } from "../media";
 import { EDIT_WINDOW_MS, ipc, IpcError, timerName, timerShort, type ContactView, type Me, type MessageView } from "../ipc";
 import { Avatar, Banner, Icon, TopBar, VerifiedMark, timeLabel } from "../ui";
 
@@ -170,7 +172,8 @@ function MessageActions({ m, name, blocked, onClose, onReply, onEdit, onDone }: 
   onClose: () => void;
   onReply: () => void;
   onEdit: () => void;
-  onDone: (error?: string) => void;
+  /** `removed`: the message is gone from the list, so focus goes to the composer. */
+  onDone: (error?: string, removed?: boolean) => void;
 }) {
   const [confirm, setConfirm] = useState(false);
   const box = useRef<HTMLDivElement>(null);
@@ -203,10 +206,10 @@ function MessageActions({ m, name, blocked, onClose, onReply, onEdit, onDone }: 
   }, [onClose]);
   const canChange = withinEditWindow(m) && !blocked;
 
-  async function run(f: () => Promise<void>, fallback: string) {
+  async function run(f: () => Promise<void>, fallback: string, removed = false) {
     try {
       await f();
-      onDone();
+      onDone(undefined, removed);
     } catch (err) {
       onDone(err instanceof IpcError ? err.message : fallback);
     }
@@ -241,7 +244,7 @@ function MessageActions({ m, name, blocked, onClose, onReply, onEdit, onDone }: 
             <div role="alertdialog" aria-labelledby="del-q">
               <p id="del-q">{canChange ? "Delete for you only, or for both of you?" : "Delete this message from this device?"}</p>
               <div className="dialog-actions">
-                <button className="btn btn-danger-ghost" type="button" autoFocus onClick={() => void run(() => ipc.deleteForMe(m.id), "Could not delete")}>Delete for me</button>
+                <button className="btn btn-danger-ghost" type="button" autoFocus onClick={() => void run(() => ipc.deleteForMe(m.id), "Could not delete", true)}>Delete for me</button>
                 {canChange ? <button className="btn btn-danger" type="button" onClick={() => void run(() => ipc.deleteForEveryone(m.id), "Could not delete")}>Delete for everyone</button> : null}
               </div>
               {canChange ? <p className="hint">{name} may already have seen it, and an old version of Veil keeps it.</p> : null}
@@ -268,6 +271,10 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
   const [loaded, setLoaded] = useState(false);
   const [tooOld, setTooOld] = useState(false);
   const opener = useRef<HTMLElement | null>(null);
+  const [viewing, setViewing] = useState<MessageView | null>(null);
+  const [recording, setRecording] = useState<Recording | null>(null);
+  const [recMs, setRecMs] = useState(0);
+  const picker = useRef<HTMLInputElement>(null);
   const end = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
 
@@ -396,6 +403,64 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
     }
   }
 
+  async function pick(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setError(null);
+    setSending(true);
+    try {
+      const m = await ipc.sendAttachment(contact.id, await prepareFile(file));
+      setMessages((prev) => [...prev, m]);
+    } catch (err) {
+      setError(err instanceof TooLarge ? "Files can be up to 25 MB." : err instanceof IpcError ? err.message : "Could not send this file");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function startVoice() {
+    setError(null);
+    try {
+      setRecording(await startRecording());
+    } catch {
+      setError("Veil could not use the microphone. Allow it for Veil in your device's settings.");
+    }
+  }
+
+  // Elapsed time while recording.
+  useEffect(() => {
+    if (!recording) return;
+    const t = window.setInterval(() => setRecMs(recording.elapsed()), 200);
+    return () => window.clearInterval(t);
+  }, [recording]);
+
+  // Leaving the chat discards an unfinished recording (only on unmount: finishing one also
+  // changes `recording`).
+  const live = useRef<Recording | null>(null);
+  live.current = recording;
+  useEffect(() => () => live.current?.cancel(), []);
+
+  async function finishVoice(send: boolean) {
+    const r = recording;
+    setRecording(null);
+    setRecMs(0);
+    if (!r) return;
+    if (!send) {
+      r.cancel();
+      return;
+    }
+    setSending(true);
+    try {
+      const m = await ipc.sendAttachment(contact.id, await r.stop());
+      setMessages((prev) => [...prev, m]);
+    } catch (err) {
+      setError(err instanceof TooLarge ? "That voice message is too long." : err instanceof IpcError ? err.message : "Could not send the voice message");
+    } finally {
+      setSending(false);
+    }
+  }
+
   function openActions(m: MessageView, from: HTMLElement) {
     setError(null);
     opener.current = from;
@@ -449,17 +514,23 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
           return (
             <div key={m.id} id={`msg-${m.id}`} className={`msg ${m.mine ? "out" : "in"} ${found === m.id ? "found" : ""}`}>
               <div
-                className="bubble"
-                role="button"
-                tabIndex={0}
-                aria-haspopup="dialog"
-                onClick={(e) => openActions(m, e.currentTarget)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    openActions(m, e.currentTarget);
-                  }
-                }}
+                className={`bubble ${m.attachment?.kind === "image" ? "media" : ""}`}
+                // A bubble with its own controls (play, save) is not itself a button: its
+                // options sit in a separate button below it.
+                {...(m.attachment
+                  ? {}
+                  : {
+                      role: "button",
+                      tabIndex: 0,
+                      "aria-haspopup": "dialog" as const,
+                      onClick: (e: React.MouseEvent<HTMLDivElement>) => openActions(m, e.currentTarget),
+                      onKeyDown: (e: React.KeyboardEvent<HTMLDivElement>) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          openActions(m, e.currentTarget);
+                        }
+                      },
+                    })}
               >
                 {m.reply ? (
                   <span className="reply">
@@ -467,7 +538,13 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
                     <span>{m.reply.text || "Original message not available"}</span>
                   </span>
                 ) : null}
-                {m.deleted ? <span className="deleted-text"><Icon name="ban" />This message was deleted</span> : m.text}
+                {m.deleted ? (
+                  <span className="deleted-text"><Icon name="ban" />This message was deleted</span>
+                ) : m.attachment ? (
+                  <AttachmentBody m={m} onOpenImage={() => setViewing(m)} onError={setError} />
+                ) : (
+                  m.text
+                )}
                 <span className="meta">
                   {m.edited && !m.deleted ? <span className="edited">edited · </span> : null}
                   {m.expiresAtMs !== null ? (<><Icon name="timer" /><span className="sr-only">disappears</span></>) : null}
@@ -475,6 +552,9 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
                   {st ? (<><Icon name={st[0]} /><span className="sr-only">{st[1]}</span></>) : null}
                 </span>
               </div>
+              {m.attachment && !m.deleted ? (
+                <button className="icon-btn msg-more" type="button" aria-haspopup="dialog" aria-label="Message options" onClick={(e) => openActions(m, e.currentTarget)}><Icon name="more" /></button>
+              ) : null}
               {groups.length ? (
                 <div className="reactions" role="group" aria-label="Reactions">
                   {groups.map((g) => (
@@ -521,15 +601,35 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
               <button className="icon-btn" type="button" aria-label={editing ? "Cancel editing" : "Cancel reply"} onClick={cancelContext}><Icon name="x" /></button>
             </div>
           ) : null}
-          <form className="composer" autoComplete="off" onSubmit={(e) => void send(e)}>
-            <div className="box">
-              <label className="sr-only" htmlFor="composer">{editing ? "Edit message" : `Message ${contact.name}`}</label>
-              <textarea ref={input} id="composer" rows={1} placeholder="Message" spellCheck value={text} maxLength={62464} onChange={(e) => edit(e.target.value)} onKeyDown={onKey} />
+          {recording ? (
+            <div className="composer recording-bar" role="status" aria-live="polite">
+              <button className="icon-btn" type="button" aria-label="Discard voice message" onClick={() => void finishVoice(false)}><Icon name="trash" /></button>
+              <span className="rec-dot" aria-hidden="true" />
+              <span className="rec-time">Recording · {formatDuration(recMs)} / {formatDuration(MAX_VOICE_MS)}</span>
+              <button className="icon-btn accent send-btn" type="button" aria-label="Send voice message" onClick={() => void finishVoice(true)}><Icon name="send" /></button>
             </div>
-            <button className="icon-btn accent send-btn" type="submit" aria-label={editing ? "Save edit" : "Send"} disabled={sending}><Icon name={editing ? "check" : "send"} /></button>
-          </form>
+          ) : (
+            <form className="composer" autoComplete="off" onSubmit={(e) => void send(e)}>
+              {editing ? null : (
+                <>
+                  <input ref={picker} type="file" className="sr-only" tabIndex={-1} aria-hidden="true" onChange={(e) => void pick(e)} />
+                  <button className="icon-btn" type="button" aria-label="Attach a photo or file" disabled={sending} onClick={() => picker.current?.click()}><Icon name="paperclip" /></button>
+                </>
+              )}
+              <div className="box">
+                <label className="sr-only" htmlFor="composer">{editing ? "Edit message" : `Message ${contact.name}`}</label>
+                <textarea ref={input} id="composer" rows={1} placeholder="Message" spellCheck value={text} maxLength={62464} onChange={(e) => edit(e.target.value)} onKeyDown={onKey} />
+              </div>
+              {text.trim() === "" && !editing && !replyTo ? (
+                <button className="icon-btn accent send-btn" type="button" aria-label="Record a voice message" disabled={sending} onClick={() => void startVoice()}><Icon name="mic" /></button>
+              ) : (
+                <button className="icon-btn accent send-btn" type="submit" aria-label={editing ? "Save edit" : "Send"} disabled={sending}><Icon name={editing ? "check" : "send"} /></button>
+              )}
+            </form>
+          )}
         </>
       )}
+      {viewing ? <PhotoViewer m={viewing} onClose={() => setViewing(null)} onError={setError} /> : null}
       {actionsFor ? (
         <MessageActions
           m={actionsFor}
@@ -547,8 +647,8 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
             setText(actionsFor.text);
             closeActions(true);
           }}
-          onDone={(err) => {
-            closeActions();
+          onDone={(err, removed) => {
+            closeActions(removed === true);
             if (err) setError(err);
           }}
         />

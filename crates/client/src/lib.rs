@@ -49,6 +49,8 @@ pub enum ClientError {
     OtherRelay,
     #[error("This contact is blocked. Unblock them first.")]
     Blocked,
+    #[error("This file is not here yet")]
+    NotReady,
     #[error("Wait until this message is sent")]
     NotSentYet,
     #[error("That message can no longer be changed")]

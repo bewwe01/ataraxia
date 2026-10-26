@@ -39,7 +39,7 @@ export interface MessageView {
   id: number;
   mine: boolean;
   /** "timer" is a notice that the disappearing-message timer changed. */
-  kind: "text" | "timer";
+  kind: "text" | "timer" | "attachment";
   text: string;
   atMs: number;
   status: MessageStatus;
@@ -54,6 +54,32 @@ export interface MessageView {
   deleted: boolean;
   /** Can be replied to and reacted to. */
   actionable: boolean;
+  attachment: AttachmentView | null;
+}
+
+export interface AttachmentView {
+  kind: "image" | "file" | "voice";
+  mime: string;
+  name: string | null;
+  size: number;
+  state: "uploading" | "sent" | "downloading" | "ready" | "failed" | "too_large";
+  /** 0 to 1 while uploading or downloading. */
+  progress: number;
+  durationMs: number | null;
+  waveform: number[];
+  /** Small JPEG preview. */
+  thumbnail: number[] | null;
+}
+
+/** What `media.ts` prepares for sending. */
+export interface OutgoingAttachment {
+  kind: "image" | "file" | "voice";
+  mime: string;
+  name: string | null;
+  data: Uint8Array;
+  thumbnail: Uint8Array | null;
+  durationMs: number | null;
+  waveform: Uint8Array | null;
 }
 
 export interface SearchHit {
@@ -133,6 +159,34 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
   }
 }
 
+/** One binary call: 4-byte length, JSON metadata, then the file (see `send_attachment`). */
+function attachmentBody(contact: number, a: OutgoingAttachment): Uint8Array {
+  const meta = new TextEncoder().encode(
+    JSON.stringify({
+      contact,
+      kind: a.kind,
+      mime: a.mime,
+      name: a.name,
+      durationMs: a.durationMs,
+      waveform: a.waveform ? Array.from(a.waveform) : null,
+      thumbnail: a.thumbnail ? Array.from(a.thumbnail) : null,
+    }),
+  );
+  const body = new Uint8Array(4 + meta.byteLength + a.data.byteLength);
+  new DataView(body.buffer).setUint32(0, meta.byteLength);
+  body.set(meta, 4);
+  body.set(a.data, 4 + meta.byteLength);
+  return body;
+}
+
+async function callRaw<T>(cmd: string, body: Uint8Array): Promise<T> {
+  try {
+    return await invoke<T>(cmd, body);
+  } catch (e) {
+    throw new IpcError(typeof e === "string" ? e : "Something went wrong");
+  }
+}
+
 export const ipc = {
   state: () => call<AppState>("app_state"),
   setup: (input: SetupInput) => call<void>("setup", { input }),
@@ -169,6 +223,13 @@ export const ipc = {
   search: (query: string) => call<SearchHit[]>("search", { query }),
   /** Checks a code scanned from the contact's phone; `true` means it matched and they are now verified. */
   verifyScanned: (contact: number, code: string) => call<boolean>("verify_scanned", { contact, code }),
+  /** Encrypts and uploads a photo, file or voice note; the message goes out when it is uploaded. */
+  sendAttachment: (contact: number, a: OutgoingAttachment) => callRaw<MessageView>("send_attachment", attachmentBody(contact, a)),
+  /** The file of an attachment that is here, to show, play or save. */
+  attachmentData: (message: number) => call<ArrayBuffer>("attachment_data", { message }),
+  /** Android: the system "save as" screen. Elsewhere this fails with "Unsupported". */
+  saveAttachment: (message: number) => call<void>("save_attachment", { message }),
+  retryAttachment: (message: number) => call<void>("retry_attachment", { message }),
   markRead: (contact: number) => call<void>("mark_read", { contact }),
   createInvite: () => call<InviteView>("create_invite"),
   acceptInvite: (link: string) => call<ContactView>("accept_invite", { link }),

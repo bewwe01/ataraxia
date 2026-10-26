@@ -33,9 +33,12 @@ use veil_wire::{ENVELOPE_BUCKETS, ErrorCode, Request, Response, ServerFrame};
 use zeroize::Zeroizing;
 
 use crate::db::{Db, SqlBackend};
+
+mod attachments;
 use crate::relay::{Relay, split_host_port};
 use crate::unlock::{self, SecretKind};
 use crate::{ClientError, Result, keystore, now_ms, now_secs, qr, write_atomic};
+pub use attachments::{AttachmentInput, AttachmentView, MAX_FILE, MAX_VOICE_MS};
 
 /// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
@@ -140,7 +143,7 @@ pub struct ContactView {
 pub struct MessageView {
     pub id: i64,
     pub mine: bool,
-    /// `text`, or `timer` for a "disappearing messages changed" notice.
+    /// `text`, `attachment`, or `timer` for a "disappearing messages changed" notice.
     pub kind: String,
     pub text: String,
     pub at_ms: i64,
@@ -157,6 +160,8 @@ pub struct MessageView {
     pub deleted: bool,
     /// Can be replied to and reacted to (messages from before 0.1.0-preview.4 cannot).
     pub actionable: bool,
+    /// For `attachment` messages: the photo, file or voice note.
+    pub attachment: Option<AttachmentView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -310,10 +315,17 @@ enum Cmd {
     DeleteForMe(i64, Reply<()>),
     Search(String, Reply<Vec<SearchHit>>),
     VerifyScanned(i64, String, Reply<bool>),
+    SendAttachment(i64, AttachmentInput, Reply<MessageView>),
+    AttachmentData(i64, Reply<(String, Option<String>, Zeroizing<Vec<u8>>)>),
+    RetryAttachment(i64, Reply<()>),
     #[cfg(feature = "test-hooks")]
     RawSend(i64, Vec<u8>, Body, Reply<()>),
     #[cfg(feature = "test-hooks")]
     MsgId(i64, Reply<Vec<u8>>),
+    #[cfg(feature = "test-hooks")]
+    Backdate(i64, i64, Reply<()>),
+    #[cfg(feature = "test-hooks")]
+    HiddenRows(i64, Reply<i64>),
     MarkRead(i64, Reply<()>),
     CreateInvite(Reply<InviteView>),
     AcceptInvite(String, Reply<ContactView>),
@@ -545,6 +557,22 @@ impl Client {
     pub async fn verify_scanned(&self, contact: i64, code: String) -> Result<bool> {
         ask!(self, VerifyScanned, contact, code)
     }
+    /// Sends a photo, file or voice note (at most [`MAX_FILE`] bytes). It is uploaded in the
+    /// background; the message goes out when the upload is done.
+    pub async fn send_attachment(&self, contact: i64, input: AttachmentInput) -> Result<MessageView> {
+        ask!(self, SendAttachment, contact, input)
+    }
+    /// The file of an attachment that is here: (type, name, bytes). For showing or saving.
+    pub async fn attachment_data(
+        &self,
+        message: i64,
+    ) -> Result<(String, Option<String>, Zeroizing<Vec<u8>>)> {
+        ask!(self, AttachmentData, message)
+    }
+    /// Tries a failed upload or download again.
+    pub async fn retry_attachment(&self, message: i64) -> Result<()> {
+        ask!(self, RetryAttachment, message)
+    }
     /// Tests only: sends arbitrary content with a chosen id, as a hostile contact could.
     #[cfg(feature = "test-hooks")]
     pub async fn raw_send(&self, contact: i64, id: Vec<u8>, body: Body) -> Result<()> {
@@ -554,6 +582,17 @@ impl Client {
     #[cfg(feature = "test-hooks")]
     pub async fn msg_id(&self, message: i64) -> Result<Vec<u8>> {
         ask!(self, MsgId, message)
+    }
+    /// Tests only: moves a message's time back by `ms`.
+    #[cfg(feature = "test-hooks")]
+    pub async fn backdate(&self, message: i64, ms: i64) -> Result<()> {
+        ask!(self, Backdate, message, ms)
+    }
+    /// Tests only: hidden outgoing rows (reactions, edits, deletes, mailbox updates) waiting
+    /// or kept for a contact.
+    #[cfg(feature = "test-hooks")]
+    pub async fn hidden_rows(&self, contact: i64) -> Result<i64> {
+        ask!(self, HiddenRows, contact)
     }
     pub async fn mark_read(&self, contact: i64) -> Result<()> {
         ask!(self, MarkRead, contact)
@@ -623,6 +662,8 @@ struct Session {
     /// When we last told each contact "typing" (in memory only).
     typing_sent: HashMap<i64, Instant>,
     last_retry: Instant,
+    /// There may be attachment transfers to move forward.
+    transfers: bool,
 }
 
 struct Actor {
@@ -669,6 +710,16 @@ fn is_invisible(c: char) -> bool {
         | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
         | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{FFA0}'
         | '\u{FFF0}'..='\u{FFFB}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// Like [`clean_name`], with a different length limit (file names).
+fn clean_name_long(s: &str, max: usize) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() && !is_invisible(*c))
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 /// Normalises a display name from the network or the user: trimmed, no control, invisible or
@@ -753,7 +804,7 @@ fn name_key(name: &str) -> String {
 
 /// The columns [`message_row`] reads, from `messages m` (with the quoted message as `q`).
 const MESSAGE_COLUMNS: &str = "m.id, m.mine, m.body, m.at_ms, m.status, m.kind, m.expires_at_ms,
-     m.edited, m.deleted, m.msg_id IS NOT NULL, m.reply_to IS NOT NULL, q.id, q.mine, q.body, q.deleted";
+     m.edited, m.deleted, m.msg_id IS NOT NULL, m.reply_to IS NOT NULL, q.id, q.mine, q.body, q.deleted, q.kind";
 
 /// Excerpt of a quoted or found message.
 fn excerpt(text: &str) -> String {
@@ -775,8 +826,9 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         Some(ReplyView {
             id: qid,
             mine: r.get::<_, Option<bool>>(12)?,
-            text: match (qid, qdeleted) {
-                (Some(_), Some(false)) => excerpt(&r.get::<_, String>(13)?),
+            text: match (qid, qdeleted, r.get::<_, Option<String>>(15)?.as_deref()) {
+                (Some(_), Some(false), Some("attachment")) => "📎 Attachment".into(),
+                (Some(_), Some(false), _) => excerpt(&r.get::<_, String>(13)?),
                 _ => String::new(),
             },
         })
@@ -791,7 +843,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         } else {
             String::new()
         },
-        actionable: kind == "text" && !deleted && r.get::<_, bool>(9)?,
+        actionable: (kind == "text" || kind == "attachment") && !deleted && r.get::<_, bool>(9)?,
         kind,
         at_ms: r.get(3)?,
         status: r.get(4)?,
@@ -801,6 +853,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         reactions: Vec::new(),
         edited: r.get(7)?,
         deleted,
+        attachment: None,
     })
 }
 
@@ -934,6 +987,9 @@ impl Actor {
         );
         loop {
             tokio::select! {
+                // Commands first, then pushes and the tick; attachment transfers take one chunk
+                // at a time only when nothing else is waiting.
+                biased;
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
                     self.handle(cmd).await;
@@ -950,6 +1006,9 @@ impl Actor {
                     }
                 }
                 _ = tick.tick() => self.on_tick().await,
+                () = std::future::ready(()), if self.wants_transfer() => {
+                    self.transfer_step().await;
+                }
             }
         }
     }
@@ -978,6 +1037,7 @@ impl Actor {
             if retry {
                 self.retry_failed().await;
             }
+            self.wake_transfers();
         }
     }
 
@@ -1009,6 +1069,7 @@ impl Actor {
             self.sync().await;
             self.retry_failed().await;
             self.flush_token_removals().await;
+            self.wake_transfers();
         } else {
             s.backoff = s.backoff.saturating_mul(2).min(Duration::from_mins(1));
             s.next_attempt = Instant::now().checked_add(s.backoff).unwrap_or_else(Instant::now);
@@ -1038,6 +1099,8 @@ impl Actor {
                 | Cmd::DeleteForMe(..)
                 | Cmd::Search(..)
                 | Cmd::VerifyScanned(..)
+                | Cmd::SendAttachment(..)
+                | Cmd::RetryAttachment(..)
                 | Cmd::CreateInvite(_)
                 | Cmd::AcceptInvite(..)
                 | Cmd::SetVerified(..)
@@ -1140,6 +1203,17 @@ impl Actor {
             Cmd::VerifyScanned(c, code, r) => {
                 let _ = r.send(self.verify_scanned(c, &code));
             }
+            Cmd::SendAttachment(c, input, r) => {
+                let res = self.send_attachment(c, input).await;
+                let _ = r.send(res);
+            }
+            Cmd::AttachmentData(m, r) => {
+                let _ = r.send(self.attachment_data(m));
+            }
+            Cmd::RetryAttachment(m, r) => {
+                let res = self.retry_attachment(m).await;
+                let _ = r.send(res);
+            }
             #[cfg(feature = "test-hooks")]
             Cmd::RawSend(c, id, body, r) => {
                 let res = self.raw_send(c, id, body).await;
@@ -1148,6 +1222,32 @@ impl Actor {
             #[cfg(feature = "test-hooks")]
             Cmd::MsgId(m, r) => {
                 let res = self.text_row(m).map(|row| row.2);
+                let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::Backdate(m, ms, r) => {
+                let res = self.s().and_then(|s| {
+                    s.db.conn()
+                        .execute(
+                            "UPDATE messages SET at_ms = at_ms - ?2 WHERE id = ?1",
+                            params![m, ms],
+                        )
+                        .map(|_| ())
+                        .map_err(Into::into)
+                });
+                let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::HiddenRows(c, r) => {
+                let res = self.s().and_then(|s| {
+                    s.db.conn()
+                        .query_row(
+                            "SELECT count(*) FROM messages WHERE contact = ?1 AND kind IN ('control', 'mailbox')",
+                            [c],
+                            |row| row.get(0),
+                        )
+                        .map_err(Into::into)
+                });
                 let _ = r.send(res);
             }
             Cmd::MarkRead(c, r) => {
@@ -1303,6 +1403,7 @@ impl Actor {
             more: true,
             typing_sent: HashMap::new(),
             last_retry: Instant::now(),
+            transfers: true,
         }));
         self.emit(ChangeKind::Connection, None);
         Ok(())
@@ -1412,6 +1513,7 @@ impl Actor {
             more: true,
             typing_sent: HashMap::new(),
             last_retry: Instant::now(),
+            transfers: true,
         }));
         self.expire_messages();
         let _ = self.cleanup_invites().await;
@@ -1611,8 +1713,11 @@ impl Actor {
             .ok_or(ClientError::UnknownContact)?;
         let last: Option<(String, bool, i64)> = conn
             .query_row(
-                "SELECT body, mine, at_ms FROM messages WHERE contact = ?1 AND kind = 'text' AND deleted = 0
-                 AND (expires_at_ms IS NULL OR expires_at_ms > ?2) ORDER BY id DESC LIMIT 1",
+                "SELECT CASE m.kind WHEN 'attachment' THEN CASE a.kind WHEN 'image' THEN '📷 Photo'
+                   WHEN 'voice' THEN '🎤 Voice message' ELSE '📄 ' || coalesce(a.name, 'File') END ELSE m.body END,
+                 m.mine, m.at_ms FROM messages m LEFT JOIN attachments a ON a.message = m.id
+                 WHERE m.contact = ?1 AND m.kind IN ('text', 'attachment') AND m.deleted = 0
+                 AND (m.expires_at_ms IS NULL OR m.expires_at_ms > ?2) ORDER BY m.id DESC LIMIT 1",
                 params![id, now_ms()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -1642,7 +1747,7 @@ impl Actor {
     fn contacts(&self) -> Result<Vec<ContactView>> {
         let s = self.s()?;
         let mut stmt = s.db.conn().prepare(
-            "SELECT c.id FROM contacts c LEFT JOIN messages m ON m.contact = c.id AND m.kind IN ('text', 'timer')
+            "SELECT c.id FROM contacts c LEFT JOIN messages m ON m.contact = c.id AND m.kind IN ('text', 'timer', 'attachment')
              GROUP BY c.id ORDER BY max(coalesce(m.at_ms, c.added_ms)) DESC",
         )?;
         let ids = stmt
@@ -1657,8 +1762,8 @@ impl Actor {
         let mut stmt = conn.prepare(&format!(
             "SELECT {MESSAGE_COLUMNS} FROM messages m
              LEFT JOIN messages q ON q.id = (SELECT x.id FROM messages x WHERE x.contact = m.contact
-                 AND x.msg_id = m.reply_to AND x.kind = 'text' ORDER BY x.id LIMIT 1)
-             WHERE m.contact = ?1 AND m.kind IN ('text', 'timer') ORDER BY m.id DESC LIMIT 500"
+                 AND x.msg_id = m.reply_to AND x.kind IN ('text', 'attachment') ORDER BY x.id LIMIT 1)
+             WHERE m.contact = ?1 AND m.kind IN ('text', 'timer', 'attachment') ORDER BY m.id DESC LIMIT 500"
         ))?;
         // Expired rows are deleted by the tick (at most 5 s late); the UI hides them on time.
         let mut out = stmt
@@ -1666,6 +1771,9 @@ impl Actor {
             .collect::<core::result::Result<Vec<_>, _>>()?;
         let mut react = conn.prepare("SELECT emoji, mine FROM reactions WHERE message = ?1 ORDER BY mine")?;
         for m in &mut out {
+            if m.kind == "attachment" {
+                m.attachment = self.attachment_view(m.id)?;
+            }
             m.reactions = react
                 .query_map([m.id], |r| {
                     Ok(ReactionView {
@@ -2028,7 +2136,7 @@ impl Actor {
                     .db
                     .conn()
                     .query_row(
-                        "SELECT msg_id FROM messages WHERE id = ?1 AND contact = ?2 AND kind = 'text'
+                        "SELECT msg_id FROM messages WHERE id = ?1 AND contact = ?2 AND kind IN ('text', 'attachment')
                          AND msg_id IS NOT NULL AND deleted = 0",
                         params![q, contact],
                         |r| r.get(0),
@@ -2084,7 +2192,7 @@ impl Actor {
             &format!(
                 "SELECT {MESSAGE_COLUMNS} FROM messages m
                  LEFT JOIN messages q ON q.id = (SELECT x.id FROM messages x WHERE x.contact = m.contact
-                 AND x.msg_id = m.reply_to AND x.kind = 'text' ORDER BY x.id LIMIT 1)
+                 AND x.msg_id = m.reply_to AND x.kind IN ('text', 'attachment') ORDER BY x.id LIMIT 1)
                  WHERE m.id = ?1"
             ),
             [id],
@@ -2100,6 +2208,9 @@ impl Actor {
                 })
             })?
             .collect::<core::result::Result<Vec<_>, _>>()?;
+        if m.kind == "attachment" {
+            m.attachment = self.attachment_view(id)?;
+        }
         Ok(m)
     }
 
@@ -2170,7 +2281,7 @@ impl Actor {
             .conn()
             .query_row(
                 "SELECT contact, mine, msg_id, at_ms, deleted FROM messages
-                 WHERE id = ?1 AND kind = 'text' AND msg_id IS NOT NULL",
+                 WHERE id = ?1 AND kind IN ('text', 'attachment') AND msg_id IS NOT NULL",
                 [message],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
@@ -2181,7 +2292,8 @@ impl Actor {
     /// Whether our message is still waiting to go out, and when it expires.
     fn pending_and_expiry(&self, message: i64) -> Result<(bool, Option<i64>)> {
         Ok(self.s()?.db.conn().query_row(
-            "SELECT envelope IS NOT NULL, expires_at_ms FROM messages WHERE id = ?1",
+            "SELECT envelope IS NOT NULL OR EXISTS(SELECT 1 FROM attachments a WHERE a.message = messages.id
+               AND a.state = 'upload'), expires_at_ms FROM messages WHERE id = ?1",
             [message],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?)
@@ -2247,9 +2359,25 @@ impl Actor {
             return Err(ClientError::BadInput);
         }
         let (contact, msg_id) = self.own_recent(message)?;
+        let is_text: bool = self.s()?.db.conn().query_row(
+            "SELECT kind = 'text' FROM messages WHERE id = ?1",
+            [message],
+            |r| r.get(0),
+        )?;
+        if !is_text {
+            return Err(ClientError::BadInput);
+        }
         let (pending, expires) = self.pending_and_expiry(message)?;
         let db = self.s()?.db.clone();
         if pending {
+            let blocked: bool =
+                db.conn()
+                    .query_row("SELECT blocked FROM contacts WHERE id = ?1", [contact], |r| {
+                        r.get(0)
+                    })?;
+            if blocked {
+                return Err(ClientError::Blocked);
+            }
             // Not sent yet: seal the message again with the new text, so they only ever get
             // that version (review M2-1).
             self.reseal_text(message, contact, msg_id, body).await?;
@@ -2328,6 +2456,8 @@ impl Actor {
                 )?;
                 db.conn()
                     .execute("DELETE FROM reactions WHERE message = ?1", [message])?;
+                db.conn()
+                    .execute("DELETE FROM attachments WHERE message = ?1", [message])?;
                 if unsent {
                     return Ok(None);
                 }
@@ -2349,7 +2479,7 @@ impl Actor {
         let contact: i64 =
             s.db.conn()
                 .query_row(
-                    "SELECT contact FROM messages WHERE id = ?1 AND kind IN ('text', 'timer')",
+                    "SELECT contact FROM messages WHERE id = ?1 AND kind IN ('text', 'timer', 'attachment')",
                     [message],
                     |r| r.get(0),
                 )
@@ -2506,6 +2636,8 @@ impl Actor {
     async fn sync(&mut self) {
         self.sync_batches().await;
         self.send_delivery_receipts().await;
+        // Anything received may be a file to download.
+        self.wake_transfers();
     }
 
     async fn sync_batches(&mut self) {
@@ -2679,6 +2811,19 @@ impl Actor {
                     |r| r.get(0),
                 )?;
                 if seen {
+                    // Their own recent text sent again with a new body: they edited it while
+                    // it looked unsent to them (a lost reply), so take it as an edit. Anything
+                    // else is dropped, and no row is ever added (review M2R2-1).
+                    if !t.body.trim().is_empty() {
+                        let n = conn.execute(
+                            "UPDATE messages SET body = ?3, edited = 1 WHERE contact = ?1 AND mine = 0 AND msg_id = ?2
+                             AND kind = 'text' AND deleted = 0 AND at_ms > ?4 AND body != ?3",
+                            params![contact, msg_id, t.body, now.saturating_sub(PEER_EDIT_WINDOW_MS)],
+                        )?;
+                        if n > 0 {
+                            self.emit(ChangeKind::Messages, Some(contact));
+                        }
+                    }
                     return Ok(());
                 }
                 // Their timer, or ours if they sent none (an older version that ignores timers).
@@ -2734,11 +2879,33 @@ impl Actor {
                     self.emit(ChangeKind::Messages, Some(contact));
                 }
             }
+            Body::Attachment(a) => {
+                // Same rules as a text: no repeated ids; their timer or ours.
+                let seen: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE contact = ?1 AND msg_id = ?2)",
+                    params![contact, msg_id],
+                    |r| r.get(0),
+                )?;
+                if seen {
+                    return Ok(());
+                }
+                let local: u32 =
+                    conn.query_row("SELECT timer_secs FROM contacts WHERE id = ?1", [contact], |r| {
+                        r.get(0)
+                    })?;
+                let expires = a
+                    .expire_timer_secs
+                    .filter(|t| *t > 0)
+                    .or((local > 0).then_some(local))
+                    .map(|t| now.saturating_add(i64::from(t).saturating_mul(1000)));
+                self.receive_attachment(contact, msg_id, &a, expires)?;
+            }
             // A reaction to any text in this conversation, theirs or ours.
             Body::Reaction(r) => {
                 let target: Option<i64> = conn
                     .query_row(
-                        "SELECT id FROM messages WHERE contact = ?1 AND msg_id = ?2 AND kind = 'text' AND deleted = 0",
+                        "SELECT id FROM messages WHERE contact = ?1 AND msg_id = ?2 AND kind IN ('text', 'attachment')
+                         AND deleted = 0",
                         params![contact, r.target_id],
                         |row| row.get(0),
                     )
@@ -2770,7 +2937,7 @@ impl Actor {
                 let target: Option<i64> = conn
                     .query_row(
                         "SELECT id FROM messages WHERE contact = ?1 AND mine = 0 AND msg_id = ?2
-                         AND kind = 'text' AND at_ms > ?3",
+                         AND kind IN ('text', 'attachment') AND at_ms > ?3",
                         params![contact, d.target_id, now.saturating_sub(PEER_EDIT_WINDOW_MS)],
                         |row| row.get(0),
                     )
@@ -2781,6 +2948,7 @@ impl Actor {
                         [target],
                     )?;
                     conn.execute("DELETE FROM reactions WHERE message = ?1", [target])?;
+                    conn.execute("DELETE FROM attachments WHERE message = ?1", [target])?;
                     self.emit(ChangeKind::Messages, Some(contact));
                     self.emit(ChangeKind::Contacts, Some(contact));
                 }
@@ -2881,7 +3049,7 @@ impl Actor {
         let rows: Vec<(i64, Vec<u8>)> =
             s.db.conn()
                 .prepare(
-                    "SELECT id, msg_id FROM messages WHERE contact = ?1 AND mine = 0 AND kind = 'text'
+                    "SELECT id, msg_id FROM messages WHERE contact = ?1 AND mine = 0 AND kind IN ('text', 'attachment')
                  AND msg_id IS NOT NULL AND receipt < ?2 ORDER BY id LIMIT 256",
                 )
                 .and_then(|mut st| {
@@ -2919,7 +3087,7 @@ impl Actor {
             s.db.conn()
                 .prepare(
                     "SELECT DISTINCT m.contact FROM messages m JOIN contacts c ON c.id = m.contact
-                 WHERE m.mine = 0 AND m.kind = 'text' AND m.msg_id IS NOT NULL AND m.receipt = 0
+                 WHERE m.mine = 0 AND m.kind IN ('text', 'attachment') AND m.msg_id IS NOT NULL AND m.receipt = 0
                  AND c.blocked = 0 AND c.intro IS NULL",
                 )
                 .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
@@ -3024,7 +3192,7 @@ impl Actor {
         for c in &contacts {
             let _ = s.db.conn().execute(
                 "UPDATE contacts SET unread = max(0, unread - (SELECT count(*) FROM (
-                   SELECT expires_at_ms FROM messages WHERE contact = ?1 AND mine = 0 AND kind = 'text'
+                   SELECT expires_at_ms FROM messages WHERE contact = ?1 AND mine = 0 AND kind IN ('text', 'attachment')
                    ORDER BY id DESC LIMIT (SELECT unread FROM contacts WHERE id = ?1))
                  WHERE expires_at_ms <= ?2)) WHERE id = ?1",
                 params![c, now],

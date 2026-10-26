@@ -208,6 +208,32 @@ mod imp {
             .map_err(|e| map(&e))
     }
 
+    #[derive(Serialize)]
+    struct SaveArg {
+        name: String,
+        mime: String,
+        data: Zeroizing<String>,
+    }
+
+    /// Opens the system "save as" screen for a received file and writes it there.
+    pub async fn save_file<R: Runtime>(
+        app: &AppHandle<R>,
+        name: &str,
+        mime: &str,
+        data: &[u8],
+    ) -> Result<(), NativeError> {
+        let h = handle(app)?;
+        let arg = SaveArg {
+            name: name.to_owned(),
+            mime: mime.to_owned(),
+            data: Zeroizing::new(B64.encode(data)),
+        };
+        h.run_mobile_plugin_async::<Flag>("saveFile", arg)
+            .await
+            .map(|_| ())
+            .map_err(|e| map(&e))
+    }
+
     pub async fn set_dark_bars<R: Runtime>(app: &AppHandle<R>, dark: bool) {
         if let Ok(h) = handle(app) {
             let _ = h
@@ -252,6 +278,15 @@ mod imp {
     }
     #[allow(clippy::unused_async)]
     pub async fn set_dark_bars<R: Runtime>(_: &AppHandle<R>, _: bool) {}
+    #[allow(clippy::unused_async)]
+    pub async fn save_file<R: Runtime>(
+        _: &AppHandle<R>,
+        _: &str,
+        _: &str,
+        _: &[u8],
+    ) -> Result<(), NativeError> {
+        Err(NativeError::Unavailable)
+    }
 }
 
 pub use imp::*;

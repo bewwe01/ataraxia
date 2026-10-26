@@ -66,6 +66,37 @@ const MIGRATIONS: &[&str] = &[
        emoji TEXT NOT NULL,
        PRIMARY KEY (message, mine)
      ) WITHOUT ROWID;",
+    // 3: photos, files and voice notes (milestone 3). The file and its ciphertext chunks
+    // stay inside SQLCipher; they go with their message.
+    "CREATE TABLE attachments (
+       message INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+       kind TEXT NOT NULL,
+       mime TEXT NOT NULL,
+       name TEXT,
+       size INTEGER NOT NULL,
+       duration_ms INTEGER,
+       waveform BLOB,
+       thumbnail BLOB,
+       blob_id BLOB NOT NULL,
+       att_key BLOB NOT NULL,
+       nonce_prefix BLOB NOT NULL,
+       sha256 BLOB NOT NULL,
+       padded_size INTEGER NOT NULL,
+       total_chunks INTEGER NOT NULL,
+       next_chunk INTEGER NOT NULL DEFAULT 0,
+       state TEXT NOT NULL,
+       upload_token BLOB,
+       attempts INTEGER NOT NULL DEFAULT 0,
+       timer_secs INTEGER,
+       data BLOB
+     );
+     CREATE INDEX attachments_pending ON attachments(state) WHERE state IN ('upload', 'download');
+     CREATE TABLE attachment_chunks (
+       message INTEGER NOT NULL REFERENCES attachments(message) ON DELETE CASCADE,
+       idx INTEGER NOT NULL,
+       data BLOB NOT NULL,
+       PRIMARY KEY (message, idx)
+     );",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

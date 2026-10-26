@@ -3404,3 +3404,102 @@ Fix: add a non-colour marker to the `.mine` state, such as a small check glyph o
 
 ### Action options
 Recommended: **B. Fix blocking only** (M2-1 to M2-4), then re-review. A, C and D (fix all, fix specific findings, or review only) are also available.
+
+## Milestone 2 review, round 2
+
+**Scope:** `git diff 6d0f275 5ae4a29` (the round-1 fixes), checked against the whole milestone (`git diff 91135dd 5ae4a29 -- crates app .github docs design`). Out of scope: `veil-TODO.md`, `app/src/media.ts` and `app/android/VeilNativePlugin.kt` (milestone 3).
+
+**Verdict: PASS WITH CONDITIONS.** Every Medium finding from round 1 (M2-1 to M2-4) is fixed and covered by a test. There are no Critical, High or Medium findings in this round. There are four new Low findings and one Info. M2R2-2 should be fixed before milestone 3 adds the microphone; the rest can be fixed now or tracked.
+
+**Commands run:**
+- The working tree had uncommitted milestone 3 work that appeared while I was reviewing (`crates/client/src/service/attachments.rs`, plus changes to `service.rs`, `db.rs` and `lib.rs`). With those files, `cargo clippy -p veil-client --lib` fails with 3 errors, all in `attachments.rs`. So I ran every command on a clean detached worktree of 5ae4a29, and removed the worktree afterwards.
+- `cargo test -p veil-client --lib --test messaging --test contacts_and_privacy`: 11 + 6 + 8 passed.
+- `cargo clippy -p veil-client --lib -- -D warnings`, which builds without `test-hooks`: clean.
+- `cargo clippy -p veil-client --all-targets -- -D warnings`: clean.
+- `cargo fmt --all --check`: clean.
+- `pnpm -C app typecheck`: clean.
+- `pnpm -C app lint`: "12 files clean".
+- `cargo tree -e features -i veil-client --manifest-path app/src-tauri/Cargo.toml`: only the `default` feature is enabled for the app. `test-hooks` appears only under `[dev-dependencies]` in the core workspace. `Cargo.lock` and `app/src-tauri/Cargo.lock` were not changed by 5ae4a29.
+
+### Round-1 findings
+
+| ID | Severity | Status | Verified against |
+|---|---|---|---|
+| M2-1 | Medium | **Fixed** | `edit_message` (`service.rs:2252`): when the target still has an envelope, it calls `reseal_text` instead of sending an `Edit`. `reseal_text` (`:2284`) seals one new `Text` with the same id, `reply_to`, `at_ms` and timer, and replaces the row's envelope and body inside one savepoint, so the seal and the update commit or roll back together. `react` refuses with `NotSentYet` when the target is ours and not sent yet (`:2198`). The actor processes commands one at a time (`run` loop at `:935`), so nothing can deliver or retry between the pending check and the re-seal. Old and new timer give the same value: `send` sets `expires = at + timer·1000`. Test: `messaging::editing_an_unsent_message` (it would fail on the round-1 code, which delivered an `Edit` with `edited = true`). One rare case is left; see M2R2-1. |
+| M2-2 | Medium | **Fixed** | `receive` drops a `Text` whose `(contact, msg_id)` is already stored (`:2676`). The core enforces 16-byte random ids (`content.rs:274`), so the only legitimate repeat is M2R2-1. The quote is now resolved through `q.id = (SELECT … ORDER BY x.id LIMIT 1)` in both `messages()` and `message()`. Test: `crafted_content_from_a_contact_stays_in_its_lane` (one row for the repeated id; three replies, each quoted once; no row id twice). The optional `UNIQUE` index was not added; that is acceptable now that inserts check first. |
+| M2-3 | Medium | **Fixed** (the test covers part of it, see M2R2-5) | `queue_control` stores the target's `expires_at_ms`, so the sweeper deletes the row with or without its envelope. `deliver` deletes a `kind = 'control'` row after a successful deposit. Interactions checked: `retry_failed` collects ids first, and a row deleted later just gets "no row" in `deliver`. The sweeper's unread adjustment counts only `mine = 0 AND kind = 'text'`, and contact ordering and `last_text` filter on `kind IN ('text','timer')`/`'text'`, so control rows do not affect either. |
+| M2-4 | Medium | **Fixed** (one gap left, M2R2-3) | `Chats.tsx`: a `document` keydown handler covers Escape from anywhere and wraps Tab between the dialog's first and last buttons. The opener is stored in `openActions` and refocused by `closeActions` (`:406`); Reply and Edit focus the composer. No other Escape listener exists in `app/src` that could also fire. |
+| M2-5 | Low | **Partially fixed**, see M2R2-2 | The release workflow now compares the APK's permissions with an allowlist (`comm -23`). The shell is correct: the `if` takes the pipeline's status, `grep .` succeeds only when there is output, and both files are sorted under the same locale. However, the list pre-approves permissions Veil does not declare, and the grep only sees `android.permission.*` names. |
+| M2-6 | Low | **Fixed** | `loaded`/`tooOld`: a hit outside the loaded window shows an info banner and clears `found`, so auto-scroll resumes. `Chat` is keyed by `contact.id` plus focus (`App.tsx:104`), so `loaded` cannot carry over from another chat. |
+| M2-7 | Low | **Fixed** | `if (stopped) return;` after `await v.play()`. |
+| M2-8 | Low | **Fixed** | `ReplyView.mine: Option<bool>`, which is NULL when the join finds no row. `ipc.ts` now has `boolean \| null`, and the UI shows no author in that case. The test was updated to `Some(true)`/`Some(false)`. |
+| M2-9 | Low | **Fixed** | There is now a crafted-content harness (`test-hooks`: `raw_send`, `msg_id`), an expired-search case, and `db::tests::migrates_a_version_1_database` (columns, `reactions` table, cascade). INV-MSG-8 slightly overclaims; see M2R2-4. |
+| M2-10 | Low | **Fixed** | The user's own reaction now gets a check glyph (`#i-check` exists in `public/icons.svg`, and `Icon` is `aria-hidden`) and a 2px border on `.reaction.mine` and `.emoji-btn.mine`. Recorded in DESIGN.md. |
+| M2-11 | Info | **Addressed** | The `SafetyView.code` doc comment is reworded, empty received edits are ignored (`Body::Edit(e) if !e.body.trim().is_empty()`), and the ASCII-only `LIKE` case folding is noted in ADR-0014. |
+
+### New findings
+
+**M2R2-1 Low: re-sealing after a deposit whose reply was lost leaves the two sides with different text, and the receiver drops the new version silently**
+`crates/client/src/service.rs:2252` (`edit_message` pending branch), `:2284` (`reseal_text`), `:2676` (`receive` repeated-id drop).
+
+"Pending" means `envelope IS NOT NULL`. That is also the state after a deposit the relay accepted but whose reply never arrived. This happens on a dropped connection, or when `interruptible` cancels `call` because of an auto-lock during a deposit.
+
+Failure scenario:
+1. Alice's text "first draft" reaches Bob's mailbox, but `deliver` records `failed` and keeps the envelope.
+2. Before the next retry (`RETRY_EVERY` = 1 min) Alice edits it to "final words". `reseal_text` seals a new envelope with the **same content id**, and it is delivered.
+3. Bob's client opens it. The text is valid (new ratchet counter), but `receive` sees the id is already stored and returns `Ok(())`.
+4. Bob keeps "first draft". Alice sees "final words" with no "edited" mark. Nothing on either side shows the difference.
+
+Before this fix, the same lost reply led to an `Edit` that Bob applied. Without an edit, a retry of the *same* envelope is harmless, because libsignal rejects the duplicate.
+
+Fix: in `receive` `Body::Text`, when the id is already stored, do not drop it unconditionally. If the existing row is that contact's own live text (`mine = 0 AND kind = 'text' AND deleted = 0 AND at_ms > now - PEER_EDIT_WINDOW_MS`) and the body differs, apply it as an edit (`UPDATE … SET body = ?, edited = 1`). Otherwise drop it. This inserts no row, so the M2-2 protection still holds, and the scope is the same one a crafted `Edit` already has. Add a case to `crafted_content_from_a_contact_stays_in_its_lane`: a repeated id with a new body updates their own row and never ours.
+
+**M2R2-2 Low: the Android permission allowlist pre-approves the microphone and misses non-`android.permission` names**
+`.github/workflows/release.yml:152-156`.
+
+- The allowlist includes `RECORD_AUDIO`, `MODIFY_AUDIO_SETTINGS`, `FOREGROUND_SERVICE*`, `WAKE_LOCK`, `RECEIVE_BOOT_COMPLETED`, `POST_NOTIFICATIONS` and `ACCESS_NETWORK_STATE`, "reserved" for milestones 3 and 4. At 5ae4a29 the APK declares only INTERNET, CAMERA (`harden.py:56`) and the biometric permissions. Round 1 established that the microphone stays denied in the webview only because RECORD_AUDIO is not in the manifest. A dependency or template change that adds RECORD_AUDIO now passes CI, and RECORD_AUDIO was the very example in M2-5.
+- `grep -o 'android.permission.[A-Z_]*'` only sees names in the `android.permission.` namespace. A dependency that adds `com.google.android.gms.permission.AD_ID` (Play Services' advertising id) or `com.google.android.c2dm.permission.RECEIVE` is never compared with the list.
+- The same grep also matches `android:permission="android.permission.BIND_…"` attributes on services. This fails closed, so it can cause a spurious failure but never a silent pass.
+
+Fix:
+- Allowlist only what this commit declares: `INTERNET CAMERA USE_BIOMETRIC USE_FINGERPRINT`. Add each further entry in the PR that declares it.
+- Read the real `<uses-permission>` set: `"$BT/aapt2" dump permissions out/*.apk | sed -n "s/^uses-permission[^:]*: name='\([^']*\)'.*/\1/p" | sort -u > perms.txt`. This covers `uses-permission-sdk-23` and every namespace. Allowlist full names, including `${applicationId}.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION` if AndroidX declares it.
+
+**M2R2-3 Low: after "Delete for me", focus goes to a bubble that is about to disappear, then drops to `<body>`** [MEDIUM confidence]
+`app/src/screens/Chats.tsx:244` (Delete for me), `:406` (`closeActions`), `:550` (`onDone`).
+
+`onDone` calls `closeActions()` without `focusComposer`. `closeActions` refocuses the opener when `back.isConnected` after `setTimeout(0)`. The deleted row only leaves the DOM after the change event bumps `version` and a second `ipc.messages` round trip completes, so at that moment the bubble is normally still in the DOM.
+
+Failure scenario: a keyboard or screen-reader user deletes a message for themselves. Focus goes to the old bubble, which is unmounted moments later, and focus falls to `<body>`. This is the case round 1 said should focus the composer. (Delete for everyone keeps a placeholder bubble, so it is fine.)
+
+Fix: report the removal from the dialog, for example `onDone(err?: string, removed = false)`. Call `run(() => ipc.deleteForMe(m.id), …, true)`, and in `Chat` call `closeActions(removed)`, which focuses the composer.
+
+**M2R2-4 Low (docs): INV-MSG-8 is marked "tested", but neither time window is tested**
+`docs/INVARIANTS.md:62`.
+
+The invariant promises edits and deletes "only their own messages from the last 48 h" (received) and "our own edits and deletes only within 24 h". The tests cover the conversation and authorship scoping, which is now mutation-checked. But no test exercises `PEER_EDIT_WINDOW_MS` or `EDIT_WINDOW_MS`: the two `TooLate` assertions (`messaging.rs:134, 158`) fail because of `!mine`, not age.
+
+Fix (either one):
+- Add a `test-hooks` helper that back-dates a row's `at_ms`, and assert `TooLate` for our own message older than 24 h, and that a crafted `Edit`/`Delete` for their message older than 48 h changes nothing.
+- Or keep "tested" for the scoping only and state that the time windows rest on the `at_ms` conditions (written argument).
+
+**M2R2-5 Info**
+- **INV-REST-9 test gap:** the docs state it honestly. `edits_and_search_respect_disappearing_messages` passes even if `queue_control` ignored `expires_at_ms`, because Bob's copy expires too and he drops a late `Edit`. Now that `test-hooks` exists, a cheap way to cover it is a `pending_rows(contact)` hook asserting the control row is gone after expiry. That would turn the written argument into a test.
+- **Leftover control rows:** a control row for a non-disappearing message that reaches `MAX_ATTEMPTS` stays forever with its envelope and `at_ms`, the same as a failed text. This is bounded by user actions, and no change is needed in this milestone. A later cleanup could delete control rows with `attempts >= MAX_ATTEMPTS` older than the edit window, since they can no longer apply.
+- **Blocked contacts:** `edit_message`'s pending branch does not check `blocked`, while `queue_control` does. The UI hides Edit for blocked contacts. `deliver` filters `c.blocked = 0`, and the re-sealed envelope only replaces one that was already queued, so nothing new can go out. For consistency, return `ClientError::Blocked` before `reseal_text`.
+
+### Questions from the brief, answered
+- **Ratchet and state in `reseal_text`:** consistent. The seal and the envelope update share one savepoint, and the rollback on `n == 0` restores the store. The skipped counter of the discarded envelope is handled by libsignal's skipped message keys, and out-of-order delivery among queued messages works the same way. Only one envelope per content id is stored. Racing with `deliver` or `retry_failed` is impossible because the actor runs one command at a time. The only failure path is the lost reply in M2R2-1.
+- **Can dropping repeated ids lose a legitimate message?** Only in M2R2-1. Ids are 16 random bytes enforced by the core, ordinary retries resend the same envelope (which libsignal drops), and no other path re-seals with an old id.
+- **`test-hooks` in release builds:** it cannot leak. The app is a separate workspace whose dependency on `veil-client` has no features. Dev-dependencies of a path dependency are never built, and `cargo tree` confirms only `default` is enabled. No workflow uses `--all-features`. The library builds and passes clippy without the feature.
+- **release.yml shell:** it is correct, and the current APK will not fail it spuriously. The problems are scope, covered in M2R2-2.
+
+### Good
+- The M2-1 fix is the right design. The unsent message is re-sealed with its original id, quote, timestamp and timer inside the same savepoint as the store update, so the peer only ever sees one version and the sender does not show a false "edited". Refusing reactions until the message is sent is simple and honest in the UI ("Wait until this message is sent").
+- The control-row lifecycle is now clear: a row expires with its target, is deleted with `secure_delete` after delivery, and leaves the unread counts, contact ordering and last-message preview untouched.
+- The `test-hooks` crafted-content harness is a real gain. It exercises the hostile-contact paths end to end through a real relay, and the mutation checks recorded in INVARIANTS.md hold up when I check them against the code.
+- The quote subquery returns exactly one row per message, and the receive-side drop fixes the cause. Together they fix M2-2 without a schema migration.
+- The dialog now has the full keyboard contract (trap, global Escape, focus return). The "my reaction" state has a non-colour cue that is recorded in DESIGN.md. The migration test now covers the real version-1 upgrade path.
+
+### Action options
+Recommended: **D. Review only**, or **C. Fix specific findings** for M2R2-2 (before milestone 3 adds the microphone) and M2R2-1. The remaining findings can be tracked in `veil-TODO.md`.

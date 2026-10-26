@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter as _, Manager as _, State};
 use veil_client::ClientError;
 use veil_client::service::{
-    AppState, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, PrivacyView, SafetyView,
-    SearchHit, SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
+    AppState, AttachmentInput, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, PrivacyView,
+    SafetyView, SearchHit, SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
 };
 use veil_client::unlock::SecretKind;
 
@@ -284,6 +284,85 @@ async fn verify_scanned(c: State<'_, Client>, contact: i64, code: String) -> Res
     c.verify_scanned(contact, code).await.map_err(err)
 }
 
+/// What the UI sends ahead of a file's bytes (see `ipc.sendAttachment`).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttachmentMeta {
+    contact: i64,
+    kind: String,
+    mime: String,
+    name: Option<String>,
+    duration_ms: Option<u32>,
+    waveform: Option<Vec<u8>>,
+    thumbnail: Option<Vec<u8>>,
+}
+
+/// Body: 4-byte big-endian length of a JSON [`AttachmentMeta`], the JSON, then the file. One
+/// binary IPC call, so a 25 MB file does not go through JSON.
+#[tauri::command]
+async fn send_attachment(c: State<'_, Client>, request: tauri::ipc::Request<'_>) -> Res<MessageView> {
+    let tauri::ipc::InvokeBody::Raw(body) = request.body() else {
+        return Err(err(ClientError::BadInput));
+    };
+    let (len, rest) = body
+        .split_at_checked(4)
+        .ok_or_else(|| err(ClientError::BadInput))?;
+    let len = usize::try_from(u32::from_be_bytes(
+        len.try_into().map_err(|_| err(ClientError::BadInput))?,
+    ))
+    .map_err(|_| err(ClientError::BadInput))?;
+    if len > 64 * 1024 {
+        return Err(err(ClientError::BadInput));
+    }
+    let (meta, data) = rest
+        .split_at_checked(len)
+        .ok_or_else(|| err(ClientError::BadInput))?;
+    let meta: AttachmentMeta = serde_json::from_slice(meta).map_err(|_| err(ClientError::BadInput))?;
+    c.send_attachment(
+        meta.contact,
+        AttachmentInput {
+            kind: meta.kind,
+            mime: meta.mime,
+            name: meta.name,
+            data: Zeroizing::new(data.to_vec()),
+            thumbnail: meta.thumbnail,
+            duration_ms: meta.duration_ms,
+            waveform: meta.waveform,
+        },
+    )
+    .await
+    .map_err(err)
+}
+
+/// The file of an attachment, as raw bytes for the UI to show or play. Display data: it is
+/// what the user sent or received.
+#[tauri::command]
+async fn attachment_data(c: State<'_, Client>, message: i64) -> Res<tauri::ipc::Response> {
+    let (_, _, data) = c.attachment_data(message).await.map_err(err)?;
+    Ok(tauri::ipc::Response::new(data.to_vec()))
+}
+
+/// Saves a received file where the user picks (Android). Elsewhere the UI saves through the
+/// webview's download, so this says "unsupported".
+#[tauri::command]
+async fn save_attachment(app: AppHandle, c: State<'_, Client>, message: i64) -> Res<()> {
+    if !cfg!(target_os = "android") {
+        return Err("Unsupported".into());
+    }
+    let (mime, name, data) = c.attachment_data(message).await.map_err(err)?;
+    let name = name.unwrap_or_else(|| "file".into());
+    match native::save_file(&app, &name, &mime, &data).await {
+        Ok(()) => Ok(()),
+        Err(NativeError::Cancelled) => Err("Cancelled".into()),
+        Err(e) => Err(native_err(e)),
+    }
+}
+
+#[tauri::command]
+async fn retry_attachment(c: State<'_, Client>, message: i64) -> Res<()> {
+    c.retry_attachment(message).await.map_err(err)
+}
+
 #[tauri::command]
 async fn mark_read(c: State<'_, Client>, contact: i64) -> Res<()> {
     c.mark_read(contact).await.map_err(err)
@@ -439,7 +518,11 @@ pub fn run() {
             delete_for_everyone,
             delete_for_me,
             search,
-            verify_scanned
+            verify_scanned,
+            send_attachment,
+            attachment_data,
+            save_attachment,
+            retry_attachment
         ])
         .run(tauri::generate_context!());
     if result.is_err() {

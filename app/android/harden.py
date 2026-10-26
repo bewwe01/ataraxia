@@ -54,6 +54,10 @@ text = text[: m.start()] + tag + text[m.end() :]
 # webview and never leave the phone. Not required: Veil installs on phones without one.
 PERMS = [
     '<uses-permission android:name="android.permission.CAMERA" />',
+    # The microphone, for voice notes (milestone 3), asked for at first use.
+    '<uses-permission android:name="android.permission.RECORD_AUDIO" />',
+    '<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />',
+    '<uses-feature android:name="android.hardware.microphone" android:required="false" />',
     '<uses-feature android:name="android.hardware.camera" android:required="false" />',
 ]
 for line in PERMS:
