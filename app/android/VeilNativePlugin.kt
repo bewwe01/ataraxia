@@ -6,6 +6,7 @@ package __PACKAGE__
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
@@ -13,12 +14,14 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.view.WindowManager
 import android.webkit.WebView
+import androidx.activity.result.ActivityResult
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.fragment.app.FragmentActivity
+import app.tauri.annotation.ActivityCallback
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
@@ -45,6 +48,13 @@ class OpenArgs {
 @InvokeArg
 class FlagArgs {
   var value: Boolean = false
+}
+
+@InvokeArg
+class SaveArgs {
+  var name: String = ""
+  var mime: String = ""
+  var data: String = ""
 }
 
 @TauriPlugin
@@ -330,5 +340,54 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
       c.isAppearanceLightNavigationBars = !dark
     }
     invoke.resolve()
+  }
+
+  /** File bytes waiting for the user to pick where to save them. */
+  private var pendingSave: ByteArray? = null
+
+  /** Saves a received file where the user chooses (the system "save as" screen). Called only
+   *  from Rust when the user taps Save; the bytes are written to that place only. */
+  @Command
+  fun saveFile(invoke: Invoke) {
+    val args = invoke.parseArgs(SaveArgs::class.java)
+    val bytes = try {
+      Base64.decode(args.data, Base64.NO_WRAP)
+    } catch (e: IllegalArgumentException) {
+      invoke.reject("Bad file", "FAILED")
+      return
+    }
+    pendingSave?.let { Arrays.fill(it, 0) }
+    pendingSave = bytes
+    val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+      addCategory(Intent.CATEGORY_OPENABLE)
+      type = args.mime.ifEmpty { "application/octet-stream" }
+      putExtra(Intent.EXTRA_TITLE, args.name)
+    }
+    startActivityForResult(invoke, intent, "saveResult")
+  }
+
+  @ActivityCallback
+  fun saveResult(invoke: Invoke, result: ActivityResult) {
+    val bytes = pendingSave
+    pendingSave = null
+    val uri = result.data?.data
+    if (result.resultCode != Activity.RESULT_OK || uri == null || bytes == null) {
+      bytes?.let { Arrays.fill(it, 0) }
+      invoke.reject("Cancelled", "CANCELLED")
+      return
+    }
+    try {
+      val out = activity.contentResolver.openOutputStream(uri)
+      if (out == null) {
+        invoke.reject("Could not save", "FAILED")
+      } else {
+        out.use { it.write(bytes) }
+        invoke.resolve(JSObject().put("value", true))
+      }
+    } catch (e: Exception) {
+      invoke.reject("Could not save", "FAILED")
+    } finally {
+      Arrays.fill(bytes, 0)
+    }
   }
 }
