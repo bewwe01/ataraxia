@@ -1,9 +1,14 @@
 # Release builds: Android APK (arm64) and Windows installer (NSIS), published to a GitHub
 # pre-release with SHA-256 checksums when a version tag is pushed.
 #
-# Build jobs never see a signing secret (review P4-5). Branch pushes only build: the APK stays
-# unsigned. On a version tag, a separate job in the protected `release` environment downloads
-# the unsigned APK and signs it without running any project code.
+# Runs only when started by hand (Actions → release → Run workflow) or for a pushed version tag,
+# so ordinary pushes cost no Actions minutes. Without a tag it only builds (unsigned APK as an
+# artifact). Build jobs never see a signing secret (review P4-5); with a tag, a separate job in
+# the protected `release` environment downloads the unsigned APK and signs it without running
+# any project code.
+#
+# Every build gets a higher Android versionCode (100000 + run number), so a newer APK signed
+# with the same key installs over the old one and keeps the app's data.
 #
 # Signing, stated plainly:
 # - Android: signed with the release keystore from the `release` environment's secrets when
@@ -20,15 +25,7 @@ on:
         description: "Release tag to create, e.g. v0.1.0-preview.1 (empty: build only)"
         required: false
   push:
-    # A version tag builds and publishes; a branch push touching the app only builds.
     tags: ["v*"]
-    branches: ["**"]
-    paths:
-      - "app/**"
-      - "crates/**"
-      - "Cargo.lock"
-      - "deny.toml"
-      - ".github/workflows/release.yml"
 
 permissions:
   contents: read
@@ -126,6 +123,14 @@ jobs:
         working-directory: app
         run: |
           pnpm install --frozen-lockfile
+          # A versionCode that only grows, so updates install over older builds.
+          python3 - "$GITHUB_RUN_NUMBER" <<'PY'
+          import json, sys
+          p = "src-tauri/tauri.conf.json"
+          c = json.load(open(p))
+          c.setdefault("bundle", {}).setdefault("android", {})["versionCode"] = 100000 + int(sys.argv[1])
+          json.dump(c, open(p, "w"), indent=2)
+          PY
           pnpm tauri android init --ci
           pnpm tauri icon app-icon.png
           # No backups of the vault, FLAG_SECURE (review P4-4, P4-8).

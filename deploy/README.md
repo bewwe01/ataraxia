@@ -57,7 +57,7 @@ Ports, for A and B:
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| 8443 | TCP | Relay (TLS 1.3, WebSocket) |
+| 8443 (or `VEIL_PORT`) | TCP | Relay (TLS 1.3, WebSocket). Set `VEIL_PORT` in `.env` if 8443 is taken |
 | 3478 | UDP + TCP | TURN |
 | 49160–49259 | UDP | TURN relay ports (one per call leg) |
 

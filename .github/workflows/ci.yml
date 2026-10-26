@@ -4,6 +4,8 @@ name: ci
 on:
   push:
     branches: [main, ccr-1230ecdf-lvfqsm]
+    # Docs-only pushes need no build (saves Actions minutes).
+    paths-ignore: ["docs/**", "**.md", "design/**"]
   pull_request:
   workflow_dispatch:
 

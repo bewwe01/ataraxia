@@ -21,7 +21,8 @@ services:
     pids_limit: 256
     mem_limit: 512m
     ports:
-      - "8443:8443/tcp"
+      # Host port from VEIL_PORT in .env (default 8443), e.g. 8444 if something else uses 8443.
+      - "${VEIL_PORT:-8443}:8443/tcp"
     volumes:
       - relay-data:/data
     environment:
