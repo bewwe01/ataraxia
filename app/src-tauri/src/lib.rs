@@ -11,7 +11,7 @@ use tauri::{AppHandle, Emitter as _, Manager as _, State};
 use veil_client::ClientError;
 use veil_client::service::{
     AppState, ChangeKind, Client, ContactView, InviteView, MeView, MessageView, PrivacyView, SafetyView,
-    SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
+    SearchHit, SecurityView, SetupInput, UnlockInfo, UnlockOutcome,
 };
 use veil_client::unlock::SecretKind;
 
@@ -250,6 +250,41 @@ async fn send(c: State<'_, Client>, contact: i64, text: String) -> Res<MessageVi
 }
 
 #[tauri::command]
+async fn reply(c: State<'_, Client>, contact: i64, text: String, to: i64) -> Res<MessageView> {
+    c.reply(contact, text, to).await.map_err(err)
+}
+
+#[tauri::command]
+async fn react(c: State<'_, Client>, message: i64, emoji: Option<String>) -> Res<()> {
+    c.react(message, emoji).await.map_err(err)
+}
+
+#[tauri::command]
+async fn edit_message(c: State<'_, Client>, message: i64, text: String) -> Res<()> {
+    c.edit_message(message, text).await.map_err(err)
+}
+
+#[tauri::command]
+async fn delete_for_everyone(c: State<'_, Client>, message: i64) -> Res<()> {
+    c.delete_for_everyone(message).await.map_err(err)
+}
+
+#[tauri::command]
+async fn delete_for_me(c: State<'_, Client>, message: i64) -> Res<()> {
+    c.delete_for_me(message).await.map_err(err)
+}
+
+#[tauri::command]
+async fn search(c: State<'_, Client>, query: String) -> Res<Vec<SearchHit>> {
+    c.search(query).await.map_err(err)
+}
+
+#[tauri::command]
+async fn verify_scanned(c: State<'_, Client>, contact: i64, code: String) -> Res<bool> {
+    c.verify_scanned(contact, code).await.map_err(err)
+}
+
+#[tauri::command]
 async fn mark_read(c: State<'_, Client>, contact: i64) -> Res<()> {
     c.mark_read(contact).await.map_err(err)
 }
@@ -397,7 +432,14 @@ pub fn run() {
             dismiss_key_warning,
             privacy,
             set_privacy,
-            typing
+            typing,
+            reply,
+            react,
+            edit_message,
+            delete_for_everyone,
+            delete_for_me,
+            search,
+            verify_scanned
         ])
         .run(tauri::generate_context!());
     if result.is_err() {

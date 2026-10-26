@@ -49,6 +49,10 @@ pub enum ClientError {
     OtherRelay,
     #[error("This contact is blocked. Unblock them first.")]
     Blocked,
+    #[error("That message can no longer be changed")]
+    TooLate,
+    #[error("This is not a Veil safety code")]
+    NotAVerifyCode,
     #[error("Unknown contact")]
     UnknownContact,
     #[error("Message failed")]

@@ -47,3 +47,18 @@ html, body { height: 100%; overflow: hidden; }
 .input select.select:focus-visible { outline: none; }
 /* Rows are buttons: fill the list, left-aligned, whatever their text length. */
 .conv { width: 100%; text-align: start; }
+.scanner-feed { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.bubble[role="button"] { cursor: pointer; }
+.bubble[role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.deleted-text { display: inline-flex; align-items: center; gap: 6px; font-style: italic; opacity: 0.85; }
+.deleted-text .icon { width: 15px; height: 15px; }
+.msg.found .bubble { outline: 2px solid var(--accent); outline-offset: 3px; }
+.reply span:empty::before { content: "\00a0"; }
+.composer-ctx { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3) 0; }
+.composer-ctx .reply { flex: 1; min-width: 0; margin: 0; color: var(--accent); background: var(--surface-2); }
+.msg-dialog .emoji-row { display: flex; justify-content: space-between; gap: var(--space-1); flex-wrap: wrap; }
+.emoji-btn { min-width: var(--tap-min); min-height: var(--tap-min); font-size: 24px; line-height: 1; border-radius: var(--radius-pill); border: 1px solid transparent; background: transparent; cursor: pointer; }
+.emoji-btn.mine { border-color: var(--accent); background: var(--accent-soft); }
+.emoji-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.msg-dialog .dialog-actions > div[role="alertdialog"] p { margin-top: 0; }
+.search-snippet { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }

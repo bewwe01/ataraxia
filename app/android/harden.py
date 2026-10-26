@@ -6,6 +6,7 @@
   through Auto Backup (cloud) or device-to-device transfer (Android 12+).
 * FLAG_SECURE on the activity: no screenshots, screen recording or plaintext snapshot in
   the recents screen.
+* The camera permission (asked for at first use), for scanning QR codes.
 
 Fails loudly if the generated project does not look as expected, so a template change in
 a Tauri upgrade cannot silently drop these protections.
@@ -47,7 +48,18 @@ tag = tag.replace(
     ' android:dataExtractionRules="@xml/veil_data_extraction_rules"',
     1,
 )
-manifest.write_text(text[: m.start()] + tag + text[m.end() :])
+text = text[: m.start()] + tag + text[m.end() :]
+
+# The camera, for scanning invite and safety codes (milestone 2). Frames are decoded in the
+# webview and never leave the phone. Not required: Veil installs on phones without one.
+PERMS = [
+    '<uses-permission android:name="android.permission.CAMERA" />',
+    '<uses-feature android:name="android.hardware.camera" android:required="false" />',
+]
+for line in PERMS:
+    if line not in text:
+        text = text.replace("<application", f"{line}\n    <application", 1)
+manifest.write_text(text)
 
 acts = list(main.rglob("MainActivity.kt"))
 if len(acts) != 1:

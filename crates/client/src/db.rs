@@ -56,6 +56,16 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX messages_by_expiry ON messages(expires_at_ms) WHERE expires_at_ms IS NOT NULL;
      CREATE INDEX messages_by_msg_id ON messages(contact, msg_id);
      CREATE TABLE token_removals (hash BLOB PRIMARY KEY) WITHOUT ROWID;",
+    // 2: replies, edits, remote deletes and reactions (milestone 2).
+    "ALTER TABLE messages ADD COLUMN reply_to BLOB;
+     ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0;
+     CREATE TABLE reactions (
+       message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+       mine INTEGER NOT NULL,
+       emoji TEXT NOT NULL,
+       PRIMARY KEY (message, mine)
+     ) WITHOUT ROWID;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

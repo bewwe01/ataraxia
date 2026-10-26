@@ -45,7 +45,27 @@ export interface MessageView {
   status: MessageStatus;
   timerSecs: number | null;
   expiresAtMs: number | null;
+  /** The message this one answers. `text` is empty when that message is gone or deleted. */
+  reply: { id: number | null; mine: boolean; text: string } | null;
+  reactions: { emoji: string; mine: boolean }[];
+  edited: boolean;
+  /** Deleted for everyone: show a placeholder. */
+  deleted: boolean;
+  /** Can be replied to and reacted to. */
+  actionable: boolean;
 }
+
+export interface SearchHit {
+  contact: number;
+  contactName: string;
+  message: number;
+  mine: boolean;
+  snippet: string;
+  atMs: number;
+}
+
+/** Own messages can be edited or deleted for everyone this long after sending. */
+export const EDIT_WINDOW_MS = 24 * 3600 * 1000;
 
 /** Both off unless the user turns them on. */
 export interface PrivacyView {
@@ -65,6 +85,9 @@ export interface SafetyView {
   groups: string[];
   verified: boolean;
   name: string;
+  /** QR code of the scannable safety number, for the other phone to scan. */
+  qrModules: string;
+  qrSize: number;
 }
 
 export type SecretKind = "pin" | "password";
@@ -135,6 +158,16 @@ export const ipc = {
   contacts: () => call<ContactView[]>("contacts"),
   messages: (contact: number) => call<MessageView[]>("messages", { contact }),
   send: (contact: number, text: string) => call<MessageView>("send", { contact, text }),
+  reply: (contact: number, text: string, to: number) => call<MessageView>("reply", { contact, text, to }),
+  /** Sets our reaction, or removes it with `null`. */
+  react: (message: number, emoji: string | null) => call<void>("react", { message, emoji }),
+  editMessage: (message: number, text: string) => call<void>("edit_message", { message, text }),
+  deleteForEveryone: (message: number) => call<void>("delete_for_everyone", { message }),
+  deleteForMe: (message: number) => call<void>("delete_for_me", { message }),
+  /** Searches message text on this device only. */
+  search: (query: string) => call<SearchHit[]>("search", { query }),
+  /** Checks a code scanned from the contact's phone; `true` means it matched and they are now verified. */
+  verifyScanned: (contact: number, code: string) => call<boolean>("verify_scanned", { contact, code }),
   markRead: (contact: number) => call<void>("mark_read", { contact }),
   createInvite: () => call<InviteView>("create_invite"),
   acceptInvite: (link: string) => call<ContactView>("accept_invite", { link }),

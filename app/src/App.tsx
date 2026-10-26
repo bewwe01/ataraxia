@@ -3,6 +3,7 @@ import { ipc, onChange, type AppState, type ContactView, type Me } from "./ipc";
 import { Chat, ChatList, type Route } from "./screens/Chats";
 import { AddContact, ContactProfile } from "./screens/Contacts";
 import { Setup, Unlock } from "./screens/Onboarding";
+import { Search } from "./screens/Search";
 import { Settings } from "./screens/Settings";
 import { Banner } from "./ui";
 
@@ -100,7 +101,7 @@ export function App() {
   switch (route.screen) {
     case "chat": {
       const c = byId(route.contact);
-      return c ? <Chat contact={c} me={me} nav={setRoute} version={version} typing={typing.has(c.id)} onChanged={refresh} /> : <ChatList contacts={contacts} me={me} nav={setRoute} typing={typing} />;
+      return c ? <Chat key={`${c.id}-${route.focus ?? ""}`} contact={c} me={me} nav={setRoute} version={version} typing={typing.has(c.id)} focus={route.focus} onChanged={refresh} /> : <ChatList contacts={contacts} me={me} nav={setRoute} typing={typing} />;
     }
     case "contact": {
       const c = byId(route.contact);
@@ -108,6 +109,8 @@ export function App() {
     }
     case "add":
       return <AddContact nav={(to) => { refresh(); setRoute(to); }} />;
+    case "search":
+      return <Search nav={setRoute} />;
     case "settings":
       return <Settings me={me} nav={setRoute} onLocked={() => { setContacts([]); setMe(null); refreshState(); }} />;
     case "chats":

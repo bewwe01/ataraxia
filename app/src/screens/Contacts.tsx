@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
 import { Banner, Icon, QrCode, Segmented, TopBar } from "../ui";
+import { Scanner } from "../components/Scanner";
 import { KeyWarning, type Nav } from "./Chats";
 
 export function AddContact({ nav }: { nav: Nav }) {
   const [tab, setTab] = useState<"mine" | "theirs">("mine");
   const [invite, setInvite] = useState<InviteView | null>(null);
   const [link, setLink] = useState("");
+  const [scanning, setScanning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -22,12 +24,12 @@ export function AddContact({ nav }: { nav: Nav }) {
     }
   }
 
-  async function accept(e: FormEvent) {
-    e.preventDefault();
+  async function accept(e?: FormEvent, scanned?: string) {
+    e?.preventDefault();
     setBusy(true);
     setError(null);
     try {
-      const c = await ipc.acceptInvite(link.trim());
+      const c = await ipc.acceptInvite((scanned ?? link).trim());
       setLink("");
       nav({ screen: "chat", contact: c.id });
     } catch (err) {
@@ -63,6 +65,21 @@ export function AddContact({ nav }: { nav: Nav }) {
             )
           ) : (
             <form className="stack" autoComplete="off" onSubmit={(e) => void accept(e)}>
+              {scanning ? (
+                <>
+                  <Scanner
+                    hint="Point at their invite code"
+                    onCode={(text) => {
+                      setScanning(false);
+                      if (text.startsWith("veil://invite/")) void accept(undefined, text);
+                      else setError("That is not a Veil invite code.");
+                    }}
+                  />
+                  <button className="btn btn-secondary btn-block" type="button" onClick={() => setScanning(false)}>Stop scanning</button>
+                </>
+              ) : (
+                <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => { setError(null); setScanning(true); }}><Icon name="scan" />Scan their code</button>
+              )}
               <div className="field">
                 <label htmlFor="inv-link">Paste their invite link</label>
                 <div className="input mono"><input id="inv-link" spellCheck={false} value={link} onChange={(e) => setLink(e.target.value)} placeholder="veil://invite/…" /></div>
@@ -82,6 +99,8 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   const [name, setName] = useState(contact.name);
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [verifyMode, setVerifyMode] = useState<"show" | "scan">("show");
+  const [verifyResult, setVerifyResult] = useState<null | "match" | "mismatch">(null);
   const deleteBtn = useRef<HTMLButtonElement>(null);
   const reopenFocus = useRef(false);
 
@@ -97,6 +116,18 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   useEffect(() => {
     void ipc.safety(contact.id).then(setSafety, () => setError("Safety number unavailable"));
   }, [contact.id, contact.verified]);
+
+  async function scanned(code: string) {
+    setVerifyMode("show");
+    setError(null);
+    try {
+      const ok = await ipc.verifyScanned(contact.id, code);
+      setVerifyResult(ok ? "match" : "mismatch");
+      if (ok) onChanged();
+    } catch (err) {
+      setError(err instanceof IpcError ? err.message : "Could not check the code");
+    }
+  }
 
   async function act(f: () => Promise<void>, fallback: string) {
     setBusy(true);
@@ -159,6 +190,25 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
               <div className="safety-grid" aria-label="Safety number">{safety.groups.map((g, i) => <span key={i}>{g}</span>)}</div>
             </div>
           ) : null}
+          <div className="stack-sm">
+            <span className="label">Verify in person</span>
+            <Segmented<"show" | "scan">
+              name="verify-mode"
+              label="Verify in person"
+              value={verifyMode}
+              options={[["show", "Show my code"], ["scan", "Scan their code"]]}
+              onChange={(m) => { setVerifyResult(null); setVerifyMode(m); }}
+            />
+            {verifyMode === "show" && safety ? (
+              <div className="qr-wrap"><div className="qr-card"><QrCode modules={safety.qrModules} size={safety.qrSize} label={`Your safety code for ${contact.name}`} /></div></div>
+            ) : null}
+            {verifyMode === "scan" ? <Scanner hint={`Point at ${contact.name}'s safety code`} onCode={(t) => void scanned(t)} /> : null}
+            {verifyResult === "match" ? <Banner tone="neutral" icon="shield-check"><strong>Codes match</strong><p>{contact.name} is now verified. No one is in the middle.</p></Banner> : null}
+            {verifyResult === "mismatch" ? (
+              <div role="alert"><Banner tone="danger" icon="shield-alert"><strong>Codes do not match</strong><p>This is not the phone of the {contact.name} you are talking to here, or someone is in the middle. Do not mark them as verified.</p></Banner></div>
+            ) : null}
+            <p className="hint">Each of you opens this page: one shows the code, the other scans it. A match marks {contact.name} as verified.</p>
+          </div>
           <div className="safety-actions">
             {contact.verified ? (
               <button className="btn btn-secondary btn-block" type="button" onClick={() => void verify(false)}>Clear verification</button>

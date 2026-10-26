@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
-import { ipc, IpcError, timerName, timerShort, type ContactView, type Me, type MessageView } from "../ipc";
+import { EDIT_WINDOW_MS, ipc, IpcError, timerName, timerShort, type ContactView, type Me, type MessageView } from "../ipc";
 import { Avatar, Banner, Icon, TopBar, VerifiedMark, timeLabel } from "../ui";
 
 export type Nav = (to: Route) => void;
 export type Route =
   | { screen: "chats" }
-  | { screen: "chat"; contact: number }
+  | { screen: "chat"; contact: number; focus?: number | undefined }
+  | { screen: "search" }
   | { screen: "add" }
   | { screen: "contact"; contact: number }
   | { screen: "settings" };
@@ -57,6 +58,7 @@ export function ChatList({ contacts, me, nav, typing }: { contacts: ContactView[
       <header className="m-appbar">
         <h1>Chats</h1>
         <span className="spacer" />
+        <button className="icon-btn" type="button" aria-label="Search messages" onClick={() => nav({ screen: "search" })}><Icon name="search" /></button>
         <button className="icon-btn" type="button" aria-label="Add contact" onClick={() => nav({ screen: "add" })}><Icon name="user-plus" /></button>
         <button className="icon-btn" type="button" aria-label="Settings" onClick={() => nav({ screen: "settings" })}><Icon name="settings" /></button>
       </header>
@@ -140,12 +142,103 @@ function TimerNotice({ m, name }: { m: MessageView; name: string }) {
   );
 }
 
-export function Chat({ contact, me, nav, version, typing, onChanged }: { contact: ContactView; me: Me | null; nav: Nav; version: number; typing: boolean; onChanged: () => void }) {
+/** Quick reactions offered on a message. */
+const QUICK = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
+/** Reactions grouped by emoji, as `.reactions` chips. */
+function groupReactions(m: MessageView): { emoji: string; n: number; mine: boolean }[] {
+  const out: { emoji: string; n: number; mine: boolean }[] = [];
+  for (const r of m.reactions) {
+    const g = out.find((x) => x.emoji === r.emoji);
+    if (g) {
+      g.n += 1;
+      g.mine ||= r.mine;
+    } else out.push({ emoji: r.emoji, n: 1, mine: r.mine });
+  }
+  return out;
+}
+
+function withinEditWindow(m: MessageView): boolean {
+  return m.mine && m.actionable && Date.now() - m.atMs < EDIT_WINDOW_MS;
+}
+
+/** What one can do with a message: react, reply, edit, delete (DESIGN.md `.dialog`). */
+function MessageActions({ m, name, blocked, onClose, onReply, onEdit, onDone }: {
+  m: MessageView;
+  name: string;
+  blocked: boolean;
+  onClose: () => void;
+  onReply: () => void;
+  onEdit: () => void;
+  onDone: (error?: string) => void;
+}) {
+  const [confirm, setConfirm] = useState(false);
+  const mineEmoji = m.reactions.find((r) => r.mine)?.emoji ?? null;
+  const canChange = withinEditWindow(m) && !blocked;
+
+  async function run(f: () => Promise<void>, fallback: string) {
+    try {
+      await f();
+      onDone();
+    } catch (err) {
+      onDone(err instanceof IpcError ? err.message : fallback);
+    }
+  }
+
+  return (
+    <div className="scrim" onClick={onClose} onKeyDown={(e) => { if (e.key === "Escape") onClose(); }}>
+      <div className="dialog glass-strong msg-dialog" role="dialog" aria-modal="true" aria-labelledby="ma-t" onClick={(e) => e.stopPropagation()}>
+        <h2 id="ma-t" className="sr-only">Message from {m.mine ? "you" : name}</h2>
+        {m.actionable && !blocked ? (
+          <div className="emoji-row" role="group" aria-label="React">
+            {QUICK.map((e, i) => (
+              <button
+                key={e}
+                className={`emoji-btn ${mineEmoji === e ? "mine" : ""}`}
+                type="button"
+                autoFocus={i === 0}
+                aria-pressed={mineEmoji === e}
+                aria-label={mineEmoji === e ? `Remove ${e}` : `React with ${e}`}
+                onClick={() => void run(() => ipc.react(m.id, mineEmoji === e ? null : e), "Could not react")}
+              >
+                {e}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        <div className="dialog-actions">
+          {m.actionable && !blocked ? <button className="btn btn-secondary" type="button" onClick={onReply}><Icon name="reply" />Reply</button> : null}
+          {canChange ? <button className="btn btn-secondary" type="button" onClick={onEdit}><Icon name="edit" />Edit</button> : null}
+          {confirm ? (
+            <div role="alertdialog" aria-labelledby="del-q">
+              <p id="del-q">{canChange ? "Delete for you only, or for both of you?" : "Delete this message from this device?"}</p>
+              <div className="dialog-actions">
+                <button className="btn btn-danger-ghost" type="button" autoFocus onClick={() => void run(() => ipc.deleteForMe(m.id), "Could not delete")}>Delete for me</button>
+                {canChange ? <button className="btn btn-danger" type="button" onClick={() => void run(() => ipc.deleteForEveryone(m.id), "Could not delete")}>Delete for everyone</button> : null}
+              </div>
+              {canChange ? <p className="hint">{name} may already have seen it, and an old version of Veil keeps it.</p> : null}
+            </div>
+          ) : (
+            <button className="btn btn-danger-ghost" type="button" autoFocus={!m.actionable || blocked} onClick={() => setConfirm(true)}><Icon name="trash" />Delete…</button>
+          )}
+          <button className="btn btn-ghost" type="button" onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { contact: ContactView; me: Me | null; nav: Nav; version: number; typing: boolean; focus?: number | undefined; onChanged: () => void }) {
   const [messages, setMessages] = useState<MessageView[]>([]);
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  const [actionsFor, setActionsFor] = useState<MessageView | null>(null);
+  const [replyTo, setReplyTo] = useState<MessageView | null>(null);
+  const [editing, setEditing] = useState<MessageView | null>(null);
+  const [found, setFound] = useState<number | undefined>(focus);
   const end = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     let live = true;
@@ -177,9 +270,19 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
     };
   }, [contact.id, version]);
 
+  // Scroll to the end on new messages, or to a search result once it is loaded.
   useEffect(() => {
+    if (found !== undefined) {
+      const el = document.getElementById(`msg-${found}`);
+      if (el) {
+        el.scrollIntoView({ block: "center" });
+        const t = window.setTimeout(() => setFound(undefined), 2500);
+        return () => window.clearTimeout(t);
+      }
+      return;
+    }
     end.current?.scrollIntoView({ block: "end" });
-  }, [messages.length, typing]);
+  }, [messages.length, typing, found]);
 
   // Tell the contact we stopped typing when leaving the chat.
   useEffect(() => () => void ipc.typing(contact.id, false).catch(() => undefined), [contact.id]);
@@ -203,7 +306,7 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
 
   function edit(value: string) {
     setText(value);
-    void ipc.typing(contact.id, value.trim() !== "").catch(() => undefined);
+    if (!editing) void ipc.typing(contact.id, value.trim() !== "").catch(() => undefined);
   }
 
   async function unblock() {
@@ -216,6 +319,12 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
     }
   }
 
+  function cancelContext() {
+    if (editing) setText("");
+    setReplyTo(null);
+    setEditing(null);
+  }
+
   async function send(e?: FormEvent) {
     e?.preventDefault();
     const body = text.trim();
@@ -223,8 +332,15 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
     setSending(true);
     setError(null);
     try {
-      const m = await ipc.send(contact.id, body);
+      if (editing) {
+        await ipc.editMessage(editing.id, body);
+        setEditing(null);
+        setText("");
+        return;
+      }
+      const m = replyTo ? await ipc.reply(contact.id, body, replyTo.id) : await ipc.send(contact.id, body);
       setText("");
+      setReplyTo(null);
       setMessages((prev) => [...prev, m]);
     } catch (err) {
       setError(err instanceof IpcError ? err.message : "Not sent");
@@ -237,7 +353,14 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       void send();
+    } else if (e.key === "Escape" && (replyTo || editing)) {
+      cancelContext();
     }
+  }
+
+  function openActions(m: MessageView) {
+    setError(null);
+    setActionsFor(m);
   }
 
   return (
@@ -272,16 +395,53 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
         {messages.map((m) => {
           if (m.kind === "timer") return <TimerNotice key={m.id} m={m} name={contact.name} />;
           const st = m.mine ? STATUS[m.status] : null;
+          const groups = groupReactions(m);
           return (
-            <div key={m.id} className={`msg ${m.mine ? "out" : "in"}`}>
-              <div className="bubble">
-                {m.text}
+            <div key={m.id} id={`msg-${m.id}`} className={`msg ${m.mine ? "out" : "in"} ${found === m.id ? "found" : ""}`}>
+              <div
+                className="bubble"
+                role="button"
+                tabIndex={0}
+                aria-haspopup="dialog"
+                onClick={() => openActions(m)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    openActions(m);
+                  }
+                }}
+              >
+                {m.reply ? (
+                  <span className="reply">
+                    <b>{m.reply.mine ? "You" : contact.name}</b>
+                    <span>{m.reply.text || "Original message not available"}</span>
+                  </span>
+                ) : null}
+                {m.deleted ? <span className="deleted-text"><Icon name="ban" />This message was deleted</span> : m.text}
                 <span className="meta">
+                  {m.edited && !m.deleted ? <span className="edited">edited · </span> : null}
                   {m.expiresAtMs !== null ? (<><Icon name="timer" /><span className="sr-only">disappears</span></>) : null}
                   <time>{timeLabel(m.atMs)}</time>
                   {st ? (<><Icon name={st[0]} /><span className="sr-only">{st[1]}</span></>) : null}
                 </span>
               </div>
+              {groups.length ? (
+                <div className="reactions" role="group" aria-label="Reactions">
+                  {groups.map((g) => (
+                    <button
+                      key={g.emoji}
+                      className={`reaction ${g.mine ? "mine" : ""}`}
+                      type="button"
+                      disabled={!m.actionable || contact.blocked}
+                      aria-pressed={g.mine}
+                      aria-label={`${g.emoji} ${g.n}${g.mine ? ", including you. Remove yours" : `. React with ${g.emoji}`}`}
+                      onClick={() => void ipc.react(m.id, g.mine ? null : g.emoji).catch((err: unknown) => setError(err instanceof IpcError ? err.message : "Could not react"))}
+                    >
+                      {g.emoji}{g.n > 1 ? <b>{g.n}</b> : null}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </div>
           );
         })}
@@ -299,14 +459,50 @@ export function Chat({ contact, me, nav, version, typing, onChanged }: { contact
           </Banner>
         </div>
       ) : (
-        <form className="composer" autoComplete="off" onSubmit={(e) => void send(e)}>
-          <div className="box">
-            <label className="sr-only" htmlFor="composer">Message {contact.name}</label>
-            <textarea id="composer" rows={1} placeholder="Message" spellCheck value={text} maxLength={62464} onChange={(e) => edit(e.target.value)} onKeyDown={onKey} />
-          </div>
-          <button className="icon-btn accent send-btn" type="submit" aria-label="Send" disabled={sending}><Icon name="send" /></button>
-        </form>
+        <>
+          {replyTo || editing ? (
+            <div className="composer-ctx">
+              <span className="reply">
+                <b>{editing ? "Editing your message" : `Replying to ${replyTo?.mine ? "yourself" : contact.name}`}</b>
+                <span>{(editing ?? replyTo)?.text}</span>
+              </span>
+              <button className="icon-btn" type="button" aria-label={editing ? "Cancel editing" : "Cancel reply"} onClick={cancelContext}><Icon name="x" /></button>
+            </div>
+          ) : null}
+          <form className="composer" autoComplete="off" onSubmit={(e) => void send(e)}>
+            <div className="box">
+              <label className="sr-only" htmlFor="composer">{editing ? "Edit message" : `Message ${contact.name}`}</label>
+              <textarea ref={input} id="composer" rows={1} placeholder="Message" spellCheck value={text} maxLength={62464} onChange={(e) => edit(e.target.value)} onKeyDown={onKey} />
+            </div>
+            <button className="icon-btn accent send-btn" type="submit" aria-label={editing ? "Save edit" : "Send"} disabled={sending}><Icon name={editing ? "check" : "send"} /></button>
+          </form>
+        </>
       )}
+      {actionsFor ? (
+        <MessageActions
+          m={actionsFor}
+          name={contact.name}
+          blocked={contact.blocked}
+          onClose={() => setActionsFor(null)}
+          onReply={() => {
+            setEditing(null);
+            setReplyTo(actionsFor);
+            setActionsFor(null);
+            input.current?.focus();
+          }}
+          onEdit={() => {
+            setReplyTo(null);
+            setEditing(actionsFor);
+            setText(actionsFor.text);
+            setActionsFor(null);
+            input.current?.focus();
+          }}
+          onDone={(err) => {
+            setActionsFor(null);
+            if (err) setError(err);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

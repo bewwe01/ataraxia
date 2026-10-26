@@ -24,7 +24,9 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use veil_core::account::{Account, IntroFields, Opened, random_id};
-use veil_core::content::{Body, Content, MailboxUpdate, Receipt, ReceiptKind, Text, TimerUpdate, Typing};
+use veil_core::content::{
+    Body, Content, Delete, Edit, MailboxUpdate, Reaction, Receipt, ReceiptKind, Text, TimerUpdate, Typing,
+};
 use veil_core::invite::{Invite, InviteMode};
 use veil_core::vault::{self, KdfParams, PurgeTag, Unlocked, VaultHeader};
 use veil_wire::{ENVELOPE_BUCKETS, ErrorCode, Request, Response, ServerFrame};
@@ -59,6 +61,15 @@ const TOKEN_REMOVALS: usize = 64;
 const TYPING_RESEND: Duration = Duration::from_secs(4);
 /// A typing message older than this (by its sender's clock) is stale and not shown.
 const TYPING_STALE_MS: i64 = 15_000;
+/// Own messages can be edited or deleted for everyone this long after sending.
+pub const EDIT_WINDOW_MS: i64 = 24 * 3600 * 1000;
+/// An edit or delete from a contact is applied only to a message received this recently.
+const PEER_EDIT_WINDOW_MS: i64 = 48 * 3600 * 1000;
+/// Search terms shorter than this match too much to be useful.
+const MIN_SEARCH: usize = 2;
+const MAX_SEARCH: usize = 100;
+const SEARCH_HITS: i64 = 100;
+const VERIFY_PREFIX: &str = "veil-verify:";
 /// While connected, retry failed messages and updates this often (not only on reconnect).
 const RETRY_EVERY: Duration = Duration::from_mins(1);
 const RECEIPTS: &str = "receipts";
@@ -122,6 +133,8 @@ pub struct ContactView {
     pub unblock_pending: bool,
 }
 
+// Display data: each flag is a separate fact the UI shows.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageView {
@@ -136,6 +149,43 @@ pub struct MessageView {
     /// For a `timer` notice: the new timer in seconds.
     pub timer_secs: Option<u32>,
     pub expires_at_ms: Option<i64>,
+    /// The message this one answers, if any.
+    pub reply: Option<ReplyView>,
+    pub reactions: Vec<ReactionView>,
+    pub edited: bool,
+    /// Deleted for everyone: the text is gone, a placeholder remains.
+    pub deleted: bool,
+    /// Can be replied to and reacted to (messages from before 0.1.0-preview.4 cannot).
+    pub actionable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyView {
+    /// The quoted message's row, if it is still here.
+    pub id: Option<i64>,
+    pub mine: bool,
+    /// A short excerpt; empty when the quoted message is gone or deleted.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionView {
+    pub emoji: String,
+    pub mine: bool,
+}
+
+/// A search result: where the match is, and a short excerpt around it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub contact: i64,
+    pub contact_name: String,
+    pub message: i64,
+    pub mine: bool,
+    pub snippet: String,
+    pub at_ms: i64,
 }
 
 /// The privacy settings: both off unless the user turns them on.
@@ -161,6 +211,13 @@ pub struct SafetyView {
     pub groups: Vec<String>,
     pub verified: bool,
     pub name: String,
+    /// QR code of the scannable safety number, for the other phone to scan.
+    pub qr_modules: String,
+    pub qr_size: usize,
+    /// The text in that QR code (public: it commits to both identity keys). Not sent to the
+    /// UI, which only draws the code; tests use it in place of a camera.
+    #[serde(skip)]
+    pub code: String,
 }
 
 /// What the locked screen needs: which keyboard, whether to offer biometrics, any wait.
@@ -244,7 +301,13 @@ enum Cmd {
     Me(Reply<MeView>),
     Contacts(Reply<Vec<ContactView>>),
     Messages(i64, Reply<Vec<MessageView>>),
-    Send(i64, String, Reply<MessageView>),
+    Send(i64, String, Option<i64>, Reply<MessageView>),
+    React(i64, Option<String>, Reply<()>),
+    EditMessage(i64, String, Reply<()>),
+    DeleteForEveryone(i64, Reply<()>),
+    DeleteForMe(i64, Reply<()>),
+    Search(String, Reply<Vec<SearchHit>>),
+    VerifyScanned(i64, String, Reply<bool>),
     MarkRead(i64, Reply<()>),
     CreateInvite(Reply<InviteView>),
     AcceptInvite(String, Reply<ContactView>),
@@ -444,7 +507,37 @@ impl Client {
         ask!(self, Messages, contact)
     }
     pub async fn send(&self, contact: i64, text: String) -> Result<MessageView> {
-        ask!(self, Send, contact, text)
+        ask!(self, Send, contact, text, None)
+    }
+    /// Sends `text` as an answer to message `to` (a row id in the same conversation).
+    pub async fn reply(&self, contact: i64, text: String, to: i64) -> Result<MessageView> {
+        ask!(self, Send, contact, text, Some(to))
+    }
+    /// Sets our reaction on a message, or removes it with `None`. One reaction per person.
+    pub async fn react(&self, message: i64, emoji: Option<String>) -> Result<()> {
+        ask!(self, React, message, emoji)
+    }
+    /// Changes the text of one of our messages, for both sides (within [`EDIT_WINDOW_MS`]).
+    pub async fn edit_message(&self, message: i64, text: String) -> Result<()> {
+        ask!(self, EditMessage, message, text)
+    }
+    /// Deletes one of our messages on both sides (within [`EDIT_WINDOW_MS`]). Best effort:
+    /// their app may be old, and nobody can take back what they already saw or copied.
+    pub async fn delete_for_everyone(&self, message: i64) -> Result<()> {
+        ask!(self, DeleteForEveryone, message)
+    }
+    /// Deletes a message from this device only.
+    pub async fn delete_for_me(&self, message: i64) -> Result<()> {
+        ask!(self, DeleteForMe, message)
+    }
+    /// Searches message text on this device. Nothing leaves the device.
+    pub async fn search(&self, query: String) -> Result<Vec<SearchHit>> {
+        ask!(self, Search, query)
+    }
+    /// Checks a code scanned from the contact's phone. On a match the contact is marked
+    /// verified and `true` is returned; a mismatch changes nothing.
+    pub async fn verify_scanned(&self, contact: i64, code: String) -> Result<bool> {
+        ask!(self, VerifyScanned, contact, code)
     }
     pub async fn mark_read(&self, contact: i64) -> Result<()> {
         ask!(self, MarkRead, contact)
@@ -590,6 +683,50 @@ fn parse_pin(s: &str) -> Result<[u8; 32]> {
 /// mailbox, token, envelope, contact id, introduction pending.
 type DeliveryRow = (Vec<u8>, Vec<u8>, Vec<u8>, i64, bool);
 
+fn hex_lower(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len().saturating_mul(2));
+    for byte in b {
+        for nibble in [byte >> 4, byte & 0x0F] {
+            s.push(char::from_digit(u32::from(nibble), 16).unwrap_or('0'));
+        }
+    }
+    s
+}
+
+/// Hex to bytes; `None` for anything else (odd length, other characters, over 1 KiB).
+fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || s.len() > 2048 {
+        return None;
+    }
+    s.as_bytes()
+        .chunks(2)
+        .map(|p| u8::from_str_radix(core::str::from_utf8(p).ok()?, 16).ok())
+        .collect()
+}
+
+/// Up to 120 characters of `body` around the first case-insensitive match of `q`.
+fn snippet(body: &str, q: &str) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let lower: Vec<char> = chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    let needle: Vec<char> = q.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).collect();
+    let at = lower
+        .windows(needle.len().max(1))
+        .position(|w| w == needle.as_slice())
+        .unwrap_or(0);
+    let start = at.saturating_sub(40);
+    let mut out: String = chars.iter().skip(start).take(120).collect();
+    if start > 0 {
+        out.insert(0, '…');
+    }
+    if chars.len() > start.saturating_add(120) {
+        out.push('…');
+    }
+    out
+}
+
 /// A name compared for the key-change warning: case and spacing do not make it different.
 fn name_key(name: &str) -> String {
     name.split_whitespace()
@@ -598,20 +735,56 @@ fn name_key(name: &str) -> String {
         .to_lowercase()
 }
 
-/// Columns: `id, mine, body, at_ms, status, kind, expires_at_ms`.
+/// The columns [`message_row`] reads, from `messages m` (with the quoted message as `q`).
+const MESSAGE_COLUMNS: &str = "m.id, m.mine, m.body, m.at_ms, m.status, m.kind, m.expires_at_ms,
+     m.edited, m.deleted, m.msg_id IS NOT NULL, m.reply_to IS NOT NULL, q.id, q.mine, q.body, q.deleted";
+
+/// Excerpt of a quoted or found message.
+fn excerpt(text: &str) -> String {
+    let mut out: String = text.chars().take(120).collect();
+    if text.chars().nth(120).is_some() {
+        out.push('…');
+    }
+    out
+}
+
 fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
     let kind: String = r.get(5)?;
     let body: String = r.get(2)?;
+    let deleted: bool = r.get(8)?;
     let timer_secs = (kind == "timer").then(|| body.parse().unwrap_or(0));
+    let reply = if r.get::<_, bool>(10)? {
+        let qid: Option<i64> = r.get(11)?;
+        let qdeleted: Option<bool> = r.get(14)?;
+        Some(ReplyView {
+            id: qid,
+            mine: r.get::<_, Option<bool>>(12)?.unwrap_or(false),
+            text: match (qid, qdeleted) {
+                (Some(_), Some(false)) => excerpt(&r.get::<_, String>(13)?),
+                _ => String::new(),
+            },
+        })
+    } else {
+        None
+    };
     Ok(MessageView {
         id: r.get(0)?,
         mine: r.get(1)?,
-        text: if kind == "text" { body } else { String::new() },
+        text: if kind == "text" && !deleted {
+            body
+        } else {
+            String::new()
+        },
+        actionable: kind == "text" && !deleted && r.get::<_, bool>(9)?,
         kind,
         at_ms: r.get(3)?,
         status: r.get(4)?,
         timer_secs,
         expires_at_ms: r.get(6)?,
+        reply,
+        reactions: Vec::new(),
+        edited: r.get(7)?,
+        deleted,
     })
 }
 
@@ -843,6 +1016,12 @@ impl Actor {
                 | Cmd::BioCommit(..)
                 | Cmd::Touch(_)
                 | Cmd::Send(..)
+                | Cmd::React(..)
+                | Cmd::EditMessage(..)
+                | Cmd::DeleteForEveryone(..)
+                | Cmd::DeleteForMe(..)
+                | Cmd::Search(..)
+                | Cmd::VerifyScanned(..)
                 | Cmd::CreateInvite(_)
                 | Cmd::AcceptInvite(..)
                 | Cmd::SetVerified(..)
@@ -920,9 +1099,30 @@ impl Actor {
             Cmd::Messages(c, r) => {
                 let _ = r.send(self.messages(c));
             }
-            Cmd::Send(c, t, r) => {
-                let res = self.send(c, &t).await;
+            Cmd::Send(c, t, to, r) => {
+                let res = self.send(c, &t, to).await;
                 let _ = r.send(res);
+            }
+            Cmd::React(m, e, r) => {
+                let res = self.react(m, e).await;
+                let _ = r.send(res);
+            }
+            Cmd::EditMessage(m, t, r) => {
+                let res = self.edit_message(m, &t).await;
+                let _ = r.send(res);
+            }
+            Cmd::DeleteForEveryone(m, r) => {
+                let res = self.delete_for_everyone(m).await;
+                let _ = r.send(res);
+            }
+            Cmd::DeleteForMe(m, r) => {
+                let _ = r.send(self.delete_for_me(m));
+            }
+            Cmd::Search(q, r) => {
+                let _ = r.send(self.search(&q));
+            }
+            Cmd::VerifyScanned(c, code, r) => {
+                let _ = r.send(self.verify_scanned(c, &code));
             }
             Cmd::MarkRead(c, r) => {
                 let res = self.mark_read(c).await;
@@ -1385,7 +1585,7 @@ impl Actor {
             .ok_or(ClientError::UnknownContact)?;
         let last: Option<(String, bool, i64)> = conn
             .query_row(
-                "SELECT body, mine, at_ms FROM messages WHERE contact = ?1 AND kind = 'text'
+                "SELECT body, mine, at_ms FROM messages WHERE contact = ?1 AND kind = 'text' AND deleted = 0
                  AND (expires_at_ms IS NULL OR expires_at_ms > ?2) ORDER BY id DESC LIMIT 1",
                 params![id, now_ms()],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -1427,14 +1627,27 @@ impl Actor {
 
     fn messages(&self, contact: i64) -> Result<Vec<MessageView>> {
         let s = self.s()?;
-        let mut stmt = s.db.conn().prepare(
-            "SELECT id, mine, body, at_ms, status, kind, expires_at_ms FROM messages WHERE contact = ?1
-             AND kind IN ('text', 'timer') ORDER BY id DESC LIMIT 500",
-        )?;
+        let conn = s.db.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages m
+             LEFT JOIN messages q ON q.contact = m.contact AND q.msg_id = m.reply_to AND q.kind = 'text'
+             WHERE m.contact = ?1 AND m.kind IN ('text', 'timer') ORDER BY m.id DESC LIMIT 500"
+        ))?;
         // Expired rows are deleted by the tick (at most 5 s late); the UI hides them on time.
         let mut out = stmt
             .query_map([contact], message_row)?
             .collect::<core::result::Result<Vec<_>, _>>()?;
+        let mut react = conn.prepare("SELECT emoji, mine FROM reactions WHERE message = ?1 ORDER BY mine")?;
+        for m in &mut out {
+            m.reactions = react
+                .query_map([m.id], |r| {
+                    Ok(ReactionView {
+                        emoji: r.get(0)?,
+                        mine: r.get(1)?,
+                    })
+                })?
+                .collect::<core::result::Result<Vec<_>, _>>()?;
+        }
         out.reverse();
         Ok(out)
     }
@@ -1463,11 +1676,44 @@ impl Actor {
                 .ok_or(ClientError::UnknownContact)?;
         let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
         let sn = s.account.safety_number(&addr)?;
+        let code = format!("{VERIFY_PREFIX}{}", hex_lower(sn.scannable()));
+        let (qr_size, qr_modules) = qr::modules(&code)?;
         Ok(SafetyView {
             groups: sn.groups().into_iter().map(str::to_owned).collect(),
             verified,
             name,
+            qr_modules,
+            qr_size,
+            code,
         })
+    }
+
+    fn verify_scanned(&self, contact: i64, code: &str) -> Result<bool> {
+        let s = self.s()?;
+        let scanned = code
+            .trim()
+            .strip_prefix(VERIFY_PREFIX)
+            .and_then(parse_hex)
+            .ok_or(ClientError::NotAVerifyCode)?;
+        let address: String =
+            s.db.conn()
+                .query_row("SELECT address FROM contacts WHERE id = ?1", [contact], |r| {
+                    r.get(0)
+                })
+                .optional()?
+                .ok_or(ClientError::UnknownContact)?;
+        let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
+        // libsignal compares both keys in the code with ours (constant time). A code for
+        // another contact, or from a phone in the middle, does not match.
+        let matched = s
+            .account
+            .safety_number(&addr)?
+            .matches_scanned(&scanned)
+            .unwrap_or(false);
+        if matched {
+            self.set_verified(contact, true)?;
+        }
+        Ok(matched)
     }
 
     fn set_verified(&self, contact: i64, v: bool) -> Result<()> {
@@ -1742,11 +1988,28 @@ impl Actor {
         Ok(id)
     }
 
-    async fn send(&mut self, contact: i64, text: &str) -> Result<MessageView> {
+    async fn send(&mut self, contact: i64, text: &str, reply_to: Option<i64>) -> Result<MessageView> {
         let body = text.trim();
         if body.is_empty() {
             return Err(ClientError::BadInput);
         }
+        // The quoted message must be a text in the same conversation that has an id.
+        let quoted: Option<Vec<u8>> = match reply_to {
+            None => None,
+            Some(q) => Some(
+                self.s()?
+                    .db
+                    .conn()
+                    .query_row(
+                        "SELECT msg_id FROM messages WHERE id = ?1 AND contact = ?2 AND kind = 'text'
+                         AND msg_id IS NOT NULL AND deleted = 0",
+                        params![q, contact],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .ok_or(ClientError::BadInput)?,
+            ),
+        };
         if let Some(s) = self.session.as_mut() {
             // The message itself ends "typing" on the other side.
             s.typing_sent.remove(&contact);
@@ -1770,30 +2033,260 @@ impl Actor {
             sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
             body: Some(Body::Text(Text {
                 body: body.to_owned(),
+                reply_to: quoted.clone(),
                 expire_timer_secs: (timer > 0).then_some(timer),
-                ..Default::default()
             })),
         };
         let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
         let at = now_ms();
         let expires = (timer > 0).then(|| at.saturating_add(i64::from(timer).saturating_mul(1000)));
         s.db.conn().execute(
-            "INSERT INTO messages (contact, mine, body, at_ms, status, envelope, msg_id, expires_at_ms)
-             VALUES (?1, 1, ?2, ?3, 'sending', ?4, ?5, ?6)",
-            params![contact, body, at, envelope, content.id, expires],
+            "INSERT INTO messages (contact, mine, body, at_ms, status, envelope, msg_id, expires_at_ms, reply_to)
+             VALUES (?1, 1, ?2, ?3, 'sending', ?4, ?5, ?6, ?7)",
+            params![contact, body, at, envelope, content.id, expires, quoted],
         )?;
         let id = s.db.conn().last_insert_rowid();
-        let status = if self.deliver(id).await { "sent" } else { "failed" };
-        Ok(MessageView {
-            id,
-            mine: true,
-            kind: "text".into(),
-            text: body.to_owned(),
-            at_ms: at,
-            status: status.to_owned(),
-            timer_secs: None,
-            expires_at_ms: expires,
-        })
+        self.deliver(id).await;
+        self.message(id)
+    }
+
+    /// One message as the UI shows it.
+    fn message(&self, id: i64) -> Result<MessageView> {
+        let conn = &self.s()?.db;
+        let mut m = conn.conn().query_row(
+            &format!(
+                "SELECT {MESSAGE_COLUMNS} FROM messages m
+                 LEFT JOIN messages q ON q.contact = m.contact AND q.msg_id = m.reply_to AND q.kind = 'text'
+                 WHERE m.id = ?1"
+            ),
+            [id],
+            message_row,
+        )?;
+        m.reactions = conn
+            .conn()
+            .prepare("SELECT emoji, mine FROM reactions WHERE message = ?1 ORDER BY mine")?
+            .query_map([id], |r| {
+                Ok(ReactionView {
+                    emoji: r.get(0)?,
+                    mine: r.get(1)?,
+                })
+            })?
+            .collect::<core::result::Result<Vec<_>, _>>()?;
+        Ok(m)
+    }
+
+    // ---- replies, reactions, edits, deletes ----
+
+    /// Seals `body` for a contact and stores it as a hidden outgoing row, delivered and
+    /// retried like a message. Returns the row; the caller delivers it once its own
+    /// transaction is committed (no relay I/O inside a savepoint).
+    async fn queue_control(&self, contact: i64, body: Body) -> Result<i64> {
+        let s = self.s()?;
+        let (address, blocked): (String, bool) = s.db.conn().query_row(
+            "SELECT address, blocked FROM contacts WHERE id = ?1",
+            [contact],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if blocked {
+            return Err(ClientError::Blocked);
+        }
+        let addr = veil_core::identity::Address::parse(&address).map_err(|_| ClientError::Storage)?;
+        let content = Content {
+            id: random_id(&mut rng()),
+            sent_at_ms: u64::try_from(now_ms()).unwrap_or(0),
+            body: Some(body),
+        };
+        let envelope = s.account.seal(&mut rng(), &addr, &content, now_secs()).await?;
+        s.db.conn().execute(
+            "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope)
+             VALUES (?1, 1, 'control', '', ?2, 'sending', ?3)",
+            params![contact, now_ms(), envelope],
+        )?;
+        Ok(s.db.conn().last_insert_rowid())
+    }
+
+    /// A text message: (contact, mine, `msg_id`, sent or received at, deleted).
+    fn text_row(&self, message: i64) -> Result<(i64, bool, Vec<u8>, i64, bool)> {
+        self.s()?
+            .db
+            .conn()
+            .query_row(
+                "SELECT contact, mine, msg_id, at_ms, deleted FROM messages
+                 WHERE id = ?1 AND kind = 'text' AND msg_id IS NOT NULL",
+                [message],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?
+            .ok_or(ClientError::BadInput)
+    }
+
+    async fn react(&mut self, message: i64, emoji: Option<String>) -> Result<()> {
+        let (contact, _, msg_id, _, deleted) = self.text_row(message)?;
+        if deleted {
+            return Err(ClientError::BadInput);
+        }
+        let emoji = emoji.map(|e| e.trim().to_owned());
+        let reaction = Reaction {
+            target_id: msg_id,
+            emoji: emoji.clone().unwrap_or_else(|| "x".into()),
+            remove: emoji.is_none(),
+        };
+        // The core checks the emoji (length, no control characters) before sealing.
+        Content {
+            id: vec![0; 16],
+            sent_at_ms: 0,
+            body: Some(Body::Reaction(reaction.clone())),
+        }
+        .validate()
+        .map_err(|_| ClientError::BadInput)?;
+        let db = self.s()?.db.clone();
+        let row = self
+            .atomically(async {
+                match &emoji {
+                    Some(e) => db.conn().execute(
+                        "INSERT OR REPLACE INTO reactions (message, mine, emoji) VALUES (?1, 1, ?2)",
+                        params![message, e],
+                    )?,
+                    None => db
+                        .conn()
+                        .execute("DELETE FROM reactions WHERE message = ?1 AND mine = 1", [message])?,
+                };
+                self.queue_control(contact, Body::Reaction(reaction)).await
+            })
+            .await?;
+        self.deliver(row).await;
+        self.emit(ChangeKind::Messages, Some(contact));
+        Ok(())
+    }
+
+    /// One of our own messages, still within the edit window.
+    fn own_recent(&self, message: i64) -> Result<(i64, Vec<u8>)> {
+        let (contact, mine, msg_id, at, deleted) = self.text_row(message)?;
+        if !mine || deleted || now_ms().saturating_sub(at) > EDIT_WINDOW_MS {
+            return Err(ClientError::TooLate);
+        }
+        Ok((contact, msg_id))
+    }
+
+    async fn edit_message(&mut self, message: i64, text: &str) -> Result<()> {
+        let body = text.trim();
+        if body.is_empty() || body.len() > veil_core::content::MAX_BODY_LEN {
+            return Err(ClientError::BadInput);
+        }
+        let (contact, msg_id) = self.own_recent(message)?;
+        let db = self.s()?.db.clone();
+        let row = self
+            .atomically(async {
+                db.conn().execute(
+                    "UPDATE messages SET body = ?2, edited = 1 WHERE id = ?1",
+                    params![message, body],
+                )?;
+                self.queue_control(
+                    contact,
+                    Body::Edit(Edit {
+                        target_id: msg_id,
+                        body: body.to_owned(),
+                    }),
+                )
+                .await
+            })
+            .await?;
+        self.deliver(row).await;
+        self.emit(ChangeKind::Messages, Some(contact));
+        Ok(())
+    }
+
+    async fn delete_for_everyone(&mut self, message: i64) -> Result<()> {
+        let (contact, msg_id) = self.own_recent(message)?;
+        let db = self.s()?.db.clone();
+        // Still waiting to go out: it never will, and there is nothing to tell them.
+        let unsent: bool = db.conn().query_row(
+            "SELECT envelope IS NOT NULL FROM messages WHERE id = ?1",
+            [message],
+            |r| r.get(0),
+        )?;
+        let row = self
+            .atomically(async {
+                db.conn().execute(
+                    "UPDATE messages SET body = '', deleted = 1, envelope = NULL WHERE id = ?1",
+                    [message],
+                )?;
+                db.conn()
+                    .execute("DELETE FROM reactions WHERE message = ?1", [message])?;
+                if unsent {
+                    return Ok(None);
+                }
+                self.queue_control(contact, Body::Delete(Delete { target_id: msg_id }))
+                    .await
+                    .map(Some)
+            })
+            .await?;
+        if let Some(row) = row {
+            self.deliver(row).await;
+        }
+        self.emit(ChangeKind::Messages, Some(contact));
+        self.emit(ChangeKind::Contacts, Some(contact));
+        Ok(())
+    }
+
+    fn delete_for_me(&self, message: i64) -> Result<()> {
+        let s = self.s()?;
+        let contact: i64 =
+            s.db.conn()
+                .query_row(
+                    "SELECT contact FROM messages WHERE id = ?1 AND kind IN ('text', 'timer')",
+                    [message],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or(ClientError::BadInput)?;
+        // Reactions go with it (ON DELETE CASCADE); secure_delete overwrites the text.
+        s.db.conn()
+            .execute("DELETE FROM messages WHERE id = ?1", [message])?;
+        self.emit(ChangeKind::Messages, Some(contact));
+        self.emit(ChangeKind::Contacts, Some(contact));
+        Ok(())
+    }
+
+    // ---- search ----
+
+    fn search(&self, query: &str) -> Result<Vec<SearchHit>> {
+        let q = query.trim();
+        let n = q.chars().count();
+        if !(MIN_SEARCH..=MAX_SEARCH).contains(&n) {
+            return Ok(Vec::new());
+        }
+        let s = self.s()?;
+        let mut pattern = String::with_capacity(q.len().saturating_add(2));
+        pattern.push('%');
+        for c in q.chars() {
+            if matches!(c, '%' | '_' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(c);
+        }
+        pattern.push('%');
+        let mut stmt = s.db.conn().prepare(
+            "SELECT m.contact, c.name, m.id, m.mine, m.body, m.at_ms FROM messages m
+             JOIN contacts c ON c.id = m.contact
+             WHERE m.kind = 'text' AND m.deleted = 0 AND m.body LIKE ?1 ESCAPE '\\'
+             AND (m.expires_at_ms IS NULL OR m.expires_at_ms > ?2)
+             ORDER BY m.id DESC LIMIT ?3",
+        )?;
+        let hits = stmt
+            .query_map(params![pattern, now_ms(), SEARCH_HITS], |r| {
+                let body: String = r.get(4)?;
+                Ok(SearchHit {
+                    contact: r.get(0)?,
+                    contact_name: r.get(1)?,
+                    message: r.get(2)?,
+                    mine: r.get(3)?,
+                    snippet: snippet(&body, q),
+                    at_ms: r.get(5)?,
+                })
+            })?
+            .collect::<core::result::Result<Vec<_>, _>>()?;
+        Ok(hits)
     }
 
     /// Deposits a stored outgoing envelope. On success the envelope is erased.
@@ -2042,6 +2535,8 @@ impl Actor {
 
 impl Actor {
     /// Stores one message from a known contact. Runs inside [`Self::process`]'s transaction.
+    // One arm per content type; splitting it would only hide the dispatch.
+    #[allow(clippy::too_many_lines)]
     fn receive(&self, contact: i64, msg_id: &[u8], sent_at_ms: u64, body: Body) -> Result<()> {
         let s = self.s()?;
         let conn = s.db.conn();
@@ -2059,9 +2554,9 @@ impl Actor {
                     .or((local > 0).then_some(local))
                     .map(|t| now.saturating_add(i64::from(t).saturating_mul(1000)));
                 conn.execute(
-                    "INSERT INTO messages (contact, mine, body, at_ms, status, msg_id, expires_at_ms)
-                     VALUES (?1, 0, ?2, ?3, 'received', ?4, ?5)",
-                    params![contact, t.body, now, msg_id, expires],
+                    "INSERT INTO messages (contact, mine, body, at_ms, status, msg_id, expires_at_ms, reply_to)
+                     VALUES (?1, 0, ?2, ?3, 'received', ?4, ?5, ?6)",
+                    params![contact, t.body, now, msg_id, expires, t.reply_to],
                 )?;
                 conn.execute("UPDATE contacts SET unread = unread + 1 WHERE id = ?1", [contact])?;
                 self.emit(ChangeKind::Messages, Some(contact));
@@ -2099,6 +2594,57 @@ impl Actor {
                 }
                 if changed > 0 {
                     self.emit(ChangeKind::Messages, Some(contact));
+                }
+            }
+            // A reaction to any text in this conversation, theirs or ours.
+            Body::Reaction(r) => {
+                let target: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM messages WHERE contact = ?1 AND msg_id = ?2 AND kind = 'text' AND deleted = 0",
+                        params![contact, r.target_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(target) = target else { return Ok(()) };
+                if r.remove {
+                    conn.execute("DELETE FROM reactions WHERE message = ?1 AND mine = 0", [target])?;
+                } else {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO reactions (message, mine, emoji) VALUES (?1, 0, ?2)",
+                        params![target, r.emoji],
+                    )?;
+                }
+                self.emit(ChangeKind::Messages, Some(contact));
+            }
+            // Only their own recent messages: an edit or delete can never touch ours.
+            Body::Edit(e) => {
+                let n = conn.execute(
+                    "UPDATE messages SET body = ?3, edited = 1 WHERE contact = ?1 AND mine = 0 AND msg_id = ?2
+                     AND kind = 'text' AND deleted = 0 AND at_ms > ?4",
+                    params![contact, e.target_id, e.body, now.saturating_sub(PEER_EDIT_WINDOW_MS)],
+                )?;
+                if n > 0 {
+                    self.emit(ChangeKind::Messages, Some(contact));
+                    self.emit(ChangeKind::Contacts, Some(contact));
+                }
+            }
+            Body::Delete(d) => {
+                let target: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM messages WHERE contact = ?1 AND mine = 0 AND msg_id = ?2
+                         AND kind = 'text' AND at_ms > ?3",
+                        params![contact, d.target_id, now.saturating_sub(PEER_EDIT_WINDOW_MS)],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(target) = target {
+                    conn.execute(
+                        "UPDATE messages SET body = '', deleted = 1 WHERE id = ?1",
+                        [target],
+                    )?;
+                    conn.execute("DELETE FROM reactions WHERE message = ?1", [target])?;
+                    self.emit(ChangeKind::Messages, Some(contact));
+                    self.emit(ChangeKind::Contacts, Some(contact));
                 }
             }
             Body::Typing(t) if self.privacy()?.typing => {
