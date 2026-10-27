@@ -26,7 +26,7 @@ What's in the preview release today.
 | ✅ | PIN or password | Choose at setup, change in Settings. Delays after 5 wrong tries. Verified by you on a Pixel 10a. | — | — |
 | ✅ | Fingerprint unlock (Android) | Keystore-backed, toggle in Settings. Verified by you on a Pixel 10a. | — | — |
 | ✅ | Purge PIN | Typed at the lock screen, it wipes everything in Veil and destroys the phone's hardware key. Verified by you on a Pixel 10a. | — | — |
-| 🟡 | Phone layout fixes | No more content under the status bar, gesture bar or keyboard. Checked at Pixel 10a size; not yet on the device. | — | — |
+| ✅ | Phone layout fixes | Checked by you on a Pixel. Tap highlights, focus rings, scrollbars and dropdowns polished in preview.6. | — | — |
 | ✅ | Screenshot switch | Settings can lift the screenshot block for a moment (Android). Verified by you on a Pixel 10a. | — | — |
 | ✅ | Themes | Aurora Glass and Ink & Signal, dark/light, 3 accents, reduce motion. | — | — |
 | ✅ | Android hardening | No cloud backup of app data, screenshots blocked. | — | — |
@@ -36,7 +36,8 @@ What's in the preview release today.
 | ✅ | CI and supply-chain checks | Tests, fuzzing, Miri, cargo deny/audit/vet, secret scan. | — | — |
 | ✅ | Review gate | Final gate passed with conditions; conditions met. | — | — |
 | ✅ | Attachment encryption | Crypto in the core, now used for photos, files and voice notes (milestone 3). | — | — |
-| 🟡 | Relay-only call filter | ICE filter done in the core; calls themselves not built. | — | — |
+| 🟡 | Relay-only call filter | Done and tested in the core; there are no calls yet, so nothing to try in the app until milestone 6. | — | — |
+| 🟡 | Erase everything (Settings) | Preview.6: the Purge PIN's wipe from Settings, behind three confirmations. | — | — |
 
 ## Working order
 
@@ -45,10 +46,10 @@ My recommended order, one milestone at a time. Each one: I build it, test it, ru
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
 | ✅ | Milestone 0: release setup | Builds only when you start a release, growing version numbers, permanent signing key, relay port in .env. | ●○○○○ | — |
-| 🟡 | Milestone 1: quick wins | Key-change warning, delete/block, disappearing messages, receipts and typing, invite cleanup. In preview.4; waiting for your Pixel test. | ●●○○○ | — |
-| 🟡 | Milestone 2: everyday messaging | Replies, reactions, edit and delete; message search; scan QR codes with the camera, and verify in person by scanning. Built, two review rounds passed. Ships in preview.5 together with 3 and 4; waiting for your Pixel test. | ●●●○○ | — |
-| 🟡 | Milestone 3: photos, files and voice notes | Encrypted uploads through the relay, voice notes, save to phone. Review: round 1 found two serious problems (sending failed on Android; photos could reach disk), fixed; round 2 passed. In preview.5; waiting for your Pixel test. | ●●●○○ | — |
-| 🟡 | Milestone 4: notifications | Never the sender or text. Works while locked; optional "stay connected in the background" on Android. Review passed, findings fixed. In preview.5; waiting for your Pixel test. | ●●●●○ | — |
+| ✅ | Milestone 1: quick wins | Key-change warning, delete/block, disappearing messages, receipts and typing, invite cleanup. Checked by you on a Pixel. | ●●○○○ | — |
+| ✅ | Milestone 2: everyday messaging | Replies, reactions, edit and delete, search, QR scan, verify by scan. Checked by you on a Pixel; swipe-to-reply and three reactions follow in preview.6. | ●●●○○ | — |
+| ✅ | Milestone 3: photos, files and voice notes | Photos and files checked by you on a Pixel (preview.5). | ●●●○○ | — |
+| 🟡 | Milestone 4: notifications | Work while Veil runs (on screen or in the background), not after it is closed: without Google's push service an app hears the relay only while it runs. | ●●●●○ | — |
 | ⬜ | Milestone 5: metadata privacy | Mailbox rotation and unlinkable sending, then Tor or proxy support. Review gate. | ●●●●○ | 2–3 sessions |
 | ⬜ | Milestone 6: calls | Voice and video through your TURN server, then Direct mode per contact. Review gate (Phase 6 of the plan). | ●●●●● | 3–5 sessions |
 | ⬜ | Milestone 7: backup and more platforms | Encrypted backup and restore, Windows Hello, Linux AppImage/.deb. | ●●●●○ | 2–3 sessions |
@@ -64,23 +65,23 @@ Small jobs with a big payoff.
 | ✅ | Relay port as a setting | VEIL_PORT in deploy/.env (default 8443). | ●○○○○ | — |
 | ✅ | Build installers only on release | Ordinary pushes no longer build them; docs-only pushes skip CI. | ●○○○○ | — |
 | ✅ | Permanent Android signing key | Your key is in GitHub. From preview.4 on, updates install over the old app and keep your chats. | ●○○○○ | — |
-| 🟡 | Clean up unused invite tokens | Built and tested; ships in preview.4. | ●○○○○ | — |
-| 🟡 | Key-change warning | Built: a new contact with a known name gets a warning. Waiting for your Pixel test (preview.4). | ●●○○○ | — |
-| 🟡 | Delete or block a contact | Built and tested; waiting for your Pixel test (preview.4). | ●●○○○ | — |
-| 🟡 | Disappearing messages | Built: 5 min to 4 weeks per chat. Waiting for your Pixel test (preview.4). | ●●○○○ | — |
-| 🟡 | Read receipts and typing | Built, off by default. Waiting for your Pixel test (preview.4). | ●●○○○ | — |
+| ✅ | Clean up unused invite tokens | Automatic: an invite that expires unused gives its relay token back. Nothing to see in the app; covered by tests. | ●○○○○ | — |
+| ✅ | Key-change warning | Checked by you. Preview.6: It’s them moves the old conversation into the new contact and removes the old one. | ●●○○○ | — |
+| ✅ | Delete or block a contact | Checked by you on a Pixel. | ●●○○○ | — |
+| ✅ | Disappearing messages | Checked by you on a Pixel. | ●●○○○ | — |
+| ✅ | Read receipts and typing | Checked by you on a Pixel. | ●●○○○ | — |
 
 ## Messaging
 
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
-| 🟡 | Photos and files | Encrypted, up to 25 MB, location data stripped from photos. In preview.5. | ●●●○○ | — |
-| 🟡 | Voice notes | Up to 5 minutes, with waveform. In preview.5. | ●●●○○ | — |
-| 🟡 | Replies, reactions, edit and delete | Edit or delete for everyone within 24 h. In preview.5. | ●●○○○ | — |
-| 🟡 | Search messages | Local only, inside the encrypted database. In preview.5. | ●●○○○ | — |
-| 🟡 | Notifications | No sender or text shown, also while locked. In preview.5. | ●●●●○ | — |
-| 🟡 | Scan QR with the camera | Invites by scanning. In preview.5. | ●●●○○ | — |
-| 🟡 | Verify in person by scanning | Scan each other's code to mark verified. In preview.5. | ●●○○○ | — |
+| ✅ | Photos and files | Checked by you on a Pixel. | ●●●○○ | — |
+| 🟡 | Voice notes | Up to 5 minutes, with waveform. Not reported on yet. | ●●●○○ | — |
+| ✅ | Replies, reactions, edit and delete | Checked by you. Preview.6: swipe right to reply, hold for actions, up to 3 reactions each, tap a quote to jump. | ●●○○○ | — |
+| ✅ | Search messages | Checked by you on a Pixel. | ●●○○○ | — |
+| 🟡 | Notifications | Work while Veil runs. Not after it is closed (no Google push service, by design). | ●●●●○ | — |
+| ✅ | Scan QR with the camera | Checked by you on a Pixel. | ●●●○○ | — |
+| ✅ | Verify in person by scanning | Checked by you on a Pixel. | ●●○○○ | — |
 | ⬜ | Link previews | Off by default, made by the sender only. | ●●●○○ | 3 h |
 
 ## Calls
