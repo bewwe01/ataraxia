@@ -1,6 +1,6 @@
 # Veil TODO
 
-Status of every feature, for v0.1.0-preview.5 (updated 2026-10-26).
+Status of every feature, for v0.1.0-preview.6 (updated 2026-10-27).
 
 ETA is my hands-on time, not including CI builds (about 20 min per release). One session is about 3–5 hours. Difficulty: 1 easy … 5 very hard. Estimates are rough.
 
