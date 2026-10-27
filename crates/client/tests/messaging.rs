@@ -142,6 +142,16 @@ async fn replies_reactions_edits_and_deletes() {
         (theirs(&m) == ["🌮", "🍔", "🍜"]).then_some(())
     })
     .await;
+    // Removing one the receiver does not have (it was already dropped) clears nothing: only
+    // the old placeholder means "all of mine" (P6-5).
+    bob.client
+        .raw_send(b_alice.id, vec![209; 16], old("🍕", true))
+        .await
+        .unwrap();
+    bob.client.send(b_alice.id, "marker".into()).await.unwrap();
+    arrives(&alice.client, a_bob.id, "marker").await;
+    let m = by_id(&alice.client, a_bob.id, q_at_alice.id).await.unwrap();
+    assert_eq!(theirs(&m), ["🌮", "🍔", "🍜"]);
     bob.client
         .raw_send(b_alice.id, vec![210; 16], old("x", true))
         .await

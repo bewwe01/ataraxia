@@ -318,9 +318,11 @@ async fn erase_everything_from_settings() {
     );
     assert_eq!(c.state().await.unwrap(), AppState::Unlocked);
     assert!(!files(d.path()).is_empty());
+    // And the relay still answers: the wrong PIN did not leave relay traffic stopped (P6-2).
+    c.create_invite().await.unwrap();
     // Something else in the folder is not Veil's to delete (review U-1).
     std::fs::create_dir(d.path().join("app_webview")).unwrap();
-    c.purge_all(z("482913")).await.unwrap();
+    assert!(c.purge_all(z("482913")).await.unwrap(), "every file deleted");
     assert_eq!(files(d.path()), vec!["app_webview".to_owned()]);
     assert_eq!(c.state().await.unwrap(), AppState::New, "Veil starts afresh");
 }

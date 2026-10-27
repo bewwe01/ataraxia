@@ -31,6 +31,8 @@ export interface ContactView {
   keyWarning: boolean;
   /** Unblocked, but they have not received their new address yet. */
   unblockPending: boolean;
+  /** With a key warning: the earlier contact "It's them" would merge here (null: unclear). */
+  previous: { id: number; name: string; verified: boolean; blocked: boolean; lastAtMs: number | null } | null;
 }
 
 export type MessageStatus = "sending" | "sent" | "failed" | "delivered" | "read" | "received";

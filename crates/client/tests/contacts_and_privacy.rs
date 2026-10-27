@@ -111,6 +111,84 @@ async fn lookalike_name_gets_a_key_warning() {
     );
 }
 
+/// Nothing that was waiting to go to the old key is sent after a merge (P6-7): hidden rows go,
+/// unsent messages and uploads stay "not sent", and the new contact never gets them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_sends_nothing_sealed_to_the_old_key() {
+    let r = relay().await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    bob.client.send(b_alice.id, "hello".into()).await.unwrap();
+    let hello = arrives_id(&alice.client, a_bob.id, "hello").await;
+    let bob2 = user(&r, "Bob").await;
+    let (a_bob2, second_phone_alice) = pair(&alice.client, &bob2.client).await;
+    // Offline: a text, a reaction and a file to the old Bob wait to go out.
+    hop.cut();
+    online(&alice.client, false).await;
+    let queued = alice
+        .client
+        .send(a_bob.id, "queued for the old key".into())
+        .await
+        .unwrap();
+    alice.client.react(hello, "👍".into(), true).await.unwrap();
+    let file = alice
+        .client
+        .send_attachment(
+            a_bob.id,
+            veil_client::service::AttachmentInput {
+                kind: "file".into(),
+                mime: "application/octet-stream".into(),
+                name: Some("old.bin".into()),
+                data: zeroize::Zeroizing::new(vec![7u8; 100_000]),
+                thumbnail: None,
+                duration_ms: None,
+                waveform: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(alice.client.hidden_rows(a_bob.id).await.unwrap() > 0);
+    alice.client.accept_key_change(a_bob2.id).await.unwrap();
+    assert_eq!(
+        alice.client.hidden_rows(a_bob2.id).await.unwrap(),
+        0,
+        "hidden rows dropped"
+    );
+    hop.restore();
+    online(&alice.client, true).await;
+    // Something new does arrive, so anything queued would have gone out by now.
+    alice
+        .client
+        .send(a_bob2.id, "after the merge".into())
+        .await
+        .unwrap();
+    arrives(&bob2.client, second_phone_alice.id, "after the merge").await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let got = texts(&bob2.client, second_phone_alice.id).await;
+    assert!(!got.contains(&"queued for the old key".to_owned()));
+    assert!(
+        bob2.client
+            .messages(second_phone_alice.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|m| m.attachment.is_none())
+    );
+    assert!(
+        texts(&bob.client, b_alice.id)
+            .await
+            .iter()
+            .all(|t| t != "queued for the old key")
+    );
+    let mine = alice.client.messages(a_bob2.id).await.unwrap();
+    let q = mine.iter().find(|m| m.id == queued.id).unwrap();
+    assert_eq!(q.status, "failed", "stays not sent");
+    let f = mine.iter().find(|m| m.id == file.id).unwrap();
+    assert_eq!(f.attachment.as_ref().unwrap().state, "failed");
+}
+
 /// Accepting a key change: the earlier conversation moves to the new contact and the old one
 /// is gone, by the user's choice only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -131,17 +209,47 @@ async fn accepting_a_key_change_moves_the_old_conversation() {
         "only after a warning"
     );
 
+    // Someone else calls themselves Bob too; Alice keeps them apart.
+    let other = user(&r, "Bob").await;
+    let (a_other, other_alice) = pair(&alice.client, &other.client).await;
+    other
+        .client
+        .send(other_alice.id, "not the real one".into())
+        .await
+        .unwrap();
+    arrives(&alice.client, a_other.id, "not the real one").await;
+    alice.client.dismiss_key_warning(a_other.id).await.unwrap();
+
     // Bob's new phone: same name, new key.
     let bob2 = user(&r, "Bob").await;
     let (a_bob2, new_phone_alice) = pair(&alice.client, &bob2.client).await;
     assert!(a_bob2.key_warning);
+    // The warning names the contact it is about: the first Bob, not the other one (P6-1).
+    let warned = alice
+        .client
+        .contacts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == a_bob2.id)
+        .unwrap();
+    assert_eq!(warned.previous.as_ref().map(|p| p.id), Some(a_bob.id));
     alice.client.accept_key_change(a_bob2.id).await.unwrap();
     let c = alice.client.contacts().await.unwrap();
-    assert_eq!(c.len(), 1, "the old contact is gone");
-    assert_eq!(c[0].id, a_bob2.id);
-    assert!(!c[0].key_warning);
+    let ids: Vec<i64> = c.iter().map(|c| c.id).collect();
+    assert!(
+        ids.contains(&a_bob2.id) && ids.contains(&a_other.id),
+        "only the first Bob merged"
+    );
+    assert!(!ids.contains(&a_bob.id), "the old contact is gone");
+    assert!(!c.iter().find(|c| c.id == a_bob2.id).unwrap().key_warning);
     let t = texts(&alice.client, a_bob2.id).await;
     assert!(t.contains(&"before the new phone".to_owned()) && t.contains(&"my answer".to_owned()));
+    assert!(!t.contains(&"not the real one".to_owned()));
+    assert_eq!(
+        texts(&alice.client, a_other.id).await,
+        vec!["not the real one".to_owned()]
+    );
     // The conversation goes on with the new key, in the same chat.
     bob2.client
         .send(new_phone_alice.id, "it's me".into())

@@ -47,6 +47,7 @@ export function KeyWarning({ contact, nav, onChanged }: { contact: ContactView; 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   if (!contact.keyWarning) return null;
+  const prev = contact.previous;
 
   async function act(f: () => Promise<void>) {
     setBusy(true);
@@ -78,9 +79,16 @@ export function KeyWarning({ contact, nav, onChanged }: { contact: ContactView; 
         )}
         {confirm ? (
           <div role="alertdialog" aria-labelledby={`kw-q-${contact.id}`}>
-            <p id={`kw-q-${contact.id}`}><strong>Move your earlier conversation with {contact.name} here and remove the old contact?</strong> Only if you are sure this is them. This cannot be undone.</p>
+            {prev ? (
+              <p id={`kw-q-${contact.id}`}>
+                <strong>Move the conversation with your earlier contact “{prev.name}” here and remove that contact?</strong>{" "}
+                That contact is {prev.verified ? "verified" : "not verified"}{prev.blocked ? " and blocked" : ""}{prev.lastAtMs !== null ? `, last message ${timeLabel(prev.lastAtMs)}` : ", with no messages"}. Only if you are sure this is them. This cannot be undone.
+              </p>
+            ) : (
+              <p id={`kw-q-${contact.id}`}>Veil cannot tell which earlier contact this would replace (there is more than one, or it is gone). Keep them apart, or delete the one you no longer need.</p>
+            )}
             <div className="banner-actions">
-              <button className="btn btn-primary" type="button" autoFocus disabled={busy} onClick={() => void act(() => ipc.acceptKeyChange(contact.id))}>Yes, it's them</button>
+              {prev ? <button className="btn btn-primary" type="button" autoFocus disabled={busy} onClick={() => void act(() => ipc.acceptKeyChange(contact.id))}>Yes, it's them</button> : null}
               <button className="btn btn-secondary" type="button" disabled={busy} onClick={() => setConfirm(false)}>Not now</button>
             </div>
           </div>
@@ -389,9 +397,10 @@ function MessageRow({ m, contact, found, onActions, onReply, onJump, onOpenImage
               className="reply"
               type="button"
               disabled={reply.id === null}
-              aria-label={reply.id === null ? undefined : `Go to the quoted message${reply.mine === null ? "" : ` from ${reply.mine ? "you" : contact.name}`}`}
               onClick={() => reply.id !== null && onJump(reply.id)}
             >
+              {/* The quote itself stays the button's name, so it is read out (P6-8). */}
+              <span className="sr-only">{reply.id === null ? "Quoted message: " : "Quoted message, go to the original: "}</span>
               {reply.mine === null ? null : <b>{reply.mine ? "You" : contact.name}</b>}
               <span>{reply.text || "Original message not available"}</span>
             </button>

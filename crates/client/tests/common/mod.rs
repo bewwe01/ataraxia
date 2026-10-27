@@ -230,3 +230,16 @@ pub async fn texts(c: &Client, contact: i64) -> Vec<String> {
 pub async fn arrives(c: &Client, contact: i64, text: &str) {
     eventually(|| async { texts(c, contact).await.iter().any(|t| t == text).then_some(()) }).await;
 }
+
+/// Waits for a message with this text and returns its id.
+pub async fn arrives_id(c: &Client, contact: i64, text: &str) -> i64 {
+    eventually(|| async {
+        c.messages(contact)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.text == text)
+            .map(|m| m.id)
+    })
+    .await
+}

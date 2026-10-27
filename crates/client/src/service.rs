@@ -141,6 +141,20 @@ pub struct ContactView {
     pub key_warning: bool,
     /// Unblocked, but the update with their new token has not reached them yet.
     pub unblock_pending: bool,
+    /// With a key-change warning: the existing contact it is about, which "It's them" would
+    /// merge into this one. None if it is gone or cannot be told apart.
+    pub previous: Option<PreviousView>,
+}
+
+/// The contact a key-change warning is about, as the confirmation shows it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviousView {
+    pub id: i64,
+    pub name: String,
+    pub verified: bool,
+    pub blocked: bool,
+    pub last_at_ms: Option<i64>,
 }
 
 // Display data: each flag is a separate fact the UI shows.
@@ -364,7 +378,7 @@ enum Cmd {
     SetTimer(i64, u32, Reply<()>),
     DismissKeyWarning(i64, Reply<()>),
     AcceptKeyChange(i64, Reply<()>),
-    PurgeAll(Zeroizing<String>, Reply<()>),
+    PurgeAll(Zeroizing<String>, Reply<bool>),
     Privacy(Reply<PrivacyView>),
     SetPrivacy(PrivacyView, Reply<()>),
     Typing(i64, bool, Reply<()>),
@@ -569,8 +583,9 @@ impl Client {
     }
     /// Erases everything, like the Purge PIN, from Settings: checks the current PIN or
     /// password, then deletes the identity, contacts, messages and device secret. Veil is new
-    /// afterwards. Cannot be undone.
-    pub async fn purge_all(&self, current: Zeroizing<String>) -> Result<()> {
+    /// afterwards. Cannot be undone. An error means the secret was not confirmed and nothing
+    /// was touched; once confirmed, `Ok(false)` says some file could not be deleted.
+    pub async fn purge_all(&self, current: Zeroizing<String>) -> Result<bool> {
         self.interrupt.pending.store(true, Ordering::SeqCst);
         self.interrupt.notify.notify_waiters();
         ask!(self, PurgeAll, current)
@@ -1440,9 +1455,13 @@ impl Actor {
                         self.lock_now();
                         self.watcher = None;
                         self.decoy = None;
-                        self.wipe()
+                        Ok(self.wipe().is_ok())
                     }
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        // Still unlocked: relay I/O goes on as before (P6-2).
+                        self.interrupt.pending.store(false, Ordering::SeqCst);
+                        Err(e)
+                    }
                 };
                 let _ = r.send(res);
             }
@@ -1888,7 +1907,32 @@ impl Actor {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
+        let previous = if key_warning {
+            match Self::warned_about(db, id, &name)? {
+                Some(old) => conn
+                    .query_row(
+                        "SELECT name, verified, blocked,
+                           (SELECT MAX(at_ms) FROM messages WHERE contact = ?1 AND kind IN ('text', 'attachment'))
+                         FROM contacts WHERE id = ?1",
+                        [old],
+                        |r| {
+                            Ok(PreviousView {
+                                id: old,
+                                name: r.get(0)?,
+                                verified: r.get(1)?,
+                                blocked: r.get(2)?,
+                                last_at_ms: r.get(3)?,
+                            })
+                        },
+                    )
+                    .optional()?,
+                None => None,
+            }
+        } else {
+            None
+        };
         Ok(ContactView {
+            previous,
             id,
             initials: initials(&name),
             hue: id.rem_euclid(8),
@@ -2951,19 +2995,29 @@ impl Actor {
                 // takes the name of an existing contact gets a warning, never their history
                 // (INV-ID-2).
                 let key = name_key(&name);
-                let clash = intro.display_name.is_some() && {
+                // The contact this one may replace: the oldest with the same name. Accepting
+                // the warning merges exactly that one (P6-1).
+                let clash: Option<i64> = if intro.display_name.is_some() {
                     let mut stmt =
                         s.db.conn()
-                            .prepare("SELECT name FROM contacts WHERE address != ?1")?;
-                    let names = stmt
-                        .query_map([from.as_str()], |r| r.get::<_, String>(0))?
+                            .prepare("SELECT id, name FROM contacts WHERE address != ?1 ORDER BY id")?;
+                    let rows = stmt
+                        .query_map([from.as_str()], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                        })?
                         .collect::<core::result::Result<Vec<_>, _>>()?;
-                    names.iter().any(|n| name_key(n) == key)
+                    rows.into_iter()
+                        .find(|(_, n)| name_key(n) == key)
+                        .map(|(id, _)| id)
+                } else {
+                    None
                 };
                 let id = self.upsert_contact(from.as_str(), &name, &mailbox, &token, &arr32(&my_token)?)?;
-                if clash {
-                    s.db.conn()
-                        .execute("UPDATE contacts SET key_warning = 1 WHERE id = ?1", [id])?;
+                if let Some(old) = clash {
+                    s.db.conn().execute(
+                        "UPDATE contacts SET key_warning = 1, key_warning_of = ?2 WHERE id = ?1",
+                        params![id, old],
+                    )?;
                 }
                 self.s()?
                     .db
@@ -3100,9 +3154,9 @@ impl Actor {
                         "DELETE FROM reactions WHERE message = ?1 AND mine = 0 AND emoji = ?2",
                         params![target, r.emoji],
                     )?;
-                    if gone == 0 {
+                    if gone == 0 && r.emoji == "x" {
                         // Veil before preview.6 had one reaction each and removed it by
-                        // sending a placeholder: that means all of theirs.
+                        // sending the placeholder "x": that means all of theirs (P6-5).
                         conn.execute("DELETE FROM reactions WHERE message = ?1 AND mine = 0", [target])?;
                     }
                 } else {
@@ -3623,18 +3677,13 @@ impl Actor {
         if !warned {
             return Err(ClientError::BadInput);
         }
-        let key = name_key(&name);
-        let olds: Vec<(i64, String, Vec<u8>)> =
-            s.db.conn()
-                .prepare("SELECT id, address, my_token, name FROM contacts WHERE id != ?1")?
-                .query_map([contact], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?))
-                })?
-                .collect::<core::result::Result<Vec<_>, _>>()?
-                .into_iter()
-                .filter(|o| name_key(&o.3) == key)
-                .map(|(id, address, token, _)| (id, address, token))
-                .collect();
+        // Exactly the contact the warning is about (P6-1), never every same-name contact.
+        let old = Self::warned_about(&s.db, contact, &name)?.ok_or(ClientError::BadInput)?;
+        let olds: Vec<(i64, String, Vec<u8>)> = vec![s.db.conn().query_row(
+            "SELECT id, address, my_token FROM contacts WHERE id = ?1",
+            [old],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?];
         let db = s.db.clone();
         self.atomically(async {
             let conn = db.conn();
@@ -3689,6 +3738,39 @@ impl Actor {
         self.emit(ChangeKind::Contacts, Some(contact));
         self.emit(ChangeKind::Messages, Some(contact));
         Ok(())
+    }
+
+    /// The contact a key-change warning is about: the one recorded when the warning was
+    /// raised, if it still exists. Warnings from before that was recorded (preview.5) fall
+    /// back to the only other contact with the same name; with several, none is chosen.
+    fn warned_about(db: &Db, contact: i64, name: &str) -> Result<Option<i64>> {
+        let conn = db.conn();
+        let recorded: Option<i64> = conn.query_row(
+            "SELECT key_warning_of FROM contacts WHERE id = ?1",
+            [contact],
+            |r| r.get(0),
+        )?;
+        if let Some(old) = recorded {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM contacts WHERE id = ?1 AND id != ?2)",
+                params![old, contact],
+                |r| r.get(0),
+            )?;
+            return Ok(exists.then_some(old));
+        }
+        let key = name_key(name);
+        let same: Vec<i64> = conn
+            .prepare("SELECT id, name FROM contacts WHERE id != ?1")?
+            .query_map([contact], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<core::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, n)| name_key(n) == key)
+            .map(|(id, _)| id)
+            .collect();
+        Ok(match same.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        })
     }
 
     fn dismiss_key_warning(&self, contact: i64) -> Result<()> {

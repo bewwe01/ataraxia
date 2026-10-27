@@ -3978,3 +3978,133 @@ Add both to ADR-0016's costs.
 
 ### Action options
 Recommended: **B. Fix blocking only**: M4-1 to M4-3, plus M4-4 as the test for the key-lifetime claim. Then do the on-device check of the Kotlin before tagging.
+
+## Preview.6 changes review, round 1
+
+**Scope:** commit `4f9b90c` ("Add swipe to reply, three reactions, key-change merge, Erase everything"), 20 files, +999/−195. Covers ADR-0017 and the INV-ID-2, INV-REST-6 and INV-MSG-8 rows. I read the whole diff plus the code it relies on: `atomically`, `forget_contact`, `queue_token_removal`/`flush_token_removals`, `verify_current`, `wipe`, `lock_now`/`interruptible`, the Purge PIN unlock path, `retry_failed`/`retry_attachment`/`restart_upload`, the intro clash check, `useDialogKeys`, and the `.reaction` rules in `base.css`. I edited no files.
+
+**Verdict: FAIL.** There is one High (P6-1). Under the CLAUDE.md gate every Critical/High must be fixed and re-reviewed. The other findings are Medium or below.
+
+### Commands run
+
+| Command | Result |
+|---|---|
+| `cargo test -p veil-client --locked` | **pass**: unit 15, attachments 10, contacts_and_privacy 9, lock_and_setup 3, messaging 7, notifications 4, pair_and_message 2, unlock_options 6; 0 failed, no flaky reruns needed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | **pass** (exit 0, no warnings) |
+| `(cd app/src-tauri && cargo clippy --all-targets --locked -- -D warnings)` | **pass** |
+| `pnpm -C app typecheck` | **pass** (`tsc --noEmit`) |
+| `pnpm -C app lint` | **pass** ("14 files clean") |
+| `pnpm -C app test` | **not run**: `app/package.json` has no `test` script (`ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL`). This was already the case before this commit, but CLAUDE.md's command table lists it |
+
+### Findings
+
+**P6-1 — High — [HIGH confidence] "It's them" merges every contact with the same name, not just "the earlier conversation"**
+`crates/client/src/service.rs:3626-3639` (`accept_key_change`); the confirmation text is in `app/src/screens/Chats.tsx:81`.
+- **What happens:** `olds` is every other contact whose *current* `name_key` equals the warned contact's. That includes contacts the user earlier chose to "Keep apart", blocked contacts, verified contacts and other warned impostors. Every one of them has its history moved into the accepted contact and is then deleted. The confirmation says "Move your earlier conversation with {name} here and remove the old contact?" (one contact) and never says which contact or how many.
+- **Scenario A (impostor):**
+  1. Alice has Bob.
+  2. An attacker pairs as "Bob" and gets the warning. Alice taps "Keep apart"; the attacker's messages stay in their own chat.
+  3. Bob gets a new phone and pairs, and is warned. Alice verifies and taps "It's them".
+  4. The attacker's messages (`mine = 0`) now sit in the verified Bob conversation, shown as Bob's earlier messages, and the attacker contact is gone. Text an impostor wrote ends up attributed to a verified identity. That goes against what INV-ID-2 and ADR-0017 ("nothing merges without the user") mean: the user agreed to one merge, not this one.
+- **Scenario B (two real people):** two different "Alex" contacts that were kept apart. Accepting a key change for one irreversibly deletes the other (session forgotten, token withdrawn) and mixes the two histories.
+- **Renamed contacts:** because matching uses the names as they are at accept time, a user who renamed either contact gets "success" with nothing moved, and the warning is cleared.
+- **Tests:** none cover more than one match.
+- **Fix:**
+  - At warning time, record which contact clashed (e.g. a `key_warning_of INTEGER REFERENCES contacts(id)` column set in the intro path at `service.rs:2953-2966`). Alternatively, have the UI pass it in: `accept_key_change(new_id, old_id)`.
+  - Merge exactly that one contact. Refuse (`BadInput`) if it no longer exists, is the same id, or no longer matches.
+  - Show the old contact in the confirmation (name, verified/blocked state, last message time).
+  - Add a test with two same-name contacts (one kept apart) and check only the chosen one moves.
+
+**P6-2 — Medium — [HIGH confidence] A wrong PIN in "Erase everything" stops all relay traffic until the next lock**
+`crates/client/src/service.rs:573-575` (`Client::purge_all`) and `:1435-1447` (`Cmd::PurgeAll`).
+- **What happens:** `purge_all` sets `interrupt.pending = true` before the secret is checked. Only `lock_now` clears that flag (`:1047`). On `WrongPassphrase` or `RetryLater` the session stays unlocked but the flag stays set.
+- **Effect:** from then on, `interruptible` (`:1062`) returns `Err(Locked)` for every relay call: `connect`, `sync`, sends, `flush_token_removals`. `retry_failed` also stops early (`:2797`, `:2804`).
+- **Scenario:** the user mistypes their PIN in step 3, cancels, and keeps chatting. Nothing is received and sends fail or queue. This lasts until a manual lock or 5 minutes without input; staying active postpones auto-lock, so it can last indefinitely.
+- **Tests:** `erase_everything_from_settings` checks only state and files after the wrong PIN, not that messaging still works.
+- **Fix:** in the `Err(e)` arm of `Cmd::PurgeAll`, add `self.interrupt.pending.store(false, Ordering::SeqCst);`. Extend the test so a message is sent and received after the wrong PIN.
+
+**P6-3 — Medium — [HIGH confidence on the cascade; MEDIUM on how often users hit it] The new reaction hit area is displaced over the bubble**
+`app/src/styles/app.css:124`.
+- **What happens:** the new rule `.reaction::after { content: ""; position: absolute; inset: -9px -4px; }` has the same specificity as the existing `base.css:723` rule and loads later. The base rule's `width: max(100%, 44px)`, `height: 44px` and `transform: translate(-50%, -50%)` still apply.
+  - With `top`, `height` and `bottom` all set, `bottom` is ignored; likewise `right`.
+  - The box then starts at `top: -9px`, `left: -4px` and is shifted up 22px and left by half its width.
+  - Net result: the hit area runs from about 31px above the chip to 13px below its top. That covers roughly the bottom 25px of the bubble (the `.reactions` row has `z-index: 1` and `margin-top: -6px`).
+- **Scenario:** on a message that has reactions, a tap on the lower part of the bubble (last text line, time, or voice-note/file controls near the bottom) hits a chip. That sends a reaction to the contact with no confirmation, or removes one. A hold or swipe started there never reaches the bubble.
+- **Fix:** delete `app.css:124`; `base.css:723` already gives a centred 44×44 area. If the override is kept, reset it fully: `inset: -9px -4px; width: auto; height: auto; transform: none;`. Note that `-4px` on a 34px chip gives only 42px width.
+
+**P6-4 — Low — [HIGH confidence] Erase skips the Android Keystore key and webview clearing if `wipe()` reports an error**
+`app/src-tauri/src/lib.rs:235-239`.
+- **What happens:** `c.purge_all(current).await.map_err(err)?` returns before `finish_purge`. In the actor the secret has already been verified, the session locked and the files partly deleted. Only `wipe()` failed, for example a file held by a scanner or backup tool on Windows, or a slow keystore.
+- **Scenario:** the hardware key and webview storage remain, while the user was told this does what the Purge PIN does. The Purge PIN path always runs `finish_purge`, because it ignores `wipe()`'s result.
+- **Fix:** distinguish the two error kinds, e.g.:
+  ```rust
+  match c.purge_all(current).await {
+      Ok(()) => { finish_purge(&app).await; Ok(()) }
+      Err(e @ (ClientError::WrongPassphrase | ClientError::RetryLater | ClientError::Locked)) => Err(err(e)),
+      Err(e) => { finish_purge(&app).await; Err(err(e)) }
+  }
+  ```
+  Or have the client return a distinct "wiped with errors" result.
+
+**P6-5 — Low — [MEDIUM confidence] The preview.5 "remove clears all" fallback also fires for preview.6 peers**
+`crates/client/src/service.rs:3097-3106`.
+- **What happens:** any removal naming an emoji the receiver does not have deletes all of that contact's reactions on the message.
+- **Scenario:** a preview.6 peer has A, B, C.
+  1. The "remove A" envelope fails transiently and stays queued for retry.
+  2. "Add D" goes out. The receiver keeps the newest three: B, C, D (A is dropped).
+  3. The retried "remove A" arrives later (libsignal decrypts out-of-order messages). The receiver has no A, so B, C and D are all cleared, although the peer still shows them.
+- **Fix:** apply the fallback only to preview.5's placeholder, which was `"x"` (old `react`: `unwrap_or_else(|| "x".into())`): `if gone == 0 && r.emoji == "x" { … }`. Add a case to `replies_reactions_edits_and_deletes`.
+
+**P6-6 — Low — [HIGH confidence] Touch-only users have no visible non-gesture way to open a message's actions**
+`app/src/styles/app.css:64-66` and `app/src/screens/Chats.tsx` (`MessageRow`).
+- **What happens:** a tap on a text bubble no longer opens the actions (before this commit it was `role="button"`). The "⋯" button has `opacity: 0` unless hovered (only with `hover: hover`) or focused.
+- **Scenario:** on a phone, a sighted user who cannot hold still for 450 ms within 10 px (tremor, motor impairment) has no visible way to react, reply, edit or delete. The invisible 44px button still takes taps, so a tap beside a bubble opens the dialog unexpectedly. Keyboard and screen-reader users are fine.
+- **Fix:** show "⋯" on coarse pointers, e.g. `@media (hover: none) { .msg-more { opacity: 0.6; } }`. Alternatively, make a single tap on a text bubble open the actions again (the hold then only adds the vibration).
+
+**P6-7 — Low — [HIGH confidence] The "nothing sealed to the old key is sent on" claim has no test (CLAUDE.md rule 9)**
+`docs/INVARIANTS.md` (INV-ID-2 row) and `crates/client/tests/contacts_and_privacy.rs` (`accepting_a_key_change_moves_the_old_conversation`).
+- **What's missing:** the row states that hidden queued rows are dropped and that unsent messages and uploads stay "not sent". The cited test only sends successfully delivered messages.
+- **Code reading:** the code looks right. Control and mailbox rows are deleted. Unsent rows get `status='failed', envelope=NULL`, and `retry_failed` needs `envelope IS NOT NULL`. Uploads become `failed` with their chunks dropped, and only the user's own Retry re-encrypts them under a fresh key for the new contact.
+- **Fix:** add a test that cuts Alice off from the relay, queues a text, a reaction and an upload to the old contact, accepts the key change, reconnects, and then checks that:
+  - `hidden_rows(new) == 0`;
+  - the text is `failed`;
+  - Bob2 receives nothing from those rows.
+
+  Also add the multi-match test from P6-1.
+
+**P6-8 — Low — [HIGH confidence] The quote button's `aria-label` hides the quoted text from screen readers**
+`app/src/screens/Chats.tsx:389-392`.
+- **What happens:** `aria-label="Go to the quoted message from Bob"` replaces the button's accessible name, so the quoted text inside is not read. Before this commit the quote was a plain span and was read.
+- **Fix:** drop the `aria-label`. Add a visually hidden prefix inside the button instead, e.g. `<span className="sr-only">Quoted message, go to original: </span>`, so the name and excerpt stay readable.
+
+**P6-9 — Info**
+- **Merged history:** after a merge, the new key holder can edit or delete (within 48 h) and react to messages the old key sent, because they are now its own conversation. This follows from the user's choice; it is worth a line in ADR-0017.
+- **preview.5 interop:** a preview.5 receiver keeps only one reaction from a preview.6 sender, and any single removal clears all of them there. ADR-0017 describes only the other direction.
+- **`user-select: none`:** this is a UX choice, not a clipboard guarantee. Rule 6 covers Veil writing to the clipboard. The same plaintext can still be selected in the action dialog's `.msg-preview` and the reply bar, so the ADR's "there is no copy" is broader than what the code does.
+- **Focus after a hold:** when the dialog was opened by a hold, the opener is the non-focusable bubble, so focus does not return anywhere useful on close. Keyboard users open it from "⋯", so the impact is small.
+- **Unsent messages after a merge:** they stay `failed` with no way to resend them, because there is no envelope and no text retry. This matches "stay as not sent" but could be stated in the UI.
+
+### Checked and found sound
+- **No auto-merge (INV-ID-2):** `accept_key_change` refuses without `key_warning` (tested). It runs only from an explicit IPC call behind a confirmation step, and neither verifying nor doing nothing merges.
+- **"Verifying no longer clears the warning" leaves no dead end:** "Keep apart" and "It's them" stay available while the contact is verified.
+- **Atomicity of the merge:** there is no relay I/O inside `atomically`. `forget_contact` writes through the same SQLite savepoint, as `delete_contact` already does, and token withdrawal happens after commit. Reactions and attachments follow the moved messages by message id, unread counts are added, and `typing_sent` is cleaned up.
+- **Erase everything:**
+  - goes through `verify_current`: attempt counting, retry delay, and no wipe on a wrong secret;
+  - on success runs the same `lock_now` and `wipe()` as the Purge PIN, and clears the watcher and decoy, so the state becomes `New` and the welcome screen shows;
+  - the UI's three steps (tick, type ERASE, PIN or password) make a slip unlikely.
+- **Reactions against a hostile contact:**
+  - incoming emoji are validated by the core (≤ 8 characters, ≤ 32 bytes, no control or bidi characters);
+  - targets are limited to that conversation's undeleted text and attachment messages;
+  - the contact's rows are trimmed to `MAX_REACTIONS` after every insert, so they cannot grow without bound;
+  - nothing in the path can panic.
+  - Our own side checks the cap before queueing anything.
+- **Migration 4:** copies the version 3 rows. Version 3's key `(message, mine)` means there are no duplicates. The rename keeps `ON DELETE CASCADE`, and the migration runs in one transaction with `user_version`. `migrates_a_version_3_database` covers data kept, a second reaction fitting, and the cascade.
+- **Gestures:**
+  - `touch-action: pan-y` keeps vertical scrolling native, and pointer cancel clears the hold timer.
+  - Pointer capture is taken only once a swipe is recognised.
+  - The click after a hold is swallowed; the flag is reset on the next pointerdown.
+  - Right-click and Android `contextmenu` do not open the actions twice.
+  - Swiping is turned off for blocked contacts, deleted messages and messages without actions.
+- **CSS:** only design tokens, no raw colours. The new transitions are transform and opacity only, use `--dur-*` (zeroed under `prefers-reduced-motion` and `data-motion="reduced"`), and are covered by the global reduced-motion overrides. `design/proto/base.css` mirrors `base.css`.
+- **Custom emoji input:** labelled, `aria-invalid`/`aria-describedby` wired, single grapheme checked with `Intl.Segmenter`, `maxLength` set, server-side validation is still the authority.
+- **The rest:** IPC stays in `ipc.ts`, the new commands are in the shell's handler list, and the docs (ADR-0017, the INVARIANTS rows, DESIGN.md) were updated with the change.

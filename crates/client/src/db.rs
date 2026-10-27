@@ -103,7 +103,8 @@ const MIGRATIONS: &[&str] = &[
        data BLOB NOT NULL,
        PRIMARY KEY (message, idx)
      );",
-    // 4: up to three reactions per person on a message, in the order they were added.
+    // 4: up to three reactions per person on a message, in the order they were added; the
+    // contact a key-change warning is about.
     "CREATE TABLE reactions_v4 (
        message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
        mine INTEGER NOT NULL,
@@ -113,7 +114,9 @@ const MIGRATIONS: &[&str] = &[
      ) WITHOUT ROWID;
      INSERT INTO reactions_v4 (message, mine, emoji) SELECT message, mine, emoji FROM reactions;
      DROP TABLE reactions;
-     ALTER TABLE reactions_v4 RENAME TO reactions;",
+     ALTER TABLE reactions_v4 RENAME TO reactions;
+     -- The contact a key-change warning is about: accepting merges exactly that one (P6-1).
+     ALTER TABLE contacts ADD COLUMN key_warning_of INTEGER;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

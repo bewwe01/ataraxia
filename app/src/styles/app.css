@@ -64,6 +64,9 @@ html, body { height: 100%; overflow: hidden; }
 .msg-more { opacity: 0; }
 .msg-more:focus-visible, .msg:focus-within .msg-more { opacity: 1; }
 @media (hover: hover) { .msg:hover .msg-more { opacity: 1; } }
+/* On touch screens it stays visible, faintly: holding still for half a second is not for
+   everyone (P6-6). */
+@media (hover: none) { .msg-more { opacity: 0.55; } }
 /* The quote is a button: it goes to the original message. */
 button.reply { width: calc(100% + 10px); text-align: start; font: inherit; font-size: var(--text-sm); cursor: pointer; }
 button.reply:disabled { cursor: default; }
@@ -120,8 +123,6 @@ button.reply:not(:disabled):active { filter: brightness(0.92); }
 .reaction-emoji { font-size: 15px; line-height: 1; }
 .reaction:disabled { cursor: default; }
 .reaction:not(:disabled):active { transform: scale(0.94); }
-/* A 44 px hit area around the 26 px chip (DESIGN.md: targets). */
-.reaction::after { content: ""; position: absolute; inset: -9px -4px; }
 .msg.has-reactions + .msg { margin-top: var(--space-3); }
 /* A short error under a field or inside a banner; text and icon-free, so colour is not alone: it says what went wrong. */
 .field-error { margin: var(--space-2) 0 0; font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--danger); }
