@@ -377,7 +377,7 @@ enum Cmd {
     SetBlocked(i64, bool, Reply<()>),
     SetTimer(i64, u32, Reply<()>),
     DismissKeyWarning(i64, Reply<()>),
-    AcceptKeyChange(i64, Reply<()>),
+    AcceptKeyChange(i64, i64, Reply<()>),
     PurgeAll(Zeroizing<String>, Reply<bool>),
     Privacy(Reply<PrivacyView>),
     SetPrivacy(PrivacyView, Reply<()>),
@@ -586,8 +586,8 @@ impl Client {
     /// afterwards. Cannot be undone. An error means the secret was not confirmed and nothing
     /// was touched; once confirmed, `Ok(false)` says some file could not be deleted.
     pub async fn purge_all(&self, current: Zeroizing<String>) -> Result<bool> {
-        self.interrupt.pending.store(true, Ordering::SeqCst);
-        self.interrupt.notify.notify_waiters();
+        // No early interrupt: the actor is not in relay I/O while it handles this, and a
+        // wrong PIN must leave a pending lock request alone (P6-2, P6R2-6).
         ask!(self, PurgeAll, current)
     }
     pub async fn me(&self) -> Result<MeView> {
@@ -734,8 +734,10 @@ impl Client {
     /// that name: the earlier conversation moves to it and the old contact is deleted (its
     /// session ends, its delivery token is withdrawn). Only after a key-change warning, and
     /// only by the user's choice (INV-ID-2).
-    pub async fn accept_key_change(&self, contact: i64) -> Result<()> {
-        ask!(self, AcceptKeyChange, contact)
+    /// `previous` is the contact the user was shown ([`ContactView::previous`]); anything
+    /// else is refused.
+    pub async fn accept_key_change(&self, contact: i64, previous: i64) -> Result<()> {
+        ask!(self, AcceptKeyChange, contact, previous)
     }
     pub async fn privacy(&self) -> Result<PrivacyView> {
         ask!(self, Privacy)
@@ -1443,8 +1445,8 @@ impl Actor {
                 let res = self.set_timer(c, t).await;
                 let _ = r.send(res);
             }
-            Cmd::AcceptKeyChange(c, r) => {
-                let res = self.accept_key_change(c).await;
+            Cmd::AcceptKeyChange(c, prev, r) => {
+                let res = self.accept_key_change(c, prev).await;
                 let _ = r.send(res);
             }
             Cmd::PurgeAll(cur, r) => {
@@ -1457,11 +1459,7 @@ impl Actor {
                         self.decoy = None;
                         Ok(self.wipe().is_ok())
                     }
-                    Err(e) => {
-                        // Still unlocked: relay I/O goes on as before (P6-2).
-                        self.interrupt.pending.store(false, Ordering::SeqCst);
-                        Err(e)
-                    }
+                    Err(e) => Err(e),
                 };
                 let _ = r.send(res);
             }
@@ -1912,9 +1910,10 @@ impl Actor {
                 Some(old) => conn
                     .query_row(
                         "SELECT name, verified, blocked,
-                           (SELECT MAX(at_ms) FROM messages WHERE contact = ?1 AND kind IN ('text', 'attachment'))
+                           (SELECT MAX(at_ms) FROM messages WHERE contact = ?1 AND kind IN ('text', 'attachment')
+                            AND deleted = 0 AND (expires_at_ms IS NULL OR expires_at_ms > ?2))
                          FROM contacts WHERE id = ?1",
-                        [old],
+                        params![old, now_ms()],
                         |r| {
                             Ok(PreviousView {
                                 id: old,
@@ -3663,7 +3662,7 @@ impl Actor {
         }
     }
 
-    async fn accept_key_change(&mut self, contact: i64) -> Result<()> {
+    async fn accept_key_change(&mut self, contact: i64, expected: i64) -> Result<()> {
         let s = self.s()?;
         let (name, warned): (String, bool) =
             s.db.conn()
@@ -3679,6 +3678,10 @@ impl Actor {
         }
         // Exactly the contact the warning is about (P6-1), never every same-name contact.
         let old = Self::warned_about(&s.db, contact, &name)?.ok_or(ClientError::BadInput)?;
+        // The one the confirmation named, and no other (P6R2-6).
+        if old != expected {
+            return Err(ClientError::BadInput);
+        }
         let olds: Vec<(i64, String, Vec<u8>)> = vec![s.db.conn().query_row(
             "SELECT id, address, my_token FROM contacts WHERE id = ?1",
             [old],
@@ -3725,7 +3728,10 @@ impl Actor {
                 Self::queue_token_removal(&db, my_token)?;
                 conn.execute("DELETE FROM contacts WHERE id = ?1", [old])?;
             }
-            conn.execute("UPDATE contacts SET key_warning = 0 WHERE id = ?1", [contact])?;
+            conn.execute(
+                "UPDATE contacts SET key_warning = 0, key_warning_of = NULL WHERE id = ?1",
+                [contact],
+            )?;
             Ok(())
         })
         .await?;
@@ -3774,11 +3780,10 @@ impl Actor {
     }
 
     fn dismiss_key_warning(&self, contact: i64) -> Result<()> {
-        let n = self
-            .s()?
-            .db
-            .conn()
-            .execute("UPDATE contacts SET key_warning = 0 WHERE id = ?1", [contact])?;
+        let n = self.s()?.db.conn().execute(
+            "UPDATE contacts SET key_warning = 0, key_warning_of = NULL WHERE id = ?1",
+            [contact],
+        )?;
         if n == 0 {
             return Err(ClientError::UnknownContact);
         }
@@ -3793,5 +3798,52 @@ pub fn default_kdf() -> KdfParams {
         KdfParams::MOBILE
     } else {
         KdfParams::DESKTOP
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    /// Warnings raised before the warned-about contact was recorded (preview.5): only an
+    /// unambiguous name picks a contact (review P6R2-3).
+    #[test]
+    fn legacy_warnings_merge_only_an_unambiguous_contact() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("veil.db"), &[3u8; 32]).unwrap();
+        let add = |address: &str, name: &str| {
+            db.conn()
+                .execute(
+                    "INSERT INTO contacts (address, name, mailbox, token, my_token, added_ms)
+                     VALUES (?1, ?2, x'00', x'00', x'00', 1)",
+                    params![address, name],
+                )
+                .unwrap();
+            db.conn().last_insert_rowid()
+        };
+        let first = add("a", "Bob");
+        let second = add("b", " bob ");
+        let warned = add("c", "BOB");
+        db.conn()
+            .execute("UPDATE contacts SET key_warning = 1 WHERE id = ?1", [warned])
+            .unwrap();
+        assert_eq!(
+            Actor::warned_about(&db, warned, "BOB").unwrap(),
+            None,
+            "two candidates"
+        );
+        db.conn()
+            .execute("DELETE FROM contacts WHERE id = ?1", [second])
+            .unwrap();
+        assert_eq!(Actor::warned_about(&db, warned, "BOB").unwrap(), Some(first));
+        // A recorded contact wins over names; once it is gone, nothing is guessed.
+        db.conn()
+            .execute(
+                "UPDATE contacts SET key_warning_of = ?2 WHERE id = ?1",
+                params![warned, second],
+            )
+            .unwrap();
+        assert_eq!(Actor::warned_about(&db, warned, "BOB").unwrap(), None);
     }
 }

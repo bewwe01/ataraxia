@@ -4108,3 +4108,145 @@ Recommended: **B. Fix blocking only**: M4-1 to M4-3, plus M4-4 as the test for t
 - **CSS:** only design tokens, no raw colours. The new transitions are transform and opacity only, use `--dur-*` (zeroed under `prefers-reduced-motion` and `data-motion="reduced"`), and are covered by the global reduced-motion overrides. `design/proto/base.css` mirrors `base.css`.
 - **Custom emoji input:** labelled, `aria-invalid`/`aria-describedby` wired, single grapheme checked with `Intl.Segmenter`, `maxLength` set, server-side validation is still the authority.
 - **The rest:** IPC stays in `ipc.ts`, the new commands are in the shell's handler list, and the docs (ADR-0017, the INVARIANTS rows, DESIGN.md) were updated with the change.
+
+## Preview.6 changes review, round 2
+
+**Scope:** fix commit `1b4a5cd` ("Fix preview.6 review round 1 findings"), 13 files, +412/−44. I checked it against round 1's findings P6-1 to P6-9. Besides the diff I read the code it relies on:
+- `upsert_contact`, the `Opened::NewContact` intro path, and core `Account::open`, to see when an intro can come from a known address;
+- `contact_view` / `contacts`, `accept_key_change` / `warned_about`, `dismiss_key_warning`;
+- `verify_current`, `wipe`, `lock_now`, `interruptible`, the `ask!` macro, `retry_failed` / `deliver` and `tick` / `connect`;
+- `finish_purge`, the shell `purge_all`, Settings' `EraseForm`, and App's handling of the `locked` event;
+- the `.reaction` / `.msg-more` / `.sr-only` CSS;
+- the contacts schema and migrations 1 to 4;
+- the preview.5 `react` code, to confirm its placeholder (`git show 4f9b90c^`).
+
+I edited no files.
+
+**Verdict: PASS.** All nine round-1 findings are fixed, including the High (P6-1). The fix code adds no Critical, High or Medium findings. The new findings below are Low, Nit or Info and can be handled as follow-ups.
+
+### Commands run
+
+| Command | Result |
+|---|---|
+| `cargo test -p veil-client --locked` | **pass**: unit 15, attachments 10, contacts_and_privacy 10 (one more than round 1: `a_merge_sends_nothing_sealed_to_the_old_key`), lock_and_setup 3, messaging 7, notifications 4, pair_and_message 2, unlock_options 6, doc 0; 0 failed |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | **pass** (exit 0) |
+| `(cd app/src-tauri && cargo clippy --all-targets --locked -- -D warnings)` | **pass** (exit 0) |
+| `pnpm -C app typecheck` | **pass** (`tsc --noEmit`, exit 0) |
+| `pnpm -C app lint` | **pass** ("lint: 14 files clean") |
+
+I ran no mutation checks: the brief did not allow edits. The commit message says mutation checks were done for P6-2 and P6-5.
+
+### Round-1 findings
+
+| ID | Sev. (r1) | Status | Evidence |
+|---|---|---|---|
+| P6-1 | High | **Fixed** | See the analysis below. |
+| P6-2 | Medium | **Fixed** | `service.rs:1460-1464`: the `Err(e)` arm of `Cmd::PurgeAll` resets `interrupt.pending`. This covers every failure there: `WrongPassphrase`, `RetryLater`, `Locked`, and header or keystore load errors. `unlock_options.rs:321` now calls `create_invite()` (relay I/O) after the wrong PIN. One narrow race remains (P6R2-6, Info). |
+| P6-3 | Medium | **Fixed** | `app.css` no longer has a `.reaction::after` override. `base.css:723` gives the centred `max(100%, var(--tap-min))` × `var(--tap-min)` area. |
+| P6-4 | Low | **Fixed** | Details below. One follow-up on what the user sees (P6R2-1). |
+| P6-5 | Low | **Fixed** | `service.rs:3157`: `gone == 0 && r.emoji == "x"`. The preview.5 placeholder was indeed `"x"` (`4f9b90c^:service.rs:2442`). `messaging.rs:145-154` sends a removal of a dropped emoji (🍕) and checks the three reactions survive, then checks that `"x"` still clears them. |
+| P6-6 | Low | **Fixed** | `app.css:69`: `@media (hover: none) { .msg-more { opacity: 0.55; } }`. `.msg:focus-within .msg-more` has higher specificity, so focus still gives full opacity. |
+| P6-7 | Low | **Fixed (with a weakness)** | `contacts_and_privacy.rs:117-190`. It queues a text, a reaction and a file while offline, merges, and checks `hidden_rows == 0`, text `failed`, file `failed`. The status checks carry the proof; the "neither Bob receives it" checks cannot fail (P6R2-2). |
+| P6-8 | Low | **Fixed** | `Chats.tsx:~400`: the `aria-label` is gone. An `sr-only` prefix ("Quoted message, go to the original: ") is followed by the author and the excerpt, so the button's name includes the quoted text. |
+| P6-9 | Info | **Mostly addressed** | ADR-0017 now covers: what the new key holder can do with merged history, preview.5 interop in both directions, and corrected `user-select` wording ("Veil itself never writes to the clipboard"). Not addressed, acceptable as Info: focus return after a hold-opened dialog, and a UI hint that unsent messages after a merge cannot be resent. |
+
+#### P6-1 in detail
+
+**Can the merge hit the wrong contact through id reuse?** No [HIGH confidence]. The rows behind each step:
+
+1. `contacts.id` is `INTEGER PRIMARY KEY` without `AUTOINCREMENT` (`db.rs:17-18`). SQLite therefore gives a new row `max(rowid)+1`, so a deleted id comes back only if it was the largest id in the table.
+2. The warned contact W always has a larger id than its recorded contact O:
+   - `Opened::NewContact` is produced only for an address the core does not know (`core/src/account.rs:657-704`; known keys yield `Opened::Message`).
+   - `forget_contact` and the contacts row are deleted together, so in practice the `upsert_contact` `ON CONFLICT` branch never runs for an intro. Every warned contact is a new, maximal row.
+   - The clash candidates are only pre-existing rows, ordered by id, so O < W.
+3. While W exists, O can never become the maximum again. After O is deleted, new rows get ids above W, so the recorded id is never reused.
+4. If O is gone, `warned_about` (`service.rs:3746-3774`) returns `None`. It does not fall back to name matching. `accept_key_change` then refuses with `BadInput`, and the UI shows "Veil cannot tell …".
+
+**Can it hit the warned contact itself?** No. The intro excludes it (`address != ?1`), and `warned_about` checks `id != ?2`.
+
+**Only one contact merged?** Yes. `accept_key_change` (`service.rs:3666-3739`) builds `olds` from that single id. The new assertions in `accepting_a_key_change_moves_the_old_conversation` show it:
+- a same-name contact the user kept apart survives;
+- its message stays in its own chat;
+- `previous.id == a_bob.id`.
+
+**Can the confirmation name a contact the user cannot see?** No. `contacts()` lists every row with no filter, and `PreviousView` is read live from the same row the backend merges. The confirmation (`Chats.tsx:82-89`) shows its current name, verified/blocked state and last-message time. "Yes, it's them" is only rendered when `previous` is non-null.
+
+**Legacy warnings (preview.5, `key_warning_of IS NULL`):** they merge only when exactly one other contact has the same name; with two or more, nothing is chosen. Because migration 4 is unreleased, the new column is safe to add there. The fallback has no test (P6R2-3).
+
+#### P6-4 in detail
+
+**Error paths before the secret is verified:** all of them return `Err` with nothing touched, and the shell's `?` (`lib.rs:237`) skips `finish_purge`. These paths are:
+- `self.s()?` (`Locked`);
+- `wait_secs > 0` (`RetryLater`);
+- `header()?`;
+- `keystore::load(..)?`;
+- `record_failure(..)?`;
+- `WrongPassphrase`.
+
+**After verification:** the arm runs `lock_now()`, clears `watcher` and `decoy`, then `Ok(self.wipe().is_ok())`. There is no way to return `Err` after that point.
+
+**Remaining `Err` sources:** only `ask!`'s channel errors. These happen if the actor thread is gone before the command is received, or dies mid-command before replying. Neither is reachable without a panic in the actor; I am noting it, not raising a finding.
+
+### New findings
+
+**P6R2-1 — Low — [HIGH confidence] The "some file could not be deleted" result never reaches the user**
+`app/src-tauri/src/lib.rs:240-244`; `app/src/screens/Settings.tsx:139-145`; `app/src/App.tsx:73-83`.
+- **What happens:** on `Ok(false)` the shell runs `finish_purge` and returns `Err(Storage)`. But `lock_now()` has already emitted `locked`, so App drops back to state routing and `EraseForm` is unmounted. `setError("Could not erase")` lands on an unmounted component.
+- **Effect:** the user sees the welcome screen, or the lock screen if `veil.header` survived, with no explanation. If `keystore::remove` was the step that failed, the PIN may still open the vault, so the user may believe the data is gone when it is not.
+- **Fix:** keep the success path as is. For `false`, have the shell emit a one-off event or return a distinct value, e.g. `Res<bool>`. Show the message on the screen the user lands on, e.g. "Some of Veil's files could not be deleted. Erase again, or remove the app's data in system settings." On the TypeScript side: `const allGone = await ipc.purgeAll(current); onErased(allGone);`.
+
+**P6R2-2 — Low — [HIGH confidence] The "neither Bob receives them" checks in P6-7's test cannot fail**
+`crates/client/tests/contacts_and_privacy.rs:159-182`; `docs/INVARIANTS.md` (INV-ID-2 row).
+- **Why:** `deliver` (`service.rs:2765-2798`) deposits to the mailbox and token of the contact the row belongs to *now*. After the merge that is Bob2. A row that kept its old-key envelope would therefore go into Bob2's mailbox. Bob2 cannot decrypt an envelope sealed to the old session and drops it, and old Bob never sees it.
+- **Effect:** `!got.contains("queued for the old key")`, `bob2 … attachment.is_none()` and the old-Bob text check pass whether or not the fix is present.
+- **What does carry the proof:**
+  - `hidden_rows == 0`;
+  - `q.status == "failed"`: if the envelope were kept, `connect` runs `retry_failed`, the row would be deposited and become `sent`, and this check would fail;
+  - the attachment state `failed`.
+  The claim holds, but the INVARIANTS row credits the test with something it does not observe.
+- **Fix:** either reword the row to "the hidden row is dropped; the text and file stay `failed`, so nothing is deposited". Or make the test observe it: add a deposit counter to the test relay or `Proxy`, take it before `hop.restore()`, and after the "after the merge" round trip assert exactly one deposit to Bob2's mailbox, e.g. `assert_eq!(r.deposits_to(bob2_mailbox) - before, 1)`. A test-only `envelope IS NULL` probe would also do.
+
+**P6R2-3 — Low — [HIGH confidence] `warned_about`'s other branches have no test**
+`crates/client/src/service.rs:3746-3774`.
+- **Covered today:** only the recorded-id path.
+- **Not covered:**
+  - the recorded contact is gone (`previous == None`, `accept_key_change` → `BadInput`, nothing deleted);
+  - the legacy `NULL` fallback with exactly one same-name contact (merges it);
+  - the legacy fallback with two or more (refuses).
+
+  These are the guards that keep P6-1 from coming back for upgraded databases (CLAUDE.md rule 9).
+- **Fix:** extend `db.rs::migrates_a_version_3_database`, or add a unit test on a v3 database:
+  1. Insert three contacts named "Bob" with `key_warning = 1` on the last.
+  2. Migrate, then assert `warned_about(..) == None`.
+  3. Delete one, then assert it is `Some(the other)`.
+
+  For the gone case, add an integration step: delete `a_bob` before accepting, then assert `BadInput` and that `a_other` is still there.
+
+**P6R2-4 — Nit — [MEDIUM confidence] `PreviousView.last_at_ms` counts deleted and expired messages**
+`crates/client/src/service.rs:1914-1916`.
+- **What happens:** `MAX(at_ms)` has no `deleted = 0` filter and no expiry filter, while the contact's own `last` query (`:1898-1906`) has both. A contact whose last message was deleted for everyone, or has expired, shows "last message <time>" for something no longer visible.
+- **Fix:** `(SELECT MAX(at_ms) FROM messages WHERE contact = ?1 AND kind IN ('text','attachment') AND deleted = 0 AND (expires_at_ms IS NULL OR expires_at_ms > ?2))`, with `params![old, now_ms()]`.
+
+**P6R2-5 — Nit — [HIGH confidence] Focus is lost when "It's them…" opens the "cannot tell" variant**
+`app/src/screens/Chats.tsx:82-89`.
+- **What happens:** the `autoFocus` is on "Yes, it's them", which is not rendered when `prev` is null. The "It's them…" button unmounts, so focus falls to `<body>`, and keyboard and screen-reader users lose their place. The verified-state text above also says "their earlier conversation can move here", which is not true in this case.
+- **Fix:** put `autoFocus={!prev}` on the "Not now" button. Optionally, when `prev` is null, skip the confirm step: replace "It's them…" with the "cannot tell" text directly.
+
+**P6R2-6 — Info**
+- **Interrupt race:** the `pending = false` reset in the `PurgeAll` error arm can clear a lock request that `Client::lock()` set while `PurgeAll` was queued.
+  - The `Cmd::Lock` itself still runs.
+  - A relay call queued between the two commands would not be interrupted: a send would block the lock only until the relay call finishes or the auto-lock timer fires. This narrowly weakens P4-1's "the relay cannot delay a lock".
+  - A generation counter, or not setting `pending` before verification in `purge_all`, would close it. The wipe path does not need an in-flight interrupt, because the actor is not mid-I/O while it handles the command.
+- **`key_warning_of` is never cleared:** neither "Keep apart" nor a merge resets it. This is harmless, because only the intro sets `key_warning = 1` and it rewrites both columns. Setting it to `NULL` on dismiss and accept would keep the data tidy.
+- **Two warnings about the same contact:** two warned contacts can point at one old contact (e.g. Bob2 and Bob3 both warned about Bob). Accepting one leaves the other's pointer dangling, so it can only "Keep apart". This is conservative and acceptable, but the "cannot tell" text could say the earlier contact was already merged.
+- **Earlier "Keep apart" choice is not shown:** the confirmation does not say the user once chose "Keep apart" for the previous contact. If the real Bob was deleted earlier, the oldest same-name contact, and so the merge target, may be an impostor the user kept apart. The confirmation names it with "not verified" and its last-message time, which is reasonable. Recording "kept apart" and saying so in the confirmation would make it clearer.
+- **No expected-id check in the merge:** `acceptKeyChange(contact.id)` does not pass the `prev.id` the user saw. With the recorded path the target cannot change. In the legacy path the target could change only if contacts were renamed, deleted or added between render and tap. Passing `prev.id` and refusing on a mismatch would be cheap defence in depth.
+
+### What is good
+- **P6-1 is fixed at the root:** the warning records its target when it is raised, the merge touches exactly that row, and every failure refuses rather than guessing (gone → refuse, ambiguous legacy → refuse). The confirmation shows exactly the row that would be merged, so the dialog and the backend cannot disagree. The new test covers the round-1 scenario directly (a same-name contact kept apart survives with its messages).
+- **`purge_all`'s `Result<bool>` contract is clean:** every `Err` comes before verification and nothing has been touched; after verification there is no error, so the shell's `?` only stops on errors where nothing was erased. The Keystore key and webview storage are now cleared exactly when the Purge PIN path would clear them.
+- **P6-5 is the minimal correct fix:** it matches the real preview.5 placeholder, and its regression test also checks that the placeholder still clears all of that person's reactions.
+- **P6-3 removes the bad override:** the base rule is used instead of a second partial reset.
+- **The P6-7 test checks rows, not only messages:** it sets up the queue genuinely offline through the proxy, covers text, reaction and upload, and asserts on persisted state. The reconnect runs `retry_failed`, so a regression in the envelope handling would make it fail.
+- **Docs kept in step:** ADR-0017, the INV-ID-2 row and the commit message were updated with the fixes, and the commit body explains each change.
+- **All gates are green:** tests, both clippy runs, typecheck and lint.

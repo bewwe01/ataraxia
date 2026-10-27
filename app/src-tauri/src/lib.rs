@@ -232,21 +232,18 @@ async fn reset(c: State<'_, Client>) -> Res<()> {
 /// "Erase everything" in Settings: the Purge PIN's effect, after the user confirmed with the
 /// current PIN or password. Veil is new afterwards.
 #[tauri::command]
-async fn purge_all(app: AppHandle, c: State<'_, Client>, current: Zeroizing<String>) -> Res<()> {
+async fn purge_all(app: AppHandle, c: State<'_, Client>, current: Zeroizing<String>) -> Res<bool> {
     // An error: the PIN or password was not confirmed, and nothing was touched.
     let all_gone = c.purge_all(current).await.map_err(err)?;
     // Confirmed: the rest goes even if deleting a file failed, as with the Purge PIN (P6-4).
+    // `false` reaches the screen Veil lands on (P6R2-1).
     finish_purge(&app).await;
-    if all_gone {
-        Ok(())
-    } else {
-        Err(err(ClientError::Storage))
-    }
+    Ok(all_gone)
 }
 
 #[tauri::command]
-async fn accept_key_change(c: State<'_, Client>, contact: i64) -> Res<()> {
-    c.accept_key_change(contact).await.map_err(err)
+async fn accept_key_change(c: State<'_, Client>, contact: i64, previous: i64) -> Res<()> {
+    c.accept_key_change(contact, previous).await.map_err(err)
 }
 
 #[tauri::command]

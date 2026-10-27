@@ -1,3 +1,4 @@
+import { ERASE_INCOMPLETE, eraseWasIncomplete } from "../notices";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ipc, IpcError, type SecretKind, type UnlockInfo } from "../ipc";
 import { Banner, Icon, Logo, SecretField, Segmented } from "../ui";
@@ -44,6 +45,7 @@ export function Setup({ onDone }: { onDone: () => void }) {
             <h1 className="onb-title">Veil</h1>
             <p className="muted">Private messages through a relay you choose. No phone number, no account, no directory.</p>
           </div>
+          {eraseWasIncomplete() ? <Banner tone="warning" icon="alert-triangle"><p>{ERASE_INCOMPLETE}</p></Banner> : null}
           <div className="onb-actions">
             <button className="btn btn-primary btn-block" type="button" onClick={() => setStep("honest")}>
               Get started
@@ -239,6 +241,7 @@ export function Unlock({ onDone }: { onDone: () => void }) {
             <Banner tone="warning" icon="clock"><p>Too many wrong attempts. Try again in {wait < 60 ? `${wait} s` : `${Math.ceil(wait / 60)} min`}.</p></Banner>
           ) : null}
           {error && wait <= 0 ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
+          {eraseWasIncomplete() ? <Banner tone="warning" icon="alert-triangle"><p>{ERASE_INCOMPLETE}</p></Banner> : null}
           <button className="btn btn-primary btn-block" type="submit" disabled={busy || !pass}>{busy ? "Unlocking…" : "Unlock"}</button>
           {info?.biometric ? (
             <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => void biometric()}>

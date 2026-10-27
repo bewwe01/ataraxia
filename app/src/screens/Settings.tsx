@@ -1,3 +1,4 @@
+import { noteEraseIncomplete } from "../notices";
 import { useEffect, useState, type FormEvent } from "react";
 import { ipc, IpcError, type Me, type NativeInfo, type NotifySettings, type PrivacyView, type SecretKind, type SecurityView } from "../ipc";
 import { applyAppearance, loadAppearance, type Accent, type Appearance, type Mode, type Style } from "../settings";
@@ -137,7 +138,7 @@ function EraseForm({ sec, native, onErased, onCancel }: { sec: SecurityView; nat
     setBusy(true);
     setError(null);
     try {
-      await ipc.purgeAll(current);
+      if (!(await ipc.purgeAll(current))) noteEraseIncomplete();
       onErased();
     } catch (err) {
       setError(errText(err, "Could not erase"));

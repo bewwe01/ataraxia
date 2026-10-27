@@ -109,6 +109,29 @@ async fn lookalike_name_gets_a_key_warning() {
         !c.iter().find(|c| c.id == a_imp2.id).unwrap().verified,
         "dismissing is not verifying"
     );
+
+    // The contact a warning is about is gone: nothing to merge, nothing guessed (P6R2-3).
+    alice.client.delete_contact(a_bob.id).await.unwrap();
+    let c = alice.client.contacts().await.unwrap();
+    let imp = c.iter().find(|c| c.id == a_imp.id).unwrap();
+    assert!(imp.key_warning && imp.previous.is_none());
+    assert_eq!(
+        alice
+            .client
+            .accept_key_change(a_imp.id, a_bob.id)
+            .await
+            .unwrap_err(),
+        ClientError::BadInput
+    );
+    assert!(
+        alice
+            .client
+            .contacts()
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.id == a_imp.id)
+    );
 }
 
 /// Nothing that was waiting to go to the old key is sent after a merge (P6-7): hidden rows go,
@@ -150,7 +173,7 @@ async fn a_merge_sends_nothing_sealed_to_the_old_key() {
         .await
         .unwrap();
     assert!(alice.client.hidden_rows(a_bob.id).await.unwrap() > 0);
-    alice.client.accept_key_change(a_bob2.id).await.unwrap();
+    alice.client.accept_key_change(a_bob2.id, a_bob.id).await.unwrap();
     assert_eq!(
         alice.client.hidden_rows(a_bob2.id).await.unwrap(),
         0,
@@ -204,7 +227,11 @@ async fn accepting_a_key_change_moves_the_old_conversation() {
     arrives(&alice.client, a_bob.id, "before the new phone").await;
     alice.client.send(a_bob.id, "my answer".into()).await.unwrap();
     assert_eq!(
-        alice.client.accept_key_change(a_bob.id).await.unwrap_err(),
+        alice
+            .client
+            .accept_key_change(a_bob.id, a_bob.id)
+            .await
+            .unwrap_err(),
         ClientError::BadInput,
         "only after a warning"
     );
@@ -234,7 +261,16 @@ async fn accepting_a_key_change_moves_the_old_conversation() {
         .find(|c| c.id == a_bob2.id)
         .unwrap();
     assert_eq!(warned.previous.as_ref().map(|p| p.id), Some(a_bob.id));
-    alice.client.accept_key_change(a_bob2.id).await.unwrap();
+    // Only the contact the confirmation named is accepted (P6R2-6).
+    assert_eq!(
+        alice
+            .client
+            .accept_key_change(a_bob2.id, a_other.id)
+            .await
+            .unwrap_err(),
+        ClientError::BadInput
+    );
+    alice.client.accept_key_change(a_bob2.id, a_bob.id).await.unwrap();
     let c = alice.client.contacts().await.unwrap();
     let ids: Vec<i64> = c.iter().map(|c| c.id).collect();
     assert!(

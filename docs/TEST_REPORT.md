@@ -2,6 +2,43 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Preview.6: gestures, three reactions, key-change merge, Erase everything (2026-10-27)
+
+ADR-0017, after the owner's device test of preview.5. Review gate, both reports in REVIEW_REPORT.md:
+- **Round 1: FAIL.** P6-1 High: "It's them" merged every same-name contact, including one kept apart. There were also two Mediums and five Lows. All are fixed in 1b4a5cd.
+- **Round 2: PASS.** Its Lows, nits and notes (P6R2-1 to P6R2-6) are fixed in the commit after it.
+
+```text
+$ cargo fmt --all --check                                          # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings   # exit 0
+$ (app/src-tauri) cargo clippy --all-targets --locked -- -D warnings; cargo test --locked   # exit 0; 3 passed
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build            # 0 errors; lint: 15 files clean; built
+$ (design/tools) node check.mjs                                    # PASS
+$ cargo test -p veil-client --locked
+  unit 16 | attachments 10 | contacts_and_privacy 10 | lock_and_setup 3 | messaging 7
+  notifications 4 | pair_and_message 2 | unlock_options 6     all ok
+```
+
+New or extended tests:
+- `messaging::replies_reactions_edits_and_deletes`: three reactions each, a fourth refused, removal one at a time, and preview.5 compatibility (the newest three kept; only the "x" placeholder clears all).
+- `contacts_and_privacy::accepting_a_key_change_moves_the_old_conversation`: only the warned-about contact is merged; a same-name contact kept apart survives; a different contact id is refused.
+- `a_merge_sends_nothing_sealed_to_the_old_key`.
+- `lookalike_name_gets_a_key_warning`: the warned-about contact is deleted, and nothing merges.
+- `service::tests::legacy_warnings_merge_only_an_unambiguous_contact`.
+- `unlock_options::erase_everything_from_settings`: a wrong PIN changes nothing and the relay still answers; the right one leaves Veil new.
+- `db::tests::migrates_a_version_3_database`.
+
+Mutation checks, each by editing the code, running the test and restoring:
+
+| Mutation | Test | Result |
+|---|---|---|
+| wrong PIN leaves relay traffic stopped (round-1 code) | `erase_everything_from_settings` | fails |
+| any unknown removal clears all reactions | `replies_reactions_edits_and_deletes` | fails |
+
+UI: the chat, the actions dialog (by "⋯" and by a hold), the custom emoji field, a half-done swipe, the key-warning confirmation and the three erase steps were rendered with a mocked IPC in headless Chromium at 411×923 px, in dark and light. No overflow remained after fixing the emoji field. The only targets under 44 px are reaction chips, which carry the 44 px hit area from `base.css`.
+
+Not verified: nothing here ran on a phone. Gestures need a device: hold, swipe and the Android context menu.
+
 ## Milestones 2–4: everyday messaging, attachments, notifications (2026-10-26)
 
 ADR-0014 (replies, reactions, edit and delete, search, QR scanning, verify by scan), ADR-0015 (photos, files, voice notes), ADR-0016 (content-free notifications). Review gate, all reports in REVIEW_REPORT.md:

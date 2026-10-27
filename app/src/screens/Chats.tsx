@@ -69,7 +69,7 @@ export function KeyWarning({ contact, nav, onChanged }: { contact: ContactView; 
         {confirm ? null : contact.verified ? (
           <>
             <strong>Safety number verified.</strong>
-            <p>Is this the {contact.name} you talked to before? Then their earlier conversation can move here.</p>
+            <p>{prev ? `Is this the ${contact.name} you talked to before? Then their earlier conversation can move here.` : "Keep this contact apart from the earlier one, or delete the one you no longer need."}</p>
           </>
         ) : (
           <>
@@ -88,8 +88,8 @@ export function KeyWarning({ contact, nav, onChanged }: { contact: ContactView; 
               <p id={`kw-q-${contact.id}`}>Veil cannot tell which earlier contact this would replace (there is more than one, or it is gone). Keep them apart, or delete the one you no longer need.</p>
             )}
             <div className="banner-actions">
-              {prev ? <button className="btn btn-primary" type="button" autoFocus disabled={busy} onClick={() => void act(() => ipc.acceptKeyChange(contact.id))}>Yes, it's them</button> : null}
-              <button className="btn btn-secondary" type="button" disabled={busy} onClick={() => setConfirm(false)}>Not now</button>
+              {prev ? <button className="btn btn-primary" type="button" autoFocus disabled={busy} onClick={() => void act(() => ipc.acceptKeyChange(contact.id, prev.id))}>Yes, it's them</button> : null}
+              <button className="btn btn-secondary" type="button" autoFocus={!prev} disabled={busy} onClick={() => setConfirm(false)}>Not now</button>
             </div>
           </div>
         ) : (

@@ -240,9 +240,10 @@ export const ipc = {
   /** Deletes the identity, contacts, messages and device secret. Cannot be undone. */
   reset: () => call<void>("reset"),
   /** "Erase everything" (Settings): the Purge PIN's effect, after the current PIN or password. */
-  purgeAll: (current: string) => call<void>("purge_all", { current }),
+  /** Resolves `false` if some file could not be deleted (the rest was erased anyway). */
+  purgeAll: (current: string) => call<boolean>("purge_all", { current }),
   /** After a key-change warning: move the earlier conversation here, remove the old contact. */
-  acceptKeyChange: (contact: number) => call<void>("accept_key_change", { contact }),
+  acceptKeyChange: (contact: number, previous: number) => call<void>("accept_key_change", { contact, previous }),
   me: () => call<Me>("me"),
   contacts: () => call<ContactView[]>("contacts"),
   messages: (contact: number) => call<MessageView[]>("messages", { contact }),
