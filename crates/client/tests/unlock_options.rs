@@ -303,3 +303,24 @@ async fn start_over_after_purge_gives_a_working_vault() {
         UnlockOutcome::Unlocked
     );
 }
+
+/// "Erase everything" in Settings: the Purge PIN's effect, behind the current PIN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn erase_everything_from_settings() {
+    let r = relay().await;
+    let d = tempfile::tempdir().unwrap();
+    let c = setup(&r, d.path(), SecretKind::Pin, "482913").await;
+    c.create_invite().await.unwrap();
+    // A wrong PIN changes nothing (and counts as a failed attempt).
+    assert_eq!(
+        c.purge_all(z("000000")).await.unwrap_err(),
+        ClientError::WrongPassphrase
+    );
+    assert_eq!(c.state().await.unwrap(), AppState::Unlocked);
+    assert!(!files(d.path()).is_empty());
+    // Something else in the folder is not Veil's to delete (review U-1).
+    std::fs::create_dir(d.path().join("app_webview")).unwrap();
+    c.purge_all(z("482913")).await.unwrap();
+    assert_eq!(files(d.path()), vec!["app_webview".to_owned()]);
+    assert_eq!(c.state().await.unwrap(), AppState::New, "Veil starts afresh");
+}

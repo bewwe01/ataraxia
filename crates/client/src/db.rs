@@ -103,6 +103,17 @@ const MIGRATIONS: &[&str] = &[
        data BLOB NOT NULL,
        PRIMARY KEY (message, idx)
      );",
+    // 4: up to three reactions per person on a message, in the order they were added.
+    "CREATE TABLE reactions_v4 (
+       message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+       mine INTEGER NOT NULL,
+       emoji TEXT NOT NULL,
+       at_ms INTEGER NOT NULL DEFAULT 0,
+       PRIMARY KEY (message, mine, emoji)
+     ) WITHOUT ROWID;
+     INSERT INTO reactions_v4 (message, mine, emoji) SELECT message, mine, emoji FROM reactions;
+     DROP TABLE reactions;
+     ALTER TABLE reactions_v4 RENAME TO reactions;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -378,6 +389,62 @@ mod tests {
             .query_row("SELECT count(*) FROM reactions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 0, "reactions cascade with their message");
+    }
+
+    /// A preview.5 vault (version 3) keeps its reactions and then takes several per person.
+    #[test]
+    fn migrates_a_version_3_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("veil.db");
+        let key = [7u8; 32];
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex(&key).as_str()))
+                .unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            for m in &MIGRATIONS[..3] {
+                conn.execute_batch(&format!("BEGIN; {m} COMMIT;")).unwrap();
+            }
+            conn.execute_batch("PRAGMA user_version = 3;").unwrap();
+            conn.execute(
+                "INSERT INTO contacts (address, name, mailbox, token, my_token, added_ms)
+                 VALUES ('a', 'Old', x'00', x'00', x'00', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (contact, mine, body, at_ms, status, msg_id) VALUES (1, 0, 'hi', 1, 'received', x'01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO reactions (message, mine, emoji) VALUES (1, 0, 'a')",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path, &key).unwrap();
+        let c = db.conn();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(usize::try_from(v).unwrap(), MIGRATIONS.len());
+        c.execute(
+            "INSERT INTO reactions (message, mine, emoji) VALUES (1, 0, 'b')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM reactions WHERE message = 1 AND mine = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "the old reaction is kept and a second one fits");
+        c.execute("DELETE FROM messages WHERE id = 1", []).unwrap();
+        let left: i64 = c
+            .query_row("SELECT count(*) FROM reactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "still cascades");
     }
 
     /// `apply` nests inside an outer savepoint: the outer rollback undoes it, the outer release

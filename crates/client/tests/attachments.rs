@@ -125,7 +125,7 @@ async fn files_photos_and_voice_notes_round_trip() {
     assert_eq!(c[0].last_text.as_deref(), Some("🎤 Voice message"));
 
     // Reactions and replies work on attachments; edits do not.
-    alice.client.react(v.id, Some("👍".into())).await.unwrap();
+    alice.client.react(v.id, "👍".into(), true).await.unwrap();
     let reply = alice.client.reply(a_bob.id, "nice".into(), pic.id).await.unwrap();
     assert_eq!(reply.reply.unwrap().text, "📎 Attachment");
     assert_eq!(

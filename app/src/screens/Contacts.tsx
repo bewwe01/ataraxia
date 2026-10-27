@@ -226,7 +226,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
 
           <div className="field">
             <span className="label">Disappearing messages</span>
-            <div className="input">
+            <div className="input select-field">
             <select
               className="select"
               aria-label="Disappearing messages"
@@ -237,6 +237,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
               {TIMERS.some(([s]) => s === contact.timerSecs) ? null : <option value={contact.timerSecs}>{timerName(contact.timerSecs)}</option>}
               {TIMERS.map(([s, label]) => <option key={s} value={s}>{label}</option>)}
             </select>
+            <Icon name="chevron-down" className="select-chevron" />
             </div>
             <p className="hint">Applies to both of you, for new messages. They are deleted from both phones that long after they arrive. Anyone can still copy or photograph them before that.</p>
           </div>

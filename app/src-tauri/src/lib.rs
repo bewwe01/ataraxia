@@ -229,6 +229,20 @@ async fn reset(c: State<'_, Client>) -> Res<()> {
     c.reset().await.map_err(err)
 }
 
+/// "Erase everything" in Settings: the Purge PIN's effect, after the user confirmed with the
+/// current PIN or password. Veil is new afterwards.
+#[tauri::command]
+async fn purge_all(app: AppHandle, c: State<'_, Client>, current: Zeroizing<String>) -> Res<()> {
+    c.purge_all(current).await.map_err(err)?;
+    finish_purge(&app).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn accept_key_change(c: State<'_, Client>, contact: i64) -> Res<()> {
+    c.accept_key_change(contact).await.map_err(err)
+}
+
 #[tauri::command]
 async fn me(c: State<'_, Client>) -> Res<MeView> {
     c.me().await.map_err(err)
@@ -255,8 +269,8 @@ async fn reply(c: State<'_, Client>, contact: i64, text: String, to: i64) -> Res
 }
 
 #[tauri::command]
-async fn react(c: State<'_, Client>, message: i64, emoji: Option<String>) -> Res<()> {
-    c.react(message, emoji).await.map_err(err)
+async fn react(c: State<'_, Client>, message: i64, emoji: String, on: bool) -> Res<()> {
+    c.react(message, emoji, on).await.map_err(err)
 }
 
 #[tauri::command]
@@ -656,6 +670,8 @@ pub fn run() {
             set_dark_bars,
             touch,
             reset,
+            purge_all,
+            accept_key_change,
             me,
             contacts,
             messages,

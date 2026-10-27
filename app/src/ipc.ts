@@ -237,13 +237,17 @@ export const ipc = {
   touch: () => call<void>("touch"),
   /** Deletes the identity, contacts, messages and device secret. Cannot be undone. */
   reset: () => call<void>("reset"),
+  /** "Erase everything" (Settings): the Purge PIN's effect, after the current PIN or password. */
+  purgeAll: (current: string) => call<void>("purge_all", { current }),
+  /** After a key-change warning: move the earlier conversation here, remove the old contact. */
+  acceptKeyChange: (contact: number) => call<void>("accept_key_change", { contact }),
   me: () => call<Me>("me"),
   contacts: () => call<ContactView[]>("contacts"),
   messages: (contact: number) => call<MessageView[]>("messages", { contact }),
   send: (contact: number, text: string) => call<MessageView>("send", { contact, text }),
   reply: (contact: number, text: string, to: number) => call<MessageView>("reply", { contact, text, to }),
-  /** Sets our reaction, or removes it with `null`. */
-  react: (message: number, emoji: string | null) => call<void>("react", { message, emoji }),
+  /** Adds (`on`) or removes one of our reactions; up to 3 different ones per message. */
+  react: (message: number, emoji: string, on: boolean) => call<void>("react", { message, emoji, on }),
   editMessage: (message: number, text: string) => call<void>("edit_message", { message, text }),
   deleteForEveryone: (message: number) => call<void>("delete_for_everyone", { message }),
   deleteForMe: (message: number) => call<void>("delete_for_me", { message }),

@@ -78,45 +78,79 @@ async fn replies_reactions_edits_and_deletes() {
         ClientError::BadInput
     );
 
-    // Reactions: one per person, changeable and removable, on either side's messages.
-    alice
-        .client
-        .react(q_at_alice.id, Some("👍".into()))
-        .await
-        .unwrap();
-    bob.client.react(q.id, Some("❤️".into())).await.unwrap();
-    eventually(|| async {
-        let m = by_id(&bob.client, b_alice.id, q.id).await?;
-        (m.reactions.len() == 2).then_some(())
-    })
-    .await;
-    alice
-        .client
-        .react(q_at_alice.id, Some("😂".into()))
-        .await
-        .unwrap();
-    eventually(|| async {
-        let m = by_id(&bob.client, b_alice.id, q.id).await?;
-        m.reactions
+    // Reactions: up to three different ones each, added and removed one by one, on either
+    // side's messages.
+    let theirs = |m: &MessageView| {
+        let mut v: Vec<String> = m
+            .reactions
             .iter()
-            .any(|x| !x.mine && x.emoji == "😂")
+            .filter(|x| !x.mine)
+            .map(|x| x.emoji.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    let react = |e: &str, on: bool| alice.client.react(q_at_alice.id, e.into(), on);
+    react("👍", true).await.unwrap();
+    bob.client.react(q.id, "❤️".into(), true).await.unwrap();
+    react("😂", true).await.unwrap();
+    react("🎉", true).await.unwrap();
+    react("👍", true).await.unwrap(); // already there: nothing happens
+    assert_eq!(
+        react("🔥", true).await.unwrap_err(),
+        ClientError::TooManyReactions
+    );
+    eventually(|| async {
+        let m = by_id(&bob.client, b_alice.id, q.id).await?;
+        (theirs(&m) == ["🎉", "👍", "😂"] && m.reactions.iter().any(|x| x.mine && x.emoji == "❤️"))
             .then_some(())
     })
     .await;
-    alice.client.react(q_at_alice.id, None).await.unwrap();
+    react("👍", false).await.unwrap();
     eventually(|| async {
         let m = by_id(&bob.client, b_alice.id, q.id).await?;
-        (m.reactions.len() == 1 && m.reactions[0].mine).then_some(())
+        (theirs(&m) == ["🎉", "😂"]).then_some(())
     })
     .await;
     assert_eq!(
-        alice
-            .client
-            .react(q_at_alice.id, Some("not an emoji at all".into()))
-            .await
-            .unwrap_err(),
+        react("not an emoji at all", true).await.unwrap_err(),
         ClientError::BadInput
     );
+    // An older Veil (one reaction each): a new reaction is added, the newest three are kept,
+    // and its removal (a placeholder emoji) clears all of its reactions.
+    let target = alice.client.msg_id(q_at_alice.id).await.unwrap();
+    let old = |emoji: &str, remove: bool| {
+        Body::Reaction(Reaction {
+            target_id: target.clone(),
+            emoji: emoji.into(),
+            remove,
+        })
+    };
+    for (n, e) in ["🍕", "🍔", "🌮", "🍜"].iter().enumerate() {
+        bob.client
+            .raw_send(
+                b_alice.id,
+                vec![200 + u8::try_from(n).unwrap(); 16],
+                old(e, false),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    eventually(|| async {
+        let m = by_id(&alice.client, a_bob.id, q_at_alice.id).await?;
+        (theirs(&m) == ["🌮", "🍔", "🍜"]).then_some(())
+    })
+    .await;
+    bob.client
+        .raw_send(b_alice.id, vec![210; 16], old("x", true))
+        .await
+        .unwrap();
+    eventually(|| async {
+        let m = by_id(&alice.client, a_bob.id, q_at_alice.id).await?;
+        theirs(&m).is_empty().then_some(())
+    })
+    .await;
 
     // Edit: only one's own messages, shown as edited on both sides.
     bob.client
@@ -406,7 +440,7 @@ async fn editing_an_unsent_message() {
     let m = alice.client.send(a_bob.id, "first draft".into()).await.unwrap();
     assert_eq!(m.status, "failed");
     assert_eq!(
-        alice.client.react(m.id, Some("👍".into())).await.unwrap_err(),
+        alice.client.react(m.id, "👍".into(), true).await.unwrap_err(),
         ClientError::NotSentYet
     );
     alice

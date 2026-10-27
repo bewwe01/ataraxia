@@ -305,6 +305,33 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 
 **Not done.** Notifications on desktop beyond the taskbar flash; delivery after the user swipes Veil away without the background option (Android stops it); unread counts in the notification.
 
+### ADR-0017: Message gestures, three reactions, accepting a key change, Erase everything (preview.6). **Accepted (owner request after testing preview.5, 2026-10-27).**
+**Context.** The owner tested preview.5 on a phone and asked for these changes:
+- swipe to reply, with the quote linked to the original;
+- press and hold for a message's actions, with the message shown in the menu;
+- up to three reactions per person, attached to the message;
+- a way to wipe Veil from Settings, not only with the Purge PIN;
+- an end to the old contact lingering after a key change was accepted.
+
+**Decision.**
+- *Gestures (`app/src/gestures.ts`):* press and hold (450 ms) or right-click opens the actions; a mostly horizontal swipe to the right of at least 56 px starts a reply. The bubble takes horizontal moves only (`touch-action: pan-y`), so vertical scrolling stays native. Bubbles are not selectable: there is no copy, because plaintext never goes to the clipboard (rule 6). A "⋯" button gives keyboard and screen-reader users the same actions; it shows on hover or focus.
+- *Quotes* are buttons: tapping one scrolls to the original and highlights it, or says it is older than the loaded messages. The action dialog starts with the message it acts on (author, time, a three-line excerpt or what the attachment is).
+- *Reactions:* up to 3 different ones per person per message (`MAX_REACTIONS`), each added or removed on its own. The wire format is unchanged: a `Reaction` names one emoji and `remove`, and the reactions table gains `emoji` in its key (migration 4). Compatibility with preview.5: an older Veil adds one at a time and never removes the one it replaces, so the receiver keeps its newest three. Its removal names a placeholder, so a removal of an emoji the receiver does not have clears all of that person's reactions. Besides six quick picks, any single emoji can be typed with the keyboard's emoji key. A chip under the message toggles one's own reaction with that emoji.
+- *Accepting a key change:* the warning stays until the user chooses, verified or not.
+  - "It's them" (with a confirmation step) moves the earlier conversation to the new contact and deletes the old contact, like Delete: its session is forgotten and its delivery token withdrawn.
+  - Whatever was queued for the old key was sealed to it and is not sent on. Hidden rows are dropped; the user's unsent messages and uploads stay, marked "not sent".
+  - "Keep apart" leaves both, as before. INV-ID-2 holds: nothing merges without the user.
+- *Erase everything:* Settings → Erase, in three steps: tick "cannot be undone", type ERASE, enter the current PIN or password. It runs the Purge PIN's wipe, including the Android Keystore key and the webview storage. A wrong PIN or password counts as a failed attempt. Veil shows the welcome screen afterwards; unlike the Purge PIN there is no decoy, because the user is the one asking.
+- *Look and feel:*
+  - No tap-highlight flash.
+  - Focus rings no longer change an element's corners.
+  - Hover effects only where there is hover.
+  - Pressed states on rows and icon buttons.
+  - Thin, themed scrollbars, and a themed dropdown with its own chevron.
+  - The same edits are in `design/proto/base.css`.
+
+**Costs.** Swipes and holds are invisible affordances; the "⋯" button and the dialog's Reply keep everything reachable without them. A merged conversation cannot be split again.
+
 ## 7. Distribution (recorded owner request)
 
 The final step, after all phases pass the code-reviewer gate, is a GitHub Actions workflow that builds the Android **APK** and publishes it to this repository's **GitHub Releases**. Details:

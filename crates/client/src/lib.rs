@@ -57,6 +57,8 @@ pub enum ClientError {
     TooLate,
     #[error("This is not a Veil safety code")]
     NotAVerifyCode,
+    #[error("Up to 3 reactions per message")]
+    TooManyReactions,
     #[error("Unknown contact")]
     UnknownContact,
     #[error("Message failed")]

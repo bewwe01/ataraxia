@@ -70,6 +70,8 @@ const TYPING_RESEND: Duration = Duration::from_secs(4);
 const TYPING_STALE_MS: i64 = 15_000;
 /// Own messages can be edited or deleted for everyone this long after sending.
 pub const EDIT_WINDOW_MS: i64 = 24 * 3600 * 1000;
+/// Different reactions one person may put on a message.
+pub const MAX_REACTIONS: i64 = 3;
 /// An edit or delete from a contact is applied only to a message received this recently.
 const PEER_EDIT_WINDOW_MS: i64 = 48 * 3600 * 1000;
 /// Search terms shorter than this match too much to be useful.
@@ -326,7 +328,7 @@ enum Cmd {
     Contacts(Reply<Vec<ContactView>>),
     Messages(i64, Reply<Vec<MessageView>>),
     Send(i64, String, Option<i64>, Reply<MessageView>),
-    React(i64, Option<String>, Reply<()>),
+    React(i64, String, bool, Reply<()>),
     EditMessage(i64, String, Reply<()>),
     DeleteForEveryone(i64, Reply<()>),
     DeleteForMe(i64, Reply<()>),
@@ -361,6 +363,8 @@ enum Cmd {
     SetBlocked(i64, bool, Reply<()>),
     SetTimer(i64, u32, Reply<()>),
     DismissKeyWarning(i64, Reply<()>),
+    AcceptKeyChange(i64, Reply<()>),
+    PurgeAll(Zeroizing<String>, Reply<()>),
     Privacy(Reply<PrivacyView>),
     SetPrivacy(PrivacyView, Reply<()>),
     Typing(i64, bool, Reply<()>),
@@ -563,6 +567,14 @@ impl Client {
         self.interrupt.notify.notify_waiters();
         ask!(self, Reset)
     }
+    /// Erases everything, like the Purge PIN, from Settings: checks the current PIN or
+    /// password, then deletes the identity, contacts, messages and device secret. Veil is new
+    /// afterwards. Cannot be undone.
+    pub async fn purge_all(&self, current: Zeroizing<String>) -> Result<()> {
+        self.interrupt.pending.store(true, Ordering::SeqCst);
+        self.interrupt.notify.notify_waiters();
+        ask!(self, PurgeAll, current)
+    }
     pub async fn me(&self) -> Result<MeView> {
         ask!(self, Me)
     }
@@ -579,9 +591,10 @@ impl Client {
     pub async fn reply(&self, contact: i64, text: String, to: i64) -> Result<MessageView> {
         ask!(self, Send, contact, text, Some(to))
     }
-    /// Sets our reaction on a message, or removes it with `None`. One reaction per person.
-    pub async fn react(&self, message: i64, emoji: Option<String>) -> Result<()> {
-        ask!(self, React, message, emoji)
+    /// Adds (`on`) or removes one of our reactions on a message. Up to
+    /// [`MAX_REACTIONS`] different ones per person.
+    pub async fn react(&self, message: i64, emoji: String, on: bool) -> Result<()> {
+        ask!(self, React, message, emoji, on)
     }
     /// Changes the text of one of our messages, for both sides (within [`EDIT_WINDOW_MS`]).
     pub async fn edit_message(&self, message: i64, text: String) -> Result<()> {
@@ -701,6 +714,13 @@ impl Client {
     }
     pub async fn dismiss_key_warning(&self, contact: i64) -> Result<()> {
         ask!(self, DismissKeyWarning, contact)
+    }
+    /// The user is sure the contact with the new safety number is the person they knew under
+    /// that name: the earlier conversation moves to it and the old contact is deleted (its
+    /// session ends, its delivery token is withdrawn). Only after a key-change warning, and
+    /// only by the user's choice (INV-ID-2).
+    pub async fn accept_key_change(&self, contact: i64) -> Result<()> {
+        ask!(self, AcceptKeyChange, contact)
     }
     pub async fn privacy(&self) -> Result<PrivacyView> {
         ask!(self, Privacy)
@@ -1207,6 +1227,7 @@ impl Actor {
                 | Cmd::SetBlocked(..)
                 | Cmd::SetTimer(..)
                 | Cmd::DismissKeyWarning(..)
+                | Cmd::AcceptKeyChange(..)
                 | Cmd::SetPrivacy(..)
                 | Cmd::Typing(..)
         ) {
@@ -1281,8 +1302,8 @@ impl Actor {
                 let res = self.send(c, &t, to).await;
                 let _ = r.send(res);
             }
-            Cmd::React(m, e, r) => {
-                let res = self.react(m, e).await;
+            Cmd::React(m, e, on, r) => {
+                let res = self.react(m, e, on).await;
                 let _ = r.send(res);
             }
             Cmd::EditMessage(m, t, r) => {
@@ -1405,6 +1426,24 @@ impl Actor {
             }
             Cmd::SetTimer(c, t, r) => {
                 let res = self.set_timer(c, t).await;
+                let _ = r.send(res);
+            }
+            Cmd::AcceptKeyChange(c, r) => {
+                let res = self.accept_key_change(c).await;
+                let _ = r.send(res);
+            }
+            Cmd::PurgeAll(cur, r) => {
+                // A wrong PIN or password counts as a failed attempt, as anywhere else.
+                let res = self.verify_current(&cur).map(|_| ());
+                let res = match res {
+                    Ok(()) => {
+                        self.lock_now();
+                        self.watcher = None;
+                        self.decoy = None;
+                        self.wipe()
+                    }
+                    Err(e) => Err(e),
+                };
                 let _ = r.send(res);
             }
             Cmd::DismissKeyWarning(c, r) => {
@@ -1896,7 +1935,8 @@ impl Actor {
         let mut out = stmt
             .query_map([contact], message_row)?
             .collect::<core::result::Result<Vec<_>, _>>()?;
-        let mut react = conn.prepare("SELECT emoji, mine FROM reactions WHERE message = ?1 ORDER BY mine")?;
+        let mut react =
+            conn.prepare("SELECT emoji, mine FROM reactions WHERE message = ?1 ORDER BY at_ms, mine")?;
         for m in &mut out {
             if m.kind == "attachment" {
                 m.attachment = self.attachment_view(m.id)?;
@@ -1980,8 +2020,9 @@ impl Actor {
 
     fn set_verified(&self, contact: i64, v: bool) -> Result<()> {
         let n = self.s()?.db.conn().execute(
-            "UPDATE contacts SET verified = ?2, key_warning = CASE WHEN ?2 THEN 0 ELSE key_warning END
-             WHERE id = ?1",
+            // The key-change warning stays until the user decides what to do with the old
+            // conversation (accept or keep apart), verified or not.
+            "UPDATE contacts SET verified = ?2 WHERE id = ?1",
             params![contact, v],
         )?;
         if n == 0 {
@@ -2327,7 +2368,7 @@ impl Actor {
         )?;
         m.reactions = conn
             .conn()
-            .prepare("SELECT emoji, mine FROM reactions WHERE message = ?1 ORDER BY mine")?
+            .prepare("SELECT emoji, mine FROM reactions WHERE message = ?1 ORDER BY at_ms, mine")?
             .query_map([id], |r| {
                 Ok(ReactionView {
                     emoji: r.get(0)?,
@@ -2426,7 +2467,7 @@ impl Actor {
         )?)
     }
 
-    async fn react(&mut self, message: i64, emoji: Option<String>) -> Result<()> {
+    async fn react(&mut self, message: i64, emoji: String, on: bool) -> Result<()> {
         let (contact, mine, msg_id, _, deleted) = self.text_row(message)?;
         if deleted {
             return Err(ClientError::BadInput);
@@ -2436,11 +2477,11 @@ impl Actor {
         if mine && pending {
             return Err(ClientError::NotSentYet);
         }
-        let emoji = emoji.map(|e| e.trim().to_owned());
+        let emoji = emoji.trim().to_owned();
         let reaction = Reaction {
             target_id: msg_id,
-            emoji: emoji.clone().unwrap_or_else(|| "x".into()),
-            remove: emoji.is_none(),
+            emoji: emoji.clone(),
+            remove: !on,
         };
         // The core checks the emoji (length, no control characters) before sealing.
         Content {
@@ -2451,17 +2492,32 @@ impl Actor {
         .validate()
         .map_err(|_| ClientError::BadInput)?;
         let db = self.s()?.db.clone();
+        let (have, count): (bool, i64) = db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM reactions WHERE message = ?1 AND mine = 1 AND emoji = ?2),
+                    (SELECT count(*) FROM reactions WHERE message = ?1 AND mine = 1)",
+            params![message, emoji],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if have == on {
+            return Ok(());
+        }
+        if on && count >= MAX_REACTIONS {
+            return Err(ClientError::TooManyReactions);
+        }
         let row = self
             .atomically(async {
-                match &emoji {
-                    Some(e) => db.conn().execute(
-                        "INSERT OR REPLACE INTO reactions (message, mine, emoji) VALUES (?1, 1, ?2)",
-                        params![message, e],
-                    )?,
-                    None => db
-                        .conn()
-                        .execute("DELETE FROM reactions WHERE message = ?1 AND mine = 1", [message])?,
-                };
+                if on {
+                    db.conn().execute(
+                        "INSERT INTO reactions (message, mine, emoji, at_ms) VALUES (?1, 1, ?2,
+                           MAX(?3, (SELECT COALESCE(MAX(at_ms), 0) + 1 FROM reactions WHERE message = ?1)))",
+                        params![message, emoji, now_ms()],
+                    )?;
+                } else {
+                    db.conn().execute(
+                        "DELETE FROM reactions WHERE message = ?1 AND mine = 1 AND emoji = ?2",
+                        params![message, emoji],
+                    )?;
+                }
                 self.queue_control(contact, Body::Reaction(reaction), expires)
                     .await
             })
@@ -3040,11 +3096,29 @@ impl Actor {
                     .optional()?;
                 let Some(target) = target else { return Ok(()) };
                 if r.remove {
-                    conn.execute("DELETE FROM reactions WHERE message = ?1 AND mine = 0", [target])?;
+                    let gone = conn.execute(
+                        "DELETE FROM reactions WHERE message = ?1 AND mine = 0 AND emoji = ?2",
+                        params![target, r.emoji],
+                    )?;
+                    if gone == 0 {
+                        // Veil before preview.6 had one reaction each and removed it by
+                        // sending a placeholder: that means all of theirs.
+                        conn.execute("DELETE FROM reactions WHERE message = ?1 AND mine = 0", [target])?;
+                    }
                 } else {
                     conn.execute(
-                        "INSERT OR REPLACE INTO reactions (message, mine, emoji) VALUES (?1, 0, ?2)",
-                        params![target, r.emoji],
+                        // Strictly increasing per message, so "newest" is clear within a batch.
+                        "INSERT OR REPLACE INTO reactions (message, mine, emoji, at_ms) VALUES (?1, 0, ?2,
+                           MAX(?3, (SELECT COALESCE(MAX(at_ms), 0) + 1 FROM reactions WHERE message = ?1)))",
+                        params![target, r.emoji, now_ms()],
+                    )?;
+                    // At most MAX_REACTIONS each: the newest are kept (an older Veil replaces
+                    // its one reaction by sending the new one).
+                    conn.execute(
+                        "DELETE FROM reactions WHERE message = ?1 AND mine = 0 AND emoji NOT IN
+                           (SELECT emoji FROM reactions WHERE message = ?1 AND mine = 0
+                            ORDER BY at_ms DESC, emoji LIMIT ?2)",
+                        params![target, MAX_REACTIONS],
                     )?;
                 }
                 self.emit(ChangeKind::Messages, Some(contact));
@@ -3533,6 +3607,88 @@ impl Actor {
                 Err(e)
             }
         }
+    }
+
+    async fn accept_key_change(&mut self, contact: i64) -> Result<()> {
+        let s = self.s()?;
+        let (name, warned): (String, bool) =
+            s.db.conn()
+                .query_row(
+                    "SELECT name, key_warning FROM contacts WHERE id = ?1",
+                    [contact],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?
+                .ok_or(ClientError::UnknownContact)?;
+        if !warned {
+            return Err(ClientError::BadInput);
+        }
+        let key = name_key(&name);
+        let olds: Vec<(i64, String, Vec<u8>)> =
+            s.db.conn()
+                .prepare("SELECT id, address, my_token, name FROM contacts WHERE id != ?1")?
+                .query_map([contact], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?))
+                })?
+                .collect::<core::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|o| name_key(&o.3) == key)
+                .map(|(id, address, token, _)| (id, address, token))
+                .collect();
+        let db = s.db.clone();
+        self.atomically(async {
+            let conn = db.conn();
+            for (old, address, my_token) in &olds {
+                let addr = veil_core::identity::Address::parse(address).map_err(|_| ClientError::Storage)?;
+                // Whatever waits to go out was sealed to the old key: it is not sent on.
+                // Hidden rows (reactions, edits, mailbox updates) go; the user's own
+                // unsent messages and uploads stay, as not sent.
+                conn.execute(
+                    "DELETE FROM messages WHERE contact = ?1 AND mine = 1 AND kind IN ('control', 'mailbox')",
+                    [old],
+                )?;
+                conn.execute(
+                    "UPDATE messages SET status = 'failed', envelope = NULL
+                     WHERE contact = ?1 AND mine = 1 AND status IN ('sending', 'failed')",
+                    [old],
+                )?;
+                conn.execute(
+                    "DELETE FROM attachment_chunks WHERE message IN
+                       (SELECT a.message FROM attachments a JOIN messages m ON m.id = a.message
+                        WHERE m.contact = ?1 AND a.state = 'upload')",
+                    [old],
+                )?;
+                conn.execute(
+                    "UPDATE attachments SET state = 'failed', upload_token = NULL, next_chunk = 0
+                     WHERE state = 'upload' AND message IN (SELECT id FROM messages WHERE contact = ?1)",
+                    [old],
+                )?;
+                conn.execute(
+                    "UPDATE contacts SET unread = unread + (SELECT unread FROM contacts WHERE id = ?1)
+                     WHERE id = ?2",
+                    params![old, contact],
+                )?;
+                conn.execute(
+                    "UPDATE messages SET contact = ?2 WHERE contact = ?1",
+                    params![old, contact],
+                )?;
+                s.account.forget_contact(&addr).await?;
+                Self::queue_token_removal(&db, my_token)?;
+                conn.execute("DELETE FROM contacts WHERE id = ?1", [old])?;
+            }
+            conn.execute("UPDATE contacts SET key_warning = 0 WHERE id = ?1", [contact])?;
+            Ok(())
+        })
+        .await?;
+        if let Some(s) = self.session.as_mut() {
+            for (old, ..) in &olds {
+                s.typing_sent.remove(old);
+            }
+        }
+        self.flush_token_removals().await;
+        self.emit(ChangeKind::Contacts, Some(contact));
+        self.emit(ChangeKind::Messages, Some(contact));
+        Ok(())
     }
 
     fn dismiss_key_warning(&self, contact: i64) -> Result<()> {

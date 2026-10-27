@@ -94,10 +94,11 @@ async fn lookalike_name_gets_a_key_warning() {
     assert_ne!(a_imp.id, a_bob.id, "never merged into the existing contact");
     assert!(texts(&alice.client, a_imp.id).await.is_empty());
 
-    // Verifying the safety number clears it; so does dismissing.
+    // Verifying the safety number does not settle it: the user still decides between
+    // accepting (the old conversation moves) and keeping the two apart (dismissing).
     alice.client.set_verified(a_imp.id, true).await.unwrap();
     let c = alice.client.contacts().await.unwrap();
-    assert!(!c.iter().find(|c| c.id == a_imp.id).unwrap().key_warning);
+    assert!(c.iter().find(|c| c.id == a_imp.id).unwrap().key_warning);
     let imposter2 = user(&r, "BOB").await;
     let (a_imp2, _) = pair(&alice.client, &imposter2.client).await;
     assert!(a_imp2.key_warning);
@@ -108,6 +109,47 @@ async fn lookalike_name_gets_a_key_warning() {
         !c.iter().find(|c| c.id == a_imp2.id).unwrap().verified,
         "dismissing is not verifying"
     );
+}
+
+/// Accepting a key change: the earlier conversation moves to the new contact and the old one
+/// is gone, by the user's choice only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepting_a_key_change_moves_the_old_conversation() {
+    let r = relay().await;
+    let alice = user(&r, "Alice").await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    bob.client
+        .send(b_alice.id, "before the new phone".into())
+        .await
+        .unwrap();
+    arrives(&alice.client, a_bob.id, "before the new phone").await;
+    alice.client.send(a_bob.id, "my answer".into()).await.unwrap();
+    assert_eq!(
+        alice.client.accept_key_change(a_bob.id).await.unwrap_err(),
+        ClientError::BadInput,
+        "only after a warning"
+    );
+
+    // Bob's new phone: same name, new key.
+    let bob2 = user(&r, "Bob").await;
+    let (a_bob2, new_phone_alice) = pair(&alice.client, &bob2.client).await;
+    assert!(a_bob2.key_warning);
+    alice.client.accept_key_change(a_bob2.id).await.unwrap();
+    let c = alice.client.contacts().await.unwrap();
+    assert_eq!(c.len(), 1, "the old contact is gone");
+    assert_eq!(c[0].id, a_bob2.id);
+    assert!(!c[0].key_warning);
+    let t = texts(&alice.client, a_bob2.id).await;
+    assert!(t.contains(&"before the new phone".to_owned()) && t.contains(&"my answer".to_owned()));
+    // The conversation goes on with the new key, in the same chat.
+    bob2.client
+        .send(new_phone_alice.id, "it's me".into())
+        .await
+        .unwrap();
+    arrives(&alice.client, a_bob2.id, "it's me").await;
+    alice.client.send(a_bob2.id, "welcome back".into()).await.unwrap();
+    arrives(&bob2.client, new_phone_alice.id, "welcome back").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5,7 +5,7 @@ import { Banner, Icon, SecretField, Segmented, ToggleRow, TopBar } from "../ui";
 import type { Nav } from "./Chats";
 import { checkSecret, KIND_HINT, kindName } from "./Onboarding";
 
-type Panel = null | "change" | "purge" | "purge-remove" | "biometric";
+type Panel = null | "change" | "purge" | "purge-remove" | "biometric" | "erase";
 
 function errText(err: unknown, fallback: string): string {
   return err instanceof IpcError ? err.message : fallback;
@@ -116,6 +116,73 @@ function PurgeForm({ sec, native, remove, onDone, onCancel }: { sec: SecurityVie
         <button className="btn btn-secondary" type="button" onClick={onCancel}>Cancel</button>
         <button className={`btn ${remove ? "btn-secondary" : "btn-danger"}`} type="submit" disabled={busy || !current}>{busy ? "Saving…" : remove ? "Remove" : "Save"}</button>
       </div>
+    </form>
+  );
+}
+
+/**
+ * "Erase everything": what the Purge PIN does, from Settings. Three deliberate steps so it
+ * cannot happen by a slip: read and tick, type ERASE, then the current PIN or password.
+ */
+function EraseForm({ sec, native, onErased, onCancel }: { sec: SecurityView; native: NativeInfo | null; onErased: () => void; onCancel: () => void }) {
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [understood, setUnderstood] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [current, setCurrent] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function erase(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.purgeAll(current);
+      onErased();
+    } catch (err) {
+      setError(errText(err, "Could not erase"));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form className="card stack" autoComplete="off" onSubmit={(e) => (step === 3 ? void erase(e) : e.preventDefault())}>
+      <h3>Erase everything <span className="hint">· step {step} of 3</span></h3>
+      {step === 1 ? (
+        <>
+          <Banner tone="danger" icon="alert-triangle">
+            <p><b>This deletes Veil's data from this device, for good.</b> Your identity, every contact, every message, photo, file and voice note, and the keys that protect them{native?.android ? ", including the phone's hardware key" : ""}. Nobody can bring them back, not even you. Your contacts keep their copies of your conversations.</p>
+          </Banner>
+          <label className="check-row">
+            <input type="checkbox" checked={understood} onChange={(e) => setUnderstood(e.target.checked)} />
+            <span>I understand this cannot be undone.</span>
+          </label>
+          <div className="btn-row">
+            <button className="btn btn-secondary" type="button" autoFocus onClick={onCancel}>Cancel</button>
+            <button className="btn btn-danger-ghost" type="button" disabled={!understood} onClick={() => setStep(2)}>Continue</button>
+          </div>
+        </>
+      ) : step === 2 ? (
+        <>
+          <div className="field">
+            <label className="label" htmlFor="er-word">Type ERASE to confirm</label>
+            <div className="input"><input id="er-word" autoFocus autoCapitalize="characters" spellCheck={false} value={typed} onChange={(e) => setTyped(e.target.value)} /></div>
+          </div>
+          <div className="btn-row">
+            <button className="btn btn-secondary" type="button" onClick={onCancel}>Cancel</button>
+            <button className="btn btn-danger-ghost" type="button" disabled={typed.trim().toUpperCase() !== "ERASE"} onClick={() => setStep(3)}>Continue</button>
+          </div>
+        </>
+      ) : (
+        <>
+          <SecretField id="er-cur" label={`Your ${kindName(sec.kind)}, to erase everything`} kind={sec.kind} value={current} onChange={setCurrent} autoComplete="current-password" autoFocus />
+          {error ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
+          <div className="btn-row">
+            <button className="btn btn-secondary" type="button" onClick={onCancel}>Cancel</button>
+            <button className="btn btn-danger" type="submit" disabled={busy || !current}>{busy ? "Erasing…" : "Erase everything now"}</button>
+          </div>
+        </>
+      )}
     </form>
   );
 }
@@ -358,6 +425,19 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
         <section className="card stack-sm">
           <p className="hint">Veil 0.1 (preview). Free software, AGPL-3.0. Not independently audited.</p>
         </section>
+        {sec ? (
+          <>
+            <h3 className="group-title">Erase</h3>
+            <div className="group card">
+              <button className="row" type="button" aria-expanded={panel === "erase"} onClick={() => { setNote(null); setPanel(panel === "erase" ? null : "erase"); }}>
+                <div className="row-icon danger"><Icon name="trash" /></div>
+                <div className="row-main"><div className="row-title">Erase everything…</div><div className="row-sub">Deletes Veil's data from this device now, like the {word}. Veil starts afresh.</div></div>
+                <Icon name="chevron-right" className="chev" />
+              </button>
+            </div>
+            {panel === "erase" ? <EraseForm sec={sec} native={native} onErased={onLocked} onCancel={() => setPanel(null)} /> : null}
+          </>
+        ) : null}
       </div>
     </div>
   );
