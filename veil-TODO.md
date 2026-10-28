@@ -94,7 +94,7 @@ Phase 6 of the original plan.
 | 🟡 | Voice and video calls | Built for contacts on your tailnet, relay-only through your TURN server (preview.8). Review gate passed. Waiting for your phone test. | ●●●●● | — |
 | 🟡 | Screen sharing | Smooth (1080p, 60 fps) or Light (720p, 30 fps), with a volume slider for the viewer. From Windows; Android can watch but not share (its WebView cannot capture the screen). | ●●●●○ | — |
 | 🟡 | Mute and deafen | Shown on both ends as small pills. Waiting for your phone test. | ●●○○○ | — |
-| ⬜ | Calls with people outside your tailnet | Without port forwarding. Options are in my report; you pick. | ●●●○○ | 2–4 h |
+| 🟡 | Calls with people outside your tailnet | Your pick: TURN through Tailscale Funnel. Built and reviewed; coturn only relays between your own callers now and is updated to 4.18.0. Needs Tailscale 1.104.4+ and one Funnel command on the Pi (deploy/README.md), then your test. | ●●●○○ | — |
 | ⬜ | Direct mode per contact | Optional peer-to-peer for faster calls; reveals your IP to that contact. | ●●●○○ | 3–4 h |
 | ⬜ | Call history in the chat | Missed, declined and ended calls as lines in the conversation. | ●●○○○ | 2 h |
 
