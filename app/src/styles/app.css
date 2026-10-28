@@ -35,7 +35,10 @@ html, body { height: 100%; overflow: hidden; }
 .qr-wrap { display: grid; place-items: center; }
 .qr-card { width: min(100%, 280px); }
 .composer { padding-left: var(--space-3); padding-right: var(--space-3); }
-.msg .bubble { max-width: min(80%, 34rem); overflow-wrap: anywhere; }
+/* The row (.msg) carries the width limit (--bubble-max-w); the bubble fills it. A percentage
+   here would be of a row sized by the bubble itself, so content (a voice note's length, a
+   file's save button) was pushed past the bubble's edge. */
+.msg .bubble { max-width: 100%; min-width: 0; overflow-wrap: anywhere; }
 /* The field container shows focus (border + ring); no second outline on the input itself. */
 .input input:focus-visible { outline: none; }
 .chat-screen > .banner { margin: var(--space-2) var(--space-3) 0; }
@@ -60,13 +63,12 @@ html, body { height: 100%; overflow: hidden; }
 .msg .bubble { touch-action: pan-y; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .swipe-reply { position: absolute; left: 0; top: 50%; transform: translateY(-50%); display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: var(--surface-2); color: var(--accent); pointer-events: none; }
 .msg.out .swipe-reply { left: auto; right: calc(100% - 32px); }
-/* "⋯": always there for keyboards and screen readers; shown on hover where there is one. */
-.msg-more { opacity: 0; }
-.msg-more:focus-visible, .msg:focus-within .msg-more { opacity: 1; }
-@media (hover: hover) { .msg:hover .msg-more { opacity: 1; } }
-/* On touch screens it stays visible, faintly: holding still for half a second is not for
-   everyone (P6-6). */
-@media (hover: none) { .msg-more { opacity: 0.55; } }
+/* Hold (or right-click) opens a message's actions. For keyboards and screen readers there is
+   a "Message options" button that stays out of sight until it is focused, like a skip link. */
+.msg-more:not(:focus-visible) {
+  position: absolute !important; width: 1px; height: 1px; min-width: 0; min-height: 0; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
 /* The quote is a button: it goes to the original message. */
 button.reply { width: calc(100% + 10px); text-align: start; font: inherit; font-size: var(--text-sm); cursor: pointer; }
 button.reply:disabled { cursor: default; }

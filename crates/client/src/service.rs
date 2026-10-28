@@ -3806,6 +3806,16 @@ pub fn default_kdf() -> KdfParams {
 mod tests {
     use super::*;
 
+    /// The app's scanner accepts exactly the links the core makes: it checked for another
+    /// prefix and refused every real invite (owner's preview.6 test).
+    #[test]
+    fn the_app_scans_the_invite_prefix_the_core_makes() {
+        let ipc =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../app/src/ipc.ts")).unwrap();
+        let line = format!("INVITE_PREFIX = \"{}\";", veil_core::invite::LINK_PREFIX);
+        assert!(ipc.contains(&line), "app/src/ipc.ts must define {line}");
+    }
+
     /// Warnings raised before the warned-about contact was recorded (preview.5): only an
     /// unambiguous name picks a contact (review P6R2-3).
     #[test]

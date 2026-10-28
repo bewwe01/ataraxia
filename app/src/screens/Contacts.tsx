@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
+import { INVITE_PREFIX, ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
 import { Banner, Icon, QrCode, Segmented, TopBar } from "../ui";
 import { Scanner } from "../components/Scanner";
 import { KeyWarning, type Nav } from "./Chats";
@@ -71,7 +71,9 @@ export function AddContact({ nav }: { nav: Nav }) {
                     hint="Point at their invite code"
                     onCode={(text) => {
                       setScanning(false);
-                      if (text.startsWith("veil://invite/")) void accept(undefined, text);
+                      // The link exactly as encoded; Rust checks the rest.
+                      const scanned = text.trim();
+                      if (scanned.startsWith(INVITE_PREFIX)) void accept(undefined, scanned);
                       else setError("That is not a Veil invite code.");
                     }}
                   />
@@ -82,7 +84,7 @@ export function AddContact({ nav }: { nav: Nav }) {
               )}
               <div className="field">
                 <label htmlFor="inv-link">Paste their invite link</label>
-                <div className="input mono"><input id="inv-link" spellCheck={false} value={link} onChange={(e) => setLink(e.target.value)} placeholder="veil://invite/…" /></div>
+                <div className="input mono"><input id="inv-link" spellCheck={false} value={link} onChange={(e) => setLink(e.target.value)} placeholder={`${INVITE_PREFIX}…`} /></div>
               </div>
               <button className="btn btn-primary btn-block" type="submit" disabled={busy || !link.trim()}>{busy ? "Connecting…" : "Add contact"}</button>
             </form>

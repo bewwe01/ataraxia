@@ -217,6 +217,9 @@ function sendAttachment(contact: number, a: OutgoingAttachment): Promise<Message
   return run;
 }
 
+/** How every invite link starts (Rust's `veil_core::invite::LINK_PREFIX`). */
+export const INVITE_PREFIX = "veil://i/";
+
 export const ipc = {
   state: () => call<AppState>("app_state"),
   setup: (input: SetupInput) => call<void>("setup", { input }),

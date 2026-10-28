@@ -2,6 +2,23 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Preview.7 fixes after the owner's device test (2026-10-28)
+
+The owner's device test of preview.6 found four problems:
+- **QR scanner:** every Veil invite was refused ("That is not a Veil invite code"). The scanner checked for `veil://invite/`, but links start with `veil://i/` (`veil_core::invite::LINK_PREFIX`). The prefix is now one constant in `ipc.ts`, and `service::tests::the_app_scans_the_invite_prefix_the_core_makes` fails if the UI and the core ever differ again.
+- **Voice note length and file save button outside the bubble:** the bubble was capped at 80% of a row sized by the bubble itself. The cap now lives only on the row.
+- **Rectangle around the focused message box:** the global focus ring drew a square ring around the bare text area. The whole field now glows, and inputs inside a field draw no ring of their own.
+- **"⋯" next to every message:** removed from view. It stays for keyboards (it appears on focus) and screen readers.
+
+```text
+$ cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings   # ok
+$ cargo test -p veil-client --lib --locked                          # 17 passed
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build            # 0 errors; clean; built
+$ (design/tools) node check.mjs                                     # PASS
+```
+
+Rendered with the mocked IPC at 411×923 px in dark and light: voice notes and files sit inside their bubbles, the focused message box glows with no inner rectangle, and no "⋯" is visible. Not verified: the scanner with a real camera (needs the phone).
+
 ## Preview.6: gestures, three reactions, key-change merge, Erase everything (2026-10-27)
 
 ADR-0017, after the owner's device test of preview.5. Review gate, both reports in REVIEW_REPORT.md:

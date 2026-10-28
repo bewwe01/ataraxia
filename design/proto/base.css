@@ -459,7 +459,9 @@ a.row:active, button.row:active { opacity: 0.72; }
 /* Composer */
 .composer { display: flex; align-items: flex-end; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-3); position: relative; z-index: var(--z-sticky); }
 .composer .box { flex: 1; min-width: 0; display: flex; align-items: center; gap: 2px; min-height: 48px; padding: 2px 4px 2px var(--space-4); border-radius: var(--composer-radius); background: var(--surface-glass-strong); border: 1px solid var(--border-default); }
-.composer .box:focus-within { border-color: var(--accent); }
+/* Focus glows around the whole field; the text area inside draws no ring of its own. */
+.composer .box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), 0 0 22px var(--accent-soft); }
+.composer .box :focus-visible, .input :focus-visible { outline: none; }
 .composer textarea { flex: 1; min-width: 0; resize: none; height: var(--tap-min); max-height: 120px; line-height: 24px; font-size: var(--bubble-font-size); padding: 10px 0; }
 .composer textarea::placeholder { color: var(--text-3); }
 .composer .send-btn { width: 48px; height: 48px; }
