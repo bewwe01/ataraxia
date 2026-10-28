@@ -1,6 +1,6 @@
 # Veil TODO
 
-Status of every feature, for v0.1.0-preview.6 (updated 2026-10-27).
+Status of every feature, for v0.1.0-preview.7 (updated 2026-10-28).
 
 ETA is my hands-on time, not including CI builds (about 20 min per release). One session is about 3–5 hours. Difficulty: 1 easy … 5 very hard. Estimates are rough.
 
@@ -37,7 +37,7 @@ What's in the preview release today.
 | ✅ | Review gate | Final gate passed with conditions; conditions met. | — | — |
 | ✅ | Attachment encryption | Crypto in the core, now used for photos, files and voice notes (milestone 3). | — | — |
 | 🟡 | Relay-only call filter | Done and tested in the core; there are no calls yet, so nothing to try in the app until milestone 6. | — | — |
-| 🟡 | Erase everything (Settings) | Preview.6: the Purge PIN's wipe from Settings, behind three confirmations. | — | — |
+| ✅ | Erase everything (Settings) | Checked by you on a Pixel (preview.6). | — | — |
 
 ## Working order
 
@@ -49,7 +49,7 @@ My recommended order, one milestone at a time. Each one: I build it, test it, ru
 | ✅ | Milestone 1: quick wins | Key-change warning, delete/block, disappearing messages, receipts and typing, invite cleanup. Checked by you on a Pixel. | ●●○○○ | — |
 | ✅ | Milestone 2: everyday messaging | Replies, reactions, edit and delete, search, QR scan, verify by scan. Checked by you on a Pixel; swipe-to-reply and three reactions follow in preview.6. | ●●●○○ | — |
 | ✅ | Milestone 3: photos, files and voice notes | Photos and files checked by you on a Pixel (preview.5). | ●●●○○ | — |
-| 🟡 | Milestone 4: notifications | Work while Veil runs (on screen or in the background), not after it is closed: without Google's push service an app hears the relay only while it runs. | ●●●●○ | — |
+| 🟡 | Milestone 4: notifications | Checked by you: work while Veil runs, also in the background; not after swiping it away. Options: a background service that outlives the app window, or self-hosted push (UnifiedPush/ntfy). | ●●●●○ | — |
 | ⬜ | Milestone 5: metadata privacy | Mailbox rotation and unlinkable sending, then Tor or proxy support. Review gate. | ●●●●○ | 2–3 sessions |
 | ⬜ | Milestone 6: calls | Voice and video through your TURN server, then Direct mode per contact. Review gate (Phase 6 of the plan). | ●●●●● | 3–5 sessions |
 | ⬜ | Milestone 7: backup and more platforms | Encrypted backup and restore, Windows Hello, Linux AppImage/.deb. | ●●●●○ | 2–3 sessions |
@@ -76,11 +76,11 @@ Small jobs with a big payoff.
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
 | ✅ | Photos and files | Checked by you on a Pixel. | ●●●○○ | — |
-| 🟡 | Voice notes | Up to 5 minutes, with waveform. Not reported on yet. | ●●●○○ | — |
-| ✅ | Replies, reactions, edit and delete | Checked by you. Preview.6: swipe right to reply, hold for actions, up to 3 reactions each, tap a quote to jump. | ●●○○○ | — |
+| ✅ | Voice notes | Checked by you on a Pixel. Preview.7: the length no longer slips out of the bubble. | ●●●○○ | — |
+| ✅ | Replies, reactions, edit and delete | Checked by you, including swipe to reply and three reactions (preview.6). Preview.7: no more dots beside messages, hold instead. | ●●○○○ | — |
 | ✅ | Search messages | Checked by you on a Pixel. | ●●○○○ | — |
-| 🟡 | Notifications | Work while Veil runs. Not after it is closed (no Google push service, by design). | ●●●●○ | — |
-| ✅ | Scan QR with the camera | Checked by you on a Pixel. | ●●●○○ | — |
+| 🟡 | Notifications | Checked by you: work while Veil runs, also in the background. Not after swiping Veil away (no Google push service, by design). | ●●●●○ | — |
+| 🟡 | Scan QR with the camera | Verify-by-scan works. Invite scanning refused every invite in preview.6 (wrong prefix); fixed in preview.7, waiting for your test. | ●●●○○ | — |
 | ✅ | Verify in person by scanning | Checked by you on a Pixel. | ●●○○○ | — |
 | ⬜ | Link previews | Off by default, made by the sender only. | ●●●○○ | 3 h |
 
