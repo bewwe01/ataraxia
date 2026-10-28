@@ -9,9 +9,10 @@
 // relay-only there are only one or two of them, and it keeps signaling to one message each way.
 //
 // Every call has the same media sections, in this order (`Slot`): microphone, camera, screen,
-// screen audio, then a data channel. The camera section is inactive in a voice call, which is
-// how the other side (and Rust) tells voice from video. Screen sharing only swaps a track into
-// a section that is already there, so it starts at once with no second offer. The data channel
+// screen audio, then a data channel. All of them can send from the start, so turning the camera
+// on in a voice call, or sharing the screen, only swaps a track into a section that is already
+// there: no second offer. A voice call's camera section carries no stream (`a=msid:-`), which is
+// how the other side (and Rust) tells voice from video. The data channel
 // carries mute, deafen, camera and sharing state; it runs inside the call's DTLS, end to end.
 import { useSyncExternalStore } from "react";
 import { ipc, IpcError, type CallSetup, type CallSignal } from "./ipc";
@@ -72,6 +73,10 @@ export interface CallState {
   peer: PeerState;
   /** Volume of their screen's sound, 0 to 1 (only here, never sent). */
   streamVolume: number;
+  /** Their camera's picture is arriving (its track is not muted). */
+  remoteCamera: boolean;
+  /** Shown as a small bubble over the app instead of full screen. */
+  minimized: boolean;
 }
 
 /** How long a call rings before it counts as unanswered. */
@@ -99,8 +104,9 @@ function reason(err: unknown, fallback: string): string {
 function fresh(id: string, contact: number, video: boolean, outgoing: boolean): CallState {
   return {
     id, contact, video, outgoing, phase: outgoing ? "calling" : "incoming", startedAt: null, ended: null,
-    muted: false, deafened: false, cameraOff: false, speaker: video, sharing: null,
+    muted: false, deafened: false, cameraOff: !video, speaker: video, sharing: null,
     local: null, remote: null, remoteScreen: null, peer: QUIET, streamVolume: 1,
+    remoteCamera: false, minimized: false,
   };
 }
 
@@ -254,7 +260,7 @@ class CallManager {
       pc = this.peer(setup);
       // The sections every call has, in `Slot` order; the camera is inactive in a voice call.
       pc.addTransceiver(local.getAudioTracks()[0] ?? "audio", { direction: "sendrecv", streams: [local] });
-      pc.addTransceiver(local.getVideoTracks()[0] ?? "video", { direction: video ? "sendrecv" : "inactive", streams: [local] });
+      pc.addTransceiver(local.getVideoTracks()[0] ?? "video", { direction: "sendrecv", streams: video ? [local] : [] });
       pc.addTransceiver("video", { direction: "sendrecv" });
       pc.addTransceiver("audio", { direction: "sendrecv" });
       await pc.setLocalDescription(await pc.createOffer());
@@ -343,11 +349,12 @@ class CallManager {
       const cam = local.getVideoTracks()[0] ?? null;
       tx[Slot.Mic]!.direction = "sendrecv";
       await tx[Slot.Mic]!.sender.replaceTrack(mic);
-      tx[Slot.Camera]!.direction = c.video ? "sendrecv" : "inactive";
+      tx[Slot.Camera]!.direction = "sendrecv";
       await tx[Slot.Camera]!.sender.replaceTrack(c.video ? cam : null);
       tx[Slot.Screen]!.direction = "sendrecv";
       tx[Slot.ScreenAudio]!.direction = "sendrecv";
-      for (const t of [tx[Slot.Mic]!, tx[Slot.Camera]!]) t.sender.setStreams?.(local);
+      tx[Slot.Mic]!.sender.setStreams?.(local);
+      if (c.video) tx[Slot.Camera]!.sender.setStreams?.(local);
       await pc.setLocalDescription(await pc.createAnswer());
       await gathered(pc);
       if (!this.live(c.id)) return this.release(local, pc);
@@ -405,13 +412,51 @@ class CallManager {
     this.tell();
   }
 
-  toggleCamera(): void {
+  /** Camera on or off. In a voice call the first "on" opens the camera; the other side shows
+   *  the picture once it arrives, with no new offer. */
+  async toggleCamera(): Promise<void> {
     const c = this.current;
-    if (!c?.local) return;
+    if (!c?.local || c.phase === "incoming" || c.phase === "ended") return;
     const cameraOff = !c.cameraOff;
-    for (const t of c.local.getVideoTracks()) t.enabled = !cameraOff;
-    this.patch({ cameraOff });
-    this.tell();
+    if (c.local.getVideoTracks().length > 0 || cameraOff) {
+      for (const t of c.local.getVideoTracks()) t.enabled = !cameraOff;
+      this.patch({ cameraOff });
+      this.tell();
+      return;
+    }
+    let next: MediaStreamTrack | undefined;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      next = stream.getVideoTracks()[0];
+      const pc = this.pc;
+      if (!next || !this.live(c.id) || !pc || (this.current?.local?.getVideoTracks().length ?? 0) > 0) {
+        next?.stop();
+        return;
+      }
+      await pc.getTransceivers()[Slot.Camera]?.sender.replaceTrack(next);
+      if (!this.live(c.id)) {
+        next.stop();
+        return;
+      }
+      const local = new MediaStream([...(this.current?.local?.getAudioTracks() ?? []), next]);
+      // A phone held at arm's length for video: the loudspeaker, as in a video call.
+      const speaker = canShare ? this.current?.speaker ?? false : true;
+      this.patch({ local, cameraOff: false, speaker });
+      if (!canShare) void ipc.callAudio(true, speaker).catch(() => undefined);
+      this.tell();
+    } catch {
+      // No camera, or not allowed: the call goes on without it.
+      next?.stop();
+    }
+  }
+
+  /** Shrinks the call to a bubble over the app, or brings it back. */
+  setMinimized(minimized: boolean): void {
+    const c = this.current;
+    if (!c || c.phase === "incoming" || c.minimized === minimized) return;
+    this.patch({ minimized });
   }
 
   /** Volume of their shared screen's sound, 0 to 1. */
@@ -492,7 +537,8 @@ class CallManager {
     const ch = this.channel;
     if (!c || ch?.readyState !== "open") return;
     try {
-      ch.send(JSON.stringify({ muted: c.muted, deafened: c.deafened, cameraOff: c.cameraOff, sharing: c.sharing !== null }));
+      const cameraOff = c.cameraOff || !c.local?.getVideoTracks().length;
+      ch.send(JSON.stringify({ muted: c.muted, deafened: c.deafened, cameraOff, sharing: c.sharing !== null }));
     } catch {
       // Closing: nothing to tell.
     }
@@ -570,6 +616,17 @@ class CallManager {
       } else if (slot === Slot.Mic || slot === Slot.Camera) {
         remote.addTrack(e.track);
         this.patch({ remote });
+        if (slot === Slot.Camera) {
+          // Their picture is shown only while it arrives, never a black frame.
+          const camera = e.track;
+          const update = () => {
+            if (this.pc === pc) this.patch({ remoteCamera: !camera.muted && camera.readyState === "live" });
+          };
+          camera.addEventListener("mute", update);
+          camera.addEventListener("unmute", update);
+          camera.addEventListener("ended", update);
+          update();
+        }
       }
     };
     pc.onconnectionstatechange = () => {

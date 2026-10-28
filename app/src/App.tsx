@@ -21,7 +21,8 @@ export function App() {
   const typingTimers = useRef(new Map<number, number>());
   const call = useCall();
   const underCall = useRef<HTMLDivElement>(null);
-  const inCall = call !== null;
+  // Full-screen calls take the app; a minimized one leaves it usable.
+  const inCall = call !== null && !(call.minimized && call.phase !== "incoming");
 
   const setTypingFor = useCallback((contact: number, on: boolean) => {
     const old = typingTimers.current.get(contact);
@@ -48,7 +49,7 @@ export function App() {
 
   useEffect(refreshState, [refreshState]);
 
-  // The app under a call is inert (review C6-4).
+  // The app under a full-screen call is inert (review C6-4).
   useEffect(() => {
     const el = underCall.current;
     if (!el) return;

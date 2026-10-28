@@ -562,6 +562,17 @@ mod tests {
                 SdpRole::Answer,
                 false,
             ),
+            // Voice calls from preview.8, with the camera section inactive.
+            (
+                include_str!("../tests/vectors/sdp/chromium-voice-preview8-offer.sdp"),
+                SdpRole::Offer,
+                false,
+            ),
+            (
+                include_str!("../tests/vectors/sdp/chromium-voice-preview8-answer.sdp"),
+                SdpRole::Answer,
+                false,
+            ),
         ] {
             let out = filter_sdp_with(sdp, Mode::RelayOnly, role, &own).unwrap();
             assert!(out.contains(" 127.0.0.1 ") && out.contains(" typ relay"));
@@ -575,11 +586,14 @@ mod tests {
                 ["m=audio", "m=video", "m=video", "m=audio", "m=application"]
             );
             assert!(out.contains("a=sctp-port:5000") && out.contains("a=fingerprint:sha-256 "));
-            assert_eq!(
-                out.contains("a=inactive"),
-                !video,
-                "the camera section marks a voice call"
-            );
+            // Stream ids survive the filter: the client tells voice from video by the camera's.
+            if video {
+                assert!(
+                    out.split("\r\n")
+                        .any(|l| l.starts_with("a=msid:") && !l.starts_with("a=msid:- ")),
+                    "a video call's camera stream id must survive"
+                );
+            }
             let without = filter_sdp(sdp, Mode::RelayOnly, role).unwrap();
             assert!(
                 !without.contains("a=candidate"),

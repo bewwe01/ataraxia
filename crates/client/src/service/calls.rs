@@ -167,16 +167,27 @@ fn is_public(ip: IpAddr) -> bool {
     ice::filter_candidate(&line, Mode::RelayOnly).is_some()
 }
 
-/// A video call is one whose first video section (the camera, ADR-0018) is sending. Voice
-/// calls carry the same sections with the camera inactive, so screen sharing needs no new offer.
+/// A video call is one whose first video section (the camera, ADR-0018) is sending a camera
+/// stream: not inactive or receive-only, and with an `a=msid` naming a stream. A voice call's
+/// camera section can send too, so the camera can be turned on later without a new offer, but
+/// carries no stream yet (`a=msid:- …`). Voice calls from preview.8 mark the section inactive.
 fn video_in(sdp: &str) -> bool {
-    let mut camera = sdp
+    if !sdp.split("\r\n").any(|l| l.starts_with("m=video ")) {
+        return false;
+    }
+    let camera: Vec<&str> = sdp
         .split("\r\n")
         .skip_while(|l| !l.starts_with("m=video "))
         .skip(1)
-        .take_while(|l| !l.starts_with("m="));
-    !camera.any(|l| l == "a=inactive" || l == "a=recvonly")
-        && sdp.split("\r\n").any(|l| l.starts_with("m=video "))
+        .take_while(|l| !l.starts_with("m="))
+        .collect();
+    let sending = !camera.iter().any(|l| *l == "a=inactive" || *l == "a=recvonly");
+    let stream = camera.iter().any(|l| {
+        l.strip_prefix("a=msid:")
+            .and_then(|v| v.split(' ').next())
+            .is_some_and(|id| !id.is_empty() && id != "-")
+    });
+    sending && stream
 }
 
 fn decode_id(hex: &str) -> Result<Vec<u8>> {
@@ -537,16 +548,21 @@ mod tests {
 
     #[test]
     fn the_camera_section_tells_voice_from_video() {
-        let call = |camera: &str| {
+        let call = |camera: &str, msid: &str| {
             format!(
-                "v=0\r\nm=audio 9 X 111\r\na=sendrecv\r\nm=video 9 X 96\r\na={camera}\r\n\
-                 m=video 9 X 96\r\na=sendrecv\r\nm=audio 9 X 111\r\na=sendrecv\r\n"
+                "v=0\r\nm=audio 9 X 111\r\na=sendrecv\r\na=msid:s1 a1\r\nm=video 9 X 96\r\na={camera}\r\n\
+                 a=msid:{msid}\r\nm=video 9 X 96\r\na=sendrecv\r\na=msid:s1 v2\r\n\
+                 m=audio 9 X 111\r\na=sendrecv\r\n"
             )
         };
-        assert!(video_in(&call("sendrecv")));
-        assert!(video_in(&call("sendonly")));
-        assert!(!video_in(&call("inactive")));
-        assert!(!video_in(&call("recvonly")));
+        assert!(video_in(&call("sendrecv", "s1 v1")));
+        assert!(video_in(&call("sendonly", "s1 v1")));
+        assert!(!video_in(&call("inactive", "s1 v1")));
+        assert!(!video_in(&call("recvonly", "s1 v1")));
+        // Can send, but no camera stream yet: a voice call whose camera may come on later.
+        assert!(!video_in(&call("sendrecv", "- v1")));
+        // A stream on another section does not count.
+        assert!(!video_in(&call("sendrecv", "")));
         assert!(!video_in("v=0\r\nm=audio 9 X 111\r\na=sendrecv\r\n"));
         // Real Chromium calls (crates/core/tests/vectors/sdp), after the filter.
         let own: [std::net::IpAddr; 1] = [std::net::Ipv4Addr::LOCALHOST.into()];
@@ -568,6 +584,17 @@ mod tests {
             ),
             (
                 include_str!("../../../core/tests/vectors/sdp/chromium-voice-answer.sdp"),
+                ice::SdpRole::Answer,
+                false,
+            ),
+            // Voice calls from preview.8, with the camera section inactive.
+            (
+                include_str!("../../../core/tests/vectors/sdp/chromium-voice-preview8-offer.sdp"),
+                ice::SdpRole::Offer,
+                false,
+            ),
+            (
+                include_str!("../../../core/tests/vectors/sdp/chromium-voice-preview8-answer.sdp"),
                 ice::SdpRole::Answer,
                 false,
             ),

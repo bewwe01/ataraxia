@@ -143,6 +143,7 @@ Evidence is in [`CHECKS.md`](CHECKS.md). Summary of the last run:
 | `.verified-burst` | `<VerifiedCelebration>` | |
 | `.keygen-orb`, `.steps` | `<KeyGenAnimation>`, `<StepList>` | driven by real progress events from Rust |
 | `callContent()`, `.transport-chip`, `.call-ctl` | `<CallScreen>`, `<TransportChip>`, `<CallControls>` | Direct chip always names who sees the IP |
+| `.call-min`, `.call-bubble` (app only, ADR-0018) | `<CallScreen>` minimize, `<CallBubble>` | Arrow at the top left; the bubble is a 120×168 card (their picture or avatar, time, End) dragged with `transform` only, snapping to the nearer side; no transition with reduced motion |
 | `.call-state`, `.share-sheet`, `.stream-volume` (app only, ADR-0018) | `<CallScreen>` pills, `<ShareSheet>`, stream volume | Mute, deafen and sharing are icon + words in a glass pill, the same on both ends; the quality bubble is a radio list (Smooth 1080p60, Light 720p30); the volume bar sets only the shared screen's sound |
 | `.dialog`, `.scrim`, `.hold-btn` | `<Dialog>`, `<AlertDialog>`, `<HoldToConfirm>` | focus trap in the app |
 | Mobile shell: `.m-appbar`, `.m-topbar`, `.m-nav`, `.m-fab` | `<AppBar>`, `<TopBar>`, `<BottomNav>`, `<Fab>` | |

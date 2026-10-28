@@ -52,6 +52,7 @@ fn sdp(setup: &str, video: bool) -> String {
             format!("a=setup:{setup}"),
             format!("a=mid:{mid}"),
             "a=sendrecv".into(),
+            format!("a=msid:s1 t{mid}"),
             "a=rtcp-mux".into(),
             format!("a=rtpmap:{pt} {rtpmap}"),
         ]

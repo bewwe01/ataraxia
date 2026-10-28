@@ -133,6 +133,111 @@ function ShareSheet({ call, onClose }: { call: CallState; onClose: () => void })
   );
 }
 
+const BUBBLE_W = 120;
+const BUBBLE_H = 168;
+const EDGE = 8;
+/** Where the bubble was left, kept while the app runs (never stored). */
+let bubbleAt: { x: number; y: number } | null = null;
+
+function clampBubble(p: { x: number; y: number }): { x: number; y: number } {
+  const maxX = Math.max(EDGE, window.innerWidth - BUBBLE_W - EDGE);
+  const maxY = Math.max(EDGE, window.innerHeight - BUBBLE_H - EDGE);
+  return { x: Math.min(maxX, Math.max(EDGE, p.x)), y: Math.min(maxY, Math.max(EDGE, p.y)) };
+}
+
+/** The minimized call: a small card over the app that can be dragged anywhere and snaps to the
+ *  nearer side. Tapping it brings the call back; it has its own End button. */
+function CallBubble({ call, name, contact, status, picture, onExpand }: {
+  call: CallState;
+  name: string;
+  contact: ContactView | undefined;
+  status: string;
+  picture: MediaStream | null;
+  onExpand: () => void;
+}) {
+  const [pos, setPos] = useState(() => clampBubble(bubbleAt ?? { x: window.innerWidth - BUBBLE_W - EDGE, y: 76 }));
+  const [dragging, setDragging] = useState(false);
+  const dragged = useRef(false);
+  const open = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    open.current?.focus();
+    const onResize = () => setPos((p) => clampBubble(p));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || (e.target as HTMLElement).closest(".end")) return;
+    const start = { x: e.clientX, y: e.clientY };
+    const origin = pos;
+    let last = origin;
+    dragged.current = false;
+    const move = (ev: PointerEvent) => {
+      const dx = ev.clientX - start.x;
+      const dy = ev.clientY - start.y;
+      if (!dragged.current && Math.hypot(dx, dy) < 6) return;
+      dragged.current = true;
+      setDragging(true);
+      last = clampBubble({ x: origin.x + dx, y: origin.y + dy });
+      setPos(last);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      setDragging(false);
+      if (!dragged.current) return;
+      // Snap to the nearer side, keeping the height.
+      const side = last.x + BUBBLE_W / 2 < window.innerWidth / 2 ? EDGE : window.innerWidth - BUBBLE_W - EDGE;
+      const snapped = clampBubble({ x: side, y: last.y });
+      bubbleAt = snapped;
+      setPos(snapped);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  };
+
+  return (
+    <div
+      className={`call-bubble${dragging ? " dragging" : ""}`}
+      style={{ transform: `translate3d(${pos.x}px, ${pos.y}px, 0)` }}
+      onPointerDown={onPointerDown}
+    >
+      <button
+        ref={open}
+        className="call-bubble-open"
+        type="button"
+        aria-label={`Back to the call with ${name}, ${status}`}
+        onClick={() => {
+          // A drag ends in a click on the same element: that one is not a tap.
+          if (dragged.current) {
+            dragged.current = false;
+            return;
+          }
+          onExpand();
+        }}
+      >
+        {picture ? (
+          <StreamVideo stream={picture} className="call-bubble-video" label={`${name}'s video`} />
+        ) : contact ? (
+          <Avatar initials={contact.initials} hue={contact.hue} size="lg" />
+        ) : null}
+        <span className="call-bubble-time" aria-hidden="true">
+          {call.muted || call.deafened ? <Icon name={call.deafened ? "headphones-off" : "mic-off"} /> : null}
+          {status}
+        </span>
+      </button>
+      {call.phase === "ended" ? null : (
+        <button className="icon-btn end" type="button" aria-label="End call" onClick={() => calls.hangup()}>
+          <Icon name="phone-off" />
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function CallScreen({ call, contact }: { call: CallState; contact: ContactView | undefined }) {
   const [now, setNow] = useState(Date.now());
   const [sheet, setSheet] = useState(false);
@@ -146,8 +251,10 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
   const name = contact?.name ?? "Contact";
   const live = call.phase === "active";
   const theirScreen = live && call.peer.sharing && (call.remoteScreen?.getVideoTracks().length ?? 0) > 0;
-  const theirCamera = live && call.video && !call.peer.cameraOff && call.remote !== null;
-  const myCamera = call.video && call.phase !== "incoming" && call.local !== null && !call.cameraOff;
+  // Their picture whenever it arrives, in a voice call too once they turn their camera on.
+  const theirCamera = live && !call.peer.cameraOff && call.remoteCamera && call.remote !== null;
+  const cameraOn = call.phase !== "incoming" && (call.local?.getVideoTracks().length ?? 0) > 0 && !call.cameraOff;
+  const myCamera = cameraOn;
   // Picture when there is one of theirs to show; otherwise their avatar.
   const visual = theirScreen || theirCamera;
 
@@ -160,10 +267,11 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
     return () => window.clearInterval(t);
   }, [live]);
 
-  // Focus the main action when the screen appears or changes phase.
+  // Focus the main action when the screen appears, changes phase or comes back from the bubble.
+  const minimized = call.minimized && call.phase !== "incoming";
   useEffect(() => {
-    first.current?.querySelector<HTMLButtonElement>("button")?.focus();
-  }, [call.phase]);
+    if (!minimized) first.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [call.phase, minimized]);
 
   const status =
     call.phase === "incoming" ? `Incoming ${call.video ? "video" : "voice"} call`
@@ -206,12 +314,10 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
       <>
         <Ctl icon={micOff ? "mic-off" : "mic"} label="Mute microphone" text={micOff ? "Unmute" : "Mute"} pressed={micOff} onClick={() => calls.toggleMute()} />
         <Ctl icon={call.deafened ? "headphones-off" : "headphones"} label="Deafen" text={call.deafened ? "Undeafen" : "Deafen"} pressed={call.deafened} onClick={() => calls.toggleDeafen()} />
-        {call.video ? (
-          <>
-            <Ctl icon={call.cameraOff ? "video-off" : "video"} label="Turn camera off" text="Camera" pressed={call.cameraOff} onClick={() => calls.toggleCamera()} />
-            {canShare ? null : <Ctl icon="flip" label="Switch camera" text="Flip" onClick={() => void calls.flip()} />}
-          </>
-        ) : canShare ? null : (
+        <Ctl icon={cameraOn ? "video" : "video-off"} label="Camera" text="Camera" pressed={cameraOn} onClick={() => void calls.toggleCamera()} />
+        {canShare ? null : cameraOn ? (
+          <Ctl icon="flip" label="Switch camera" text="Flip" onClick={() => void calls.flip()} />
+        ) : (
           <Ctl icon="speaker" label="Speaker" text="Speaker" pressed={call.speaker} onClick={() => calls.toggleSpeaker()} />
         )}
         {canShare && live ? (
@@ -235,15 +341,18 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
     </div>
   );
 
-  return (
+  const screen = (
     <div className="call-overlay" role="dialog" aria-modal="true" aria-label={`${call.video ? "Video" : "Voice"} call with ${name}`}>
       <section className={`call ${visual ? "video" : "audio"}${theirScreen ? " watching" : ""}`}>
+        {call.phase === "incoming" || call.phase === "ended" ? null : (
+          <button className="icon-btn call-min" type="button" aria-label="Minimize call" onClick={() => calls.setMinimized(true)}>
+            <Icon name="chevron-down" />
+          </button>
+        )}
         <span className="call-bg">
           {theirScreen ? <StreamVideo stream={call.remoteScreen} className="call-video screen" label={`${name}'s screen`} />
             : theirCamera ? <StreamVideo stream={call.remote} className="call-video" label={`${name}'s video`} /> : null}
         </span>
-        <StreamAudio stream={call.remote} muted={call.deafened} />
-        {theirScreen ? <StreamAudio stream={call.remoteScreen} muted={call.deafened} volume={call.streamVolume} /> : null}
         {visual ? (
           <div className="call-top">
             <span className="call-name">{name}</span>
@@ -279,8 +388,26 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
         <div className="call-controls" ref={first}>{controls}</div>
         {sheet && live ? <ShareSheet call={call} onClose={closeSheet} /> : null}
       </section>
+    </div>
+  );
+
+  return (
+    <>
+      {/* Sound plays the same whether the call is full screen or a bubble. */}
+      <StreamAudio stream={call.remote} muted={call.deafened} />
+      {theirScreen ? <StreamAudio stream={call.remoteScreen} muted={call.deafened} volume={call.streamVolume} /> : null}
+      {minimized ? (
+        <CallBubble
+          call={call}
+          name={name}
+          contact={contact}
+          status={status}
+          picture={theirScreen ? call.remoteScreen : theirCamera ? call.remote : null}
+          onExpand={() => calls.setMinimized(false)}
+        />
+      ) : screen}
       {/* Phase changes are announced once; the running clock is not. */}
       <span className="sr-only" role="status">{live ? `Call connected${call.peer.sharing ? `. ${name} is sharing their screen` : ""}${call.peer.deafened ? `. ${name} is deafened` : call.peer.muted ? `. ${name} is muted` : ""}` : status}</span>
-    </div>
+    </>
   );
 }

@@ -2,6 +2,27 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Calls: camera in voice calls, and the minimized call bubble (2026-10-28)
+
+The owner tested preview.8 on a Pixel and Windows, inside and outside the tailnet. Calls, screen sharing (watched on Android), mute, deafen and Funnel calls worked. Two requests followed: a camera button in voice calls, and an arrow that shrinks the call to a draggable bubble.
+
+Chromium marks a camera section that has no stream with `a=msid:- …` (checked with a scratch page). A voice call's camera section can now send, and the camera can come on later without a second offer. Rust's `video_in` reads "video" from the camera section's stream id.
+
+Tests:
+- `calls::tests::the_camera_section_tells_voice_from_video`:
+  - a sending camera section with no stream is voice;
+  - a stream on another section does not count;
+  - all six real Chromium SDPs are classified correctly: video, voice, and preview.8's inactive voice calls.
+- `ice::tests::real_chromium_calls_pass` covers the new voice SDPs and keeps the preview.8 ones.
+
+In Chromium, two app pages through coturn:
+- Voice call controls: Mute, Deafen, Camera, Share, End.
+- Alice pressed Camera. Bob's call screen switched to her video (320×180 after 1.5 s, during the bandwidth ramp-up), and her Camera button showed as on. She pressed it again, and Bob's video went away.
+- Bob pressed the arrow. The bubble appeared, the app under it was not inert, and he typed in the chat.
+- Dragging the bubble from (283, 76) to the left left it snapped at x=8, y=236, still minimized.
+- A tap brought the call back full screen (app inert again). Ending from the bubble showed "Call ended" on Alice's side.
+- The video, voice and screen-share runs passed as before.
+
 ## Funnel calls: the owner's first real call, and the relay-ip fix (2026-10-28)
 
 The owner's first call with an outsider through Funnel, on preview.8 (Windows and Android), rang and was accepted, then stayed on "Connecting…" and ended.

@@ -133,6 +133,21 @@ button.reply:not(:disabled):active { filter: brightness(0.92); }
 .msg-dialog { max-width: calc(100vw - 2 * var(--space-4)); }
 
 /* Calls (ADR-0018, DESIGN.md CallScreen): over everything, full screen. */
+/* Minimize: an arrow at the top left of the call screen. */
+.call .call-min { position: absolute; z-index: 3; top: calc(env(safe-area-inset-top) + var(--space-3)); left: var(--space-3); color: var(--on-media); background: var(--call-glass); border: 1px solid var(--call-glass-line); }
+
+/* The minimized call: a small card over the app, dragged with transform only. */
+.call-bubble { position: fixed; z-index: 100; left: 0; top: 0; width: 120px; height: 168px; border-radius: var(--radius-lg); overflow: hidden; background: var(--media-backdrop); border: 1px solid var(--call-glass-line); box-shadow: var(--shadow-3); touch-action: none; -webkit-user-select: none; user-select: none; transition: transform var(--dur-base) var(--ease-out); }
+.call-bubble.dragging { transition: none; }
+:root[data-motion="reduced"] .call-bubble { transition: none; }
+@media (prefers-reduced-motion: reduce) { .call-bubble { transition: none; } }
+.call-bubble-open { position: absolute; inset: 0; width: 100%; height: 100%; display: grid; place-items: center; padding: 0; border: 0; background: var(--call-glass); color: var(--on-media); cursor: grab; }
+.call-bubble.dragging .call-bubble-open { cursor: grabbing; }
+.call-bubble-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+.call-bubble-time { position: absolute; left: 6px; bottom: 10px; display: inline-flex; align-items: center; gap: 4px; max-width: calc(100% - 60px); padding: 2px 6px; border-radius: var(--radius-pill); background: var(--call-glass); font-size: var(--text-2xs); font-weight: var(--weight-semibold); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.call-bubble-time .icon { width: 12px; height: 12px; flex: none; }
+.call-bubble .icon-btn.end { position: absolute; right: 4px; bottom: 4px; width: 44px; height: 44px; background: var(--danger-strong); color: var(--on-media); }
+
 /* The app under a call: no box of its own, so layout is unchanged. */
 .under-call { display: contents; }
 .call-overlay { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; }
