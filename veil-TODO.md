@@ -1,6 +1,6 @@
 # Veil TODO
 
-Status of every feature, for v0.1.0-preview.7 (updated 2026-10-28).
+Status of every feature, for v0.1.0-preview.8 (updated 2026-10-28).
 
 ETA is my hands-on time, not including CI builds (about 20 min per release). One session is about 3–5 hours. Difficulty: 1 easy … 5 very hard. Estimates are rough.
 
@@ -36,7 +36,7 @@ What's in the preview release today.
 | ✅ | CI and supply-chain checks | Tests, fuzzing, Miri, cargo deny/audit/vet, secret scan. | — | — |
 | ✅ | Review gate | Final gate passed with conditions; conditions met. | — | — |
 | ✅ | Attachment encryption | Crypto in the core, now used for photos, files and voice notes (milestone 3). | — | — |
-| 🟡 | Relay-only call filter | Done and tested in the core; there are no calls yet, so nothing to try in the app until milestone 6. | — | — |
+| ✅ | Relay-only call filter | Every call SDP is filtered both ways; your own tailnet TURN server is allowed. Tested with real Chromium calls (preview.8). | — | — |
 | ✅ | Erase everything (Settings) | Checked by you on a Pixel (preview.6). | — | — |
 
 ## Working order
@@ -49,9 +49,10 @@ My recommended order, one milestone at a time. Each one: I build it, test it, ru
 | ✅ | Milestone 1: quick wins | Key-change warning, delete/block, disappearing messages, receipts and typing, invite cleanup. Checked by you on a Pixel. | ●●○○○ | — |
 | ✅ | Milestone 2: everyday messaging | Replies, reactions, edit and delete, search, QR scan, verify by scan. Checked by you on a Pixel; swipe-to-reply and three reactions follow in preview.6. | ●●●○○ | — |
 | ✅ | Milestone 3: photos, files and voice notes | Photos and files checked by you on a Pixel (preview.5). | ●●●○○ | — |
-| 🟡 | Milestone 4: notifications | Checked by you: work while Veil runs, also in the background; not after swiping it away. Options: a background service that outlives the app window, or self-hosted push (UnifiedPush/ntfy). | ●●●●○ | — |
+| ✅ | Milestone 4: notifications | Checked by you: work while Veil runs, also in the background. Not after swiping Veil away; you decided against push (2026-10-28), so that stays as is. | ●●●●○ | — |
+| ⬜ | Milestone 4.5: make it yours | Your request (2026-10-28): colours and look, profile picture and name shown to contacts, per-chat touches, and small preferences. Plan below, waiting for your picks. Review gate for the profile part. | ●●●○○ | 2–4 sessions |
 | ⬜ | Milestone 5: metadata privacy | Mailbox rotation and unlinkable sending, then Tor or proxy support. Review gate. | ●●●●○ | 2–3 sessions |
-| ⬜ | Milestone 6: calls | Voice and video through your TURN server, then Direct mode per contact. Review gate (Phase 6 of the plan). | ●●●●● | 3–5 sessions |
+| 🟡 | Milestone 6: calls | Built for your tailnet (preview.8): voice, video, screen sharing, mute and deafen. Review gate passed (round 2). Waiting for your phone test. Still to do: calls with people outside your tailnet (pick an option), then Direct mode. | ●●●●● | 1–2 sessions left |
 | ⬜ | Milestone 7: backup and more platforms | Encrypted backup and restore, Windows Hello, Linux AppImage/.deb. | ●●●●○ | 2–3 sessions |
 | ⬜ | Milestone 8: hardening before 1.0 | App tests and accessibility, extra failure tests, cargo vet for the app, final review gate (Phase 8). | ●●●●○ | 1–2 sessions |
 | ⬜ | After 1.0 | Multiple relays, phone + PC on one account, group chats, macOS/iOS, translations, update check, post-quantum TLS. Each is big; we pick per need. | ●●●●● | — |
@@ -79,7 +80,7 @@ Small jobs with a big payoff.
 | ✅ | Voice notes | Checked by you on a Pixel. Preview.7: the length no longer slips out of the bubble. | ●●●○○ | — |
 | ✅ | Replies, reactions, edit and delete | Checked by you, including swipe to reply and three reactions (preview.6). Preview.7: no more dots beside messages, hold instead. | ●●○○○ | — |
 | ✅ | Search messages | Checked by you on a Pixel. | ●●○○○ | — |
-| 🟡 | Notifications | Checked by you: work while Veil runs, also in the background. Not after swiping Veil away (no Google push service, by design). | ●●●●○ | — |
+| ✅ | Notifications | Checked by you: work while Veil runs, also in the background. Not after swiping Veil away (no Google push service, by design; you chose to leave it so). | ●●●●○ | — |
 | 🟡 | Scan QR with the camera | Verify-by-scan works. Invite scanning refused every invite in preview.6 (wrong prefix); fixed in preview.7, waiting for your test. | ●●●○○ | — |
 | ✅ | Verify in person by scanning | Checked by you on a Pixel. | ●●○○○ | — |
 | ⬜ | Link previews | Off by default, made by the sender only. | ●●●○○ | 3 h |
@@ -90,8 +91,31 @@ Phase 6 of the original plan.
 
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
-| ⬜ | Voice and video calls | WebRTC through your TURN server, with its own review gate. | ●●●●● | 3–5 sessions |
-| ⬜ | Direct mode per contact | Optional peer-to-peer for faster calls; reveals your IP to that contact. | ●●●○○ | part of calls |
+| 🟡 | Voice and video calls | Built for contacts on your tailnet, relay-only through your TURN server (preview.8). Review gate passed. Waiting for your phone test. | ●●●●● | — |
+| 🟡 | Screen sharing | Smooth (1080p, 60 fps) or Light (720p, 30 fps), with a volume slider for the viewer. From Windows; Android can watch but not share (its WebView cannot capture the screen). | ●●●●○ | — |
+| 🟡 | Mute and deafen | Shown on both ends as small pills. Waiting for your phone test. | ●●○○○ | — |
+| ⬜ | Calls with people outside your tailnet | Without port forwarding. Options are in my report; you pick. | ●●●○○ | 2–4 h |
+| ⬜ | Direct mode per contact | Optional peer-to-peer for faster calls; reveals your IP to that contact. | ●●●○○ | 3–4 h |
+| ⬜ | Call history in the chat | Missed, declined and ended calls as lines in the conversation. | ●●○○○ | 2 h |
+
+## Make it yours (Milestone 4.5)
+
+Brainstorm for your request; nothing built yet. Tell me what to keep, drop or add.
+
+| | Feature | Notes | Difficulty | ETA |
+|---|---|---|---|---|
+| ⬜ | Accent colour picker | Any colour, not just three. Veil adjusts it so text stays readable (contrast check). | ●●○○○ | 2 h |
+| ⬜ | Bubble colours and chat wallpaper | Your bubble colour or gradient. Wallpaper from presets or your own photo, kept encrypted on the device, with dim and blur. | ●●●○○ | 3–4 h |
+| ⬜ | More looks | Pure-black (AMOLED) dark mode, follow the system's light/dark, text size, compact or roomy spacing, bubble roundness. | ●●○○○ | 2–3 h |
+| ⬜ | Per-chat colour and wallpaper | Give a conversation its own colour or wallpaper; only you see it. | ●●○○○ | 2 h |
+| ⬜ | Profile picture | Pick and crop a photo. It goes to your contacts end-to-end encrypted, never in the clear to the relay. Metadata stripped, size capped. Choose who sees it: all contacts, or nobody. Needs a protocol addition and a review gate. | ●●●●○ | 1 session |
+| ⬜ | Name and short status | Change your display name and an optional one-line status; sent to contacts like the picture. | ●●●○○ | part of profile |
+| ⬜ | Nicknames and pictures for contacts | Rename a contact or give them a picture only you see; it overrides theirs. | ●●○○○ | 2 h |
+| ⬜ | Your own quick reactions | Choose the six emoji in the reaction bar. | ●○○○○ | 1 h |
+| ⬜ | Auto-lock time | 1, 5, 15 or 60 minutes instead of always 5. | ●○○○○ | 1 h |
+| ⬜ | Small preferences | Enter sends or adds a line (desktop), 12 or 24 hour clock, haptics on or off, default screen-share quality, ringtone from a few built-in sounds. | ●●○○○ | 2–3 h |
+| ⬜ | Mute a chat | No notices from one conversation, for a while or always. | ●●○○○ | 2 h |
+| ⬜ | Disguised app icon (Android) | Optional plain icon and name, so Veil does not stand out on the home screen. | ●●●○○ | 3 h |
 
 ## Privacy
 
