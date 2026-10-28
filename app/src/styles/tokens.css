@@ -145,6 +145,8 @@
   --z-nav: 20;
   --z-panel: 30;
   --z-overlay: 40;
+  /* The minimized call floats over content, under dialogs and toasts (review CB-7). */
+  --z-call-bubble: 45;
   --z-modal: 50;
   --z-toast: 60;
 

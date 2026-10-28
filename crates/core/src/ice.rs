@@ -586,14 +586,21 @@ mod tests {
                 ["m=audio", "m=video", "m=video", "m=audio", "m=application"]
             );
             assert!(out.contains("a=sctp-port:5000") && out.contains("a=fingerprint:sha-256 "));
-            // Stream ids survive the filter: the client tells voice from video by the camera's.
-            if video {
-                assert!(
-                    out.split("\r\n")
-                        .any(|l| l.starts_with("a=msid:") && !l.starts_with("a=msid:- ")),
-                    "a video call's camera stream id must survive"
-                );
-            }
+            // The camera section's stream id survives the filter: the client tells voice from
+            // video by it (review CB-5: the camera section only, both ways).
+            let camera: Vec<&str> = out
+                .split("\r\n")
+                .skip_while(|l| !l.starts_with("m=video "))
+                .skip(1)
+                .take_while(|l| !l.starts_with("m="))
+                .collect();
+            let named = camera
+                .iter()
+                .any(|l| l.starts_with("a=msid:") && !l.starts_with("a=msid:- "));
+            assert_eq!(
+                named, video,
+                "the camera section's stream id must survive the filter"
+            );
             let without = filter_sdp(sdp, Mode::RelayOnly, role).unwrap();
             assert!(
                 !without.contains("a=candidate"),

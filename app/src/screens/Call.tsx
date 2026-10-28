@@ -169,11 +169,14 @@ function CallBubble({ call, name, contact, status, picture, onExpand }: {
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0 || (e.target as HTMLElement).closest(".end")) return;
+    // One pointer drives the drag; a second finger is ignored (review CB-3).
+    const id = e.pointerId;
     const start = { x: e.clientX, y: e.clientY };
     const origin = pos;
     let last = origin;
     dragged.current = false;
     const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== id) return;
       const dx = ev.clientX - start.x;
       const dy = ev.clientY - start.y;
       if (!dragged.current && Math.hypot(dx, dy) < 6) return;
@@ -182,12 +185,17 @@ function CallBubble({ call, name, contact, status, picture, onExpand }: {
       last = clampBubble({ x: origin.x + dx, y: origin.y + dy });
       setPos(last);
     };
-    const up = () => {
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== id) return;
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       window.removeEventListener("pointercancel", up);
       setDragging(false);
       if (!dragged.current) return;
+      // The click that may follow this drag is skipped; none follows if it ended off the bubble.
+      window.setTimeout(() => {
+        dragged.current = false;
+      }, 0);
       // Snap to the nearer side, keeping the height.
       const side = last.x + BUBBLE_W / 2 < window.innerWidth / 2 ? EDGE : window.innerWidth - BUBBLE_W - EDGE;
       const snapped = clampBubble({ x: side, y: last.y });
@@ -209,10 +217,12 @@ function CallBubble({ call, name, contact, status, picture, onExpand }: {
         ref={open}
         className="call-bubble-open"
         type="button"
-        aria-label={`Back to the call with ${name}, ${status}`}
-        onClick={() => {
-          // A drag ends in a click on the same element: that one is not a tap.
-          if (dragged.current) {
+        // Not the running clock: the focused button's name would change every second (CB-4).
+        aria-label={call.phase === "active" ? `Back to the call with ${name}` : `Back to the call with ${name}, ${status}`}
+        onClick={(e) => {
+          // A drag ends in a click on the same element: that one is not a tap. Keyboard and
+          // assistive-tech activations (detail 0) always count.
+          if (dragged.current && e.detail !== 0) {
             dragged.current = false;
             return;
           }
@@ -342,7 +352,9 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
   );
 
   const screen = (
-    <div className="call-overlay" role="dialog" aria-modal="true" aria-label={`${call.video ? "Video" : "Voice"} call with ${name}`}>
+    // Not aria-modal: the app under it is inert already, and the call's live status sits beside
+    // the overlay so it is still heard when the call is minimized (review CB-1).
+    <div className="call-overlay" role="dialog" aria-label={`${call.video ? "Video" : "Voice"} call with ${name}`}>
       <section className={`call ${visual ? "video" : "audio"}${theirScreen ? " watching" : ""}`}>
         {call.phase === "incoming" || call.phase === "ended" ? null : (
           <button className="icon-btn call-min" type="button" aria-label="Minimize call" onClick={() => calls.setMinimized(true)}>

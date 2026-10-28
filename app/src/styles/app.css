@@ -137,7 +137,7 @@ button.reply:not(:disabled):active { filter: brightness(0.92); }
 .call .call-min { position: absolute; z-index: 3; top: calc(env(safe-area-inset-top) + var(--space-3)); left: var(--space-3); color: var(--on-media); background: var(--call-glass); border: 1px solid var(--call-glass-line); }
 
 /* The minimized call: a small card over the app, dragged with transform only. */
-.call-bubble { position: fixed; z-index: 100; left: 0; top: 0; width: 120px; height: 168px; border-radius: var(--radius-lg); overflow: hidden; background: var(--media-backdrop); border: 1px solid var(--call-glass-line); box-shadow: var(--shadow-3); touch-action: none; -webkit-user-select: none; user-select: none; transition: transform var(--dur-base) var(--ease-out); }
+.call-bubble { position: fixed; z-index: var(--z-call-bubble); left: 0; top: 0; width: 120px; height: 168px; border-radius: var(--radius-lg); overflow: hidden; background: var(--media-backdrop); border: 1px solid var(--call-glass-line); box-shadow: var(--shadow-3); touch-action: none; -webkit-user-select: none; user-select: none; transition: transform var(--dur-base) var(--ease-out); }
 .call-bubble.dragging { transition: none; }
 :root[data-motion="reduced"] .call-bubble { transition: none; }
 @media (prefers-reduced-motion: reduce) { .call-bubble { transition: none; } }

@@ -424,6 +424,11 @@ class CallManager {
       this.tell();
       return;
     }
+    // Only where the camera section was agreed to send: a call from preview.8 has it inactive,
+    // and the camera would light up for nothing (review CB-2). Checked before opening it.
+    const sendable = (t: RTCRtpTransceiver | undefined): t is RTCRtpTransceiver =>
+      t !== undefined && (t.currentDirection === "sendrecv" || t.currentDirection === "sendonly");
+    if (!sendable(this.pc?.getTransceivers()[Slot.Camera])) return;
     let next: MediaStreamTrack | undefined;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -431,11 +436,12 @@ class CallManager {
       });
       next = stream.getVideoTracks()[0];
       const pc = this.pc;
-      if (!next || !this.live(c.id) || !pc || (this.current?.local?.getVideoTracks().length ?? 0) > 0) {
+      const camera = pc?.getTransceivers()[Slot.Camera];
+      if (!next || !this.live(c.id) || !sendable(camera) || (this.current?.local?.getVideoTracks().length ?? 0) > 0) {
         next?.stop();
         return;
       }
-      await pc.getTransceivers()[Slot.Camera]?.sender.replaceTrack(next);
+      await camera.sender.replaceTrack(next);
       if (!this.live(c.id)) {
         next.stop();
         return;
@@ -456,7 +462,8 @@ class CallManager {
   setMinimized(minimized: boolean): void {
     const c = this.current;
     if (!c || c.phase === "incoming" || c.minimized === minimized) return;
-    this.patch({ minimized });
+    // After the end, a tap on the bubble still shows the full "Call ended" (review CB-8).
+    this.patch({ minimized }, c.phase === "ended");
   }
 
   /** Volume of their shared screen's sound, 0 to 1. */

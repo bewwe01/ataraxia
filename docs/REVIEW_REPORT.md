@@ -4689,3 +4689,113 @@ The TEST_REPORT's local check also ran coturn 4.6.1, which has this IPv6 bug. On
   - I could not test 4.18.0 itself here. coturn 4.18.0 is a real release (2026-09-08), and its changelog shows no option removals that would affect this config. CI is the check for the exact image.
 - **Compose and CI:** `VEIL_TURN_RELAY_IPS` takes the same value as coturn's `external-ip`. Images are pinned by digest. In CI, `-t` makes only the client leg TCP, which still works with `no-tcp-relay`.
 - **Docs:** PROTOCOL §8, INVARIANTS INV-NET-1, THREAT_MODEL items 12-14, the deploy README Funnel steps and the TEST_REPORT description match the code. The only exception is F6-3. TURN URLs are still refused for private IPs other than the relay's own, so item 12 is still accurate. I did not verify the Tailscale "1.104.4 / Tailworm" claim.
+
+## Camera in voice calls and call bubble review, round 1 (commit 753adb0)
+
+**Verdict: PASS.** No Critical or High findings. There are one Medium, five Low and two Nit findings.
+
+Scope: `git diff 753adb0~1 753adb0`, 14 files, about 800 lines (about 410 of them are SDP vectors). Commands run on 753adb0:
+
+```text
+$ pnpm -C app typecheck                     # tsc --noEmit, exit 0
+$ pnpm -C app lint                          # lint: 17 files clean
+$ cargo test -p veil-client --lib camera    # the_camera_section_tells_voice_from_video ... ok (1 passed)
+$ cargo test -p veil-core --lib ice         # 15 passed, 0 failed (incl. arbitrary_input_never_panics, relay_only_sdp_never_leaks)
+```
+
+### CB-1: Medium. The call's live status was moved outside the `aria-modal` dialog, so the full-screen call no longer announces anything
+- **Where:** `app/src/screens/Call.tsx:410` (the `<span className="sr-only" role="status">`), together with `Call.tsx:345` (`role="dialog" aria-modal="true"`).
+- **Problem:** The status span used to sit inside `.call-overlay`. It is now a sibling of the overlay inside the fragment. Chromium is the engine of both WebView2 and the Android WebView. When focus is inside an `aria-modal="true"` dialog, Chromium treats everything outside that dialog as ignored in the accessibility tree (`IsBlockedByAriaModalDialog`). On every full-screen render, the focus effect at `Call.tsx:312` moves focus into `.call-controls`. So while the call is full screen, the live region is outside the active modal and is pruned. (Confidence MEDIUM: the Chromium behaviour is from the engine's design, not tested here with a screen reader.)
+- **Failure scenario:** A screen-reader user places a voice call and keeps it full screen. They no longer hear "Call connected", "Alex is muted" or "Alex is sharing their screen". Before this commit they did. The announcements only work while the call is minimized.
+- **Fix:** The `.under-call` element already gets `inert` while the call is full screen (`App.tsx:52-57`), so `aria-modal` is redundant. Remove it and leave the status span where it is:
+  ```tsx
+  <div className="call-overlay" role="dialog" aria-label={`${call.video ? "Video" : "Voice"} call with ${name}`}>
+  ```
+  The other option is to keep `aria-modal` and render the status span inside the overlay when full screen and inside the bubble's root when minimized.
+
+### CB-2: Low. Mixed versions with preview.8: the voice/video signal no longer agrees, in both directions
+- **Where:** `crates/client/src/service/calls.rs:174-191` (the new `video_in` rule), `app/src/calls.ts:263` (voice offers now carry a sending camera section), `app/src/calls.ts:417-453` (`toggleCamera`).
+- **Problem (a), new caller to preview.8 callee:** preview.8's `video_in` (the parent commit's) reads any camera section that is not `inactive`/`recvonly` as video. A voice offer from this build has `a=sendrecv` + `a=msid:- …`, so preview.8 shows "Incoming video call". On Accept, `media(true)` opens the callee's camera. The new caller then shows that picture, because `remoteCamera` turns true. The callee did accept a "video call", so no camera opens without consent, but the caller's choice of voice is lost.
+- **Problem (b), preview.8 caller to new callee:** The offer's camera section is `a=inactive`, so the negotiated direction is inactive. On the new side the Camera button still works locally. `getUserMedia` opens the camera, `replaceTrack` succeeds on an inactive transceiver, the self-view shows, and `tell()` sends `cameraOff: false`. Nothing is ever sent. The same wrong state happens if `pc.getTransceivers()[Slot.Camera]` is `undefined` (the `?.` at `calls.ts:438` silently skips `replaceTrack`, and `local` is still patched with the camera).
+- **Failure scenario:** An outsider on preview.8 calls the owner, who is on the new build. The owner presses Camera and sees themselves "on camera". The other side never sees it, and the owner's camera light stays on for nothing.
+- **Fix:**
+  1. In `toggleCamera`, do not open the camera unless the camera transceiver exists and was negotiated to send:
+     ```ts
+     const cam = pc.getTransceivers()[Slot.Camera];
+     if (!cam || !(cam.currentDirection === "sendrecv" || cam.currentDirection === "sendonly")) { next.stop(); return; }
+     await cam.sender.replaceTrack(next);
+     ```
+     Better still, run this check before `getUserMedia`, so the camera is never opened. Note that `currentDirection` is null until negotiation completes, so this also blocks the camera while the call is "calling". If that matters, allow `currentDirection === null` and check `cam.direction`.
+  2. In ADR-0018 "Voice or video", add one line: a voice call from this build is read as video by preview.8, so both sides need this build.
+
+### CB-3: Low. A drag that ends off the bubble swallows the next keyboard or assistive-tech activation
+- **Where:** `app/src/screens/Call.tsx:175-199` and `Call.tsx:213-220`.
+- **Problem:** `dragged.current` is reset only on the next `pointerdown` or inside the button's `click`. If the bubble is clamped at an edge, the finger keeps moving and lifts outside the bubble. No `click` follows, so `dragged.current` stays `true`. Enter or Space on the focused "Back to the call" button, or a screen reader's activate, fires a `click` with no `pointerdown`, and that click is thrown away. A related issue: the window listeners do not filter by `pointerId`. A second finger's `pointerup` ends the first finger's drag, and both fingers' moves drive one drag.
+- **Failure scenario:** The user drags the bubble hard into the bottom corner, lets go, then presses Enter (or double-taps with a screen reader) to return to the call. Nothing happens until they try again.
+- **Fix:**
+  - Ignore keyboard clicks in the suppression: `if (dragged.current && e.detail !== 0) { … return; }`. For activation that has no pointer, `e.detail` is 0.
+  - Clear the flag after the click would have fired: in `up`, add `window.setTimeout(() => { dragged.current = false; }, 0);`.
+  - Track a single pointer: store `const id = e.pointerId` and return early in `move`/`up` when `ev.pointerId !== id`. Optionally call `e.currentTarget.setPointerCapture(id)`.
+
+### CB-4: Low. The focused bubble button's accessible name changes every second
+- **Where:** `app/src/screens/Call.tsx:212` (`aria-label={`Back to the call with ${name}, ${status}`}`), and `status` is the running clock. The bubble focuses this button on mount (`Call.tsx:164`).
+- **Problem:** The focused element's name changes once a second. NVDA and JAWS on Chromium may speak name changes of the focused object, so this repeats the running-timer problem raised earlier (REVIEW_REPORT, `Chats.tsx` recording bar: "announce it every second"). (Confidence MEDIUM: depends on the screen reader.)
+- **Failure scenario:** A screen-reader user minimizes a call and hears "Back to the call with Alex, 0:42 … 0:43 …" until they move focus.
+- **Fix:** Keep the label static, and let the visible time stay `aria-hidden` as it already is:
+  ```tsx
+  aria-label={call.phase === "active" ? `Back to the call with ${name}` : `Back to the call with ${name}, ${status}`}
+  ```
+
+### CB-5: Low. The core SDP test's new voice/video assertion cannot fail
+- **Where:** `crates/core/src/ice.rs:589-596`.
+- **Problem:** The old check (`a=inactive` present exactly in voice calls) was removed. The new one checks that some `a=msid:` line in the whole SDP is not `a=msid:- `. In every vector, the microphone section already carries `a=msid:<stream> <track>`, so the assertion holds even if the filter dropped the camera section's msid. Nothing replaced the check on the voice side. (The client test `the_camera_section_tells_voice_from_video` does cover the filtered vectors end to end, so this is not a coverage hole, but the core test now claims more than it checks. See CLAUDE.md rule 9.)
+- **Fix:** Look at the camera section (the first `m=video`) only, and check both cases:
+  ```rust
+  let camera: Vec<&str> = out.split("\r\n").skip_while(|l| !l.starts_with("m=video ")).skip(1)
+      .take_while(|l| !l.starts_with("m=")).collect();
+  let named = camera.iter().any(|l| l.starts_with("a=msid:") && !l.starts_with("a=msid:- "));
+  assert_eq!(named, video, "the camera section's stream id must survive the filter");
+  ```
+
+### CB-6: Low. The TEST_REPORT entry has no real command output
+- **Where:** `docs/TEST_REPORT.md:5-24`.
+- **Problem:** CLAUDE.md says "updated `docs/TEST_REPORT.md` (real command output)", and earlier entries include a `text` block with fmt, clippy, test and audit results. This entry lists test names and manual browser steps, but no `cargo fmt/clippy/test` or `pnpm typecheck/lint` output for 753adb0.
+- **Fix:** Add the block, for example `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `pnpm -C app typecheck`, `pnpm -C app lint`, each with its result.
+
+### CB-7: Nit. The bubble sits above dialogs and toasts
+- **Where:** `app/src/styles/app.css:140` (`z-index: 100`). The tokens are `--z-modal: 50` and `--z-toast: 60`.
+- **Problem:** Unlike the full-screen overlay, the bubble is meant to sit over a usable app, so it also covers that app's modals and toasts. Its default spot (top right, y=76) can hide a dialog's top-right Close button until the user drags it away. The z-index is also a raw number, not a token.
+- **Fix:** Add a token between sticky and modal, for example `--z-call-bubble: 40`, and use `z-index: var(--z-call-bubble)`. Then dialogs and toasts stay on top, and the bubble still floats over the content.
+
+### CB-8: Nit. The bubble keeps acting like a live call after the call ends
+- **Where:** `app/src/calls.ts:456-460` (`setMinimized`), `calls.ts:218-219` (`patch` ignores changes once the call has ended), `calls.ts:449-452`, and `app/src/screens/Call.tsx:209-220`.
+- **Problem:** During the `ENDED_MS` window, the bubble still says "Back to the call with X, Call ended", but tapping it does nothing, because `patch` drops the change. Separately, when `toggleCamera` fails (no camera, or permission denied), the user gets no feedback.
+- **Fix:**
+  - Make the bubble's open button do nothing visible once the call has ended, for example `aria-disabled={call.phase === "ended"}` with a label of just `status`.
+  - Or let `setMinimized(false)` bring back the full-screen "Call ended" view with `this.patch({ minimized }, true)` when the phase is `"ended"`.
+  - For the camera failure, consider a short status message, such as reusing `reason(err, …)` in the sr-only status.
+
+### Checked and fine
+- **`video_in` (Rust):**
+  - No indexing, `unwrap` or panics. It uses `split`/`strip_prefix`/`is_some_and` only, and the `Vec` is bounded by the SDP size limit applied before it.
+  - It runs on the SDP after `filter_sdp_with`, which keeps `a=msid` (`KEPT_ATTRIBUTES`).
+  - All six vectors are correct: video offer/answer have a camera stream id, the new voice offer/answer have `a=msid:- …`, and the preview8 offer/answer have `a=inactive`.
+  - The preview8 vectors are byte-identical to the parent's voice vectors.
+  - A missing `a=msid` reads as voice.
+- **Abuse of the flag:** a caller who forges a camera stream id only makes the callee's screen say "Incoming video call" and open the camera after an explicit "Accept video call". That is exactly a normal video call, so nothing new is exposed.
+- **`toggleCamera` races:**
+  - Double tap: the second `getUserMedia` result is stopped when the first already set a video track.
+  - `end()`, `abandon()` or glare during `getUserMedia` or `replaceTrack`: `live()` checks stop `next`. After the patch, `end()` and `release()` stop it as part of `c.local`.
+  - `flip()` cannot run before a video track exists. The audio tracks are carried over, so mute and deafen keep working.
+  - The phone speaker switch is documented in ADR-0018, and `end()` resets audio.
+- **`remoteCamera`:**
+  - Listeners are tied to the remote track's lifetime, and patches are ignored when `this.pc !== pc` or the call has ended.
+  - `fresh()` resets `remoteCamera` and `minimized`, and voice calls start with `cameraOff: true`.
+  - `tell()` reports the camera as off when there is no video track.
+  - A camera that is turned off stays hidden through `peer.cameraOff` (a disabled track sends black frames and does not mute).
+- **Audio:** every `<video>` is `muted`. The remote voice and screen `<audio>` elements keep the same positions in the fragment, so they are not remounted when the call is minimized or expanded. There is no double playback.
+- **App and focus:** `App.tsx` makes the app inert only for a full-screen call. Incoming calls can never be minimized. Focus goes to the bubble on minimize and back to the first control on expand. The resize listener is cleaned up. Drag listeners are removed on `pointerup` and `pointercancel`. `bubbleAt` lives in module memory only, which matches the ADR's "never stored".
+- **CSS:** only tokens for colour. Movement is `transform` only, with no transition while dragging, under `data-motion="reduced"` or under `prefers-reduced-motion`. The End button is 44×44 and the open button is 120×168. All icon buttons have labels, and the Camera button shows its state with icon and `aria-pressed`, not colour alone. All icons used exist in `public/icons.svg`.
+- **IPC:** it only uses `ipc.callAudio`, through `ipc.ts`, with no direct `invoke`. Nothing new reaches the network, and no key material, paths or plaintext reach the webview.
+- **Docs:** ADR-0018 ("Fixed media sections", "Voice or video", "Camera in a voice call", "Minimize", the updated "Not done"), the DESIGN.md §6 row and the TEST_REPORT steps match the code, apart from CB-2's missing compatibility note and CB-6.
+- **Checks:** `pnpm -C app typecheck` and `lint` are clean, and the `veil-client` and `veil-core` ice tests pass.

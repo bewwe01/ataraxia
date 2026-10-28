@@ -2,6 +2,38 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Camera and bubble: review round 1 and its fixes (2026-10-28)
+
+The review was a **PASS**, with one Medium, five Lows and two nits (REVIEW_REPORT.md). All of them are fixed:
+- **CB-1:** the call overlay is no longer `aria-modal` (the app under it is inert), so its live status is heard again.
+- **CB-2:** the camera opens only where the camera section was agreed to send, and ADR-0018 notes that both sides need the new build.
+- **CB-3:** a bubble drag follows one pointer, and never swallows a keyboard or assistive-tech activation.
+- **CB-4:** the bubble's label no longer changes every second.
+- **CB-5:** the core SDP test checks the camera section's stream id, both ways.
+- **CB-6:** this report has the real command output below.
+- **CB-7:** the bubble sits under dialogs and toasts (`--z-call-bubble`).
+- **CB-8:** a tap on the bubble after the call ended shows the full "Call ended".
+
+```text
+$ cargo fmt --all --check
+# ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.61s
+$ cargo test --workspace --locked
+# 227 passed, 0 failed
+$ (app) pnpm typecheck; pnpm lint; vite build
+# tsc: 0 errors
+# lint: 17 files clean
+# ✓ built in 1.04s
+$ (design/tools) node check.mjs
+# PASS
+```
+
+In Chromium:
+- The voice-call camera and bubble test passed again: camera on and off, typing under the bubble, drag and snap, tap, end from the bubble.
+- The video and screen-share run passed again.
+- New check: Alice's offer was rewritten to preview.8's inactive camera section. When Bob pressed Camera, `getUserMedia` was called 0 times, no self-view appeared, and the button stayed off.
+
 ## Calls: camera in voice calls, and the minimized call bubble (2026-10-28)
 
 The owner tested preview.8 on a Pixel and Windows, inside and outside the tailnet. Calls, screen sharing (watched on Android), mute, deafen and Funnel calls worked. Two requests followed: a camera button in voice calls, and an arrow that shrinks the call to a draggable bubble.
