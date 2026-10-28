@@ -1,6 +1,6 @@
 # Veil TODO
 
-Status of every feature, for v0.1.0-preview.8 (updated 2026-10-28).
+Status of every feature, for v0.1.0-preview.9 (updated 2026-10-28).
 
 ETA is my hands-on time, not including CI builds (about 20 min per release). One session is about 3–5 hours. Difficulty: 1 easy … 5 very hard. Estimates are rough.
 
@@ -91,10 +91,10 @@ Phase 6 of the original plan.
 
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
-| 🟡 | Voice and video calls | Built for contacts on your tailnet, relay-only through your TURN server (preview.8). Review gate passed. Waiting for your phone test. | ●●●●● | — |
-| 🟡 | Screen sharing | Smooth (1080p, 60 fps) or Light (720p, 30 fps), with a volume slider for the viewer. From Windows; Android can watch but not share (its WebView cannot capture the screen). | ●●●●○ | — |
-| 🟡 | Mute and deafen | Shown on both ends as small pills. Waiting for your phone test. | ●●○○○ | — |
-| 🟡 | Calls with people outside your tailnet | Your pick: TURN through Tailscale Funnel. Built and reviewed; coturn only relays between your own callers now and is updated to 4.18.0. Needs Tailscale 1.104.4+ and one Funnel command on the Pi (deploy/README.md), then your test. | ●●●○○ | — |
+| ✅ | Voice and video calls | Checked by you on a Pixel (preview.8). Preview.9: a Camera button in voice calls turns video on mid-call, and an arrow shrinks the call to a draggable bubble so you can keep chatting. | ●●●●● | — |
+| ✅ | Screen sharing | Checked by you: Smooth (1080p, 60 fps) or Light (720p, 30 fps), volume slider for the viewer. From Windows; Android can watch but not share (its WebView cannot capture the screen). | ●●●●○ | — |
+| ✅ | Mute and deafen | Checked by you on a Pixel. | ●●○○○ | — |
+| ✅ | Calls with people outside your tailnet | Checked by you: Windows outsider through Funnel to your Pixel, after the relay-ip fix. coturn only relays between your own callers, on 4.18.0. | ●●●○○ | — |
 | ⬜ | Direct mode per contact | Optional peer-to-peer for faster calls; reveals your IP to that contact. | ●●●○○ | 3–4 h |
 | ⬜ | Call history in the chat | Missed, declined and ended calls as lines in the conversation. | ●●○○○ | 2 h |
 
