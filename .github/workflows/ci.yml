@@ -206,10 +206,10 @@ jobs:
           uc -t -y -c -n 20 -m 1 -l 170 -u "$(cred 11)" -w "$(cred 12)" "$TURN_IP" | tee tcp.txt
           grep -q "Total lost packets 0 " tcp.txt
           uc -c -e 10.0.0.1 -n 5 -m 1 -u "$(cred 3)" -w "$(cred 4)" "$TURN_IP" | tee denied.txt
-          grep -q "403 (Forbidden IP)" denied.txt
+          grep -q "channel bind: error 403" denied.txt
           # Not the public internet either: this server relays only to itself (ADR-0018).
           uc -c -e 1.1.1.1 -n 5 -m 1 -u "$(cred 13)" -w "$(cred 14)" "$TURN_IP" | tee public.txt
-          grep -q "403 (Forbidden IP)" public.txt
+          grep -q "channel bind: error 403" public.txt
           uc -y -c -n 5 -m 1 -u "$(cred 5)" -w "wrong$(cred 6)" "$TURN_IP" | tee bad.txt
           grep -q "Cannot complete Allocation" bad.txt
           # A host UDP service outside the relay range must not be reachable through TURN (P3-8).

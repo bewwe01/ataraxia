@@ -9,7 +9,7 @@ The review was a **PASS**, with two Lows and a nit (REVIEW_REPORT.md):
 - **F6-2:** if the TURN addresses cannot be fetched when a call arrives, offers and answers wait, retried every 5 s, instead of going out without their candidate. New test `an_offer_waits_for_the_turn_addresses`: with TURN credentials rate-limited to zero, the hangup comes through and the offer is held.
 - **F6-3:** ADR-0018 cites the coturn advisories that apply.
 
-CI on dc2b29a ran coturn 4.18.0 for real. Allocations, denied peers and bad credentials passed. The new TCP check failed with `486 Allocation Quota Reached`, because it reused the first credential while that credential's allocations were still live (coturn's per-user quota working). The smoke test now mints seven credential pairs, and the new checks get their own.
+CI on dc2b29a ran coturn 4.18.0 for real. Allocations, denied peers and bad credentials passed. The new TCP check failed with `486 Allocation Quota Reached`, because it reused the first credential while that credential's allocations were still live (coturn's per-user quota working). The smoke test now mints seven credential pairs, and the new checks get their own. The next run showed that 4.18.0 reports a refused peer as `channel bind: error 403 ()`, without the old "Forbidden IP" text, so the checks now match the status code.
 
 ## Milestone 6: calls with contacts outside the tailnet, through Funnel (2026-10-28)
 
