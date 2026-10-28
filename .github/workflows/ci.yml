@@ -205,6 +205,10 @@ jobs:
           # The same over TCP, as a client behind Tailscale Funnel reaches coturn (ADR-0018).
           uc -t -y -c -n 20 -m 1 -l 170 -u "$(cred 11)" -w "$(cred 12)" "$TURN_IP" | tee tcp.txt
           grep -q "Total lost packets 0 " tcp.txt
+          # And arriving on loopback, as Funnel delivers outsiders: relays must still use the
+          # advertised address, or the two legs of a call cannot reach each other.
+          uc -t -y -c -n 20 -m 1 -l 170 -u "$(cred 15)" -w "$(cred 16)" 127.0.0.1 | tee loopback.txt
+          grep -q "Total lost packets 0 " loopback.txt
           uc -c -e 10.0.0.1 -n 5 -m 1 -u "$(cred 3)" -w "$(cred 4)" "$TURN_IP" | tee denied.txt
           grep -q "channel bind: error 403" denied.txt
           # Not the public internet either: this server relays only to itself (ADR-0018).

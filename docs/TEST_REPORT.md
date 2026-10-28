@@ -2,6 +2,20 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Funnel calls: the owner's first real call, and the relay-ip fix (2026-10-28)
+
+The owner's first call with an outsider through Funnel, on preview.8 (Windows and Android), rang and was accepted, then stayed on "Connecting…" and ended.
+
+The cause is coturn's default with no `relay-ip`: it relays from the address the client connected to. Tailnet clients arrive on `100.x`, but Funnel hands outsiders to coturn on `127.0.0.1`. Their relay socket sat on loopback while the candidate it advertised named `100.x`, so the two legs could not reach each other.
+
+My earlier test missed it because it put everything on 127.0.0.1. Reproduced on this machine with two addresses: Alice on `192.0.2.2` over UDP, Bob through the TLS proxy to `127.0.0.1`, and coturn set up like the Pi (`external-ip` and `allowed-peer-ip` = 192.0.2.2, all other peers denied). Results:
+
+- Browser call, without `relay-ip`: never connected (timed out waiting for "Call connected").
+- Browser call, with `relay-ip=192.0.2.2`: connected. Alice's path was relay/udp, Bob's relay/tls, and Bob saw the screen share at 1920×1080 at 6.5 s.
+- `turnutils_uclient -t -y` against `127.0.0.1`: 100% lost without `relay-ip`, 0 lost with it.
+
+Fix: `entrypoint.sh` sets `relay-ip` to the local half of `TURN_EXTERNAL_IP`. CI now runs the loopback probe against coturn 4.18.0, and the smoke test mints eight credential pairs.
+
 ## Funnel calls: review round 1 and its fixes (2026-10-28)
 
 The review was a **PASS**, with two Lows and a nit (REVIEW_REPORT.md):

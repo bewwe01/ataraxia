@@ -103,6 +103,11 @@ Set `.env`:
 * **C with contacts outside your tailnet (Tailscale Funnel):** as C, plus a third URL for them;
   see the next section.
 
+coturn relays media from the address after `/` in `TURN_EXTERNAL_IP`, or from the only address
+given, so that address must belong to this machine. On a cloud VPS whose public IP is not on
+its network interface (AWS, Google Cloud, Oracle: `ip addr` doesn't show it), use
+`<public IP>/<private IP>`.
+
 ### Calls with people outside your tailnet (Tailscale Funnel)
 
 If contacts outside your tailnet reach the relay through Funnel, they can call too, with nothing
