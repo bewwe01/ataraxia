@@ -463,6 +463,12 @@
   --on-media: #fff;
   /* QR codes need a white quiet zone to scan, whatever the theme. */
   --qr-paper: #fff;
+  /* The call screen's Accept button: white icon on green, readable in every theme. */
+  --call-accept: #0b7a4b;
+  /* Call overlay glass: the call screen is always dark, over video. */
+  --call-glass: rgb(10 12 30 / 0.74);
+  --call-glass-line: rgb(255 255 255 / 0.16);
+  --on-media-2: rgb(255 255 255 / 0.74);
   --sent-gradient: linear-gradient(135deg, var(--sent-a) 0%, var(--sent-b) 58%, var(--sent-c) 100%);
   --sent-bg: var(--sent-gradient);
   --sent-text: var(--text-on-accent);

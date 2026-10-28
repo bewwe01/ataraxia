@@ -2,6 +2,36 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Milestone 6: calls for tailnet peers, screen sharing, mute and deafen (2026-10-28)
+
+ADR-0018. Before the review gate.
+
+```text
+$ cargo fmt --all --check                                          # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings   # exit 0
+$ cargo test --workspace --locked                                  # 223 passed, 0 failed
+$ (app/src-tauri) cargo clippy --all-targets --locked -- -D warnings   # exit 0
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build            # 0 errors; lint: 17 files clean; built
+$ (design/tools) node check.mjs                                    # PASS
+```
+
+New tests:
+- `veil-core` `ice::tests::own_turn_server_may_be_private`: a relay candidate at the user's own relay IP passes, any other private address and any host or srflx candidate does not.
+- `veil-core` `ice::tests::real_chromium_calls_pass`: four real SDPs from Chromium (video and voice, offer and answer, `tests/vectors/sdp/`) pass the relay-only filter with the TURN host as the user's own. They keep the five sections, the data channel and the fingerprint. Without the allowance they lose their candidate.
+- `veil-client` `calls::tests::the_camera_section_tells_voice_from_video`, including on the real SDPs; `turn_urls_from_the_relay_are_checked`; `call_ids_round_trip_and_are_checked`.
+- `veil-client` `tests/calls.rs`, through a real relay:
+  - `a_call_is_signalled_relay_only`: TURN URLs are filtered; private candidates are stripped both ways; offer, answer, hangup and busy are delivered; bad input is refused; no SDP or ICE credentials are at rest after lock; the signal queue is empty after unlock.
+  - `no_calls_without_turn_and_none_from_blocked_contacts`.
+
+End to end in Chromium (the engine of the Android WebView and WebView2): the built app ran in two browser pages with mocked IPC, and signals were passed between them. Media went through a real coturn on 127.0.0.1 (`use-auth-secret`, HMAC credentials as the relay issues them), with `iceTransportPolicy: "relay"`.
+- *Video call:* each offer and answer carried exactly one candidate, `typ relay`. Both sides played the other's camera (640×360 and 320×180 after 2.5 s).
+- *Mute:* Alice muted, and Bob saw "Alice is muted"; Alice saw "You're muted".
+- *Deafen:* Bob deafened. Alice saw "Bob is deafened"; every audio element on Bob's side was muted. Undeafening cleared it on both sides.
+- *Screen share:* Alice shared at Smooth, and Bob received 1920×1080. Bob's volume slider set the screen's sound alone to 0.35, with the voice at 1. Switching to Light and stopping both worked without a new offer.
+- *Voice call:* the camera section was `a=inactive`, both sides showed a voice call, and the same steps passed. The screen arrived at 480×270 after 2.5 s while bandwidth estimation ramped up.
+
+Not verified here: the Android plugin code (call audio route, "Calls" notification channel) is not compiled locally, only in the release workflow. No call has run on a phone yet. Screen sharing on Windows WebView2 is untested on a real machine.
+
 ## Preview.7 fixes after the owner's device test (2026-10-28)
 
 The owner's device test of preview.6 found four problems:

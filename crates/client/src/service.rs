@@ -35,6 +35,7 @@ use zeroize::Zeroizing;
 use crate::db::{Db, SqlBackend};
 
 mod attachments;
+mod calls;
 mod watcher;
 use crate::relay::{Relay, split_host_port};
 use crate::unlock::{self, SecretKind};
@@ -43,6 +44,7 @@ pub use attachments::{
     AUTO_DOWNLOAD_PER_DAY, AUTO_DOWNLOAD_UNOPENED, AttachmentInput, AttachmentView, MAX_FILE,
     MAX_VOICE_BYTES, MAX_VOICE_MS,
 };
+pub use calls::{CallSetup, CallSignal, IceServerView};
 
 /// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
@@ -293,6 +295,10 @@ pub enum ChangeKind {
     /// while unlocked, or, while locked, a relay notice that something arrived (no contact).
     /// The app shell turns it into a content-free notification (INV-REST-5).
     Incoming,
+    /// Call signals arrived for the contact: take them with [`Client::call_signals`].
+    Call,
+    /// A contact is calling (with `Call`); the shell rings, without a name (INV-REST-5).
+    Ringing,
 }
 
 /// The notification setting. On by default: the notice never names the sender or shows
@@ -378,6 +384,9 @@ enum Cmd {
     SetTimer(i64, u32, Reply<()>),
     DismissKeyWarning(i64, Reply<()>),
     AcceptKeyChange(i64, i64, Reply<()>),
+    CallSetup(i64, Reply<CallSetup>),
+    CallSend(i64, String, calls::Outgoing, Option<String>, Reply<()>),
+    CallSignals(Reply<Vec<CallSignal>>),
     PurgeAll(Zeroizing<String>, Reply<bool>),
     Privacy(Reply<PrivacyView>),
     SetPrivacy(PrivacyView, Reply<()>),
@@ -739,6 +748,26 @@ impl Client {
     pub async fn accept_key_change(&self, contact: i64, previous: i64) -> Result<()> {
         ask!(self, AcceptKeyChange, contact, previous)
     }
+    /// TURN servers for a call with this contact (ADR-0018): relay-only, from the relay.
+    pub async fn call_setup(&self, contact: i64) -> Result<CallSetup> {
+        ask!(self, CallSetup, contact)
+    }
+    /// Sends a call signal now: `offer` or `answer` (with the webview's SDP, filtered here) or
+    /// `hangup` / `busy`. `call_id` is 32 hex characters.
+    pub async fn call_send(
+        &self,
+        contact: i64,
+        call_id: String,
+        kind: &str,
+        sdp: Option<String>,
+    ) -> Result<()> {
+        let kind = calls::Outgoing::parse(kind).ok_or(ClientError::BadInput)?;
+        ask!(self, CallSend, contact, call_id, kind, sdp)
+    }
+    /// Call signals that arrived since the last call (each returned once; memory only).
+    pub async fn call_signals(&self) -> Result<Vec<CallSignal>> {
+        ask!(self, CallSignals)
+    }
     pub async fn privacy(&self) -> Result<PrivacyView> {
         ask!(self, Privacy)
     }
@@ -770,6 +799,8 @@ struct Session {
     more: bool,
     /// When we last told each contact "typing" (in memory only).
     typing_sent: HashMap<i64, Instant>,
+    /// Call signals from contacts, waiting for the UI (in memory only, ADR-0018).
+    calls: calls::Pending,
     last_retry: Instant,
     /// There may be attachment transfers to move forward.
     transfers: bool,
@@ -1245,6 +1276,8 @@ impl Actor {
                 | Cmd::SetTimer(..)
                 | Cmd::DismissKeyWarning(..)
                 | Cmd::AcceptKeyChange(..)
+                | Cmd::CallSetup(..)
+                | Cmd::CallSend(..)
                 | Cmd::SetPrivacy(..)
                 | Cmd::Typing(..)
         ) {
@@ -1445,6 +1478,17 @@ impl Actor {
                 let res = self.set_timer(c, t).await;
                 let _ = r.send(res);
             }
+            Cmd::CallSetup(c, r) => {
+                let res = self.call_setup(c).await;
+                let _ = r.send(res);
+            }
+            Cmd::CallSend(c, id, kind, sdp, r) => {
+                let res = self.call_send(c, &id, kind, sdp).await;
+                let _ = r.send(res);
+            }
+            Cmd::CallSignals(r) => {
+                let _ = r.send(self.call_signals());
+            }
             Cmd::AcceptKeyChange(c, prev, r) => {
                 let res = self.accept_key_change(c, prev).await;
                 let _ = r.send(res);
@@ -1582,6 +1626,7 @@ impl Actor {
             backoff: Duration::from_secs(2),
             more: true,
             typing_sent: HashMap::new(),
+            calls: calls::Pending::default(),
             last_retry: Instant::now(),
             transfers: true,
         }));
@@ -1695,6 +1740,7 @@ impl Actor {
             backoff: Duration::from_secs(2),
             more: true,
             typing_sent: HashMap::new(),
+            calls: calls::Pending::default(),
             last_retry: Instant::now(),
             transfers: true,
         }));
@@ -3219,6 +3265,7 @@ impl Actor {
                     self.emit(kind, Some(contact));
                 }
             }
+            Body::Call(c) => self.receive_call(contact, sent_at_ms, c)?,
             // A new delivery token for this contact (they unblocked us). Moving to another
             // relay is not supported, so such an update is ignored.
             // Only a newer one (by their clock) counts, as for timers (review M1R2-1).

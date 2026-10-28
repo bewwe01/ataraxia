@@ -4,6 +4,7 @@ import { formatDuration, MAX_VOICE_MS, prepareFile, startRecording, TooLarge, ty
 import { EDIT_WINDOW_MS, ipc, IpcError, timerName, timerShort, type ContactView, type Me, type MessageView } from "../ipc";
 import { Avatar, Banner, Icon, TopBar, VerifiedMark, timeLabel, useDialogKeys } from "../ui";
 import { SWIPE_AT_PX, useBubbleGestures } from "../gestures";
+import { calls } from "../calls";
 
 export type Nav = (to: Route) => void;
 export type Route =
@@ -707,6 +708,12 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
             </span>
           </span>
         </button>
+              {contact.blocked ? null : (
+          <>
+            <button className="icon-btn" type="button" aria-label={`Voice call ${contact.name}`} onClick={() => void calls.start(contact.id, false)}><Icon name="phone" /></button>
+            <button className="icon-btn" type="button" aria-label={`Video call ${contact.name}`} onClick={() => void calls.start(contact.id, true)}><Icon name="video" /></button>
+          </>
+        )}
       </header>
       <ConnectionBar me={me} />
       <KeyWarning contact={contact} nav={nav} onChanged={onChanged} />

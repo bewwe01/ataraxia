@@ -334,6 +334,32 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 
 **Costs.** Swipes and holds are invisible affordances; the "⋯" button and the dialog's Reply keep everything reachable without them. A merged conversation cannot be split again.
 
+### ADR-0018: Voice and video calls (milestone 6). **Accepted (owner request, 2026-10-28).**
+**Context.** The owner asked for voice and video calls, first between contacts on their tailnet. Their relay and its coturn run on a Pi reached at its Tailscale IP (deploy option C), so the TURN server's address is a CGNAT `100.x` address, which the relay-only filter (PROTOCOL §8) refused as a relay candidate. Media must never reveal a user's IP to the contact (INV-NET-1), and the webview must not get keys (rule 2).
+
+**Decision.**
+- *Media in the webview:* WebRTC runs in the webview (Android WebView, WebView2), with `iceTransportPolicy: "relay"`, `bundlePolicy: "max-bundle"` and `rtcpMuxPolicy: "require"`. Media is DTLS-SRTP between the two webviews; the DTLS fingerprint travels in the E2EE signal (INV-NET-4). The webview holds the per-call DTLS key, which WebRTC creates itself; no Veil key reaches it.
+- *No trickle ICE:* the webview waits for gathering to finish (at most 6 s) and sends one offer or answer. The SDP must contain a `typ relay` candidate. `Ice` signals are ignored on receipt. One message per side keeps signaling simple and lets Rust check the whole SDP at once.
+- *Signaling:* `Content::Call` (`Offer`, `Answer`, `Hangup`, `Busy`) over the session, never the relay's own messages (INV-NET-3). Rust filters every SDP both ways with `filter_sdp_with`. Signals are sent with a 60 s expiry; a receiver drops one sent more than 90 s ago, so a phone that was offline does not ring for an old call.
+- *Signals in memory only:* received signals wait in a queue in the client actor (at most 32) until the webview takes them, and the queue is dropped on lock. Nothing of a call is written to the database: no SDP, no ICE credentials, no call history (tested by `a_call_is_signalled_relay_only`). A contact that is blocked can neither call nor ring.
+- *The user's own TURN server may be private:* a relay candidate is allowed at a public address **or at the IP the configured relay address names** (`own_turn`, only when the relay address is an IP literal). A TURN server on the relay's host belongs to the user, and the address is the server's, not the caller's, so it reveals nothing about either user. Host, server-reflexive and peer-reflexive candidates are still refused in relay-only mode.
+- *TURN servers given to the webview:* only the relay's TURN URLs whose host is public, is the relay's own IP, or is a DNS name that does not look local (no `.local`, `.lan`, `.internal`, `.home.arpa`, `.localhost`, and at least one dot). A hostile relay therefore cannot point the webview at hosts on the user's network. Without any TURN server, calls are off (`NoCalls`).
+- *Ringing:* an offer raises `Ringing`. The shell posts a content-free "Incoming call" notice (ADR-0016 rules: no name), on Android in a high-importance "Calls" channel, on Windows by flashing the taskbar. The app rings for 45 s (WebAudio tone and vibration) and replies `Busy` to a second call.
+- *Audio route:* on Android the plugin sets `MODE_IN_COMMUNICATION` during a call, switches between earpiece and speaker, and keeps the screen on; everything is restored when the call ends.
+- *Fixed media sections (owner request, 2026-10-28):* every call offers the same sections in the same order: microphone, camera, screen, screen audio, and a data channel. The camera section is `a=inactive` in a voice call, which is how the receiver (`video_in`) tells voice from video. Screen sharing puts a track into the screen sections with `replaceTrack`, so it starts and stops without a second offer through the relay.
+- *Screen sharing:* two qualities, as the owner asked: Smooth (1080p, 60 fps, up to 6 Mbit/s) and Light (720p, 30 fps, up to 2.5 Mbit/s), chosen in a bubble before sharing and changeable while sharing. The screen's sound is shared when the system offers it, and the viewer has a volume slider for it alone. Only where the webview has `getDisplayMedia`: WebView2 on Windows can share, the Android WebView cannot, so Android shows no Share button but can watch. Media goes through the TURN server like the rest of the call, so 1080p60 needs that much upload at the sharer and at the TURN server.
+- *Mute and deafen:* mute turns the microphone off. Deafen turns it off and silences everything from the other side (their voice and their screen's sound); undeafening restores the mute state from before, and unmuting while deafened undeafens, as people expect from other apps.
+- *Call state between the two sides:* mute, deafen, camera off and sharing are sent over the call's WebRTC data channel, inside the call's DTLS (so peer to peer, end to end, never through the relay's messages). Each side shows the other's state and its own as small pills with an icon and words, never colour alone. A state message is parsed strictly (four booleans, at most 256 characters); anything else is ignored.
+- *Lock during a call:* the call ends. While a call is up, the app reports activity every 60 s, so the vault does not lock for idleness during a call.
+
+**Costs.**
+- Contacts learn the TURN server's IP from the relay candidate. That is the server the relay already exposes, a tailnet address for option C.
+- Call setup takes up to 6 s longer than trickle ICE.
+- A missed call leaves no trace once the app locks, by design.
+- Calls between a tailnet contact and someone outside the tailnet do not work with option C: the outsider cannot reach `100.x`. Options for that are listed for the owner to choose from.
+
+**Not done.** Screen sharing from Android (the WebView has no `getDisplayMedia`; it would need native capture), call history lines in the chat, switching a voice call to video mid-call, group calls, Direct and LAN mode for calls, desktop call audio routing, and the packet-capture test of INV-NET-1 with two real devices.
+
 ## 7. Distribution (recorded owner request)
 
 The final step, after all phases pass the code-reviewer gate, is a GitHub Actions workflow that builds the Android **APK** and publishes it to this repository's **GitHub Releases**. Details:

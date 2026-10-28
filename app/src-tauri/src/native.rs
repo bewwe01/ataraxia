@@ -211,12 +211,27 @@ mod imp {
     #[derive(Serialize)]
     struct NotifyArg {
         certain: bool,
+        call: bool,
     }
 
-    pub async fn notify_message<R: Runtime>(app: &AppHandle<R>, certain: bool) {
+    pub async fn notify_message<R: Runtime>(app: &AppHandle<R>, certain: bool, call: bool) {
         if let Ok(h) = handle(app) {
             let _ = h
-                .run_mobile_plugin_async::<Option<Empty>>("notifyMessage", NotifyArg { certain })
+                .run_mobile_plugin_async::<Option<Empty>>("notifyMessage", NotifyArg { certain, call })
+                .await;
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CallAudioArg {
+        active: bool,
+        speaker: bool,
+    }
+
+    pub async fn call_audio<R: Runtime>(app: &AppHandle<R>, active: bool, speaker: bool) {
+        if let Ok(h) = handle(app) {
+            let _ = h
+                .run_mobile_plugin_async::<Option<Empty>>("callAudio", CallAudioArg { active, speaker })
                 .await;
         }
     }
@@ -337,6 +352,8 @@ mod imp {
     pub async fn request_notifications<R: Runtime>(_: &AppHandle<R>) {}
     #[allow(clippy::unused_async)]
     pub async fn ask_notifications_once<R: Runtime>(_: &AppHandle<R>) {}
+    #[allow(clippy::unused_async)]
+    pub async fn call_audio<R: Runtime>(_: &AppHandle<R>, _: bool, _: bool) {}
     #[allow(clippy::unused_async)]
     pub async fn background<R: Runtime>(_: &AppHandle<R>) -> bool {
         false

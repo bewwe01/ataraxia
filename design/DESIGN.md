@@ -143,6 +143,7 @@ Evidence is in [`CHECKS.md`](CHECKS.md). Summary of the last run:
 | `.verified-burst` | `<VerifiedCelebration>` | |
 | `.keygen-orb`, `.steps` | `<KeyGenAnimation>`, `<StepList>` | driven by real progress events from Rust |
 | `callContent()`, `.transport-chip`, `.call-ctl` | `<CallScreen>`, `<TransportChip>`, `<CallControls>` | Direct chip always names who sees the IP |
+| `.call-state`, `.share-sheet`, `.stream-volume` (app only, ADR-0018) | `<CallScreen>` pills, `<ShareSheet>`, stream volume | Mute, deafen and sharing are icon + words in a glass pill, the same on both ends; the quality bubble is a radio list (Smooth 1080p60, Light 720p30); the volume bar sets only the shared screen's sound |
 | `.dialog`, `.scrim`, `.hold-btn` | `<Dialog>`, `<AlertDialog>`, `<HoldToConfirm>` | focus trap in the app |
 | Mobile shell: `.m-appbar`, `.m-topbar`, `.m-nav`, `.m-fab` | `<AppBar>`, `<TopBar>`, `<BottomNav>`, `<Fab>` | |
 | Desktop shell: `.rail`, `.pane-list`, `.resizer`, `.pane-main`, `.pane-info` | `<Rail>`, `<ListPane>`, `<PaneResizer>`, `<MainPane>`, `<InfoPanel>` | info panel overlays below 1180px |

@@ -59,6 +59,8 @@ pub enum ClientError {
     NotAVerifyCode,
     #[error("Up to 3 reactions per message")]
     TooManyReactions,
+    #[error("Calls are not set up on this relay")]
+    NoCalls,
     #[error("Unknown contact")]
     UnknownContact,
     #[error("Message failed")]

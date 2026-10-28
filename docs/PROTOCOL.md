@@ -248,7 +248,10 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 
 ## 8. Calls
 
-- **Signaling** (offer, answer, ICE, hangup) travels only as `Content::Call` over the E2EE session. The relay sees ordinary padded envelopes (INV-NET-3).
+- **Signaling** (offer, answer, ICE, hangup, busy) travels only as `Content::Call` over the E2EE session. The relay sees ordinary padded envelopes (INV-NET-3).
+  - Veil does not trickle: one complete offer and one complete answer, each with its relay candidates. Incoming `Ice` signals are ignored (ADR-0018).
+  - Signals are sent with a 60 s expiry, and a receiver drops any sent more than 90 s ago. They are held in memory until the app takes them, never stored, and dropped on lock.
+- **TURN URLs** from the relay reach the webview only if their host is public, is the relay's own IP, or is a DNS name that does not look local (`.local`, `.lan`, `.internal`, `.home.arpa`, `.localhost` and dotless names are refused). A relay that offers none disables calls.
 - **DTLS identity binding.**
   - The SDP carries `a=fingerprint:sha-256`, and the WebRTC stack refuses a DTLS peer whose certificate doesn't match. Because the SDP arrives authenticated by the session, a relay or TURN operator cannot substitute its own DTLS endpoint (INV-NET-4).
   - Clients MUST reject SDP without a `sha-256` fingerprint, with more than one fingerprint, or with `a=setup` inconsistent with the offer/answer role.
@@ -262,7 +265,7 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
     - Candidates (any case) are re-serialised from validated fields only:
       - the address must be an IP literal (mDNS and other hostnames are dropped);
       - `typ` must be `relay`;
-      - the relay address must be public (loopback, private, link-local, CGNAT and metadata addresses are refused);
+      - the relay address must be public (loopback, private, link-local, CGNAT and metadata addresses are refused), **or** equal to the IP of the user's configured relay, whose own TURN server may sit on a tailnet or LAN (`filter_sdp_with`, ADR-0018);
       - `raddr`/`rport` become `0.0.0.0 0`;
       - only `tcptype`, `generation`, `ufrag`, `network-id` and `network-cost` extensions are kept.
     - Any kept `a=` line that could still carry an address (a `hexdigit.digit` sequence, or any embedded IP literal, `::` included) rejects the whole SDP (fail closed).

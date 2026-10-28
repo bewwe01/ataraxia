@@ -48,6 +48,13 @@ pub enum SdpRole {
 /// extension attributes kept are `tcptype`, `generation`, `ufrag`, `network-id` and
 /// `network-cost`, with validated values. Anything else on the line is discarded.
 pub fn filter_candidate(line: &str, mode: Mode) -> Option<String> {
+    filter_candidate_with(line, mode, &[])
+}
+
+/// [`filter_candidate`], also accepting `relay` candidates at `own_turn`: the addresses of the
+/// user's own TURN server when it sits on a private network or a tailnet (ADR-0018). The
+/// caller must only pass addresses the user configured, never ones a peer or relay chose.
+pub fn filter_candidate_with(line: &str, mode: Mode, own_turn: &[IpAddr]) -> Option<String> {
     if line.len() > MAX_CANDIDATE || !line.is_ascii() || line.chars().any(char::is_control) {
         return None;
     }
@@ -88,7 +95,8 @@ pub fn filter_candidate(line: &str, mode: Mode) -> Option<String> {
     let allowed = match (mode, kind.as_str()) {
         // A TURN relay is a public server; a "relay" candidate pointing at loopback, a private
         // network, link-local or cloud-metadata addresses is refused (review M1).
-        (Mode::RelayOnly, "relay") => is_public_ip(ip),
+        (Mode::RelayOnly, "relay") => is_public_ip(ip) || own_turn.contains(&ip),
+        (Mode::Direct { .. }, "relay") if own_turn.contains(&ip) => true,
         (Mode::Direct { allow_lan }, "host" | "srflx" | "prflx" | "relay") => allow_lan || is_public_ip(ip),
         _ => false,
     };
@@ -257,6 +265,12 @@ const KEPT_ATTRIBUTES: &[&str] = &[
 ///
 /// DTLS checks run on the filtered output.
 pub fn filter_sdp(sdp: &str, mode: Mode, role: SdpRole) -> Result<String> {
+    filter_sdp_with(sdp, mode, role, &[])
+}
+
+/// [`filter_sdp`] with the user's own TURN server addresses accepted for `relay` candidates
+/// (see [`filter_candidate_with`]).
+pub fn filter_sdp_with(sdp: &str, mode: Mode, role: SdpRole, own_turn: &[IpAddr]) -> Result<String> {
     if sdp.len() > MAX_SDP {
         return Err(CoreError::TooLarge);
     }
@@ -285,7 +299,7 @@ pub fn filter_sdp(sdp: &str, mode: Mode, role: SdpRole) -> Result<String> {
             "a=" => {
                 let name = value.split(':').next().unwrap_or_default().to_ascii_lowercase();
                 if name == "candidate" {
-                    filter_candidate(line, mode)
+                    filter_candidate_with(line, mode, own_turn)
                 } else if KEPT_ATTRIBUTES.contains(&name.as_str()) {
                     let rest = value.get(name.len()..).unwrap_or_default();
                     Some(format!("a={name}{rest}"))
@@ -517,6 +531,89 @@ mod tests {
                 "{addr}"
             );
         }
+    }
+
+    /// Real calls from Chromium (the engine of the Android `WebView` and `WebView2`), captured
+    /// relay-only through a local coturn on 127.0.0.1 (ADR-0018): video and voice, each an offer
+    /// and an answer with Veil's fixed sections (microphone, camera, screen, screen audio, data
+    /// channel). They must survive the filter with the TURN host as the user's own, or calls
+    /// could not start; without that allowance the private relay candidate is dropped.
+    #[test]
+    fn real_chromium_calls_pass() {
+        let own: [IpAddr; 1] = ["127.0.0.1".parse().unwrap()];
+        for (sdp, role, video) in [
+            (
+                include_str!("../tests/vectors/sdp/chromium-video-offer.sdp"),
+                SdpRole::Offer,
+                true,
+            ),
+            (
+                include_str!("../tests/vectors/sdp/chromium-video-answer.sdp"),
+                SdpRole::Answer,
+                true,
+            ),
+            (
+                include_str!("../tests/vectors/sdp/chromium-voice-offer.sdp"),
+                SdpRole::Offer,
+                false,
+            ),
+            (
+                include_str!("../tests/vectors/sdp/chromium-voice-answer.sdp"),
+                SdpRole::Answer,
+                false,
+            ),
+        ] {
+            let out = filter_sdp_with(sdp, Mode::RelayOnly, role, &own).unwrap();
+            assert!(out.contains(" 127.0.0.1 ") && out.contains(" typ relay"));
+            let sections: Vec<&str> = out
+                .split("\r\n")
+                .filter(|l| l.starts_with("m="))
+                .map(|l| l.split(' ').next().unwrap_or(""))
+                .collect();
+            assert_eq!(
+                sections,
+                ["m=audio", "m=video", "m=video", "m=audio", "m=application"]
+            );
+            assert!(out.contains("a=sctp-port:5000") && out.contains("a=fingerprint:sha-256 "));
+            assert_eq!(
+                out.contains("a=inactive"),
+                !video,
+                "the camera section marks a voice call"
+            );
+            let without = filter_sdp(sdp, Mode::RelayOnly, role).unwrap();
+            assert!(
+                !without.contains("a=candidate"),
+                "a private relay address needs the allowance"
+            );
+        }
+    }
+
+    /// The user's own TURN server on a tailnet or LAN (ADR-0018): its address, and only its
+    /// address, passes as a relay candidate; host candidates there still never do.
+    #[test]
+    fn own_turn_server_may_be_private() {
+        let own: [IpAddr; 1] = ["100.101.102.103".parse().unwrap()];
+        assert!(filter_candidate_with(&cand("100.101.102.103", "relay"), Mode::RelayOnly, &own).is_some());
+        for other in ["100.101.102.104", "10.0.0.1", "192.168.0.1", "127.0.0.1"] {
+            assert_eq!(
+                filter_candidate_with(&cand(other, "relay"), Mode::RelayOnly, &own),
+                None,
+                "{other}"
+            );
+        }
+        assert_eq!(
+            filter_candidate_with(&cand("100.101.102.103", "host"), Mode::RelayOnly, &own),
+            None
+        );
+        assert_eq!(
+            filter_candidate_with(&cand("100.101.102.103", "srflx"), Mode::RelayOnly, &own),
+            None
+        );
+        // Without the allowance, the same candidate is refused as before.
+        assert_eq!(
+            filter_candidate(&cand("100.101.102.103", "relay"), Mode::RelayOnly),
+            None
+        );
     }
 
     #[test]

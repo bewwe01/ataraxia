@@ -6,6 +6,8 @@ import { Setup, Unlock } from "./screens/Onboarding";
 import { Search } from "./screens/Search";
 import { Settings } from "./screens/Settings";
 import { Banner } from "./ui";
+import { calls, useCall } from "./calls";
+import { CallScreen } from "./screens/Call";
 
 export function App() {
   const [state, setState] = useState<AppState | null>(null);
@@ -17,6 +19,7 @@ export function App() {
   // Contacts shown as typing; each entry clears itself if no "stopped" arrives.
   const [typing, setTyping] = useState<ReadonlySet<number>>(new Set());
   const typingTimers = useRef(new Map<number, number>());
+  const call = useCall();
 
   const setTypingFor = useCallback((contact: number, on: boolean) => {
     const old = typingTimers.current.get(contact);
@@ -72,6 +75,8 @@ export function App() {
     let off: (() => void) | undefined;
     void onChange((kind, contact) => {
       if (kind === "locked") {
+        // The session that carried the call's signaling is gone.
+        calls.drop();
         // Drop everything shown while unlocked, previews included.
         setContacts([]);
         setMe(null);
@@ -83,7 +88,11 @@ export function App() {
         return;
       }
       // The shell already turned it into a notification; messages refresh on "messages".
-      if (kind === "incoming") return;
+      if (kind === "incoming" || kind === "ringing") return;
+      if (kind === "call") {
+        void ipc.callSignals().then((s) => calls.handle(s), () => undefined);
+        return;
+      }
       if (kind === "typing" || kind === "typingstopped") {
         if (contact !== null) setTypingFor(contact, kind === "typing");
         return;
@@ -106,6 +115,17 @@ export function App() {
   if (state === "locked") return <Unlock onDone={refreshState} />;
 
   const byId = (id: number) => contacts.find((c) => c.id === id);
+  const screen = mainScreen();
+  return call ? (
+    <>
+      {screen}
+      <CallScreen call={call} contact={byId(call.contact)} />
+    </>
+  ) : (
+    screen
+  );
+
+  function mainScreen() {
   switch (route.screen) {
     case "chat": {
       const c = byId(route.contact);
@@ -123,5 +143,6 @@ export function App() {
       return <Settings me={me} nav={setRoute} onLocked={() => { setContacts([]); setMe(null); refreshState(); }} />;
     case "chats":
       return <ChatList contacts={contacts} me={me} nav={setRoute} typing={typing} />;
+  }
   }
 }

@@ -65,12 +65,22 @@ class FlagArgs {
 class NotifyArgs {
   /** True when Veil knows a message arrived (unlocked); false for "may have" (locked). */
   var certain: Boolean = false
+  /** Someone is calling (ADR-0018): "Incoming call", still without a name. */
+  var call: Boolean = false
+}
+
+@InvokeArg
+class CallAudioArgs {
+  var active: Boolean = false
+  var speaker: Boolean = false
 }
 
 /** Content-free notifications (milestone 4, ADR-0016): never a sender, never text. */
 object VeilNotify {
   const val MESSAGES = "veil.messages"
   const val CONNECTION = "veil.connection"
+  const val CALLS = "veil.calls"
+  const val CALL_ID = 3
   const val MESSAGE_ID = 1
   const val SERVICE_ID = 2
 
@@ -80,6 +90,12 @@ object VeilNotify {
     nm.createNotificationChannel(
       NotificationChannel(MESSAGES, "Messages", NotificationManager.IMPORTANCE_DEFAULT).apply {
         description = "Says that something new arrived. Never who, never what."
+        lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+      }
+    )
+    nm.createNotificationChannel(
+      NotificationChannel(CALLS, "Calls", NotificationManager.IMPORTANCE_HIGH).apply {
+        description = "Says that someone is calling. Never who."
         lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
       }
     )
@@ -157,6 +173,7 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
   override fun onResume() {
     resumed = true
     NotificationManagerCompat.from(activity).cancel(VeilNotify.MESSAGE_ID)
+    NotificationManagerCompat.from(activity).cancel(VeilNotify.CALL_ID)
   }
 
   override fun onPause() {
@@ -174,25 +191,69 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
 
   @Command
   fun notifyMessage(invoke: Invoke) {
-    val certain = invoke.parseArgs(NotifyArgs::class.java).certain
+    val args = invoke.parseArgs(NotifyArgs::class.java)
+    val certain = args.certain
     if (!resumed && VeilNotify.allowed(activity)) {
       VeilNotify.channels(activity)
-      val n = NotificationCompat.Builder(activity, VeilNotify.MESSAGES)
+      val n = NotificationCompat.Builder(activity, if (args.call) VeilNotify.CALLS else VeilNotify.MESSAGES)
         .setSmallIcon(R.drawable.ic_stat_veil)
         .setContentTitle("Veil")
-        .setContentText(if (certain) "New message" else "You may have new messages")
+        .setContentText(if (args.call) "Incoming call" else if (certain) "New message" else "You may have new messages")
+        .setCategory(if (args.call) NotificationCompat.CATEGORY_CALL else NotificationCompat.CATEGORY_MESSAGE)
+        .setPriority(if (args.call) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
         .setAutoCancel(true)
         .setOnlyAlertOnce(false)
         .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
         .setContentIntent(VeilNotify.openApp(activity))
         .build()
       try {
-        NotificationManagerCompat.from(activity).notify(VeilNotify.MESSAGE_ID, n)
+        NotificationManagerCompat.from(activity).notify(if (args.call) VeilNotify.CALL_ID else VeilNotify.MESSAGE_ID, n)
       } catch (e: SecurityException) {
         // Permission withdrawn meanwhile: nothing to show.
       }
     }
     invoke.resolve()
+  }
+
+  /** Phone audio for a call (ADR-0018): communication mode so echo cancellation and the
+   *  earpiece work, speaker on or off, and the screen kept on; all undone when it ends. */
+  @Command
+  fun callAudio(invoke: Invoke) {
+    val args = invoke.parseArgs(CallAudioArgs::class.java)
+    activity.runOnUiThread {
+      val am = activity.getSystemService(android.media.AudioManager::class.java)
+      try {
+        if (args.active) {
+          am?.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
+          setSpeaker(am, args.speaker)
+          activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+          setSpeaker(am, false)
+          am?.mode = android.media.AudioManager.MODE_NORMAL
+          activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+      } catch (e: Exception) {
+        // Audio routing is best effort; the call goes on either way.
+      }
+    }
+    invoke.resolve()
+  }
+
+  private fun setSpeaker(am: android.media.AudioManager?, on: Boolean) {
+    if (am == null) return
+    if (Build.VERSION.SDK_INT >= 31) {
+      if (on) {
+        val speaker = am.availableCommunicationDevices.firstOrNull {
+          it.type == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        }
+        if (speaker != null) am.setCommunicationDevice(speaker)
+      } else {
+        am.clearCommunicationDevice()
+      }
+    } else {
+      @Suppress("DEPRECATION")
+      am.isSpeakerphoneOn = on
+    }
   }
 
   @Command

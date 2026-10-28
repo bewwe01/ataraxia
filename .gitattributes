@@ -1,0 +1,2 @@
+# SDP test vectors are CRLF by definition (RFC 8866); never convert them.
+*.sdp -text

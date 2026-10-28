@@ -221,6 +221,12 @@ function sendAttachment(contact: number, a: OutgoingAttachment): Promise<Message
 export const INVITE_PREFIX = "veil://i/";
 
 export const ipc = {
+  callSetup: (contact: number) => call<CallSetup>("call_setup", { contact }),
+  /** `offer`/`answer` carry the webview's SDP; Rust filters it to relay-only before sending. */
+  callSend: (contact: number, callId: string, kind: "offer" | "answer" | "hangup" | "busy", sdp: string | null = null) =>
+    call<void>("call_send", { contact, callId, kind, sdp }),
+  callSignals: () => call<CallSignal[]>("call_signals"),
+  callAudio: (active: boolean, speaker: boolean) => call<void>("call_audio", { active, speaker }),
   state: () => call<AppState>("app_state"),
   setup: (input: SetupInput) => call<void>("setup", { input }),
   unlock: (passphrase: string) => call<void>("unlock", { passphrase }),
@@ -316,7 +322,21 @@ export function timerShort(secs: number): string {
 }
 
 /** Something changed on the Rust side; the payload names what, never content. */
-export type ChangeKind = "contacts" | "messages" | "connection" | "locked" | "typing" | "typingstopped" | "incoming";
+export type ChangeKind = "contacts" | "messages" | "connection" | "locked" | "typing" | "typingstopped" | "incoming" | "call" | "ringing";
+
+/** TURN servers for one call (ADR-0018); the webview uses them relay-only. */
+export interface CallSetup {
+  iceServers: { urls: string[]; username: string; credential: string }[];
+}
+
+/** A call signal from a contact, already filtered by Rust. */
+export interface CallSignal {
+  contact: number;
+  callId: string;
+  kind: "offer" | "answer" | "hangup" | "busy";
+  sdp: string | null;
+  video: boolean;
+}
 
 export function onChange(handler: (kind: ChangeKind, contact: number | null) => void): Promise<UnlistenFn> {
   return listen<{ kind: ChangeKind; contact: number | null }>("veil://changed", (e) => {

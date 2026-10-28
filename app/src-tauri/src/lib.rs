@@ -553,25 +553,66 @@ fn data_dir(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
     Ok(dir)
 }
 
-/// Tells the user something arrived, without saying who or what (INV-REST-5): an Android
-/// notification when Veil is not on screen, or a taskbar flash on the desktop.
-fn alert(app: &AppHandle, certain: bool) {
+/// What to tell the user, never who or what (INV-REST-5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Notice {
+    /// A message arrived (Veil is unlocked).
+    Message,
+    /// The locked watcher heard that something arrived.
+    MayHave,
+    /// Someone is calling.
+    Call,
+}
+
+/// Tells the user something arrived: an Android notification when Veil is not on screen, or
+/// a taskbar flash on the desktop.
+fn alert(app: &AppHandle, notice: Notice) {
     // `#[cfg]`, not `cfg!`: window attention does not exist in Tauri's mobile API, so it
     // must not even be compiled there.
     #[cfg(target_os = "android")]
     {
         let app = app.clone();
-        tauri::async_runtime::spawn(async move { native::notify_message(&app, certain).await });
+        tauri::async_runtime::spawn(async move {
+            native::notify_message(&app, notice != Notice::MayHave, notice == Notice::Call).await;
+        });
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = certain;
         if let Some(w) = app.get_webview_window("main")
             && !w.is_focused().unwrap_or(true)
         {
-            let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+            let how = if notice == Notice::Call {
+                tauri::UserAttentionType::Critical
+            } else {
+                tauri::UserAttentionType::Informational
+            };
+            let _ = w.request_user_attention(Some(how));
         }
     }
+}
+
+/// TURN servers for a call (ADR-0018). The credentials are the relay's short-lived TURN
+/// login, which the webview's WebRTC needs; no Veil key is involved.
+#[tauri::command]
+async fn call_setup(c: State<'_, Client>, contact: i64) -> Res<veil_client::service::CallSetup> {
+    c.call_setup(contact).await.map_err(err)
+}
+
+/// Sends `offer`/`answer` (with SDP, which Rust filters) or `hangup`/`busy`.
+#[tauri::command]
+async fn call_send(c: State<'_, Client>, contact: i64, call_id: String, kind: String, sdp: Option<String>) -> Res<()> {
+    c.call_send(contact, call_id, &kind, sdp).await.map_err(err)
+}
+
+#[tauri::command]
+async fn call_signals(c: State<'_, Client>) -> Res<Vec<veil_client::service::CallSignal>> {
+    c.call_signals().await.map_err(err)
+}
+
+/// Phone audio for a call: communication mode, speaker or earpiece, screen kept on.
+#[tauri::command]
+async fn call_audio(app: AppHandle, active: bool, speaker: bool) {
+    native::call_audio(&app, active, speaker).await;
 }
 
 /// Notification settings: Veil's own switch, and on Android the system permission and the
@@ -640,7 +681,10 @@ pub fn run() {
                     handle.state::<Uploads>().clear();
                 }
                 if kind == ChangeKind::Incoming {
-                    alert(&handle, contact.is_some());
+                    alert(&handle, if contact.is_some() { Notice::Message } else { Notice::MayHave });
+                }
+                if kind == ChangeKind::Ringing {
+                    alert(&handle, Notice::Call);
                 }
                 let _ = handle.emit("veil://changed", Changed { kind, contact });
             });
@@ -675,6 +719,10 @@ pub fn run() {
             reset,
             purge_all,
             accept_key_change,
+            call_setup,
+            call_send,
+            call_signals,
+            call_audio,
             me,
             contacts,
             messages,
