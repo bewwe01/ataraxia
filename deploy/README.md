@@ -124,6 +124,8 @@ volume, as they already do for messages. People on your tailnet keep using UDP d
    tailscale funnel status
    ```
    Check the flag with `tailscale funnel --help` on your version first.
+   If you set `TURN_LISTEN_IP` (coturn listens on the Tailscale address only, see
+   `.env.example`), point Funnel at that address instead of `127.0.0.1`: `tcp://100.x.y.z:3478`.
 3. Add the Funnel URL to `.env` (keep the two tailnet ones):
    `VEIL_TURN_URLS=turn:100.x.y.z:3478?transport=udp,turn:100.x.y.z:3478?transport=tcp,turns:<pi>.<tailnet>.ts.net:10000?transport=tcp`
 4. `docker compose up -d`.

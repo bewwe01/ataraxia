@@ -32,6 +32,10 @@ printf 'relay-ip=%s\n' "$local_ip" >> "$conf"
 # with TURN credentials send UDP to *any* port on that address, so deploy/firewall/veil-turn.nft
 # is required: it limits coturn's relay sockets to the relay port range on this host (P3-8).
 printf 'allowed-peer-ip=%s\n' "$public" >> "$conf"
+# Optional: listen only on this address (e.g. the Pi's Tailscale IP) instead of every interface.
+if [ -n "${TURN_LISTEN_IP:-}" ]; then
+  printf 'listening-ip=%s\n' "$TURN_LISTEN_IP" >> "$conf"
+fi
 unset secret
 
 exec turnserver -c "$conf"

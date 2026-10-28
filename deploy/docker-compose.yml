@@ -64,6 +64,8 @@ services:
       - ./coturn/entrypoint.sh:/veil/entrypoint.sh:ro
     environment:
       TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP in deploy/.env}
+      # Optional: listen only on this address (see .env.example).
+      TURN_LISTEN_IP: ${TURN_LISTEN_IP:-}
     secrets: [turn_secret]
     logging:
       driver: local

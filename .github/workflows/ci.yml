@@ -240,6 +240,18 @@ jobs:
           docker rm -f udp-svc
           grep -q "Total lost packets 5 (100" docker-probe.txt
           sudo nft list table inet veil_turn | grep -E "counter packets [1-9]"
+      - name: TURN_LISTEN_IP keeps coturn on one address, and calls still connect
+        working-directory: deploy
+        run: |
+          echo "TURN_LISTEN_IP=$TURN_IP" >> .env
+          docker compose up -d --force-recreate coturn
+          sleep 3
+          ss -lunt | awk '$5 ~ /:3478$/ {print $5}' | sort -u | tee listen.txt
+          test "$(cat listen.txt)" = "$TURN_IP:3478"
+          docker run --rm --network host --entrypoint turnutils_uclient \
+            docker.io/coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3 \
+            -y -c -n 20 -m 1 -l 170 -u "$(sed -n 17p "$RUNNER_TEMP/turn")" -w "$(sed -n 18p "$RUNNER_TEMP/turn")" "$TURN_IP" 2>&1 | tee listen-ok.txt
+          grep -q "Total lost packets 0 " listen-ok.txt
       - name: Nothing about clients in either container's logs
         working-directory: deploy
         run: |
