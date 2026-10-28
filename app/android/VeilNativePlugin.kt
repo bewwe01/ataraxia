@@ -243,6 +243,16 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
     invoke.resolve()
   }
 
+  /** Clears the "Incoming call" notice alone, for a call turned away while another is up
+   *  (review C6R2-4); unlike callAudio it leaves the audio route as it is. */
+  @Command
+  fun cancelCallNotice(invoke: Invoke) {
+    activity.runOnUiThread {
+      NotificationManagerCompat.from(activity).cancel(VeilNotify.CALL_ID)
+    }
+    invoke.resolve()
+  }
+
   private fun setSpeaker(am: android.media.AudioManager?, on: Boolean) {
     if (am == null) return
     if (Build.VERSION.SDK_INT >= 31) {

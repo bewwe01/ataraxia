@@ -600,7 +600,13 @@ async fn call_setup(c: State<'_, Client>, contact: i64) -> Res<veil_client::serv
 
 /// Sends `offer`/`answer` (with SDP, which Rust filters) or `hangup`/`busy`.
 #[tauri::command]
-async fn call_send(c: State<'_, Client>, contact: i64, call_id: String, kind: String, sdp: Option<String>) -> Res<()> {
+async fn call_send(
+    c: State<'_, Client>,
+    contact: i64,
+    call_id: String,
+    kind: String,
+    sdp: Option<String>,
+) -> Res<()> {
     c.call_send(contact, call_id, &kind, sdp).await.map_err(err)
 }
 
@@ -613,6 +619,12 @@ async fn call_signals(c: State<'_, Client>) -> Res<Vec<veil_client::service::Cal
 #[tauri::command]
 async fn call_audio(app: AppHandle, active: bool, speaker: bool) {
     native::call_audio(&app, active, speaker).await;
+}
+
+/// Removes the "Incoming call" notice for a call that was turned away (busy or glare).
+#[tauri::command]
+async fn cancel_call_notice(app: AppHandle) {
+    native::cancel_call_notice(&app).await;
 }
 
 /// Notification settings: Veil's own switch, and on Android the system permission and the
@@ -681,7 +693,14 @@ pub fn run() {
                     handle.state::<Uploads>().clear();
                 }
                 if kind == ChangeKind::Incoming {
-                    alert(&handle, if contact.is_some() { Notice::Message } else { Notice::MayHave });
+                    alert(
+                        &handle,
+                        if contact.is_some() {
+                            Notice::Message
+                        } else {
+                            Notice::MayHave
+                        },
+                    );
                 }
                 if kind == ChangeKind::Ringing {
                     alert(&handle, Notice::Call);
@@ -723,6 +742,7 @@ pub fn run() {
             call_send,
             call_signals,
             call_audio,
+            cancel_call_notice,
             me,
             contacts,
             messages,

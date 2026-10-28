@@ -236,6 +236,14 @@ mod imp {
         }
     }
 
+    pub async fn cancel_call_notice<R: Runtime>(app: &AppHandle<R>) {
+        if let Ok(h) = handle(app) {
+            let _ = h
+                .run_mobile_plugin_async::<Option<Empty>>("cancelCallNotice", ())
+                .await;
+        }
+    }
+
     pub async fn notifications_allowed<R: Runtime>(app: &AppHandle<R>) -> bool {
         let Ok(h) = handle(app) else { return false };
         h.run_mobile_plugin_async::<Flag>("notificationsAllowed", ())
@@ -354,6 +362,8 @@ mod imp {
     pub async fn ask_notifications_once<R: Runtime>(_: &AppHandle<R>) {}
     #[allow(clippy::unused_async)]
     pub async fn call_audio<R: Runtime>(_: &AppHandle<R>, _: bool, _: bool) {}
+    #[allow(clippy::unused_async)]
+    pub async fn cancel_call_notice<R: Runtime>(_: &AppHandle<R>) {}
     #[allow(clippy::unused_async)]
     pub async fn background<R: Runtime>(_: &AppHandle<R>) -> bool {
         false

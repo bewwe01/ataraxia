@@ -2,6 +2,28 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Milestone 6: review round 2 and its fixes (2026-10-28)
+
+Round 2 was a **PASS** (REVIEW_REPORT.md). Its Medium, Lows and nit are fixed in the commit after it:
+- **C6R2-1:** Flip opens only a camera, and lets it go if the call ended meanwhile.
+- **C6R2-2:** the side that steps aside in glare sends a hangup for its own call.
+- **C6R2-3:** a dialog left open under a call no longer holds the keyboard.
+- **C6R2-4:** a new `cancelCallNotice` command clears "Incoming call" for an offer turned away as busy or in glare.
+- **C6R2-5:** a comment moved back above its own effect.
+
+```text
+$ cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings   # ok; exit 0
+$ cargo test --workspace --locked                                  # 225 passed, 0 failed
+$ (app/src-tauri) cargo fmt --check; cargo clippy --all-targets --locked -- -D warnings; cargo test --locked   # ok; exit 0; 3 passed
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build            # 0 errors; 17 files clean; built
+$ (design/tools) node check.mjs                                    # PASS
+```
+
+In Chromium:
+- The feature test passed again: screen at 1920×1080, deafen, stream volume.
+- The early-hangup test passed again: both tracks `ended`, only a hangup sent.
+- New glare test: both sides pressed "Voice call" at once. The smaller id (Bob's) went ahead. Alice stepped aside and sent a hangup for her own id; nobody saw "Busy". Alice was rung, accepted, and the call connected.
+
 ## Milestone 6: fixes after review round 1 (2026-10-28)
 
 Round 1 was a FAIL with one High (C6-1); the report is in REVIEW_REPORT.md. All findings, C6-1 to C6-11, are fixed:

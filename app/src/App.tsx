@@ -48,8 +48,7 @@ export function App() {
 
   useEffect(refreshState, [refreshState]);
 
-  // Notifications are on by default; Android asks for its permission the first time
-  // (review M4-3). Kotlin remembers that it asked.
+  // The app under a call is inert (review C6-4).
   useEffect(() => {
     const el = underCall.current;
     if (!el) return;
@@ -57,6 +56,8 @@ export function App() {
     else el.removeAttribute("inert");
   }, [inCall, state]);
 
+  // Notifications are on by default; Android asks for its permission the first time
+  // (review M4-3). Kotlin remembers that it asked.
   useEffect(() => {
     if (state === "unlocked") void ipc.notifyWelcome().catch(() => undefined);
   }, [state]);

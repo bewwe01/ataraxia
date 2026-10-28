@@ -4429,3 +4429,164 @@ The `{contact.blocked ? null : (` block is indented 14 spaces instead of 8. Refo
   - the range input is `--tap-min` tall and the radio rows 56 px.
 - **SDP vectors:** only 127.0.0.1 relay candidates and `raddr 0.0.0.0`, nothing identifying; marked `-text` in `.gitattributes`.
 - **IPC:** all new calls go through `ipc.ts`, with no direct `invoke`.
+
+## Milestone 6 calls review, round 2 (commit 07b6547)
+
+**Verdict: PASS** (0 Critical, 0 High; 1 Medium, 3 Low, 1 Nit)
+
+Scope: `git diff bde54b3 07b6547`, 14 files. No files were modified.
+
+Commands run:
+- `cargo test -p veil-client --features test-hooks --test calls`: 3 passed, including `an_undelivered_offer_is_never_sent_later`.
+- `cargo test -p veil-client --lib calls`: 4 passed, including `old_signals_are_stale`.
+- `cargo test -p veil-core --lib ice`: 15 passed.
+- `pnpm -C app typecheck`: 0 errors.
+
+The full-workspace totals in TEST_REPORT (225 passed, clippy, lint, design check) were not re-run.
+
+---
+
+### Round-1 findings
+
+| ID | Status | Notes |
+|---|---|---|
+| C6-1 (High) | **fixed** | See the `start()` / `accept()` walk-through below the table. The same leak exists in `flip()`, which the fix did not touch: C6R2-1. |
+| C6-2 (Medium) | **fixed** | See the `call_send` notes below the table. |
+| C6-3 (Medium) | **fixed** | See the TURN host notes below the table. |
+| C6-4 (Medium) | **fixed** | See the ShareSheet notes below the table. A dialog left open under the call can still swallow Tab: C6R2-3. |
+| C6-5 (Low) | **fixed** | `is_stale` was extracted and tested at 0, 89, 90 and 90.001 s, plus the future, `u64::MAX` and `i64::MAX`. Clock skew is in ADR-0018 Costs. |
+| C6-6 (Low) | **fixed** | Same delete as C6-2. The new test checks `hidden_rows == 0`. ADR-0018, PROTOCOL §8 and INV-NET-3 wording match the code. |
+| C6-7 (Low) | **fixed** | The tie-break is consistent on both sides: lowercase 32-hex ids, so string comparison equals numeric comparison. A small gap remains: C6R2-2. |
+| C6-8 (Low) | **fixed for answered, missed and ended calls** | `callAudio` cancels `CALL_ID` on every `end()` and when the call connects. Offers rejected as busy or ignored in glare are not covered: C6R2-4. |
+| C6-9 (Nit) | **fixed** | INVARIANTS now cites `real_chromium_calls_pass` (`ice.rs` L542). |
+| C6-10 (Nit) | **fixed** | `IceServerView` and `CallSignal` have redacting `Debug` impls. `CallSetup`'s derived `Debug` delegates to them. |
+| C6-11 (Nit) | **fixed** | `Chats.tsx` L711 is now indented 8 spaces. |
+
+**C6-1 walk-through (`start()` and `accept()`).** Every await has a `live(id)` check that releases what was taken:
+- `callSetup`: nothing is held yet, so it just returns.
+- `media`: `release(local, null)`.
+- `createOffer` / `setRemoteDescription` / `setLocalDescription` on a pc that `end()` or `abandon()` closed: they throw, and the catch path calls `release`.
+- `gathered`: `release(local, pc)`.
+- `callSend`: the ring timer is no longer armed for a call that has gone.
+
+Calling `pc.close()` and `track.stop()` twice is harmless. `release` nulls `this.pc` only if it still points at that pc, so a call that started in the 1.8 s "ended" window keeps its own pc. `patch()` is a no-op after the call ends, except for the `end()` patch itself. If a hangup is sent while the offer or answer is still in flight, the actor sends the hangup second, so the peer ends cleanly.
+
+**C6-2 (`call_send`).** The `DELETE … AND kind='control'` runs in the same actor turn as `deliver` (`&mut self`), so `retry_failed` and `tick` cannot interleave. It runs in autocommit after the `atomically` savepoint is released, like `deliver`'s own updates. Deleting a sealed envelope after the ratchet has advanced leaves a gap in the message chain, which libsignal tolerates.
+
+The new test is meaningful. On the old code the failed row (`attempts=1`, not expired) would be redelivered by `connect()` → `retry_failed()` before "back", so both `hidden_rows == 0` and the "no signal, no ring" asserts would fail.
+
+**C6-3 (TURN host check).** `tld_ok` requires a last label of at least two letters, all alphabetic. That rejects every `inet_aton` shorthand form: decimal, octal and hex labels all contain a digit. Bare 32-bit integers are dotless and already refused. The ADR, PROTOCOL and THREAT_MODEL §4 item 12 now state the residual risk from DNS correctly. Renumbering "Bugs" to item 13 left no stale references in the docs.
+
+**C6-4 (ShareSheet).** `closeSheet` is stable, and initial focus runs only once. `useDialogKeys` traps Tab across [Close, Share/Stop], and the native tab order passes through the radio group between them. The trap cycle (Close, radio, Share) and Shift+Tab both work. Focus returns to the Share control when the sheet closes.
+
+---
+
+### New findings
+
+#### C6R2-1: Medium [HIGH that tracks are not stopped; MEDIUM that the OS indicator stays on]. `flip()` never stops a microphone track it opens, and leaks the new camera track if the call ends mid-flip
+**Where:** `app/src/calls.ts` L493-509 (`flip`) and L122-127 (`media`). This code is unchanged since bde54b3. It is the same class of bug as C6-1, and the C6-1 fix does not cover it.
+
+**Problem:**
+1. **The microphone track.** `media(true, facing)` always requests `audio` as well as video. `flip()` keeps only `getVideoTracks()[0]`. The new audio track is never stored or stopped. The rebuilt `local` keeps the old audio track, so `end()` does not stop the new one either. This happens on every successful flip.
+2. **The camera track.** If the call ends during `await media(...)`, `end()` has set `this.pc = null`. The next line, `this.pc.getTransceivers()`, then throws a TypeError, which the catch swallows. `next` is never stopped, so the camera keeps capturing with no call. If a new call has started in the meantime, `this.pc` is the new call's pc, and the old flip's track is swapped into its camera slot.
+
+**Failure scenario:** On Android, Flip is shown in every video call. After one flip, an extra microphone capture is held. The other side hanging up while the user is flipping (camera switch takes about 0.5-1 s on Android) leaves the camera running and the privacy indicator lit after the call screen has gone. This is the harm C6-1 was raised for.
+
+**Fix:**
+```ts
+async flip(): Promise<void> {
+  const c = this.current;
+  const old = c?.local?.getVideoTracks()[0];
+  if (!c || !old || !this.pc) return;
+  const facing = old.getSettings().facingMode === "environment" ? "user" : "environment";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+    });
+    const next = stream.getVideoTracks()[0];
+    if (!next) return;
+    const pc = this.pc;
+    if (!this.live(c.id) || !pc) { next.stop(); return; }
+    next.enabled = !c.cameraOff;
+    await pc.getTransceivers()[Slot.Camera]?.sender.replaceTrack(next);
+    old.stop();
+    this.patch({ local: new MediaStream([...(this.current?.local?.getAudioTracks() ?? []), next]) });
+  } catch { /* keep the current camera */ }
+}
+```
+The key change is to request video only, so no stray microphone track is opened.
+
+#### C6R2-2: Low [HIGH]. In glare, the side that steps aside sends nothing for its own call, so a late copy of its offer can ring later
+**Where:** `app/src/calls.ts` L276-287 (`handle`, glare) and L355-361 (`abandon`).
+
+**Problem:** The side with the larger id (B) drops its call silently. If B's offer had already been deposited and reaches A only after A's own call has ended, A is idle when it arrives. A then rings for a call B gave up on. A's call ends locally if A hangs up or its setup fails; B's offer is within the 90 s window.
+
+**Failure scenario:**
+1. A, on a flaky mobile link, and B call each other at the same moment. A's offer reaches B, and B steps aside and rings for A.
+2. A sees only "Calling…" and hangs up after 10 s. B sees "Missed call".
+3. A's next sync fetches B's stale offer, and A's phone rings for up to 45 s.
+4. If A answers, B ignores the answer. A sits in "Connecting…" until ICE fails.
+
+**Fix:** In `abandon()`, send a hangup for our own id. The peer ignores hangups whose `callId` is not current (L297), so this is harmless in the normal case. In the late case, the hangup follows the offer in session order and ends the ring at once.
+```ts
+private abandon() {
+  const c = this.current;
+  window.clearTimeout(this.ringTimer);
+  if (c) void ipc.callSend(c.contact, c.id, "hangup").catch(() => undefined);
+  this.release(c?.local ?? null, this.pc);
+  this.current = null;
+  this.emit();
+}
+```
+
+#### C6R2-3: Low [HIGH]. A dialog open under the call still holds the keyboard: Tab does nothing on the call screen
+**Where:** `app/src/ui.tsx` L187-211 (`useDialogKeys`), used by MessageActions (`Chats.tsx` L271) and PhotoViewer (`Attachment.tsx` L353); `app/src/App.tsx` L53-58 (`inert`).
+
+**Problem:** The app now stays mounted under the call, so an open MessageActions dialog or PhotoViewer keeps its `document` keydown listener. On Tab, focus is outside its box, so the listener calls `preventDefault()` and then `first.focus()`. That focus call fails silently because the target is inert. The net effect is that Tab never moves.
+
+Before this diff, focus went behind the overlay instead. That was also broken, so this is not a regression, but the C6-4 claim that focus stays in the call is not met in this case. Escape also closes the hidden dialog.
+
+**Failure scenario:** A desktop keyboard-only user has a photo open when a call comes in. The call screen focuses Decline. Tab cannot reach Accept, so Enter can only decline.
+
+**Fix:** Make the hook stand down while its dialog is inert:
+```ts
+const onKey = (e: globalThis.KeyboardEvent) => {
+  if (box.current?.closest("[inert]")) return;
+  ...
+```
+
+#### C6R2-4: Low [MEDIUM]. On Android, an "Incoming call" notice for an offer rejected as busy (or ignored in glare) stays up through the current call
+**Where:** `app/src/calls.ts` L281-285 (the busy reply and the glare `continue`), `app/src-tauri/src/lib.rs` L686-687, `app/android/VeilNativePlugin.kt` L192-214 and L222-227.
+
+**Problem:** Rust raises `Ringing` for every offer it accepts. If Veil is in the background, the shell posts a high-priority "Incoming call" notice. The webview then replies busy, or ignores the offer in glare, but nothing cancels the notice. It is only cleared by `callAudio`, which runs when the current call connects or ends, or on a speaker toggle. C6-8 covers answered, missed and ended calls, but not these.
+
+**Failure scenario:** An Android user switches to another app during a voice call. A second contact calls. A heads-up notice alerts on the Calls channel and stays in the shade for the rest of the call, for a call that was already turned away. Tapping it shows the existing call.
+
+**Fix:** Add a dedicated `cancelCallNotice` plugin command, exposed as `ipc.cancelCallNotice()`, that only cancels `VeilNotify.CALL_ID`. Call it from the busy and glare-ignore branches of `handle()`. Do not reuse `callAudio(true, …)` there, because it would switch the audio mode.
+
+#### C6R2-5: Nit. A comment now sits above the wrong effect
+**Where:** `app/src/App.tsx` L51-52.
+
+The comment "Notifications are on by default; Android asks for its permission the first time (review M4-3)…" now sits above the new `inert` effect, not above the `notifyWelcome` effect it describes. Move the `inert` effect (L53-58) above that comment, and give it its own one-line comment (e.g. "The app under a call is inert (C6-4)").
+
+---
+
+### Checked and fine
+- **`start()` / `accept()` await paths:** all checked; see the C6-1 walk-through above.
+- **Glare:** symmetric and deterministic.
+  - Only an outgoing call in `calling` to the same contact counts as glare, and an offer echoing our own id is not treated as one.
+  - `abandon()` clears the ring timer and releases tracks and pc. The pending `start()` continuation then releases or returns at its next `live()` check, and no longer overwrites `ringTimer`.
+  - A busy reply for the abandoned id is ignored, because its `callId` is not current.
+- **`call_send` delete:** cannot race `retry_failed`, `deliver` or `tick` (same actor turn). It is outside any open savepoint, matching how `deliver` writes. A blocked contact or pending intro also ends in delete plus `Unreachable`.
+- **`is_stale`:** saturating arithmetic, no panics. Senders with a fast clock are not penalised, by design (ADR-0018 Costs covers the slow-clock case).
+- **`turn_url_ok`:** the rule holds against `127.1`, `10.1`, `192.168.1`, `0x7f.1`, `1.2.3.4.5`, a trailing-dot name (refused), bracketed and bare IPv6 (refused unless public or own), and zone ids (charset).
+- **Redacted `Debug`:** `IceServerView` prints only `urls`; `CallSignal` prints only contact, kind and video. `CallSetup` delegates to them. Nothing in the diff logs them.
+- **`.under-call { display: contents }`:** no layout rule depends on `#root`'s direct child. The wrapper also keeps the main screen at the same tree position whether or not a call is up, so drafts survive. `inert` is re-applied after unlock (the `state` dependency).
+- **ShareSheet:** stable `closeSheet`; the focus trap and the return of focus to the Share control work.
+- **Android `callAudio`:** cancels `CALL_ID` on the UI thread, before the audio-mode changes. `NotificationManagerCompat` is already imported.
+- **Docs match the code:**
+  - ADR-0018 (signaling, memory-only signals, TURN names, ringing, glare, Costs);
+  - PROTOCOL §8;
+  - THREAT_MODEL §4 item 12, with "Bugs" renumbered to 13 and no stale references;
+  - INVARIANTS INV-NET-1 and INV-NET-3;
+  - the TEST_REPORT round-1 fix section, including the mutation claim for the new client test, which holds by reasoning: on the old code `retry_failed` redelivers the failed row on reconnect.

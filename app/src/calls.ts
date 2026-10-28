@@ -279,10 +279,17 @@ class CallManager {
           // so neither gets "Busy" (review C6-7). The other side ignores ours the same way.
           const glare = c.outgoing && c.phase === "calling" && s.contact === c.contact && s.callId !== c.id;
           if (!glare) {
-            if (s.callId !== c.id) void ipc.callSend(s.contact, s.callId, "busy").catch(() => undefined);
+            if (s.callId !== c.id) {
+              void ipc.callSend(s.contact, s.callId, "busy").catch(() => undefined);
+              // The shell may have shown "Incoming call" for it (review C6R2-4).
+              void ipc.cancelCallNotice().catch(() => undefined);
+            }
             continue;
           }
-          if (s.callId > c.id) continue;
+          if (s.callId > c.id) {
+            void ipc.cancelCallNotice().catch(() => undefined);
+            continue;
+          }
           this.abandon();
         }
         window.clearTimeout(this.clearTimer);
@@ -351,10 +358,12 @@ class CallManager {
     }
   }
 
-  /** Drops our own outgoing call without a word, to take theirs instead (glare). */
+  /** Drops our own outgoing call to take theirs instead (glare). The hangup for our id is
+   *  ignored by them now, but ends a late copy of our offer at once (review C6R2-2). */
   private abandon() {
     const c = this.current;
     window.clearTimeout(this.ringTimer);
+    if (c) void ipc.callSend(c.contact, c.id, "hangup").catch(() => undefined);
     this.release(c?.local ?? null, this.pc);
     this.current = null;
     this.emit();
@@ -489,22 +498,35 @@ class CallManager {
     }
   }
 
-  /** Front or back camera, swapped without renegotiating. */
+  /** Front or back camera, swapped without renegotiating. Only a camera is opened (no second
+   *  microphone), and it is let go if the call ends meanwhile (review C6R2-1). */
   async flip(): Promise<void> {
     const c = this.current;
     const old = c?.local?.getVideoTracks()[0];
     if (!c || !old || !this.pc) return;
     const facing = old.getSettings().facingMode === "environment" ? "user" : "environment";
+    let next: MediaStreamTrack | undefined;
     try {
-      const next = (await media(true, facing)).getVideoTracks()[0];
-      if (!next) return;
-      next.enabled = !c.cameraOff;
-      await this.pc.getTransceivers()[Slot.Camera]?.sender.replaceTrack(next);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      next = stream.getVideoTracks()[0];
+      const pc = this.pc;
+      if (!next || !this.live(c.id) || !pc) {
+        next?.stop();
+        return;
+      }
+      next.enabled = !(this.current?.cameraOff ?? true);
+      await pc.getTransceivers()[Slot.Camera]?.sender.replaceTrack(next);
+      if (!this.live(c.id)) {
+        next.stop();
+        return;
+      }
       old.stop();
-      const local = new MediaStream([...c.local!.getAudioTracks(), next]);
-      this.patch({ local });
+      this.patch({ local: new MediaStream([...(this.current?.local?.getAudioTracks() ?? []), next]) });
     } catch {
       // Only one camera, or it is busy: keep the current one.
+      if (next && next !== this.current?.local?.getVideoTracks()[0]) next.stop();
     }
   }
 

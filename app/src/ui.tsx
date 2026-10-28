@@ -187,6 +187,8 @@ export function ToggleRow({ id, icon, tone = "", title, sub, checked, disabled =
 export function useDialogKeys(box: RefObject<HTMLElement | null>, onClose: () => void): void {
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
+      // A dialog under a call is inert: the call has the keyboard (review C6R2-3).
+      if (box.current?.closest("[inert]")) return;
       if (e.key === "Escape") {
         e.preventDefault();
         onClose();

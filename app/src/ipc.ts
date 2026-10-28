@@ -227,6 +227,7 @@ export const ipc = {
     call<void>("call_send", { contact, callId, kind, sdp }),
   callSignals: () => call<CallSignal[]>("call_signals"),
   callAudio: (active: boolean, speaker: boolean) => call<void>("call_audio", { active, speaker }),
+  cancelCallNotice: () => call<void>("cancel_call_notice"),
   state: () => call<AppState>("app_state"),
   setup: (input: SetupInput) => call<void>("setup", { input }),
   unlock: (passphrase: string) => call<void>("unlock", { passphrase }),
