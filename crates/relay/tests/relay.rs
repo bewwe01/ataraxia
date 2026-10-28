@@ -490,6 +490,7 @@ async fn turn_credentials() {
             secret: zeroize::Zeroizing::new(vec![7; 32]),
             urls: vec!["turns:turn.relay.test:5349".into()],
             ttl_secs: 3600,
+            relay_ips: vec!["100.101.102.103".parse().unwrap()],
         }),
         ..Config::default()
     };
@@ -508,6 +509,7 @@ async fn turn_credentials() {
     assert!(exp.parse::<u64>().unwrap() > now());
     assert!(!t.username.contains(&common_hex(&m[..4])));
     assert_eq!(t.urls, vec!["turns:turn.relay.test:5349".to_owned()]);
+    assert_eq!(t.relay_ips, vec!["100.101.102.103".to_owned()]);
     // Without TURN configured the request is refused cleanly.
     let plain = TestRelay::start(Config::default()).await;
     let mut d = plain.client().await;

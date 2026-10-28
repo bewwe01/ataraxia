@@ -14,6 +14,8 @@ pub struct TurnConfig {
     pub secret: Zeroizing<Vec<u8>>,
     pub urls: Vec<String>,
     pub ttl_secs: u32,
+    /// Where coturn relays media (its `external-ip`), announced to clients (ADR-0018).
+    pub relay_ips: Vec<core::net::IpAddr>,
 }
 
 impl core::fmt::Debug for TurnConfig {
@@ -21,6 +23,7 @@ impl core::fmt::Debug for TurnConfig {
         f.debug_struct("TurnConfig")
             .field("urls", &self.urls)
             .field("ttl_secs", &self.ttl_secs)
+            .field("relay_ips", &self.relay_ips)
             .finish_non_exhaustive()
     }
 }
@@ -50,6 +53,7 @@ mod tests {
             secret: Zeroizing::new(b"secret".to_vec()),
             urls: vec![],
             ttl_secs: 3600,
+            relay_ips: vec![],
         };
         let (u, c) = credentials(&cfg, 1_700_000_000, &mut rand::rng()).unwrap();
         let (exp, hex) = u.split_once(':').unwrap();

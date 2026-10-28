@@ -100,6 +100,40 @@ Set `.env`:
   and use your DDNS name in `VEIL_TURN_URLS`. If your home IP changes, update `.env` and run
   `docker compose up -d` again. (coturn needs the IP itself, not a name.)
 * **C (Tailscale):** `TURN_EXTERNAL_IP=100.x.y.z` and `VEIL_TURN_URLS=turn:100.x.y.z:3478?transport=udp,turn:100.x.y.z:3478?transport=tcp`.
+* **C with contacts outside your tailnet (Tailscale Funnel):** as C, plus a third URL for them;
+  see the next section.
+
+### Calls with people outside your tailnet (Tailscale Funnel)
+
+If contacts outside your tailnet reach the relay through Funnel, they can call too, with nothing
+forwarded on your router. Funnel carries their TURN connection over TLS to coturn's TCP port; the
+media inside stays end-to-end encrypted (DTLS-SRTP), so Tailscale's servers see only timing and
+volume, as they already do for messages. People on your tailnet keep using UDP directly.
+
+1. Update Tailscale on the Pi to **1.104.4 or later** (fixes for the "Tailworm" Serve and Funnel
+   findings, October 2026): `tailscale version`.
+2. Give coturn one of Funnel's ports (443, 8443 or 10000) that your relay doesn't use, with TLS
+   ended by Tailscale (its certificate is from a public CA, which WebRTC requires for `turns:`):
+   ```sh
+   sudo tailscale funnel --bg --tls-terminated-tcp=10000 tcp://127.0.0.1:3478
+   tailscale funnel status
+   ```
+   Check the flag with `tailscale funnel --help` on your version first.
+3. Add the Funnel URL to `.env` (keep the two tailnet ones):
+   `VEIL_TURN_URLS=turn:100.x.y.z:3478?transport=udp,turn:100.x.y.z:3478?transport=tcp,turns:<pi>.<tailnet>.ts.net:10000?transport=tcp`
+4. `docker compose up -d`.
+
+The relay announces `TURN_EXTERNAL_IP` to apps (`VEIL_TURN_RELAY_IPS`, set by the compose file),
+so apps that reach the relay by its Funnel name accept call candidates on your `100.x` address.
+They never connect to that address themselves; only coturn does, to itself.
+
+Costs:
+- Their leg runs over TCP, which stalls briefly when packets are lost, so calls can lag a
+  little more on a bad connection.
+- Funnel's bandwidth limits are not published. Video adapts down, and for screen sharing to them
+  "Light" (720p) is safer.
+- coturn is then reachable from the internet. Keep the image current (the compose file pins it),
+  and keep the firewall rule.
 
 Create the relay's TLS key and certificate. List every name or IP clients will use:
 
@@ -220,13 +254,14 @@ expire after 14 days. Run it only on a relay you are about to reset.
     appears in a process's arguments or environment.
 * **TURN:**
   * Allocations need relay-minted credentials (HMAC, 1 h lifetime), which the relay gives to any
-    authenticated mailbox. Mailbox creation is open, so in practice **anyone can use your TURN
-    server**, like any public TURN service. Per-user and total quotas, a bandwidth cap, no CLI and
-    no TCP relay endpoints limit what they can do.
-  * Peers in private, loopback, link-local, CGNAT/Tailscale, documentation and multicast ranges are
-    refused (tested: `403 Forbidden IP`), so nobody can use your TURN server to reach your LAN or
-    tailnet.
-  * The one exception is the server's own `TURN_EXTERNAL_IP`, because both legs of a call are
+    authenticated mailbox. Mailbox creation is open, so in practice **anyone who knows your relay
+    can get TURN credentials**. Per-user and total quotas, a bandwidth cap, no CLI and no TCP relay
+    endpoints limit what they can do with them.
+  * **coturn relays to nobody but itself.** Every peer address is refused (tested:
+    `403 Forbidden IP` for a LAN address and for a public one), so nobody can use your TURN server
+    to reach your LAN, your tailnet, or anything on the internet. It can only connect two Veil
+    call legs on this server (ADR-0018).
+  * The one address allowed is the server's own `TURN_EXTERNAL_IP`, because both legs of a call are
     relayed through it. Without the firewall rule, that exception would let anyone send UDP to
     *every* service listening on that address (DNS, Pi-hole, WireGuard, ...).
   * `firewall/veil-turn.nft` restricts coturn's relay sockets, towards this host's own addresses, to
@@ -270,9 +305,9 @@ expire after 14 days. Run it only on a relay you are about to reset.
   ML-KEM). Message *content* is post-quantum protected end to end (PQXDH + SPQR), but the metadata
   the relay sees could be recorded today and decrypted by a future quantum attacker who also
   recorded the traffic. See ADR-0010 in `docs/ARCHITECTURE.md`.
-* **Plain `turn:`, not `turns:`.** Call media is DTLS-SRTP-encrypted end to end, but an on-path
-  observer can see that you're using TURN. `turns:` requires a certificate from a public CA, because
-  WebRTC doesn't accept pinned certificates for TURN.
+* **Plain `turn:`, not `turns:`**, except through Funnel. Call media is DTLS-SRTP-encrypted end to
+  end, but an on-path observer can see that you're using TURN. `turns:` requires a certificate from
+  a public CA, because WebRTC doesn't accept pinned certificates for TURN; Funnel provides one.
 * **IP addresses in memory.** The relay must hold connected clients' IP addresses in memory while
   they're connected, and as a rate-limit key for up to about 30 minutes after their last
   activity. coturn must hold them for the length of a call. Neither writes them anywhere.

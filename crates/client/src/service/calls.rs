@@ -202,38 +202,67 @@ fn encode_id(id: &[u8]) -> String {
     })
 }
 
-/// Incoming signals waiting for the UI (in memory only).
+/// The addresses the relay announces its TURN server relays media on (ADR-0018), as clients
+/// accept them: IP literals that are not unspecified or multicast, at most four.
+fn announced(relay_ips: &[String]) -> Vec<IpAddr> {
+    relay_ips
+        .iter()
+        .filter_map(|ip| ip.parse::<IpAddr>().ok())
+        .filter(|ip| !ip.is_unspecified() && !ip.is_multicast())
+        .take(4)
+        .collect()
+}
+
+/// A received signal waiting for the UI. An offer's or answer's SDP was checked when it
+/// arrived, but is filtered when the UI takes it, with the TURN addresses known by then
+/// (review: an outsider's first call arrives before it has asked the relay for them).
+struct Waiting {
+    signal: CallSignal,
+    role: Option<SdpRole>,
+}
+
+/// Call state in memory only: incoming signals for the UI, and the relay's TURN addresses.
 #[derive(Default)]
-pub(super) struct Pending(std::cell::RefCell<VecDeque<CallSignal>>);
+pub(super) struct Pending {
+    queue: std::cell::RefCell<VecDeque<Waiting>>,
+    relay_ips: std::cell::RefCell<Option<Vec<IpAddr>>>,
+}
 
 impl Pending {
-    fn push(&self, s: CallSignal) {
-        let mut q = self.0.borrow_mut();
+    fn push(&self, w: Waiting) {
+        let mut q = self.queue.borrow_mut();
         if q.len() >= MAX_PENDING {
             q.pop_front();
         }
-        q.push_back(s);
+        q.push_back(w);
     }
 
-    fn take(&self) -> Vec<CallSignal> {
-        self.0.borrow_mut().drain(..).collect()
+    fn take(&self) -> Vec<Waiting> {
+        self.queue.borrow_mut().drain(..).collect()
+    }
+
+    fn needs_sdp_filter(&self) -> bool {
+        self.queue.borrow().iter().any(|w| w.role.is_some())
     }
 }
 
 impl Actor {
-    /// TURN servers for a call with `contact` (who must exist and not be blocked).
-    pub(super) async fn call_setup(&self, contact: i64) -> Result<CallSetup> {
+    /// Where a relay candidate may point (ADR-0018): the configured relay's own IP, and the
+    /// addresses its TURN server relays on, as last announced.
+    fn turn_hosts(&self) -> Result<Vec<IpAddr>> {
         let s = self.s()?;
-        let blocked: bool =
-            s.db.conn()
-                .query_row("SELECT blocked FROM contacts WHERE id = ?1", [contact], |r| {
-                    r.get(0)
-                })
-                .map_err(|_| ClientError::UnknownContact)?;
-        if blocked {
-            return Err(ClientError::Blocked);
+        let mut hosts = own_turn(&s.relay_addr);
+        for ip in s.calls.relay_ips.borrow().iter().flatten() {
+            if !hosts.contains(ip) {
+                hosts.push(*ip);
+            }
         }
-        let own = own_turn(&s.relay_addr);
+        Ok(hosts)
+    }
+
+    /// Fresh TURN credentials from the relay; remembers the addresses it announces.
+    async fn turn_credentials(&self) -> Result<veil_wire::TurnResponse> {
+        let s = self.s()?;
         let Response::Turn(t) = self
             .call(Request::TurnCredentials(veil_wire::MailboxRef {
                 mailbox_id: s.mailbox.to_vec(),
@@ -247,6 +276,26 @@ impl Actor {
         else {
             return Err(ClientError::Relay);
         };
+        *self.s()?.calls.relay_ips.borrow_mut() = Some(announced(&t.relay_ips));
+        Ok(t)
+    }
+
+    /// TURN servers for a call with `contact` (who must exist and not be blocked).
+    pub(super) async fn call_setup(&self, contact: i64) -> Result<CallSetup> {
+        let s = self.s()?;
+        let blocked: bool =
+            s.db.conn()
+                .query_row("SELECT blocked FROM contacts WHERE id = ?1", [contact], |r| {
+                    r.get(0)
+                })
+                .map_err(|_| ClientError::UnknownContact)?;
+        if blocked {
+            return Err(ClientError::Blocked);
+        }
+        // TURN URLs may name only the relay's own IP among private addresses: the announced
+        // relay addresses are for candidates, never for where the webview connects.
+        let own = own_turn(&s.relay_addr);
+        let t = self.turn_credentials().await?;
         let urls: Vec<String> = t.urls.into_iter().filter(|u| turn_url_ok(u, &own)).collect();
         if urls.is_empty() || t.username.is_empty() || t.credential.is_empty() {
             return Err(ClientError::NoCalls);
@@ -269,9 +318,8 @@ impl Actor {
         kind: Outgoing,
         sdp: Option<String>,
     ) -> Result<()> {
-        let s = self.s()?;
         let id = decode_id(call_id)?;
-        let own = own_turn(&s.relay_addr);
+        let own = self.turn_hosts()?;
         let filtered = |role| -> Result<String> {
             let raw = sdp.as_deref().ok_or(ClientError::BadInput)?;
             ice::filter_sdp_with(raw, Mode::RelayOnly, role, &own).map_err(|_| ClientError::BadInput)
@@ -304,9 +352,29 @@ impl Actor {
         }
     }
 
-    /// The signals that arrived since the last call; each is returned once.
-    pub(super) fn call_signals(&self) -> Result<Vec<CallSignal>> {
-        Ok(self.s()?.calls.take())
+    /// The signals that arrived since the last call; each is returned once. Offers and answers
+    /// are filtered now; if the relay's TURN addresses are not known yet, they are asked for
+    /// first (a failure there only means fewer candidates pass).
+    pub(super) async fn call_signals(&self) -> Result<Vec<CallSignal>> {
+        let s = self.s()?;
+        if s.calls.needs_sdp_filter() && s.calls.relay_ips.borrow().is_none() {
+            let _ = self.turn_credentials().await;
+        }
+        let hosts = self.turn_hosts()?;
+        Ok(self
+            .s()?
+            .calls
+            .take()
+            .into_iter()
+            .filter_map(|w| {
+                let mut signal = w.signal;
+                if let Some(role) = w.role {
+                    let raw = signal.sdp.take()?;
+                    signal.sdp = Some(ice::filter_sdp_with(&raw, Mode::RelayOnly, role, &hosts).ok()?);
+                }
+                Some(signal)
+            })
+            .collect())
     }
 
     /// A call signal from a contact (inside `process`'s transaction). Stale, malformed or
@@ -321,26 +389,33 @@ impl Actor {
         if blocked || is_stale(now_ms(), sent_at_ms) {
             return Ok(());
         }
-        let own = own_turn(&s.relay_addr);
-        let incoming = |sdp: &str, role| ice::filter_sdp_with(sdp, Mode::RelayOnly, role, &own).ok();
-        let (kind, sdp) = match c.kind {
-            Some(CallKind::Offer(sdp)) => ("offer", incoming(&sdp, SdpRole::Offer)),
-            Some(CallKind::Answer(sdp)) => ("answer", incoming(&sdp, SdpRole::Answer)),
-            Some(CallKind::Hangup(_)) => ("hangup", None),
-            Some(CallKind::Busy(_)) => ("busy", None),
+        let (kind, role, raw) = match c.kind {
+            Some(CallKind::Offer(sdp)) => ("offer", Some(SdpRole::Offer), Some(sdp)),
+            Some(CallKind::Answer(sdp)) => ("answer", Some(SdpRole::Answer), Some(sdp)),
+            Some(CallKind::Hangup(_)) => ("hangup", None, None),
+            Some(CallKind::Busy(_)) => ("busy", None, None),
             // Trickled candidates: we send complete SDPs, so there is nothing to add them to.
             Some(CallKind::Ice(_)) | None => return Ok(()),
         };
-        if matches!(kind, "offer" | "answer") && sdp.is_none() {
-            return Ok(());
+        // Malformed SDP is dropped now; which relay candidates pass is decided when the UI
+        // takes it (`call_signals`). Only candidates depend on the TURN addresses, never
+        // whether the SDP is accepted.
+        let mut video = false;
+        if let (Some(role), Some(raw)) = (role, raw.as_deref()) {
+            let Ok(checked) = ice::filter_sdp_with(raw, Mode::RelayOnly, role, &self.turn_hosts()?) else {
+                return Ok(());
+            };
+            video = video_in(&checked);
         }
-        let video = sdp.as_deref().is_some_and(video_in);
-        s.calls.push(CallSignal {
-            contact,
-            call_id: encode_id(&c.call_id),
-            kind: kind.into(),
-            sdp,
-            video,
+        s.calls.push(Waiting {
+            signal: CallSignal {
+                contact,
+                call_id: encode_id(&c.call_id),
+                kind: kind.into(),
+                sdp: raw,
+                video,
+            },
+            role,
         });
         if kind == "offer" {
             self.emit(ChangeKind::Ringing, Some(contact));

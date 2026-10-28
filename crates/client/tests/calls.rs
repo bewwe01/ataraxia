@@ -68,6 +68,7 @@ fn turn(urls: &[&str]) -> TurnConfig {
         secret: Zeroizing::new(b"0123456789abcdef0123456789abcdef".to_vec()),
         urls: urls.iter().map(|u| (*u).to_owned()).collect(),
         ttl_secs: 3600,
+        relay_ips: vec![],
     }
 }
 
@@ -254,4 +255,68 @@ async fn an_undelivered_offer_is_never_sent_later() {
             .iter()
             .all(|e| e.0 != veil_client::service::ChangeKind::Ringing)
     );
+}
+
+/// A contact who reaches the relay by a name (through Tailscale Funnel, say) calls with one on
+/// the tailnet (ADR-0018). Their TURN server relays on a private address, which only the
+/// relay's announcement lets through: as relay candidates, both ways, even for an offer that
+/// arrives before the outsider has asked the relay for anything. Never as a TURN URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_outsider_reaching_the_relay_by_name_can_call() {
+    for announce in [true, false] {
+        let r = relay_with(|c| {
+            let mut t = turn(&[
+                "turn:127.0.0.1:3478?transport=udp",
+                "turns:turn.example.org:10000?transport=tcp",
+            ]);
+            if announce {
+                t.relay_ips = vec!["127.0.0.1".parse().unwrap()];
+            }
+            c.turn = Some(t);
+        })
+        .await;
+        let port = r.addr.rsplit(':').next().unwrap();
+        let tailnet = user(&r, "Alice").await;
+        let outsider = user_at(&r, &format!("localhost:{port}"), "Bob", None).await;
+        let (a_bob, b_alice) = pair(&tailnet.client, &outsider.client).await;
+
+        // Alice, on the tailnet, calls first: Bob has never asked for TURN details.
+        tailnet.client.call_setup(a_bob.id).await.unwrap();
+        tailnet
+            .client
+            .call_send(a_bob.id, CALL.into(), "offer", Some(sdp("actpass", true)))
+            .await
+            .unwrap();
+        let offer = signal(&outsider.client, "offer").await;
+        assert_eq!(offer.contact, b_alice.id);
+        assert!(offer.video);
+        let got = offer.sdp.unwrap();
+        assert_eq!(
+            got.contains(" 127.0.0.1 49170 typ relay"),
+            announce,
+            "announce={announce}"
+        );
+        assert!(got.contains(" 8.8.4.4 3478 typ relay"));
+        assert!(!got.contains("10.0.0.1") && !got.contains("192.168.1.20"));
+
+        // Bob's TURN servers: the private one is not his relay's address, so only the name.
+        let setup = outsider.client.call_setup(b_alice.id).await.unwrap();
+        assert_eq!(
+            setup.ice_servers[0].urls,
+            vec!["turns:turn.example.org:10000?transport=tcp".to_owned()]
+        );
+        // His answer keeps his relay candidate on that address only when it was announced.
+        outsider
+            .client
+            .call_send(b_alice.id, CALL.into(), "answer", Some(sdp("active", true)))
+            .await
+            .unwrap();
+        let answer = signal(&tailnet.client, "answer").await.sdp.unwrap();
+        // Alice's own relay is 127.0.0.1, so she accepts it either way; what Bob sent decides.
+        assert_eq!(
+            answer.contains(" 127.0.0.1 49170 typ relay"),
+            announce,
+            "announce={announce}"
+        );
+    }
 }

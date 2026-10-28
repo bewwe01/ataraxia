@@ -451,6 +451,11 @@ pub struct TurnResponse {
     pub ttl_secs: u32,
     #[prost(string, repeated, tag = "4")]
     pub urls: Vec<String>,
+    /// The IP literals the TURN server relays media on (coturn's `external-ip`), at most 4.
+    /// Clients reached through another address (a Funnel name) need them to accept relay
+    /// candidates there (ADR-0018). Empty when the operator did not set them.
+    #[prost(string, repeated, tag = "5")]
+    pub relay_ips: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -501,7 +506,13 @@ impl ServerFrame {
                 ensure(!t.urls.is_empty() && t.urls.len() <= MAX_URLS)?;
                 ensure(t.urls.iter().all(|u| {
                     u.len() <= MAX_URL && (u.starts_with("turn:") || u.starts_with("turns:")) && u.is_ascii()
-                }))
+                }))?;
+                ensure(t.relay_ips.len() <= MAX_URLS)?;
+                ensure(
+                    t.relay_ips
+                        .iter()
+                        .all(|ip| ip.len() <= 45 && ip.parse::<core::net::IpAddr>().is_ok()),
+                )
             }
             Response::NewEnvelopes(n) => {
                 ensure(self.id == 0)?;
@@ -697,9 +708,34 @@ mod tests {
                 credential: "x".into(),
                 ttl_secs: 3600,
                 urls: vec!["http://evil".into()],
+                relay_ips: vec![],
             })),
         };
         assert!(ServerFrame::decode_strict(&bad_turn.encode()).is_err());
+        let turn = |relay_ips: &[&str]| ServerFrame {
+            v: VERSION,
+            id: 1,
+            resp: Some(Response::Turn(TurnResponse {
+                username: "1:ab".into(),
+                credential: "x".into(),
+                ttl_secs: 3600,
+                urls: vec!["turn:relay.example.org:3478".into()],
+                relay_ips: relay_ips.iter().map(|s| (*s).to_owned()).collect(),
+            })),
+        };
+        assert!(ServerFrame::decode_strict(&turn(&[]).encode()).is_ok());
+        assert!(ServerFrame::decode_strict(&turn(&["100.101.102.103", "fd00::1"]).encode()).is_ok());
+        for bad in [
+            &["pi.example.ts.net"][..],
+            &["100.1"],
+            &["1.1.1.1"; 5],
+            &["1.1.1.1/10.0.0.1"],
+        ] {
+            assert!(
+                ServerFrame::decode_strict(&turn(bad).encode()).is_err(),
+                "{bad:?}"
+            );
+        }
         assert!(ServerFrame::decode_strict(&ServerFrame::error(1, ErrorCode::NotFound).encode()).is_ok());
         let unknown_code = ServerFrame {
             v: VERSION,

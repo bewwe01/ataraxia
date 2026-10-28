@@ -58,7 +58,8 @@ Status: **Phase 1 draft, awaiting approval.** Every "protected" claim below poin
 10. **Metadata of invites.** Whoever obtains an invite link before it is used can redeem it. That shows up as an unverified contact that must be checked.
 11. **The first contact (trust on first use) for remote invites**, until you compare safety numbers.
 12. **A hostile relay's TURN names.** The relay names the TURN servers for calls. Veil refuses private IP addresses (other than the relay's own) and local-looking names, but it checks a DNS name only by its form (ADR-0018). A relay that controls a public-looking name can point it at an address on your network, and your device would connect to it to speak TURN. Your relay is yours or someone you chose; a relay you do not trust should not get your calls at all.
-13. **Bugs.** Veil, libsignal and every dependency are software. libsignal's use outside Signal is unsupported by Signal. There has been **no independent audit yet.**
+13. **Media decoders.** A call plays audio and video that a contact sends, decoded by the webview's WebRTC (Android System WebView, WebView2). A contact who has a codec exploit could attack that decoder. Only contacts can call, blocked ones cannot, and unknown senders cannot reach you at all; keep the WebView and Edge WebView2 updated. Contacts who call through Tailscale Funnel also show their IP and call timing to Tailscale.
+14. **Bugs.** Veil, libsignal and every dependency are software. libsignal's use outside Signal is unsupported by Signal. There has been **no independent audit yet.**
 
 ## 5. Metadata leakage by transport mode
 

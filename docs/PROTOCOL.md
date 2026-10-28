@@ -265,7 +265,7 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
     - Candidates (any case) are re-serialised from validated fields only:
       - the address must be an IP literal (mDNS and other hostnames are dropped);
       - `typ` must be `relay`;
-      - the relay address must be public (loopback, private, link-local, CGNAT and metadata addresses are refused), **or** equal to the IP of the user's configured relay, whose own TURN server may sit on a tailnet or LAN (`filter_sdp_with`, ADR-0018);
+      - the relay address must be public (loopback, private, link-local, CGNAT and metadata addresses are refused), **or** equal to the IP of the user's configured relay, **or** one of the TURN addresses the relay announces, because the user's own TURN server may sit on a tailnet or LAN (`filter_sdp_with`, ADR-0018);
       - `raddr`/`rport` become `0.0.0.0 0`;
       - only `tcptype`, `generation`, `ufrag`, `network-id` and `network-cost` extensions are kept.
     - Any kept `a=` line that could still carry an address (a `hexdigit.digit` sequence, or any embedded IP literal, `::` included) rejects the whole SDP (fail closed).
@@ -288,6 +288,7 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 - **TURN credentials.**
   - Clients authenticated to a mailbox may request credentials from the relay.
   - Format (coturn `use-auth-secret`): `username = "<expiry_unix>:<16 random hex>"`, `credential = base64(HMAC-SHA1(turn_secret, username))`, TTL 1 hour, rate-limited per mailbox.
+  - The response also lists up to 4 `relay_ips`, IP literals that coturn relays on (its `external-ip`). Clients accept relay candidates at those addresses, both ways, besides public ones and the relay's own IP, so that a client reaching the relay by a name (Tailscale Funnel) can call one on the tailnet (ADR-0018). They are never used as TURN URLs.
   - The username contains **no identity or mailbox ID**.
 - **Media** is DTLS-SRTP end to end between peers. TURN relays ciphertext only.
 

@@ -63,6 +63,7 @@ async fn relay_logs_nothing_about_clients() {
             secret: zeroize::Zeroizing::new(vec![7; 32]),
             urls: vec!["turn:turn.relay.test:3478".into()],
             ttl_secs: 3600,
+            relay_ips: vec![],
         }),
         ..Config::default()
     };

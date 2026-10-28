@@ -12,6 +12,9 @@
 //! * `VEIL_RELAY_CERT`, `VEIL_RELAY_KEY` (default `<data>/tls/cert.pem`, `<data>/tls/key.pem`)
 //! * `VEIL_TURN_SECRET_FILE`: file holding coturn's `static-auth-secret` (enables TURN)
 //! * `VEIL_TURN_URLS`: comma-separated `turn:`/`turns:` URLs handed to clients
+//! * `VEIL_TURN_RELAY_IPS`: optional, coturn's `external-ip` value(s), comma-separated; in
+//!   `public/private` form only the first part counts. Announced so that clients reaching the
+//!   relay by a name (Funnel) accept relay candidates there (ADR-0018)
 //! * `VEIL_QUOTA_ENVELOPES_MB` (default 1024), `VEIL_QUOTA_BLOBS_MB` (default 4096): disk caps for
 //!   queued envelopes and attachment blobs
 //! * `VEIL_MAX_CONN_PER_SOURCE` (default 32): concurrent connections per IPv4 address or
@@ -80,6 +83,56 @@ fn main() -> ExitCode {
 }
 
 /// Storage caps and the per-source connection cap from the environment.
+/// TURN from `VEIL_TURN_SECRET_FILE`, `VEIL_TURN_URLS` and `VEIL_TURN_RELAY_IPS`; `None` when no
+/// secret file is set (calls off).
+fn turn_from_env() -> Result<Option<TurnConfig>, &'static str> {
+    let Some(path) = env("VEIL_TURN_SECRET_FILE") else {
+        return Ok(None);
+    };
+    let Ok(raw) = std::fs::read(&path).map(Zeroizing::new) else {
+        return Err("cannot read VEIL_TURN_SECRET_FILE");
+    };
+    let secret = Zeroizing::new(raw.trim_ascii().to_vec());
+    drop(raw);
+    if secret.len() < 32 {
+        return Err("the TURN secret must be at least 32 bytes");
+    }
+    let urls: Vec<String> = env("VEIL_TURN_URLS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|u| u.trim().to_owned())
+        .filter(|u| !u.is_empty())
+        .collect();
+    if urls.is_empty()
+        || urls.len() > 4
+        || !urls
+            .iter()
+            .all(|u| u.starts_with("turn:") || u.starts_with("turns:"))
+    {
+        return Err("VEIL_TURN_URLS must list 1-4 turn:/turns: URLs");
+    }
+    let mut relay_ips = Vec::new();
+    for entry in env("VEIL_TURN_RELAY_IPS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        // coturn's `public/private` form: clients see the first part.
+        let first = entry.split('/').next().unwrap_or_default();
+        match first.parse::<std::net::IpAddr>() {
+            Ok(ip) if relay_ips.len() < 4 => relay_ips.push(ip),
+            _ => return Err("VEIL_TURN_RELAY_IPS must list at most 4 IP addresses"),
+        }
+    }
+    Ok(Some(TurnConfig {
+        secret,
+        urls,
+        ttl_secs: 3600,
+        relay_ips,
+    }))
+}
+
 fn limits_from_env(cfg: &mut Config) -> Result<(), String> {
     for (name, slot) in [
         (
@@ -130,34 +183,9 @@ fn serve() -> ExitCode {
     if let Err(e) = limits_from_env(&mut cfg) {
         return fail(&e);
     }
-    if let Some(path) = env("VEIL_TURN_SECRET_FILE") {
-        let Ok(raw) = std::fs::read(&path).map(Zeroizing::new) else {
-            return fail("cannot read VEIL_TURN_SECRET_FILE");
-        };
-        let secret = Zeroizing::new(raw.trim_ascii().to_vec());
-        drop(raw);
-        if secret.len() < 32 {
-            return fail("the TURN secret must be at least 32 bytes");
-        }
-        let urls: Vec<String> = env("VEIL_TURN_URLS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|u| u.trim().to_owned())
-            .filter(|u| !u.is_empty())
-            .collect();
-        if urls.is_empty()
-            || urls.len() > 4
-            || !urls
-                .iter()
-                .all(|u| u.starts_with("turn:") || u.starts_with("turns:"))
-        {
-            return fail("VEIL_TURN_URLS must list 1-4 turn:/turns: URLs");
-        }
-        cfg.turn = Some(TurnConfig {
-            secret,
-            urls,
-            ttl_secs: 3600,
-        });
+    match turn_from_env() {
+        Ok(turn) => cfg.turn = turn,
+        Err(e) => return fail(e),
     }
     let cache_mb = match env("VEIL_DB_CACHE_MB").map(|v| v.parse::<usize>()) {
         None => 64,

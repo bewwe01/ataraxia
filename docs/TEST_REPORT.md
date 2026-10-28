@@ -2,6 +2,38 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Milestone 6: calls with contacts outside the tailnet, through Funnel (2026-10-28)
+
+The owner chose TURN through Tailscale Funnel and asked for the safest form of it (ADR-0018, "Contacts outside the tailnet").
+
+```text
+$ cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings   # ok; exit 0
+$ cargo test --workspace --locked                                  # 226 passed, 0 failed
+$ (app/src-tauri) cargo clippy --all-targets --locked -- -D warnings   # exit 0
+$ pnpm -C app audit --prod                                         # No known vulnerabilities found
+```
+
+New and extended tests:
+- `veil-wire`: a `Turn` response with announced relay addresses decodes. Names, shorthand IPv4, `public/private` pairs and more than four entries are refused.
+- `veil-relay` `turn_credentials`: the configured relay address is announced.
+- `veil-client` `tests/calls.rs` `an_outsider_reaching_the_relay_by_name_can_call` runs twice, with and without the announcement. Alice uses the relay's IP; Bob reaches the same relay as `localhost:port`, standing in for a Funnel name.
+  - Alice's offer arrives before Bob has asked for TURN details. With the announcement, taking the signal fetches it, and the private relay candidate passes; without it, the candidate is stripped.
+  - Bob's TURN servers are only the public-looking name: the private TURN URL is refused even when announced.
+  - Bob's answer keeps his candidate only with the announcement.
+
+End to end in Chromium, with a TLS-terminating proxy on port 10000 in front of coturn's TCP port 3478 (standing in for `tailscale funnel --tls-terminated-tcp`):
+- Alice got only `turn:127.0.0.1:3478?transport=udp`, Bob only `turns:localhost:10000?transport=tcp`.
+- `getStats` showed the selected pairs `relay/udp` (Alice) and `relay/tls` (Bob), each to the other's relay candidate. The proxy carried one TLS connection.
+- Bob received Alice's 1080p screen share at 1920×1080, still at 6.5 s.
+- Mute, deafen, stream volume and stop sharing passed as before.
+
+coturn relays to nobody but itself. On a local coturn (4.6.1), with `denied-peer-ip` covering all of IPv4 and IPv6 and `allowed-peer-ip=127.0.0.1`:
+- the same call connected over the UDP and TLS legs;
+- `turnutils_uclient -e 1.1.1.1` got `channel bind: error 403 (Forbidden IP)`;
+- relaying between the server's own allocations (`-y`) lost 0 packets.
+
+CI now also checks a public peer (`403`) and a TCP client (0 lost) against the pinned coturn 4.18.0. Not verified here: coturn 4.18.0 itself (no Docker daemon in this environment; CI runs it), and real Funnel.
+
 ## Milestone 6: review round 2 and its fixes (2026-10-28)
 
 Round 2 was a **PASS** (REVIEW_REPORT.md). Its Medium, Lows and nit are fixed in the commit after it:

@@ -1487,7 +1487,8 @@ impl Actor {
                 let _ = r.send(res);
             }
             Cmd::CallSignals(r) => {
-                let _ = r.send(self.call_signals());
+                let res = self.call_signals().await;
+                let _ = r.send(res);
             }
             Cmd::AcceptKeyChange(c, prev, r) => {
                 let res = self.accept_key_change(c, prev).await;

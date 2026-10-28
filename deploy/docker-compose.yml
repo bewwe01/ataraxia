@@ -28,6 +28,9 @@ services:
     environment:
       VEIL_TURN_SECRET_FILE: /run/secrets/turn_secret
       VEIL_TURN_URLS: ${VEIL_TURN_URLS:?set VEIL_TURN_URLS in deploy/.env}
+      # Where coturn relays media, announced to clients that reach the relay by a name
+      # (Tailscale Funnel, ADR-0018). The same value coturn advertises.
+      VEIL_TURN_RELAY_IPS: ${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP in deploy/.env}
       VEIL_LOG: ${VEIL_LOG:-info}
       VEIL_QUOTA_ENVELOPES_MB: ${VEIL_QUOTA_ENVELOPES_MB:-1024}
       VEIL_QUOTA_BLOBS_MB: ${VEIL_QUOTA_BLOBS_MB:-4096}
@@ -39,7 +42,7 @@ services:
       options: { max-size: "5m", max-file: "2" }
 
   coturn:
-    image: docker.io/coturn/coturn:4.7.0@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93
+    image: docker.io/coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
     restart: unless-stopped
     # Host networking: TURN needs a large UDP port range, which Docker's userland proxy handles badly.
     network_mode: host

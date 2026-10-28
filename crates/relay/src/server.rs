@@ -1040,6 +1040,7 @@ impl Conn {
                     credential,
                     ttl_secs: cfg.ttl_secs,
                     urls: cfg.urls.clone(),
+                    relay_ips: cfg.relay_ips.iter().map(ToString::to_string).collect(),
                 }))
             }
         }

@@ -199,11 +199,17 @@ jobs:
         run: |
           cred() { sed -n "$1p" "$RUNNER_TEMP/turn"; }
           uc() { docker run --rm --network host --entrypoint turnutils_uclient \
-            docker.io/coturn/coturn:4.7.0@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93 "$@" 2>&1; }
+            docker.io/coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3 "$@" 2>&1; }
           uc -y -c -n 20 -m 1 -l 170 -u "$(cred 1)" -w "$(cred 2)" "$TURN_IP" | tee ok.txt
           grep -q "Total lost packets 0 " ok.txt
+          # The same over TCP, as a client behind Tailscale Funnel reaches coturn (ADR-0018).
+          uc -t -y -c -n 20 -m 1 -l 170 -u "$(cred 1)" -w "$(cred 2)" "$TURN_IP" | tee tcp.txt
+          grep -q "Total lost packets 0 " tcp.txt
           uc -c -e 10.0.0.1 -n 5 -m 1 -u "$(cred 3)" -w "$(cred 4)" "$TURN_IP" | tee denied.txt
           grep -q "403 (Forbidden IP)" denied.txt
+          # Not the public internet either: this server relays only to itself (ADR-0018).
+          uc -c -e 1.1.1.1 -n 5 -m 1 -u "$(cred 3)" -w "$(cred 4)" "$TURN_IP" | tee public.txt
+          grep -q "403 (Forbidden IP)" public.txt
           uc -y -c -n 5 -m 1 -u "$(cred 5)" -w "wrong$(cred 6)" "$TURN_IP" | tee bad.txt
           grep -q "Cannot complete Allocation" bad.txt
           # A host UDP service outside the relay range must not be reachable through TURN (P3-8).
@@ -224,7 +230,7 @@ jobs:
           # Also a UDP service *published by Docker* on the host (Pi-hole in Docker, say): the
           # rule must run before Docker's NAT (review P3R2-5).
           docker run -d --name udp-svc -p 40001:3480/udp --entrypoint turnutils_peer \
-            docker.io/coturn/coturn:4.7.0@sha256:a00afb5b4890de4df22bbe70379c6b316685dffee297d53cac1271dcb91fab93
+            docker.io/coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
           sleep 1
           uc -c -e "$TURN_IP" -r 40001 -n 5 -m 1 -u "$(cred 9)" -w "$(cred 10)" "$TURN_IP" | tee docker-probe.txt
           docker rm -f udp-svc
