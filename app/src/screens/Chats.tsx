@@ -708,7 +708,7 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
             </span>
           </span>
         </button>
-              {contact.blocked ? null : (
+        {contact.blocked ? null : (
           <>
             <button className="icon-btn" type="button" aria-label={`Voice call ${contact.name}`} onClick={() => void calls.start(contact.id, false)}><Icon name="phone" /></button>
             <button className="icon-btn" type="button" aria-label={`Video call ${contact.name}`} onClick={() => void calls.start(contact.id, true)}><Icon name="video" /></button>

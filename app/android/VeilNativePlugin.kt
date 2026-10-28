@@ -216,11 +216,15 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   /** Phone audio for a call (ADR-0018): communication mode so echo cancellation and the
-   *  earpiece work, speaker on or off, and the screen kept on; all undone when it ends. */
+   *  earpiece work, speaker on or off, and the screen kept on; all undone when it ends.
+   *  Also clears the "Incoming call" notification, which the app calls this for on every end. */
   @Command
   fun callAudio(invoke: Invoke) {
     val args = invoke.parseArgs(CallAudioArgs::class.java)
     activity.runOnUiThread {
+      // Answered, missed or ended: either way the "Incoming call" notice is stale now
+      // (review C6-8).
+      NotificationManagerCompat.from(activity).cancel(VeilNotify.CALL_ID)
       val am = activity.getSystemService(android.media.AudioManager::class.java)
       try {
         if (args.active) {

@@ -4250,3 +4250,182 @@ I ran no mutation checks: the brief did not allow edits. The commit message says
 - **The P6-7 test checks rows, not only messages:** it sets up the queue genuinely offline through the proxy, covers text, reaction and upload, and asserts on persisted state. The reconnect runs `retry_failed`, so a regression in the envelope handling would make it fail.
 - **Docs kept in step:** ADR-0017, the INV-ID-2 row and the commit message were updated with the fixes, and the commit body explains each change.
 - **All gates are green:** tests, both clippy runs, typecheck and lint.
+
+## Milestone 6 calls review, round 1 (commit bde54b3)
+
+**Verdict: FAIL** (1 High)
+
+Scope: `git diff 62e1bda bde54b3`, 28 files, about 2,750 added lines. No files were modified.
+
+Commands run:
+- `cargo test -p veil-core --lib ice`: 15 passed.
+- `cargo test -p veil-client --test calls`: 2 passed.
+- `cargo test -p veil-client --lib calls`: 3 passed.
+- `pnpm -C app typecheck`: 0 errors.
+
+---
+
+### C6-1: High. Hanging up during call setup leaves the microphone and camera on, and can still send the offer or answer
+**Where:** `app/src/calls.ts` L231, L244 (`start`), L296, L317 (`accept`), and `end()` L542-548.
+
+**Problem:** After each `await`, `start()` and `accept()` only check `this.current?.id !== id`. `end()` does not clear `current`. It sets `phase: "ended"` and keeps the same `id` for `ENDED_MS` (1.8 s). So a hangup or decline during `ipc.callSetup` or `getUserMedia` passes that check. The code then:
+- patches `local` into the ended state;
+- creates a new `RTCPeerConnection` and assigns it to `this.pc`;
+- negotiates, and sends the offer or answer if gathering finishes within the 1.8 s.
+
+When gathering finishes after `current` has been nulled, the function returns early. Nothing stops the `local` tracks or closes that `pc`, and the next call overwrites `this.pc`.
+
+**Failure scenario:** A user taps "Voice call", sees they picked the wrong contact, and taps End within about a second. Their microphone (and camera for a video call) stays capturing with no call on screen. The Android mic/camera indicator stays on until the app is killed, and a TURN allocation is held open. If the offer went out after the hangup, the contact's phone rings for 45 s for a call that no longer exists: the hangup arrived first and was ignored because no call existed yet. The `accept()` path behaves the same way: the answer is sent after a decline, and the callee's capture leaks.
+
+**Fix:** Check that the call is still live, not just that the id matches, and release everything on bail-out:
+```ts
+private live(id: string): boolean {
+  return this.current?.id === id && this.current.phase !== "ended";
+}
+// start(), after media():
+if (!this.live(id)) { for (const t of local.getTracks()) t.stop(); return; }
+// start(), after gathered(pc):
+if (!this.live(id)) { if (this.pc === pc) { pc.close(); this.pc = null; } for (const t of local.getTracks()) t.stop(); return; }
+// same two checks in accept() with c.id
+```
+Also make `patch()` a no-op once `phase === "ended"`, except for the patch in `end()` itself.
+
+---
+
+### C6-2: Medium. A call signal that failed to send is retried later, so the contact rings for an abandoned call
+**Where:** `crates/client/src/service/calls.rs` L254-262; `service.rs` `retry_failed` (about L2866), `connect()` L1235; `app/src/calls.ts` L247-248.
+
+**Problem:** `call_send` stores the sealed signal as a `control` row with `expires_at_ms = now + 60 s`. When `deliver` fails (relay connection drops, deposit error), the row stays in `failed` status. The UI gets `Unreachable` and calls `end(…, false)`, so no hangup is ever queued. On reconnect, `retry_failed()` delivers every failed row, call signals included, as long as `expire_messages` has not removed it yet. The receiver accepts anything sent less than 90 s ago.
+
+**Failure scenario:** The caller is on a flaky mobile link. The deposit fails and they see "could not start". The link comes back 20 s later, the offer goes out, and the callee rings for 45 s. If they answer, they sit in "Connecting…" because the caller ignores the answer.
+
+**Fix:** Call signals are only useful right now, so do not queue them for retry. In `call_send`, delete the row when delivery fails:
+```rust
+if self.deliver(row).await { Ok(()) } else {
+    let _ = self.s()?.db.conn().execute("DELETE FROM messages WHERE id = ?1 AND kind = 'control'", [row]);
+    Err(ClientError::Unreachable)
+}
+```
+Add a client test: offer with the relay down, then reconnect, then the peer receives nothing.
+
+---
+
+### C6-3: Medium. The TURN URL host check can be bypassed, and the docs claim more than it guarantees
+**Where:** `crates/client/src/service/calls.rs` L117-126 (`turn_url_ok`); `docs/PROTOCOL.md` §8 (new TURN URLs bullet); `docs/ARCHITECTURE.md` ADR-0018 ("A hostile relay therefore cannot point the webview at hosts on the user's network").
+
+**Problem:** A host that does not parse as a Rust `IpAddr` is treated as a DNS name, and it passes if it contains a dot and uses only `[A-Za-z0-9.-]`. Rust's IPv4 parser is strict, but the resolver WebRTC uses (`getaddrinfo` / `inet_aton`) accepts shorthand:
+- `turn:127.1:3478` resolves to 127.0.0.1;
+- `turn:10.1` resolves to 10.0.0.1;
+- `turn:192.168.1` resolves to 192.168.0.1;
+- `turn:0x7f.1` resolves to 127.0.0.1.
+
+All of these pass `turn_url_ok` today. Separately, any public-looking name can have an A record pointing at a private address, which the filter cannot see.
+
+**Failure scenario:** A hostile relay returns `turn:192.168.1:3478?transport=tcp`. The webview opens TCP connections to a LAN host and writes STUN to it. PROTOCOL §8 says this is impossible, which breaks CLAUDE.md rule 9: the security claim needs a test or a correct written argument.
+
+**Fix:**
+1. Reject names whose last label is not alphabetic (real TLDs never are):
+   ```rust
+   && lower.rsplit('.').next().is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()))
+   ```
+   Add `127.1`, `10.1`, `192.168.1` and `0x7f.1` to the test's `bad` list.
+2. Reword the ADR and PROTOCOL claim: IP literals are enforced, but names are checked syntactically only. A relay-controlled DNS name can still resolve to a private address. coturn's `denied-peer-ip` does not cover this, because it is the TURN client's own connection. Record this residual risk in `THREAT_MODEL.md`.
+
+---
+
+### C6-4: Medium. The share-quality sheet steals keyboard focus every second
+**Where:** `app/src/screens/Call.tsx` L88-95 (`ShareSheet` effect with `[onClose]`), L277 (`onClose={() => setSheet(false)}`), L151-157 (1 s clock).
+
+**Problem:** While the call is active, `CallScreen` re-renders every second for the clock. Each render passes a new inline `onClose`, so the `ShareSheet` effect tears down and runs again. That moves focus back to the checked radio every second.
+
+**Failure scenario:** A keyboard or screen-reader user tabs to "Share screen" or "Close". Within a second focus is pulled back to the radio, so the sheet is effectively unusable without a pointer. The sheet and the call overlay also set `aria-modal` with no focus trap, even though DESIGN.md says dialogs trap focus in the app.
+
+**Fix:**
+- Use `const closeSheet = useCallback(() => setSheet(false), [])` in `CallScreen`.
+- In `ShareSheet`, split the effect: initial focus with `[]` deps, and keys via the existing `useDialogKeys(box, onClose)` from `ui.tsx`, which also traps Tab.
+- Return focus to the Share button when the sheet closes.
+
+---
+
+### C6-5: Low. The 90 s staleness rule has no test and depends on the sender's clock
+**Where:** `crates/client/src/service/calls.rs` L279-281.
+
+**Problem:** "A phone that was offline does not ring for an old call" (ADR-0018, PROTOCOL §8) is a stated promise with no test. It also trusts the sender's `sent_at_ms`. A sender whose clock is more than 90 s behind has every call silently dropped: the caller sees "No answer" and the callee gets nothing.
+
+**Fix:** Extract `fn is_stale(now_ms: i64, sent_at_ms: u64) -> bool` and unit-test it at the edges (89 s, 91 s, future, `u64::MAX`). Document the clock-skew limitation in ADR-0018 Costs, or add the 30 s grace on both sides symmetrically.
+
+---
+
+### C6-6: Low. The docs say nothing of a call is written to the database, but undelivered signals are
+**Where:** `docs/ARCHITECTURE.md` ADR-0018 "Signals in memory only"; `docs/INVARIANTS.md` INV-NET-3; `calls.rs` L255-257.
+
+**Problem:** Outgoing offers and answers are stored as sealed envelopes in the `messages` table until delivered. An undelivered row survives a lock until the next unlock's `expire_messages`. It is ciphertext inside the encrypted DB, so the risk is small, but the written claim is wrong. The `UFRAG` test only checks state after successful delivery.
+
+**Fix:** The C6-2 fix (delete the row on failure) makes the claim true. Then add an assertion to `a_call_is_signalled_relay_only` that no `kind='control'` row is left after a failed send.
+
+---
+
+### C6-7: Low. Two people calling each other at once both get "Busy"
+**Where:** `app/src/calls.ts` L255-258.
+
+**Problem:** Both sides are in `calling` when the other's offer arrives. Each replies `busy`, and both calls end.
+
+**Fix:** Break the tie deterministically. If `c.outgoing && c.phase === "calling" && s.contact === c.contact`, the side with the smaller `callId` drops its own call quietly (close the pc, stop tracks, no busy) and takes the incoming offer. The other side keeps waiting and receives the answer as a hangup or busy for its own id.
+
+---
+
+### C6-8: Low. The Android "Incoming call" notification outlives the call
+**Where:** `app/android/VeilNativePlugin.kt` (`notifyMessage` with `CALL_ID`, cancelled only in `onResume`).
+
+**Problem:** After a missed call or a caller hangup, the heads-up "Incoming call" notification stays until the app is opened. A later tap opens Veil with no call on screen.
+
+**Fix:** Add a `cancelCall` command (or reuse `callAudio(false)`) that cancels `VeilNotify.CALL_ID`, and call it from `CallManager.end()`.
+
+---
+
+### C6-9: Nit. INVARIANTS cites a test that does not exist
+**Where:** `docs/INVARIANTS.md` INV-NET-1 row.
+
+The row cites `real_chromium_video_call_passes`. The test is `ice::tests::real_chromium_calls_pass` (`crates/core/src/ice.rs` L542). Rename the reference.
+
+### C6-10: Nit. `Debug` derives would print TURN credentials and SDP if ever logged
+**Where:** `crates/client/src/service/calls.rs` L30, L46.
+
+`IceServerView` derives `Debug` with `credential`, and `CallSignal` with the SDP (ICE password, fingerprint). Nothing logs them today, but a future `tracing::debug!(?setup)` would print a token. Implement a redacting `Debug`, as `SetupInput` does.
+
+### C6-11: Nit. Indentation in the chat header
+**Where:** `app/src/screens/Chats.tsx` L711.
+
+The `{contact.blocked ? null : (` block is indented 14 spaces instead of 8. Reformat.
+
+---
+
+### Checked and fine
+- **INV-NET-1 with `own_turn`:**
+  - The allowance only adds `typ relay` candidates whose IP equals the user-configured relay host (`setup` input, stored as `relay`). Host, srflx and prflx are still refused (`own_turn_server_may_be_private`).
+  - Every contact uses the same relay (moving relays is unsupported), so contacts already know that address. It is the server's address, not the user's, and no new address is leaked.
+  - IPv4-mapped v6 forms do not match and fail closed.
+  - On incoming SDP, a peer can only name addresses on the user's own TURN host, and coturn `denied-peer-ip` plus the nft rules bound that. Allowing public relay IPs was already the case before this change.
+  - The `Mode::Direct` branch is unused by calls.
+- **No panics on untrusted input in `calls.rs`:**
+  - no indexing or `unwrap`;
+  - `decode_id` and `encode_id` are bounded;
+  - `call_id` length and SDP size are enforced by `Content` validation (`content.rs` L315-329);
+  - `sent_at_ms` is converted with saturation.
+- **Relay I/O rules:** `call_send` seals inside `atomically` and delivers after commit. `receive_call` runs inside `process` with no relay I/O. A re-processed duplicate offer is harmless because the UI compares `callId`.
+- **Blocked contacts:** `call_setup`, `queue_control` and `receive_call` all refuse them, and this is tested.
+- **Signal queue:** memory only, capped at 32, dropped with the session on lock (tested).
+- **`video_in`:** correct on the real Chromium vectors and the synthetic cases. A caller-controlled flag only changes the callee's own "Accept video call" prompt.
+- **TURN credentials in the webview:** short-lived relay HMAC logins, no Veil keys (rule 2). CSP is unchanged; WebRTC is governed by `iceTransportPolicy: "relay"`.
+- **Data channel state parsing:** strict (four booleans, 256-character limit, wrong types ignored), and stale-pc messages are rejected (`this.pc === pc`).
+- **Screen sharing:** via `replaceTrack` into fixed slots. A peer offer with fewer than 4 transceivers is refused, and wrong-kind slots throw and end the call.
+- **Notifications are content-free:** "Incoming call" with no name on Android (`IMPORTANCE_HIGH`, `CATEGORY_CALL`); on desktop a Critical attention flash only when the window is unfocused.
+- **Android audio:** `callAudio` restores `MODE_NORMAL`, clears the communication device and `KEEP_SCREEN_ON` on end.
+- **Design rules:**
+  - new colours are tokens in both `tokens.css` files;
+  - the only animation (`share-in`) uses transform and opacity and honours `data-motion` and `prefers-reduced-motion`;
+  - controls are `.icon-btn` with labels and visible text;
+  - state pills use icon plus words, not colour alone;
+  - the range input is `--tap-min` tall and the radio rows 56 px.
+- **SDP vectors:** only 127.0.0.1 relay candidates and `raddr 0.0.0.0`, nothing identifying; marked `-text` in `.gitattributes`.
+- **IPC:** all new calls go through `ipc.ts`, with no direct `invoke`.

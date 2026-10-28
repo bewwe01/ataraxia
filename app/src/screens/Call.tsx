@@ -5,10 +5,10 @@
 // Sound: every <video> here is muted, and the other side's voice and their shared screen's
 // sound play through their own <audio> elements, so deafening silences both and the stream
 // volume applies to the screen's sound only.
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { calls, canShare, QUALITIES, type CallState, type Quality } from "../calls";
 import type { ContactView } from "../ipc";
-import { Avatar, Icon } from "../ui";
+import { Avatar, Icon, useDialogKeys } from "../ui";
 
 const QUALITY_KEY = "veil.shareQuality";
 
@@ -85,14 +85,11 @@ function ShareSheet({ call, onClose }: { call: CallState; onClose: () => void })
   const [quality, setQuality] = useState<Quality>(call.sharing ?? savedQuality());
   const box = useRef<HTMLDivElement>(null);
 
+  // Focus the chosen quality once, when the bubble opens; Escape closes it and Tab stays in it.
   useEffect(() => {
     box.current?.querySelector<HTMLInputElement>("input:checked")?.focus();
-    const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", key);
-    return () => window.removeEventListener("keydown", key);
-  }, [onClose]);
+  }, []);
+  useDialogKeys(box, onClose);
 
   const pick = (q: Quality) => {
     setQuality(q);
@@ -140,6 +137,12 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
   const [now, setNow] = useState(Date.now());
   const [sheet, setSheet] = useState(false);
   const first = useRef<HTMLDivElement>(null);
+  // Stable, so the bubble's effects do not rerun with the clock (review C6-4); focus goes back
+  // to the Share button.
+  const closeSheet = useCallback(() => {
+    setSheet(false);
+    first.current?.querySelector<HTMLButtonElement>('button[aria-label="Share screen"]')?.focus();
+  }, []);
   const name = contact?.name ?? "Contact";
   const live = call.phase === "active";
   const theirScreen = live && call.peer.sharing && (call.remoteScreen?.getVideoTracks().length ?? 0) > 0;
@@ -274,7 +277,7 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
           </div>
         ) : null}
         <div className="call-controls" ref={first}>{controls}</div>
-        {sheet && live ? <ShareSheet call={call} onClose={() => setSheet(false)} /> : null}
+        {sheet && live ? <ShareSheet call={call} onClose={closeSheet} /> : null}
       </section>
       {/* Phase changes are announced once; the running clock is not. */}
       <span className="sr-only" role="status">{live ? `Call connected${call.peer.sharing ? `. ${name} is sharing their screen` : ""}${call.peer.deafened ? `. ${name} is deafened` : call.peer.muted ? `. ${name} is muted` : ""}` : status}</span>

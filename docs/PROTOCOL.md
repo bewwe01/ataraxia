@@ -250,8 +250,8 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 
 - **Signaling** (offer, answer, ICE, hangup, busy) travels only as `Content::Call` over the E2EE session. The relay sees ordinary padded envelopes (INV-NET-3).
   - Veil does not trickle: one complete offer and one complete answer, each with its relay candidates. Incoming `Ice` signals are ignored (ADR-0018).
-  - Signals are sent with a 60 s expiry, and a receiver drops any sent more than 90 s ago. They are held in memory until the app takes them, never stored, and dropped on lock.
-- **TURN URLs** from the relay reach the webview only if their host is public, is the relay's own IP, or is a DNS name that does not look local (`.local`, `.lan`, `.internal`, `.home.arpa`, `.localhost` and dotless names are refused). A relay that offers none disables calls.
+  - Signals are sent with a 60 s expiry, and a receiver drops any sent more than 90 s ago. One that cannot be delivered is deleted, never retried. Received signals are held in memory until the app takes them, never stored, and dropped on lock.
+- **TURN URLs** from the relay reach the webview only if their host is a public IP, is the relay's own IP, or is a DNS name that does not look local. Refused names: `.local`, `.lan`, `.internal`, `.home.arpa`, `.localhost`, dotless names, and names whose last label is not alphabetic (shorthand IPv4 such as `127.1`). Names are checked by form only; where they resolve is not (THREAT_MODEL §4). A relay that offers none disables calls.
 - **DTLS identity binding.**
   - The SDP carries `a=fingerprint:sha-256`, and the WebRTC stack refuses a DTLS peer whose certificate doesn't match. Because the SDP arrives authenticated by the session, a relay or TURN operator cannot substitute its own DTLS endpoint (INV-NET-4).
   - Clients MUST reject SDP without a `sha-256` fingerprint, with more than one fingerprint, or with `a=setup` inconsistent with the offer/answer role.

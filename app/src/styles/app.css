@@ -133,6 +133,8 @@ button.reply:not(:disabled):active { filter: brightness(0.92); }
 .msg-dialog { max-width: calc(100vw - 2 * var(--space-4)); }
 
 /* Calls (ADR-0018, DESIGN.md CallScreen): over everything, full screen. */
+/* The app under a call: no box of its own, so layout is unchanged. */
+.under-call { display: contents; }
 .call-overlay { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; }
 .call-overlay > .call { flex: 1; min-height: 0; padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
 .call-video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }

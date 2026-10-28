@@ -20,6 +20,8 @@ export function App() {
   const [typing, setTyping] = useState<ReadonlySet<number>>(new Set());
   const typingTimers = useRef(new Map<number, number>());
   const call = useCall();
+  const underCall = useRef<HTMLDivElement>(null);
+  const inCall = call !== null;
 
   const setTypingFor = useCallback((contact: number, on: boolean) => {
     const old = typingTimers.current.get(contact);
@@ -48,6 +50,13 @@ export function App() {
 
   // Notifications are on by default; Android asks for its permission the first time
   // (review M4-3). Kotlin remembers that it asked.
+  useEffect(() => {
+    const el = underCall.current;
+    if (!el) return;
+    if (inCall) el.setAttribute("inert", "");
+    else el.removeAttribute("inert");
+  }, [inCall, state]);
+
   useEffect(() => {
     if (state === "unlocked") void ipc.notifyWelcome().catch(() => undefined);
   }, [state]);
@@ -115,14 +124,13 @@ export function App() {
   if (state === "locked") return <Unlock onDone={refreshState} />;
 
   const byId = (id: number) => contacts.find((c) => c.id === id);
-  const screen = mainScreen();
-  return call ? (
+  // The app stays mounted under a call (drafts and scroll survive it), but inert, so focus and
+  // screen readers stay in the call (review C6-4).
+  return (
     <>
-      {screen}
-      <CallScreen call={call} contact={byId(call.contact)} />
+      <div className="under-call" ref={underCall}>{mainScreen()}</div>
+      {call ? <CallScreen call={call} contact={byId(call.contact)} /> : null}
     </>
-  ) : (
-    screen
   );
 
   function mainScreen() {

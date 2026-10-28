@@ -208,14 +208,32 @@ class CallManager {
     for (const fn of this.listeners) fn();
   }
 
-  private patch(p: Partial<CallState>) {
-    if (!this.current) return;
+  /** Changes the live call; an ended call only changes through `end` (review C6-1). */
+  private patch(p: Partial<CallState>, ending = false) {
+    if (!this.current || (this.current.phase === "ended" && !ending)) return;
     this.current = { ...this.current, ...p };
     this.emit();
   }
 
   private busy(): boolean {
     return this.current !== null && this.current.phase !== "ended";
+  }
+
+  /** Whether call `id` is still the one in progress (not hung up, declined or replaced). */
+  private live(id: string): boolean {
+    return this.current?.id === id && this.current.phase !== "ended";
+  }
+
+  /** Lets go of what a setup that lost its call had taken: camera, microphone, connection. */
+  private release(local: MediaStream | null, pc: RTCPeerConnection | null) {
+    for (const t of local?.getTracks() ?? []) t.stop();
+    if (pc) {
+      pc.close();
+      if (this.pc === pc) {
+        this.pc = null;
+        this.channel = null;
+      }
+    }
   }
 
   /** Starts a call to `contact`. */
@@ -225,15 +243,15 @@ class CallManager {
     const id = newId();
     this.current = fresh(id, contact, video, true);
     this.emit();
+    let local: MediaStream | null = null;
+    let pc: RTCPeerConnection | null = null;
     try {
       const setup = await ipc.callSetup(contact);
-      const local = await media(video);
-      if (this.current?.id !== id) {
-        for (const t of local.getTracks()) t.stop();
-        return;
-      }
+      if (!this.live(id)) return;
+      local = await media(video);
+      if (!this.live(id)) return this.release(local, null);
       this.patch({ local });
-      const pc = this.peer(setup);
+      pc = this.peer(setup);
       // The sections every call has, in `Slot` order; the camera is inactive in a voice call.
       pc.addTransceiver(local.getAudioTracks()[0] ?? "audio", { direction: "sendrecv", streams: [local] });
       pc.addTransceiver(local.getVideoTracks()[0] ?? "video", { direction: video ? "sendrecv" : "inactive", streams: [local] });
@@ -241,11 +259,13 @@ class CallManager {
       pc.addTransceiver("audio", { direction: "sendrecv" });
       await pc.setLocalDescription(await pc.createOffer());
       await gathered(pc);
-      if (this.current?.id !== id) return;
+      if (!this.live(id)) return this.release(local, pc);
       await ipc.callSend(contact, id, "offer", finalSdp(pc));
+      if (!this.live(id)) return;
       this.ringTimer = window.setTimeout(() => this.end("No answer", true), RING_MS);
     } catch (err) {
-      if (this.current?.id === id) this.end(reason(err, "The call could not start"), false);
+      if (this.live(id)) this.end(reason(err, "The call could not start"), false);
+      else this.release(local, pc);
     }
   }
 
@@ -253,9 +273,17 @@ class CallManager {
   async handle(signals: CallSignal[]): Promise<void> {
     for (const s of signals) {
       if (s.kind === "offer") {
-        if (this.busy()) {
-          if (s.callId !== this.current?.id) void ipc.callSend(s.contact, s.callId, "busy").catch(() => undefined);
-          continue;
+        const c = this.current;
+        if (c && this.busy()) {
+          // Both calling each other at once: the smaller call id goes ahead, on both sides,
+          // so neither gets "Busy" (review C6-7). The other side ignores ours the same way.
+          const glare = c.outgoing && c.phase === "calling" && s.contact === c.contact && s.callId !== c.id;
+          if (!glare) {
+            if (s.callId !== c.id) void ipc.callSend(s.contact, s.callId, "busy").catch(() => undefined);
+            continue;
+          }
+          if (s.callId > c.id) continue;
+          this.abandon();
         }
         window.clearTimeout(this.clearTimer);
         this.offer = s.sdp;
@@ -290,16 +318,17 @@ class CallManager {
     this.stopRinging();
     window.clearTimeout(this.ringTimer);
     this.patch({ phase: "connecting" });
+    const offer = this.offer;
+    let local: MediaStream | null = null;
+    let pc: RTCPeerConnection | null = null;
     try {
       const setup = await ipc.callSetup(c.contact);
-      const local = await media(c.video);
-      if (this.current?.id !== c.id) {
-        for (const t of local.getTracks()) t.stop();
-        return;
-      }
+      if (!this.live(c.id)) return;
+      local = await media(c.video);
+      if (!this.live(c.id)) return this.release(local, null);
       this.patch({ local });
-      const pc = this.peer(setup);
-      await pc.setRemoteDescription({ type: "offer", sdp: this.offer });
+      pc = this.peer(setup);
+      await pc.setRemoteDescription({ type: "offer", sdp: offer });
       // The offer made the sections; fill ours in, in `Slot` order.
       const tx = pc.getTransceivers();
       if (tx.length < 4) throw new Error("The call could not connect");
@@ -314,11 +343,21 @@ class CallManager {
       for (const t of [tx[Slot.Mic]!, tx[Slot.Camera]!]) t.sender.setStreams?.(local);
       await pc.setLocalDescription(await pc.createAnswer());
       await gathered(pc);
-      if (this.current?.id !== c.id) return;
+      if (!this.live(c.id)) return this.release(local, pc);
       await ipc.callSend(c.contact, c.id, "answer", finalSdp(pc));
     } catch (err) {
-      if (this.current?.id === c.id) this.end(reason(err, "The call could not connect"), true);
+      if (this.live(c.id)) this.end(reason(err, "The call could not connect"), true);
+      else this.release(local, pc);
     }
+  }
+
+  /** Drops our own outgoing call without a word, to take theirs instead (glare). */
+  private abandon() {
+    const c = this.current;
+    window.clearTimeout(this.ringTimer);
+    this.release(c?.local ?? null, this.pc);
+    this.current = null;
+    this.emit();
   }
 
   decline(): void {
@@ -539,7 +578,7 @@ class CallManager {
     for (const t of [...(c.local?.getTracks() ?? []), ...(this.screen?.getTracks() ?? [])]) t.stop();
     this.screen = null;
     void ipc.callAudio(false, false).catch(() => undefined);
-    this.patch({ phase: "ended", ended: why, local: null, remote: null, remoteScreen: null, sharing: null, peer: QUIET });
+    this.patch({ phase: "ended", ended: why, local: null, remote: null, remoteScreen: null, sharing: null, peer: QUIET }, true);
     this.clearTimer = window.setTimeout(() => {
       if (this.current?.id === c.id) {
         this.current = null;

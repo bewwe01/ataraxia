@@ -57,7 +57,8 @@ Status: **Phase 1 draft, awaiting approval.** Every "protected" claim below poin
 9. **Weak passphrases on a stolen device**, if the attacker also extracts the OS-keystore secret (rooted device or unpatched keystore vulnerability). Argon2id raises the cost but does not make a weak passphrase strong.
 10. **Metadata of invites.** Whoever obtains an invite link before it is used can redeem it. That shows up as an unverified contact that must be checked.
 11. **The first contact (trust on first use) for remote invites**, until you compare safety numbers.
-12. **Bugs.** Veil, libsignal and every dependency are software. libsignal's use outside Signal is unsupported by Signal. There has been **no independent audit yet.**
+12. **A hostile relay's TURN names.** The relay names the TURN servers for calls. Veil refuses private IP addresses (other than the relay's own) and local-looking names, but it checks a DNS name only by its form (ADR-0018). A relay that controls a public-looking name can point it at an address on your network, and your device would connect to it to speak TURN. Your relay is yours or someone you chose; a relay you do not trust should not get your calls at all.
+13. **Bugs.** Veil, libsignal and every dependency are software. libsignal's use outside Signal is unsupported by Signal. There has been **no independent audit yet.**
 
 ## 5. Metadata leakage by transport mode
 

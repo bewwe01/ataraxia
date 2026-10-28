@@ -27,11 +27,20 @@ const SIGNAL_TTL_MS: i64 = 60_000;
 const MAX_PENDING: usize = 32;
 
 /// One TURN server for the webview's `RTCPeerConnection`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct IceServerView {
     pub urls: Vec<String>,
     pub username: String,
     pub credential: String,
+}
+
+/// Redacted: the login is a short-lived token (review C6-10).
+impl core::fmt::Debug for IceServerView {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IceServerView")
+            .field("urls", &self.urls)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the webview needs to start or answer a call: the TURN servers it may use. The
@@ -43,7 +52,7 @@ pub struct CallSetup {
 }
 
 /// A call signal from a contact, after filtering, for the UI.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallSignal {
     pub contact: i64,
@@ -55,6 +64,17 @@ pub struct CallSignal {
     pub sdp: Option<String>,
     /// Offers: whether the caller asks for video.
     pub video: bool,
+}
+
+/// Redacted: the SDP holds the call's ICE password and fingerprint (review C6-10).
+impl core::fmt::Debug for CallSignal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CallSignal")
+            .field("contact", &self.contact)
+            .field("kind", &self.kind)
+            .field("video", &self.video)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the UI sends.
@@ -101,7 +121,9 @@ fn host_of(addr: &str) -> Option<&str> {
 
 /// Whether the webview may use this TURN URL. The relay is not trusted to point us at our own
 /// network: an IP must be public, or be the relay's own private address; a name must look like
-/// a public DNS name.
+/// a public DNS name, ending in an alphabetic top-level label, so shorthand IPv4 that resolvers
+/// accept (`127.1`, `192.168.1`, `0x7f.1`) is refused (review C6-3). A name is only checked
+/// for its form: what it resolves to is up to DNS (ADR-0018, Costs).
 pub(super) fn turn_url_ok(url: &str, own: &[IpAddr]) -> bool {
     let Some(rest) = url.strip_prefix("turn:").or_else(|| url.strip_prefix("turns:")) else {
         return false;
@@ -119,11 +141,24 @@ pub(super) fn turn_url_ok(url: &str, own: &[IpAddr]) -> bool {
     let local = ["local", "localhost", "internal", "lan", "home.arpa"]
         .iter()
         .any(|suffix| lower == *suffix || lower.strip_suffix(suffix).is_some_and(|rest| rest.ends_with('.')));
+    let tld_ok = lower
+        .rsplit('.')
+        .next()
+        .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()));
     lower.contains('.')
+        && tld_ok
         && !local
         && lower
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+}
+
+/// Whether a signal sent at `sent_at_ms` (the sender's clock) is too old to act on: its TTL
+/// plus 30 s for clocks that disagree. A sender whose clock is further behind than that cannot
+/// call (ADR-0018, Costs); one ahead is not penalised.
+fn is_stale(now_ms: i64, sent_at_ms: u64) -> bool {
+    let sent = i64::try_from(sent_at_ms).unwrap_or(i64::MAX);
+    now_ms.saturating_sub(sent) > SIGNAL_TTL_MS + 30_000
 }
 
 /// Public unicast, judged the way the core judges relay candidates.
@@ -258,6 +293,13 @@ impl Actor {
         if self.deliver(row).await {
             Ok(())
         } else {
+            // A call signal is only worth sending now: never retried after a reconnect, where a
+            // late offer would ring for a call the caller gave up on (review C6-2). Gone from
+            // the database too, so nothing of a call stays at rest (C6-6).
+            self.s()?
+                .db
+                .conn()
+                .execute("DELETE FROM messages WHERE id = ?1 AND kind = 'control'", [row])?;
             Err(ClientError::Unreachable)
         }
     }
@@ -276,8 +318,7 @@ impl Actor {
                 .query_row("SELECT blocked FROM contacts WHERE id = ?1", [contact], |r| {
                     r.get(0)
                 })?;
-        let sent = i64::try_from(sent_at_ms).unwrap_or(i64::MAX);
-        if blocked || now_ms().saturating_sub(sent) > SIGNAL_TTL_MS + 30_000 {
+        if blocked || is_stale(now_ms(), sent_at_ms) {
             return Ok(());
         }
         let own = own_turn(&s.relay_addr);
@@ -314,6 +355,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn old_signals_are_stale() {
+        let now = 1_800_000_000_000_i64;
+        let at = |ago: i64| u64::try_from(now - ago).unwrap();
+        assert!(!is_stale(now, at(0)));
+        assert!(!is_stale(now, at(89_000)));
+        assert!(!is_stale(now, at(90_000)));
+        assert!(is_stale(now, at(90_001)));
+        assert!(is_stale(now, at(91_000)));
+        assert!(is_stale(now, 0));
+        // From the future (a clock ahead) and absurd values: not stale, no overflow.
+        assert!(!is_stale(now, at(-3_600_000)));
+        assert!(!is_stale(now, u64::MAX));
+        assert!(is_stale(i64::MAX, 0));
+    }
+
+    #[test]
     fn turn_urls_from_the_relay_are_checked() {
         let own = own_turn("100.101.102.103:8443");
         assert!(turn_url_ok("turn:100.101.102.103:3478?transport=udp", &own));
@@ -329,6 +386,12 @@ mod tests {
             "stun:8.8.4.4:3478",
             "http://8.8.4.4",
             "turn:8.8.4.4:3478 ?x",
+            // Shorthand IPv4 that system resolvers accept (review C6-3).
+            "turn:127.1:3478",
+            "turn:10.1",
+            "turn:192.168.1:3478?transport=tcp",
+            "turn:0x7f.1",
+            "turn:1.2.3.4.5",
         ] {
             assert!(!turn_url_ok(bad, &own), "{bad}");
         }

@@ -2,6 +2,36 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Milestone 6: fixes after review round 1 (2026-10-28)
+
+Round 1 was a FAIL with one High (C6-1); the report is in REVIEW_REPORT.md. All findings, C6-1 to C6-11, are fixed:
+- **C6-1:** a call hung up or declined during setup now releases its microphone, camera and peer connection, and sends no offer or answer. The call state no longer changes once a call has ended.
+- **C6-2, C6-6:** a call signal that cannot be delivered is deleted, never retried.
+- **C6-3:** TURN host names must end in an alphabetic label; the residual DNS risk is written down.
+- **C6-4:** the quality bubble keeps focus and traps Tab, and the app under a call is `inert`.
+- **C6-5:** staleness is a tested function, and clock skew is documented.
+- **C6-7:** two people calling each other at once: the smaller call id goes ahead.
+- **C6-8:** the "Incoming call" notice is removed when the call ends.
+- **C6-9 to C6-11:** a test name in the docs, redacted `Debug` impls, indentation.
+
+```text
+$ cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings   # ok; exit 0
+$ cargo test --workspace --locked                                  # 225 passed, 0 failed
+$ (app/src-tauri) cargo clippy --all-targets --locked -- -D warnings   # exit 0
+$ (app) tsc --noEmit; node scripts/lint.mjs; vite build            # 0 errors; 17 files clean; built
+$ (design/tools) node check.mjs                                    # PASS
+```
+
+New tests:
+- `calls::tests::old_signals_are_stale`: edges at 89, 90 and 91 s, a sender ahead in time, `u64::MAX`.
+- More shorthand-IPv4 cases in `turn_urls_from_the_relay_are_checked`.
+- `tests/calls.rs` `an_undelivered_offer_is_never_sent_later`: the relay is cut, the offer fails with `Unreachable` and leaves no row. After reconnecting, a text arrives but no call signal and no ring. Mutation-checked: with the delete removed, the test fails.
+
+In Chromium, with the same harness:
+- Hanging up 0.2 s into a video call, while the camera was still being opened, left both tracks `ended`. Only the hangup went out, and Bob never rang.
+- A call right after that connected normally.
+- The video and voice runs of the feature test passed again: 1920×1080 screen, deafen, volume 0.35.
+
 ## Milestone 6: calls for tailnet peers, screen sharing, mute and deafen (2026-10-28)
 
 ADR-0018. Before the review gate.

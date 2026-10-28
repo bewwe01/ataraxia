@@ -215,3 +215,43 @@ async fn no_calls_without_turn_and_none_from_blocked_contacts() {
             .all(|e| e.0 != veil_client::service::ChangeKind::Ringing)
     );
 }
+
+/// A call signal that cannot be delivered is gone, not queued: after the connection comes
+/// back, the contact must not ring for a call the caller already gave up on (review C6-2), and
+/// nothing of it stays in the database (C6-6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undelivered_offer_is_never_sent_later() {
+    let r = relay_with(|c| c.turn = Some(turn(&["turn:127.0.0.1:3478?transport=udp"]))).await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    alice.client.call_setup(a_bob.id).await.unwrap();
+
+    hop.cut();
+    online(&alice.client, false).await;
+    assert_eq!(
+        alice
+            .client
+            .call_send(a_bob.id, CALL.into(), "offer", Some(sdp("actpass", false)))
+            .await
+            .unwrap_err(),
+        ClientError::Unreachable
+    );
+    assert_eq!(alice.client.hidden_rows(a_bob.id).await.unwrap(), 0);
+
+    hop.restore();
+    online(&alice.client, true).await;
+    // Something that is retried does arrive, so the connection really is back.
+    alice.client.send(a_bob.id, "back".into()).await.unwrap();
+    arrives(&bob.client, b_alice.id, "back").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(bob.client.call_signals().await.unwrap().is_empty());
+    assert!(
+        bob.events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.0 != veil_client::service::ChangeKind::Ringing)
+    );
+}
