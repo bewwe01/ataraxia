@@ -6,7 +6,7 @@
 //!   cargo test -p veil-relay --test smoke -- --ignored --nocapture
 //! ```
 //!
-//! With `VEIL_SMOKE_TURN_OUT=<file>` it also writes five freshly minted TURN username/credential
+//! With `VEIL_SMOKE_TURN_OUT=<file>` it also writes seven freshly minted TURN username/credential
 //! pairs there (two lines each) so they can be checked against coturn with `turnutils_uclient`;
 //! separate credentials keep coturn's per-user allocation quota from coupling the checks.
 #![allow(
@@ -60,7 +60,7 @@ async fn deployed_relay_round_trip() {
     assert_eq!(got.items[0].envelope, envelope);
 
     let mut turn = String::new();
-    for _ in 0..5 {
+    for _ in 0..7 {
         match owner
             .call(Request::TurnCredentials(veil_wire::MailboxRef {
                 mailbox_id: m.to_vec(),

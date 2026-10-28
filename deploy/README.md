@@ -134,6 +134,12 @@ Costs:
   "Light" (720p) is safer.
 - coturn is then reachable from the internet. Keep the image current (the compose file pins it),
   and keep the firewall rule.
+- Anyone who knows your relay can open a mailbox and get TURN credentials (review F6-1). They
+  cannot reach anything through coturn, but they can use up its 100 allocations and its
+  bandwidth, and block calls until their allocations expire (at most an hour). Through Funnel
+  coturn sees everyone as one local address, so it cannot tell them apart. If that happens,
+  stop the Funnel for coturn (`tailscale funnel --tls-terminated-tcp=10000 off`); tailnet calls
+  keep working.
 
 Create the relay's TLS key and certificate. List every name or IP clients will use:
 

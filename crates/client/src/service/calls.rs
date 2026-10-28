@@ -219,13 +219,20 @@ fn announced(relay_ips: &[String]) -> Vec<IpAddr> {
 struct Waiting {
     signal: CallSignal,
     role: Option<SdpRole>,
+    /// When it was sent (the sender's clock), so one held back does not ring late.
+    sent_at_ms: u64,
 }
+
+/// How often a failed TURN lookup is tried again while offers or answers wait for it.
+const LOOKUP_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Call state in memory only: incoming signals for the UI, and the relay's TURN addresses.
 #[derive(Default)]
 pub(super) struct Pending {
     queue: std::cell::RefCell<VecDeque<Waiting>>,
     relay_ips: std::cell::RefCell<Option<Vec<IpAddr>>>,
+    /// The earliest time to ask again after a failed lookup.
+    next_lookup: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl Pending {
@@ -241,8 +248,22 @@ impl Pending {
         self.queue.borrow_mut().drain(..).collect()
     }
 
+    /// Signals without SDP (hangup, busy); offers and answers stay queued.
+    fn take_without_sdp(&self) -> Vec<Waiting> {
+        let mut q = self.queue.borrow_mut();
+        let (plain, keep): (VecDeque<Waiting>, VecDeque<Waiting>) =
+            q.drain(..).partition(|w| w.role.is_none());
+        *q = keep;
+        plain.into_iter().collect()
+    }
+
     fn needs_sdp_filter(&self) -> bool {
         self.queue.borrow().iter().any(|w| w.role.is_some())
+    }
+
+    /// Whether offers or answers wait for TURN addresses we do not have yet.
+    fn waiting_for_lookup(&self) -> bool {
+        self.needs_sdp_filter() && self.relay_ips.borrow().is_none()
     }
 }
 
@@ -309,6 +330,29 @@ impl Actor {
         })
     }
 
+    /// On the tick: offers or answers held back by a failed TURN lookup get another try, at
+    /// most every few seconds; when it works, the UI is told to take them.
+    pub(super) async fn retry_turn_lookup(&self) {
+        let Ok(s) = self.s() else { return };
+        if !s.calls.waiting_for_lookup() {
+            return;
+        }
+        if s.calls
+            .next_lookup
+            .get()
+            .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            return;
+        }
+        if self.turn_credentials().await.is_ok() {
+            self.emit(ChangeKind::Call, None);
+        } else if let Ok(s) = self.s() {
+            s.calls
+                .next_lookup
+                .set(std::time::Instant::now().checked_add(LOOKUP_RETRY));
+        }
+    }
+
     /// Sends one signal now. Offers and answers are filtered first; nothing is kept for later
     /// beyond a minute, so a call that could not be signalled never rings afterwards.
     pub(super) async fn call_send(
@@ -357,15 +401,23 @@ impl Actor {
     /// first (a failure there only means fewer candidates pass).
     pub(super) async fn call_signals(&self) -> Result<Vec<CallSignal>> {
         let s = self.s()?;
-        if s.calls.needs_sdp_filter() && s.calls.relay_ips.borrow().is_none() {
-            let _ = self.turn_credentials().await;
-        }
+        let waiting = s.calls.waiting_for_lookup();
+        // If the lookup fails, offers and answers stay queued rather than going out without the
+        // candidates it would allow (review F6-2); the tick asks again and tells the UI.
+        let taken = if waiting && self.turn_credentials().await.is_err() {
+            let s = self.s()?;
+            s.calls
+                .next_lookup
+                .set(std::time::Instant::now().checked_add(LOOKUP_RETRY));
+            s.calls.take_without_sdp()
+        } else {
+            self.s()?.calls.take()
+        };
         let hosts = self.turn_hosts()?;
-        Ok(self
-            .s()?
-            .calls
-            .take()
+        let now = now_ms();
+        Ok(taken
             .into_iter()
+            .filter(|w| !is_stale(now, w.sent_at_ms))
             .filter_map(|w| {
                 let mut signal = w.signal;
                 if let Some(role) = w.role {
@@ -416,6 +468,7 @@ impl Actor {
                 video,
             },
             role,
+            sent_at_ms,
         });
         if kind == "offer" {
             self.emit(ChangeKind::Ringing, Some(contact));

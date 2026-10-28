@@ -4590,3 +4590,102 @@ The comment "Notifications are on by default; Android asks for its permission th
   - THREAT_MODEL §4 item 12, with "Bugs" renumbered to 13 and no stale references;
   - INVARIANTS INV-NET-1 and INV-NET-3;
   - the TEST_REPORT round-1 fix section, including the mutation claim for the new client test, which holds by reasoning: on the old code `retry_failed` redelivers the failed row on reconnect.
+
+## Funnel calls review, round 1 (commit dc2b29a)
+
+**Verdict: PASS.** No Critical or High findings. There are two Lows and one Nit.
+
+Scope: 19 files. Reviewed in full: `crates/wire`, `crates/relay` (`main.rs`, `server.rs`, `turn.rs`, tests), `crates/client` (`service.rs`, `service/calls.rs`, `tests/calls.rs`), deploy (`turnserver.conf`, `entrypoint.sh`, `docker-compose.yml`, `.env.example`, `README.md`), `.github/workflows/ci.yml`, and the docs (ARCHITECTURE ADR-0018, PROTOCOL §8, THREAT_MODEL, INVARIANTS, TEST_REPORT). I also read the relevant parts of `crates/core/src/ice.rs`.
+
+Tests run on this commit:
+- `cargo test -p veil-client --features test-hooks --test calls`: 4 passed, including `an_outsider_reaching_the_relay_by_name_can_call`.
+- `cargo test -p veil-wire`: 5 passed.
+- `cargo test -p veil-client --lib`: 21 passed.
+- `cargo test -p veil-relay`: **not run.** The volume filled up (0 MB free) during its build, and after that no shell command could run. Someone needs to free space (most likely `target/`) before running it.
+
+### F6-1. Low. Strangers can use up coturn's allocations through Funnel and block the owner's calls
+`deploy/coturn/turnserver.conf` L15-19 (`user-quota=4`, `total-quota=100`, `max-allocate-lifetime=3600`); `deploy/README.md` "Calls with people outside your tailnet" and the TURN bullet at about L256.
+
+**Problem.** The deny-all-peers change works: nobody can reach the LAN, the tailnet or the internet through this coturn. Availability is a separate matter:
+- Mailbox creation is open, and the relay gives out up to 10 TURN credentials per mailbox at once, then 1 per minute.
+- Every credential has a fresh username, so `user-quota=4` limits each credential, not each person.
+- Funnel now puts coturn on the internet, and with option C it was reachable only from the tailnet before. Through Funnel every client also appears to coturn as tailscaled's loopback address, so coturn cannot tell people apart.
+
+**Scenario.** A stranger who knows the relay's Funnel name creates three mailboxes and fetches 30 credentials. With 4 allocations each, that is 120 allocations, more than `total-quota=100`. The attacker refreshes them for an hour. Every new call from the owner and their contacts then fails to allocate. The attacker can also relay traffic between two of their own allocations (each allocation is allowed to send to coturn's own address) and use up to 1 MB/s per session of the Pi's Funnel bandwidth. The README says the quotas "limit what they can do", but it does not say this can block the owner's calls.
+
+**Fix.** Document it in the README's "Costs" list, for example: "Anyone who can open a mailbox can use up coturn's 100 allocations and block calls until they expire. Turn Funnel for coturn off if that happens." Optionally make it harder: cut the relay's `turn_per_mailbox` burst from 10 to 3. Rate limits per mailbox cannot stop this, because mailbox creation is open, so the README note is the real fix.
+
+### F6-2. Low. If the first-call TURN lookup fails, the outsider's first call silently cannot connect
+`crates/client/src/service/calls.rs` L358-377 (`call_signals`).
+
+**Problem.** If `relay_ips` is still unknown, `call_signals` asks the relay once (`let _ = self.turn_credentials().await;`). If that request fails, it still drains the whole queue and filters each SDP without the announced addresses. Possible reasons for the failure:
+- the relay connection is still being re-established;
+- `RateLimited`: the burst is 10, then 1 per minute, shared with `call_setup`;
+- a timeout.
+
+For an outsider, the tailnet caller's only relay candidate (on `100.x`) is then removed. The UI rings with an offer that has no usable candidate. When the user answers, `call_setup` does fill `relay_ips`, but the offer has already been handed over with the candidate removed. Nothing goes back to re-filter it, so the call never connects and the user is not told why. This is not a security problem: removing candidates fails closed.
+
+**Scenario.** Bob (outside the tailnet) unlocks his app just as Alice calls. The push with her offer arrives before his relay connection is ready to answer requests. The lookup fails, the phone rings, and the answered call stays at "connecting" until it times out.
+
+**Fix.** If the lookup failed, keep the offers and answers in the queue and return only signals without SDP. The UI polls again shortly:
+```rust
+if s.calls.needs_sdp_filter() && s.calls.relay_ips.borrow().is_none()
+    && self.turn_credentials().await.is_err()
+{
+    return Ok(self.s()?.calls.take_without_sdp()); // offers/answers stay queued for the next poll
+}
+```
+Alternatively, after a failure keep a "fetch failed" marker and let `call_setup` re-filter the waiting offer. Add a test that exercises the failure, for example a relay with TURN rate-limited to 0.
+
+### F6-3. Nit. The ADR cites some CVEs that do not apply and misses the one that does
+`docs/ARCHITECTURE.md`, ADR-0018 "Kept current" bullet.
+
+**Problem.** I checked the cited CVEs against the coturn GitHub advisories:
+- **CVE-2026-40613** (GHSA-j662-9wcj-mf36): unauthenticated crash on ARM64, fixed in 4.10.0. Cited correctly.
+- **CVE-2026-73212** (GHSA-2x4g-wx24-48m4): bypass on the RFC 6062 TCP CONNECT relay path, fixed in 4.13.1. Veil's config sets `no-tcp-relay`, so this one never applied.
+- **CVE-2026-27624** (GHSA-j8mm-mpf8-gvjg): the advisory lists no patched version.
+- **CVE-2026-73213** (GHSA-4v97-rxjj-4f99), not cited: the IPv6 comparison in `addr_less_eq()` lets clients get past `denied-peer-ip`/`allowed-peer-ip` ranges. It affects 4.15.0 and earlier and is fixed in 4.16.0. This is the advisory that matters for the new `denied-peer-ip=::-ffff:…` line.
+
+The TEST_REPORT's local check also ran coturn 4.6.1, which has this IPv6 bug. Only IPv4 peers were tested there, so the results still hold.
+
+**Fix.** Change the sentence to: "…peer-restriction bypasses (CVE-2026-27624; CVE-2026-73213, IPv6 range comparison, fixed in 4.16.0, which the deny-all IPv6 line depends on)". Drop CVE-2026-73212, or mark it as not applicable because of `no-tcp-relay`.
+
+### Checked and fine
+- **Wire (`crates/wire/src/lib.rs`):**
+  - `relay_ips` is checked in `decode_strict`: at most 4 entries (`MAX_URLS`), each at most 45 bytes and parsed as an `IpAddr` before use.
+  - Names, shorthand IPv4, `public/private` pairs and 5 entries are refused, and the tests cover these.
+  - Tag 5 is new, so it does not break the wire format.
+- **Relay (`turn_from_env`, `server.rs`, `turn.rs`):**
+  - In `public/private` form only the part before `/` is used (`unwrap_or_default`, no panic). A bad IP or a 5th entry stops startup with an error.
+  - The redacting `Debug` on `TurnConfig` now also shows the operator's IPs, which contain no client data.
+  - The response sends the configured IPs as strings. The secret handling is unchanged.
+- **Client, announced addresses (`announced`, `turn_hosts`):**
+  - Unparseable, unspecified and multicast entries are dropped, and at most 4 are kept. Nothing on this path can panic.
+- **Client, TURN URLs never use announced addresses:**
+  - `call_setup` filters URLs with `own_turn(&s.relay_addr)` only, never with `turn_hosts`.
+  - The test confirms it: with `127.0.0.1` announced, an outsider's setup still drops `turn:127.0.0.1…` and keeps only the name URL.
+- **A hostile relay announcing addresses gains nothing:**
+  - Announced addresses only widen which `typ relay` candidates pass the filter. With `iceTransportPolicy: relay`, the webview sends only to the TURN servers it was given; remote candidates are reached through that TURN server.
+  - On the outgoing side, `filter_sdp_with` still requires `typ relay`, so the user's host or srflx addresses cannot leak even if the relay announces the user's LAN IP.
+  - INV-NET-1 holds.
+- **Lazy filtering does not change what is accepted or rung:**
+  - Each candidate line is kept or dropped on its own and is not subject to the fail-closed address scan. `validate_dtls` does not depend on candidates, and `video_in` reads only the `m=` and direction lines.
+  - So whether a signal is accepted, rung, and marked as video is decided at arrival and cannot change at take time. The `filter_map` that drops signals at take time cannot fire for an SDP that passed at arrival.
+- **No unfiltered SDP reaches the UI:**
+  - `call_signals` is the only reader of the queue (`calls.take`; grep confirms), and it filters every `Some(role)` entry.
+  - The raw SDP waiting in memory was size-checked at arrival (`MAX_SDP`) and is bounded by `MAX_PENDING`.
+- **No borrow conflict in `call_signals`:** the `RefCell` borrow in the `if` condition ends before `turn_credentials` writes to the same cell (the passing test exercises this path).
+- **State on lock and between accounts:**
+  - `Pending` (queue plus the `relay_ips` cache) lives in `Session` and is created fresh at create and unlock (`service.rs` L1630, L1744). It is dropped on lock. The relay address never changes within a session.
+  - `call_setup` refreshes `relay_ips` on every call.
+- **Test `an_outsider_reaching_the_relay_by_name_can_call` is meaningful:**
+  - It runs both with and without the announcement. Bob reaches the relay as `localhost:port`, which stands in for a Funnel name.
+  - Filtering at arrival (the old behaviour), or removing the lazy lookup, would fail the `announce=true` check on the offer.
+  - It checks both directions and the TURN URL rule.
+- **coturn config:**
+  - In coturn's `good_peer_addr` (checked against coturn master), the allowed list is checked before the denied list, so `allowed-peer-ip` overrides the deny-all ranges.
+  - Link-local and ULA addresses are always denied before the allowed list is checked. That does not affect `100.x` (option C), public IPs (A), or the public half of B's `public/private` form. `entrypoint.sh` strips `/private`, so B allows the public address, the same as before. Relaying to it still needs hairpin NAT on the router, which is unchanged.
+  - CI tests the override: the client-to-client run (`-y`, UDP and new TCP) must lose 0 packets, and peers `10.0.0.1` and `1.1.1.1` must get `403`.
+  - I could not test 4.18.0 itself here. coturn 4.18.0 is a real release (2026-09-08), and its changelog shows no option removals that would affect this config. CI is the check for the exact image.
+- **Compose and CI:** `VEIL_TURN_RELAY_IPS` takes the same value as coturn's `external-ip`. Images are pinned by digest. In CI, `-t` makes only the client leg TCP, which still works with `no-tcp-relay`.
+- **Docs:** PROTOCOL §8, INVARIANTS INV-NET-1, THREAT_MODEL items 12-14, the deploy README Funnel steps and the TEST_REPORT description match the code. The only exception is F6-3. TURN URLs are still refused for private IPs other than the relay's own, so item 12 is still accurate. I did not verify the Tailscale "1.104.4 / Tailworm" claim.

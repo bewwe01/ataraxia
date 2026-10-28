@@ -320,3 +320,48 @@ async fn an_outsider_reaching_the_relay_by_name_can_call() {
         );
     }
 }
+
+/// If the outsider's app cannot learn the TURN addresses when a call arrives (the relay refuses
+/// or is not ready), the offer is held back rather than handed over without its only usable
+/// candidate; signals without SDP still go through (review F6-2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_waits_for_the_turn_addresses() {
+    let r = relay_with(|c| {
+        let mut t = turn(&["turns:turn.example.org:10000?transport=tcp"]);
+        t.relay_ips = vec!["127.0.0.1".parse().unwrap()];
+        c.turn = Some(t);
+        // No TURN credentials at all: every lookup fails.
+        c.limits.turn_per_mailbox = veil_relay::limits::Rate {
+            burst: 0,
+            per_sec: 0.0,
+        };
+    })
+    .await;
+    let port = r.addr.rsplit(':').next().unwrap();
+    let tailnet = user(&r, "Alice").await;
+    let outsider = user_at(&r, &format!("localhost:{port}"), "Bob", None).await;
+    let (a_bob, _) = pair(&tailnet.client, &outsider.client).await;
+
+    tailnet
+        .client
+        .call_send(a_bob.id, CALL.into(), "offer", Some(sdp("actpass", false)))
+        .await
+        .unwrap();
+    tailnet
+        .client
+        .call_send(a_bob.id, CALL.into(), "hangup", None)
+        .await
+        .unwrap();
+    // The hangup comes through; the offer, which would have lost its candidate, does not.
+    let got = within(Duration::from_secs(15), || async {
+        let s = outsider.client.call_signals().await.unwrap();
+        (!s.is_empty()).then_some(s)
+    })
+    .await;
+    assert_eq!(
+        got.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>(),
+        ["hangup"]
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(outsider.client.call_signals().await.unwrap().is_empty());
+}

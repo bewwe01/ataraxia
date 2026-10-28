@@ -1202,6 +1202,7 @@ impl Actor {
             if retry {
                 self.retry_failed().await;
             }
+            self.retry_turn_lookup().await;
             self.wake_transfers();
         }
     }
