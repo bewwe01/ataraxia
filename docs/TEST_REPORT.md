@@ -2,6 +2,32 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Look: review round 2 and its fixes (2026-10-29)
+
+Round 2 of the review gate failed on one High finding, LK2-1: the custom accent was checked against too few panels and dropped to 3.91:1 on Aurora dark `--surface-2`. All five findings (LK2-1 to LK2-5) were fixed in this round.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 232 passed, 0 failed
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 20 files clean
+# contrast: worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001
+# ✓ built in 1.57s
+```
+
+- **LK2-1:**
+  - The accent is now checked against every `--bg-0..2` and `--surface-1..2` of every theme: 13 dark and 9 light panels.
+  - The check reads `tokens.css` and fails if a panel there is missing from `color.ts`.
+- **LK2-2:** "Use a photo…" is a button of its own. In Chromium, nine presses of ArrowRight through the wallpaper group opened 0 file choosers.
+- **LK2-3:** the photo's base64 is wrapped for wiping before any check, and the `data:` URL is sized up front.
+- **LK2-4:** focus returns after the photo question closes. A slider released while another save runs shows the saved level again.
+- **LK2-5:** warning notices keep their tint over a wallpaper, and the call-line hover is opaque.
+- The round 1 browser checks still pass: Tab saves 0 times, a photo is not removed before confirming, and a 26 MiB file is refused. No console errors.
+
 ## Look: review round 1 and its fixes (2026-10-29)
 
 Round 1 of the review gate failed on one High finding: LK-1, meta text on custom colours at 3.64:1. All thirteen findings (LK-1 to LK-13) were fixed in this round.

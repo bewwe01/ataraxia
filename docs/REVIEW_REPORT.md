@@ -4994,3 +4994,142 @@ Add a case for this to `tests/look.rs`.
 ---
 
 **Verdict: FAIL.** One High finding: LK-1, the meta-text contrast. Fixing LK-1 and adding LK-12's test is enough to clear the gate. LK-2 to LK-5 should go into the same round.
+
+## Look (milestone 4.5) review, round 2 (2026-10-29)
+
+**Scope:** fix commit 503a6bb, on top of fdd85b5. I read all 14 changed files and did not edit any. Line numbers below come from `git show 503a6bb:<path>`. The working tree's uncommitted profile work is in `crates/` only, and `app/` is unchanged, so the frontend results below apply to the commit itself.
+
+**Checks run**
+- `pnpm -C app lint`: passes. Output: `lint: 20 files clean`, then `contrast: worst white 5.4293, meta 4.5001, accentDark 4.5127, accentLight 4.5002`.
+- `pnpm -C app typecheck`: passes, 0 errors.
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-client --test look`: 2 passed (`wallpapers_and_chat_colours`, `a_key_change_keeps_the_chats_look`). This build includes the uncommitted working-tree changes in `crates/client`.
+- I copied `color.ts` from the commit into the scratchpad and measured the computed accents for all 360 hues against every surface token in `tokens.css`. That run produced the figures in LK2-1.
+- I read WebKit's `RadioInputType::handleKeydownEvent` for LK2-2. When an arrow key moves the selection, it calls `dispatchSimulatedClick` on the newly selected radio.
+
+### Status of the round 1 findings
+
+| ID | Status | Notes |
+|---|---|---|
+| LK-1 | **Fixed for meta text. The accent part is incomplete (see LK2-1).** | `readable()` now checks white and 86 % white. The worst meta case is 4.5001, and 0.86 is the dimmer theme (light is 0.88). Pure black `--surface-3` was added to the accent backgrounds, but Aurora dark and Ink dark `--surface-1`/`--surface-2` are missing, and they do carry accent text. |
+| LK-2 | Fixed | `useSliderCommit` listens to the native `change` event, so Tab no longer saves. `HuePicker` and `levels()` skip a save when the value has not changed. The `shown` dependency re-binds Dim and Blur when they mount. |
+| LK-3 | **Partly fixed (see LK2-2, LK2-4)** | `disabled={busy}` was removed and a ref guard replaces it. Leaving a photo now asks first, which removes the data-loss risk. However, arrowing onto "Photo" still opens the file chooser. |
+| LK-4 | Fixed | `.chat-screen:has(> .chat-wallpaper) :is(.sys-msg, .day-sep)` gives an opaque `--surface-2` pill. `ChatWallpaper` is a direct child of `.chat-screen` (Chats.tsx:745). There are two small side effects, noted in LK2-5. |
+| LK-5 | Fixed | A 25 MiB limit is checked before `createImageBitmap`. The canvas is filled with `--bg-1` (a plain hex value in every theme) before drawing. |
+| LK-6 | **Partly fixed (see LK2-3)** | The decoded bytes and the BLOB are now `Zeroizing`. The `data:` URL string is not pre-sized, so building it leaves freed copies. |
+| LK-7 | Fixed | New photos must be `image/jpeg`, and a unit test covers PNG rejection. Stored PNG/WebP photos still read back. ADR-0019 states that the size check runs after IPC deserialization. |
+| LK-8 | Fixed | The App.tsx effect cleanup calls `forgetWallpapers()`. `refreshWallpaper` checks the epoch and clears all photos. `refresh`, `refreshState` and `setTypingFor` are stable `useCallback([])`, so the cleanup only runs when the state changes. |
+| LK-9 | Fixed | A failed photo read deletes its own cache entry. It is retried on the next store change, and there is no retry loop. |
+| LK-10 | Fixed | The Ink rule (specificity 0,4,0) comes before the soft/minimal rules. `bubbleVars` sets `--sent-ink`, so a chat's colour applies in Ink. |
+| LK-11 | Fixed | The look is carried over inside the `atomically` block. `COALESCE` keeps the new contact's own settings. `UPDATE OR IGNORE`, guarded by `LIKE 'photo:%'`, moves the photo only when the merged wallpaper is a photo; otherwise the trigger removes it. The new integration test passes. |
+| LK-12 | Fixed | `app/scripts/contrast-check.mjs` runs from `pnpm lint`. Release CI uses Node 22, which supports `--experimental-strip-types`. Its background list is incomplete (LK2-1). |
+| LK-13 | Fixed | Renamed to `.hue-swatches` / `.hue-swatch`, and the DESIGN.md §6 row is updated. |
+
+### New findings
+
+#### LK2-1: High. Custom accent text fails 4.5:1 on the surfaces it actually sits on [HIGH]
+**Where:** `app/src/color.ts:38` (`DARK_BGS`), `:101`. The check in `app/scripts/contrast-check.mjs:20` inherits the same gap.
+
+**Problem:**
+- `DARK_BGS` holds Aurora dark `--bg-2` (16,19,49) and pure-black `--surface-3` (26,26,31). Pure-black `--surface-3` never carries accent text.
+- Accent text does sit on lighter surfaces:
+  - `.msg.in .reply { background: var(--surface-2); color: var(--accent) }` (base.css:385). This is the quoted sender's name in every received reply.
+  - `.composer-ctx .reply` (app.css:82).
+  - `.btn-ghost` and `.link-btn` on cards (`--surface-1`).
+- Measured worst cases, all at hue 243:
+
+  | Surface | Worst contrast | Hues below 4.5 |
+  |---|---|---|
+  | Aurora dark `--surface-2` `#1e2250` (the default style) | 3.91:1 | 114 |
+  | Ink dark `--surface-2` `#1f1f25` | 4.27:1 | 65 |
+  | Aurora dark `--surface-1` `#171a3d` | 4.37:1 | 43 |
+
+- The presets pass on the same surfaces; for example Aurora `#a49dff` on `#1e2250` is 6.32:1.
+- This is the same class of defect as LK-1. The commit and ADR-0019 now claim the accent keeps 4.5:1 "on every panel it sits on", and the lint check passes only because the list omits these surfaces.
+
+**Fix:**
+```ts
+/** Every dark panel accent text sits on: Aurora --bg-2, --surface-1, --surface-2;
+ *  Ink --surface-1, --surface-2; pure black --surface-2/3. */
+export const DARK_BGS: Rgb[] = [[16, 19, 49], [23, 26, 61], [30, 34, 80], [26, 26, 31], [31, 31, 37]];
+```
+I verified this in the scratchpad: the worst case becomes 4.500 on Aurora `--surface-2`, with 0 failures on any surface that carries accent text. The light surfaces already pass (worst 4.575). Also update the ADR-0019 wording.
+
+Better still, have `contrast-check.mjs` read the `--surface-1`/`--surface-2`/`--bg-2` hex values from `src/styles/tokens.css`, so a later token change cannot reopen the gap.
+
+#### LK2-2: Medium. Arrow keys still open the file chooser on "Photo" [HIGH]
+**Where:** `app/src/components/Look.tsx:154`.
+
+**Problem:**
+- Arrow navigation in a native radio group dispatches a simulated `click` on the newly selected radio. WebKit does this in `RadioInputType::handleKeydownEvent` (`dispatchSimulatedClick`), and Chromium does the same; React's radio `onChange` relies on exactly that.
+- So `onClick={() => file.current?.click()}` still fires when a keyboard user arrows past "Photo". The key press counts as a user activation, so the OS file chooser opens and interrupts navigation.
+- The code comment ("never as arrow keys pass by") and the DESIGN.md §6 row are therefore wrong.
+- The photo is no longer deleted by mistake, because the confirm handles that.
+
+**Fix:** take "pick a photo" out of the radio's activation:
+```tsx
+const viaArrow = useRef(false);
+<div className="wp-tiles" role="radiogroup" … onKeyDownCapture={(e) => { viaArrow.current = e.key.startsWith("Arrow"); }}>
+…
+<input type="radio" … onClick={() => { if (viaArrow.current) { viaArrow.current = false; return; } file.current?.click(); }} />
+```
+Alternatively, and more simply, keep "Photo" as a radio that only selects, and add a separate `<button>` labelled "Choose photo…" that opens the chooser.
+
+#### LK2-3: Low. The photo `data:` URL grows without pre-sizing, leaving unwiped copies [HIGH]
+**Where:** `crates/client/src/service/look.rs:244-245`, and `:94`.
+
+**Problem:**
+- base64 0.23 `encode_string` pushes 1 KiB chunks into the `String` with `push_str` and never reserves space up front (checked in the vendored source).
+- So a ~2–4 MiB URL is reallocated about 12 times, and each freed buffer keeps part of the photo's base64. This misses the pre-sized form that LK-6 asked for.
+- Separately, the `TooLarge` return at L94 and the `_ => BadInput` arm drop the base64 `String` before it is wrapped in `Zeroizing`.
+
+**Fix:**
+```rust
+let prefix = format!("data:{mime};base64,");
+let mut url = String::with_capacity(prefix.len() + base64::encoded_len(data.len(), true)?);
+url.push_str(&prefix);
+STANDARD.encode_string(&*data, &mut url);
+```
+Here `?` stands for mapping the `None` result to `ClientError::Storage`. Also move `let b64 = Zeroizing::new(b64);` above the length check.
+
+#### LK2-4: Low. Keyboard focus is lost after "Keep photo", and saves during a save are dropped silently [MEDIUM]
+**Where:** `app/src/components/Look.tsx:168`, `:103`, `:124`.
+
+**Problem:**
+- "Keep photo" unmounts the alert along with the focused button, so focus falls to `<body>`. That is the same focus loss LK-3 set out to remove.
+- Separately, `save()` returns at once while another save is in flight, for example a photo upload. A Dim or Blur release during that time is dropped, but the slider keeps showing the unsaved value. The resync effect only runs when `value.dim`/`value.blur` change.
+
+**Fix:**
+- Before calling `setReplacing`, store the focused radio in a ref: `const back = useRef<HTMLElement | null>(null); back.current = document.activeElement as HTMLElement`. On both buttons, call `back.current?.focus()` after closing.
+- In `levels()`, when `saving.current` is set, reset the sliders: `setDim(value.dim); setBlur(value.blur)`. Alternatively, queue the latest levels and save them in the `finally`.
+
+#### LK2-5: Low. The wallpaper pill override also catches hover and warning pills [HIGH]
+**Where:** `app/src/styles/app.css:221`.
+
+**Problem:**
+- `button.sys-msg.call-line:hover` (specificity 0,3,1, app.css:140) outranks the new rule (0,3,0). Over a photo, hovering a call line brings back the translucent `--surface-glass-strong`.
+- The new rule outranks `.sys-msg.warning` (0,2,0), so timer and key-warning notices lose their `--warning-soft` tint.
+
+**Fix:**
+```css
+@media (hover: hover) { .chat-screen:has(> .chat-wallpaper) button.sys-msg.call-line:hover { background: var(--surface-3); } }
+.chat-screen:has(> .chat-wallpaper) .sys-msg.warning { background: linear-gradient(var(--warning-soft), var(--warning-soft)), var(--surface-2); }
+```
+
+### Also checked and found correct
+- **Contrast math:** `meta()` composites white at 0.86 alpha correctly. The script measures the exact hex values `bubbleVars`/`accentVars` produce, including `--sent-solid`/`--sent-ink` and the gradient midpoints.
+- **Gradients:** luminance is convex along an sRGB line segment, so the lightest point of each gradient segment is a stop. Sampling the stops is sufficient for white text.
+- **`useSliderCommit`:** the latest-callback ref avoids stale closures, and the listener is removed on cleanup.
+- **Cache epoch:** a stale `refreshWallpaper` cannot repopulate the cache after a lock. A photo read still in flight is never re-cached once `photos.clear()` has run.
+- **`accept_key_change`:** every statement runs inside one `atomically` SAVEPOINT. No `UPDATE` trigger interferes, and the `wallpaper_photos.owner` primary-key conflict is handled by `OR IGNORE`.
+- **Rust boundary:** no `unwrap`/indexing on the IPC input, and nothing new is logged or reaches the network.
+
+### Verdict: **FAIL**
+LK2-1 is High: custom-accent text still drops to 3.91:1 in the default Aurora dark style, and the new lint check misses it. Fixing LK2-1 clears the gate. LK2-2 should go into the same round, because it leaves part of LK-3 open. LK2-3 to LK2-5 can follow.
+
+### Action options
+- **A.** Fix all of LK2-1 to LK2-5.
+- **B (recommended).** Fix LK2-1 and LK2-2, then re-run `pnpm -C app lint` and re-review.
+- **C.** Fix specific items.
+- **D.** Report only.
+
+Files: `/home/user/ataraxia/app/src/color.ts`, `/home/user/ataraxia/app/scripts/contrast-check.mjs`, `/home/user/ataraxia/app/src/components/Look.tsx`, `/home/user/ataraxia/app/src/styles/app.css`, `/home/user/ataraxia/crates/client/src/service/look.rs`, `/home/user/ataraxia/docs/REVIEW_REPORT.md`.

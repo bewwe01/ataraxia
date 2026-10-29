@@ -33,10 +33,17 @@ export const WHITE: Rgb = [255, 255, 255];
 /** Meta text in sent bubbles is white at this opacity (`--text-on-accent-2`, the dimmer of the
  *  two themes). */
 export const META_ALPHA = 0.86;
-/** The hardest backgrounds accent text sits on: the lightest dark panels (Aurora dark --bg-2,
- *  and pure black's --surface-3) and the darkest light one (Aurora light --bg-0). */
-export const DARK_BGS: Rgb[] = [[16, 19, 49], [26, 26, 31]];
-export const LIGHT_BGS: Rgb[] = [[231, 233, 245]];
+/** Every panel accent text can sit on (`--bg-0..2`, `--surface-1..2` of each theme in
+ *  tokens.css); `scripts/contrast-check.mjs` reads tokens.css and fails if one is missing. */
+export const DARK_BGS: Rgb[] = [
+  [6, 7, 26], [11, 13, 34], [16, 19, 49], [23, 26, 61], [30, 34, 80], // Aurora dark
+  [10, 10, 12], [14, 14, 17], [17, 17, 20], [26, 26, 31], [31, 31, 37], // Ink dark
+  [5, 5, 6], [12, 12, 15], [19, 19, 23], // pure black
+];
+export const LIGHT_BGS: Rgb[] = [
+  [231, 233, 245], [246, 247, 252], [238, 240, 249], [255, 255, 255], [233, 235, 246], // Aurora light
+  [233, 233, 236], [247, 247, 248], [242, 242, 244], [235, 235, 239], // Ink light
+];
 
 const hex = ([r, g, b]: Rgb) => `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
 const rgba = ([r, g, b]: Rgb, a: number) => `rgb(${r} ${g} ${b} / ${a})`;

@@ -90,6 +90,8 @@ export function WallpaperPicker({ contact, value, photoUrl }: { contact: number 
   // Radios stay enabled while saving (disabling the focused one would drop keyboard focus);
   // a ref keeps one save at a time.
   const saving = useRef(false);
+  /** Where focus goes back to when the photo question closes. */
+  const back = useRef<HTMLElement | null>(null);
   const file = useRef<HTMLInputElement>(null);
   const dimRef = useRef<HTMLInputElement>(null);
   const blurRef = useRef<HTMLInputElement>(null);
@@ -117,11 +119,20 @@ export function WallpaperPicker({ contact, value, photoUrl }: { contact: number 
     save(() => saveWallpaper(contact, preset === "none" ? null : { preset, photo: null, keepPhoto: false, dim, blur }));
   function choose(preset: WallpaperPreset | "none") {
     // Leaving a photo deletes it: ask first (an arrow key in the group is enough to get here).
-    if (value?.photo) setReplacing(preset);
+    if (value?.photo) {
+      back.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      setReplacing(preset);
+    }
     else void apply(preset);
   }
   const levels = (d: number, b: number) => {
     if (!value || (d === value.dim && b === value.blur)) return;
+    // Another save is running: show what is saved rather than a level that was not.
+    if (saving.current) {
+      setDim(value.dim);
+      setBlur(value.blur);
+      return;
+    }
     void save(() => saveWallpaper(contact, { preset: value.preset, photo: null, keepPhoto: value.photo, dim: d, blur: b }));
   };
   useSliderCommit(dimRef, (d) => levels(d, blur), value !== null);
@@ -138,35 +149,46 @@ export function WallpaperPicker({ contact, value, photoUrl }: { contact: number 
     <div className="stack-sm">
       <div className="wp-tiles" role="radiogroup" aria-label="Wallpaper" aria-busy={busy}>
         <label className="wp-tile">
-          <input type="radio" name={name} checked={value === null} onChange={() => choose("none")} />
+          <input type="radio" name={name} value="none" checked={value === null} onChange={() => choose("none")} />
           <span className="wp-thumb" aria-hidden="true" />
           <span className="wp-name">{contact === null ? "None" : "Default"}</span>
         </label>
         {WALLPAPER_PRESETS.map((p) => (
           <label key={p} className="wp-tile">
-            <input type="radio" name={name} checked={value?.preset === p} onChange={() => choose(p)} />
+            <input type="radio" name={name} value={p} checked={value?.preset === p} onChange={() => choose(p)} />
             <span className="wp-thumb" aria-hidden="true"><WallpaperLayer w={{ preset: p, photo: false, ...shown }} photoUrl={null} /></span>
             <span className="wp-name">{PRESET_NAMES[p]}</span>
           </label>
         ))}
-        <label className="wp-tile">
-          {/* The file chooser opens on a click or Space only, never as arrow keys pass by. */}
-          <input type="radio" name={name} checked={value?.photo === true} onChange={() => undefined} onClick={() => file.current?.click()} />
-          <span className="wp-thumb" aria-hidden="true">
-            {value?.photo && photoUrl ? <WallpaperLayer w={{ preset: null, photo: true, ...shown }} photoUrl={photoUrl} /> : <Icon name="image" />}
-          </span>
-          <span className="wp-name">{value?.photo ? "Change photo" : "Photo"}</span>
-        </label>
-        <input ref={file} type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(e) => void pick(e)} />
+        {value?.photo ? (
+          // The photo in use, as a choice like the others; picking a file is the button below,
+          // so arrowing through the group never opens a file chooser (review LK2-2).
+          <label className="wp-tile">
+            <input type="radio" name={name} checked onChange={() => undefined} />
+            <span className="wp-thumb" aria-hidden="true">
+              {photoUrl ? <WallpaperLayer w={{ preset: null, photo: true, ...shown }} photoUrl={photoUrl} /> : <Icon name="image" />}
+            </span>
+            <span className="wp-name">Your photo</span>
+          </label>
+        ) : null}
       </div>
+      <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => file.current?.click()}>
+        <Icon name="image" />{value?.photo ? "Choose another photo…" : "Use a photo…"}
+      </button>
+      <input ref={file} type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(e) => void pick(e)} />
       {replacing ? (
         <div role="alertdialog" aria-labelledby={`${name}-rt`} aria-describedby={`${name}-rd`}>
           <Banner tone="warning" icon="image">
             <strong id={`${name}-rt`}>Remove your photo wallpaper?</strong>
             <p id={`${name}-rd`}>The photo is deleted from Veil. You can pick it again from your files.</p>
             <div className="banner-actions">
-              <button className="btn btn-secondary" type="button" autoFocus onClick={() => setReplacing(null)}>Keep photo</button>
-              <button className="btn btn-danger" type="button" onClick={() => { const p = replacing; setReplacing(null); void apply(p); }}>Remove</button>
+              <button className="btn btn-secondary" type="button" autoFocus onClick={() => { setReplacing(null); back.current?.focus(); }}>Keep photo</button>
+              <button className="btn btn-danger" type="button" onClick={() => {
+                const p = replacing;
+                setReplacing(null);
+                // The photo's tile goes away: focus moves to the choice just made.
+                void apply(p).then(() => document.querySelector<HTMLInputElement>(`input[name="${name}"][value="${p}"]`)?.focus());
+              }}>Remove</button>
             </div>
           </Banner>
         </div>

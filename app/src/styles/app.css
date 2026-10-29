@@ -219,6 +219,8 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 /* Over a wallpaper (a bright photo, little dim), notices and day separators get an opaque
    pill so their text keeps its contrast. */
 .chat-screen:has(> .chat-wallpaper) :is(.sys-msg, .day-sep) { background: var(--surface-2); }
+.chat-screen:has(> .chat-wallpaper) .sys-msg.warning { background: linear-gradient(var(--warning-soft), var(--warning-soft)), var(--surface-2); }
+@media (hover: hover) { .chat-screen:has(> .chat-wallpaper) button.sys-msg.call-line:hover { background: var(--surface-3); } }
 .chat-wallpaper { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
 .chat-wallpaper::before { content: ""; position: absolute; inset: calc(-2 * var(--wp-blur, 0px)); filter: blur(var(--wp-blur, 0px)); background: var(--bg-1); }
 .chat-wallpaper::after { content: ""; position: absolute; inset: 0; background: var(--media-backdrop); opacity: var(--wp-dim, 0); }

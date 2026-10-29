@@ -86,14 +86,14 @@ pub(super) fn check(input: Option<WallpaperInput>) -> Result<Checked> {
     if i.dim > MAX_DIM || i.blur > MAX_BLUR {
         return Err(ClientError::BadInput);
     }
-    let (preset, photo) = match (i.preset, i.photo, i.keep_photo) {
+    // Wrapped first, so every path below wipes the photo's base64 (review LK2-3).
+    let (preset, photo) = match (i.preset, i.photo.map(Zeroizing::new), i.keep_photo) {
         (Some(p), None, false) if PRESETS.contains(&p.as_str()) => (Some(p), None),
         (None, Some(b64), false) => {
             // Base64 is 4/3 the size: refuse before decoding anything too big.
             if b64.len() > MAX_PHOTO_BYTES / 3 * 4 + 4 {
                 return Err(ClientError::TooLarge);
             }
-            let b64 = Zeroizing::new(b64);
             let bytes = Zeroizing::new(
                 base64::engine::general_purpose::STANDARD
                     .decode(b64.as_bytes())
@@ -241,7 +241,11 @@ impl Actor {
         // The photo is the user's: no unwiped copies besides the URL the webview gets.
         Ok(row.and_then(|(mime, data)| {
             let mime = image_mime(&data).filter(|m| *m == mime)?;
-            let mut url = format!("data:{mime};base64,");
+            // Sized up front, so growing it leaves no freed copies behind (review LK2-3).
+            let prefix = format!("data:{mime};base64,");
+            let mut url =
+                String::with_capacity(prefix.len().checked_add(base64::encoded_len(data.len(), true)?)?);
+            url.push_str(&prefix);
             base64::engine::general_purpose::STANDARD.encode_string(&*data, &mut url);
             Some(url)
         }))
