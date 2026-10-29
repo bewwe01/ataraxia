@@ -27,6 +27,10 @@ export interface ContactView {
   blocked: boolean;
   /** Disappearing-message timer in seconds; 0 is off. */
   timerSecs: number;
+  /** This chat's own bubble colour (hue 0–359), or null for the app's accent. */
+  accentHue: number | null;
+  /** This chat's own wallpaper, or null for the default. */
+  wallpaper: WallpaperView | null;
   /** Arrived with the same name as an existing contact, under a different key. */
   keyWarning: boolean;
   /** Unblocked, but they have not received their new address yet. */
@@ -59,6 +63,27 @@ export interface MessageView {
   attachment: AttachmentView | null;
   /** For a call line: how the call went (kept on this device only). */
   call: CallLogView | null;
+}
+
+/** Built-in wallpapers (Rust's `look::PRESETS`). */
+export const WALLPAPER_PRESETS = ["dusk", "aurora", "grid", "dots", "waves", "paper"] as const;
+export type WallpaperPreset = (typeof WALLPAPER_PRESETS)[number];
+
+export interface WallpaperView {
+  preset: WallpaperPreset | null;
+  photo: boolean;
+  /** Darkening in percent (0–80). */
+  dim: number;
+  /** Blur in px (0–24). */
+  blur: number;
+}
+
+export interface WallpaperInput {
+  preset: WallpaperPreset | null;
+  photo: string | null;
+  keepPhoto: boolean;
+  dim: number;
+  blur: number;
 }
 
 export type CallOutcome = "ended" | "missed" | "declined" | "unanswered" | "busy" | "cancelled" | "failed";
@@ -185,7 +210,7 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 
 const PART_BYTES = 1024 * 1024;
 
-function base64(bytes: Uint8Array): string {
+export function base64(bytes: Uint8Array): string {
   let bin = "";
   for (let i = 0; i < bytes.length; i += 0x8000) {
     bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
@@ -237,6 +262,12 @@ export const ipc = {
   callSend: (contact: number, callId: string, kind: "offer" | "answer" | "hangup" | "busy", sdp: string | null = null) =>
     call<void>("call_send", { contact, callId, kind, sdp }),
   callSignals: () => call<CallSignal[]>("call_signals"),
+  wallpaper: () => call<WallpaperView | null>("wallpaper"),
+  /** `contact` null is the default wallpaper. A new photo is base64; `keepPhoto` keeps the current one. */
+  setWallpaper: (contact: number | null, wallpaper: WallpaperInput | null) => call<void>("set_wallpaper", { contact, wallpaper }),
+  /** A `data:` URL of the wallpaper photo, for display. */
+  wallpaperPhoto: (contact: number | null) => call<string | null>("wallpaper_photo", { contact }),
+  setChatAccent: (contact: number, hue: number | null) => call<void>("set_chat_accent", { contact, hue }),
   callLog: (contact: number, outgoing: boolean, video: boolean, outcome: CallOutcome, secs: number) =>
     call<void>("call_log", { contact, outgoing, video, outcome, secs }),
   callAudio: (active: boolean, speaker: boolean) => call<void>("call_audio", { active, speaker }),

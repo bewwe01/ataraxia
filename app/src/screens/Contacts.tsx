@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { INVITE_PREFIX, ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
 import { Banner, Icon, QrCode, Segmented, TopBar } from "../ui";
 import { Scanner } from "../components/Scanner";
+import { HuePicker, WallpaperPicker } from "../components/Look";
+import { useChatWallpaper } from "../wallpaper";
 import { KeyWarning, type Nav } from "./Chats";
 
 export function AddContact({ nav }: { nav: Nav }) {
@@ -101,6 +103,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   const [name, setName] = useState(contact.name);
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const wallpaper = useChatWallpaper(contact);
   const [verifyMode, setVerifyMode] = useState<"show" | "scan">("show");
   const [verifyResult, setVerifyResult] = useState<null | "match" | "mismatch">(null);
   const deleteBtn = useRef<HTMLButtonElement>(null);
@@ -242,6 +245,15 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
             <Icon name="chevron-down" className="select-chevron" />
             </div>
             <p className="hint">Applies to both of you, for new messages. They are deleted from both phones that long after they arrive. Anyone can still copy or photograph them before that.</p>
+          </div>
+
+          <div className="field">
+            <span className="label">Chat colour</span>
+            <HuePicker name={`chat-hue-${contact.id}`} label="Chat colour" none="App accent" value={contact.accentHue} onChange={(h) => void act(() => ipc.setChatAccent(contact.id, h), "Could not change the colour")} />
+          </div>
+          <div className="field">
+            <span className="label">Chat wallpaper</span>
+            <WallpaperPicker contact={contact.id} value={contact.wallpaper} photoUrl={wallpaper.photoUrl} />
           </div>
 
           <div className="stack-sm">

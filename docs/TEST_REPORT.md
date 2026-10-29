@@ -2,6 +2,51 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Look: accent, pure black, bubbles, text size, wallpapers (2026-10-29)
+
+Milestone 4.5, first part (ADR-0019). Wallpapers and chat colours stay on the device, in the encrypted database.
+
+```text
+$ cargo fmt --all --check   # ok (after cargo fmt)
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 231 passed, 0 failed
+$ (app/src-tauri) cargo clippy -- -D warnings
+#     Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.27s
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 20 files clean
+# ✓ built in 1.50s
+$ (design/tools) node check.mjs
+# PASS
+```
+
+New tests:
+- `service::look` unit tests `wallpapers_are_checked` and `stored_wallpapers_parse_strictly`:
+  - unknown presets, a preset and a photo together, dim over 80, blur over 24, an SVG and "keep the photo" with a preset are refused;
+  - a photo over 3 MiB is `TooLarge`;
+  - stored values parse strictly, and anything malformed reads as no wallpaper.
+- `tests/look.rs` `wallpapers_and_chat_colours`:
+  - a default preset, then a chat's own photo and colour; the other side's view of the chat has neither;
+  - "keep the photo" changes the dim only; going back to a preset deletes the photo;
+  - unknown chats and hues of 360 or more are refused;
+  - after lock, the photo's bytes are not found anywhere in the data directory;
+  - deleting the chat deletes its photo, and the default stays.
+
+The colour check (`contrast-check`, all 360 hues, both themes) gives these worst cases:
+- white on a sent bubble: 4.5007;
+- accent on the dark panel: 4.5003;
+- accent on the light panel: 4.5002.
+
+In Chromium, with the app against an IPC mock:
+- Custom accent Teal set `--accent` to `#4cf0d5` (dark).
+- Pure black set `data-black="true"`.
+- A 2400×1200 PNG picked as the default wallpaper reached Rust as a 1600×800 JPEG (`data:image/jpeg;base64,/9j/4AA…`).
+- The chat showed the photo; the profile's Teal and Waves gave that chat its own gradient and wallpaper.
+- Light mode kept the chat's colour.
+- No console errors.
+
 ## Call lines in the chat (2026-10-29)
 
 Owner request: call history as lines in the conversation (ADR-0018, "Call lines"). Each device records its own; nothing is sent.

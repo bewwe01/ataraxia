@@ -63,6 +63,8 @@ pub enum ClientError {
     NoCalls,
     #[error("Unknown contact")]
     UnknownContact,
+    #[error("This picture is too large")]
+    TooLarge,
     #[error("Message failed")]
     Protocol,
 }

@@ -25,6 +25,7 @@ thiserror.workspace = true
 rusqlite.workspace = true
 qrcode.workspace = true
 serde.workspace = true
+base64.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 keyring.workspace = true

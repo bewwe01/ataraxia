@@ -36,6 +36,7 @@ use crate::db::{Db, SqlBackend};
 
 mod attachments;
 mod calls;
+mod look;
 mod watcher;
 use crate::relay::{Relay, split_host_port};
 use crate::unlock::{self, SecretKind};
@@ -45,6 +46,7 @@ pub use attachments::{
     MAX_VOICE_BYTES, MAX_VOICE_MS,
 };
 pub use calls::{CallLogView, CallSetup, CallSignal, IceServerView};
+pub use look::{WallpaperInput, WallpaperView};
 
 /// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
@@ -137,6 +139,10 @@ pub struct ContactView {
     pub blocked: bool,
     /// Disappearing-message timer in seconds; 0 is off.
     pub timer_secs: u32,
+    /// This chat's own bubble colour (a hue), or `None` for the app's accent. Local only.
+    pub accent_hue: Option<u16>,
+    /// This chat's own wallpaper, or `None` for the default. Local only.
+    pub wallpaper: Option<WallpaperView>,
     /// This contact arrived with the same name as an existing one: possibly someone who
     /// reinstalled Veil, possibly an impostor. Shown until the safety number is verified or
     /// the user dismisses it (INV-ID-2).
@@ -390,6 +396,10 @@ enum Cmd {
     CallSend(i64, String, calls::Outgoing, Option<String>, Reply<()>),
     CallSignals(Reply<Vec<CallSignal>>),
     CallLog(i64, calls::CallRecord, Reply<()>),
+    Wallpaper(Reply<Option<WallpaperView>>),
+    SetWallpaper(Option<i64>, Option<WallpaperInput>, Reply<()>),
+    WallpaperPhoto(Option<i64>, Reply<Option<String>>),
+    SetChatAccent(i64, Option<u16>, Reply<()>),
     PurgeAll(Zeroizing<String>, Reply<bool>),
     Privacy(Reply<PrivacyView>),
     SetPrivacy(PrivacyView, Reply<()>),
@@ -770,6 +780,22 @@ impl Client {
     /// Call signals that arrived since the last call (each returned once; memory only).
     pub async fn call_signals(&self) -> Result<Vec<CallSignal>> {
         ask!(self, CallSignals)
+    }
+    /// The default chat wallpaper.
+    pub async fn wallpaper(&self) -> Result<Option<WallpaperView>> {
+        ask!(self, Wallpaper)
+    }
+    /// Sets or clears the default wallpaper (`contact` None) or one chat's.
+    pub async fn set_wallpaper(&self, contact: Option<i64>, w: Option<WallpaperInput>) -> Result<()> {
+        ask!(self, SetWallpaper, contact, w)
+    }
+    /// The wallpaper photo of the default (`contact` None) or of one chat, as a `data:` URL.
+    pub async fn wallpaper_photo(&self, contact: Option<i64>) -> Result<Option<String>> {
+        ask!(self, WallpaperPhoto, contact)
+    }
+    /// A chat's own bubble colour (hue 0–359), or `None` for the app's accent.
+    pub async fn set_chat_accent(&self, contact: i64, hue: Option<u16>) -> Result<()> {
+        ask!(self, SetChatAccent, contact, hue)
     }
     /// Records how a call with `contact` went, as a line in that chat (this device only).
     /// `outcome` is one of `ended`, `missed`, `declined`, `unanswered`, `busy`, `cancelled` or
@@ -1510,6 +1536,19 @@ impl Actor {
                 let res = self.call_send(c, &id, kind, sdp).await;
                 let _ = r.send(res);
             }
+            Cmd::Wallpaper(r) => {
+                let _ = r.send(self.wallpaper());
+            }
+            Cmd::SetWallpaper(c, w, r) => {
+                let res = self.set_wallpaper(c, w).await;
+                let _ = r.send(res);
+            }
+            Cmd::WallpaperPhoto(c, r) => {
+                let _ = r.send(self.wallpaper_photo(c));
+            }
+            Cmd::SetChatAccent(c, h, r) => {
+                let _ = r.send(self.set_chat_accent(c, h));
+            }
             Cmd::CallLog(c, rec, r) => {
                 let _ = r.send(self.call_log(c, &rec));
             }
@@ -1960,11 +1999,32 @@ impl Actor {
 
     fn contact_view(db: &Db, id: i64) -> Result<ContactView> {
         let conn = db.conn();
-        let (name, verified, unread, blocked, timer_secs, key_warning): (String, bool, i64, bool, u32, bool) =
-            conn.query_row(
-                "SELECT name, verified, unread, blocked, timer_secs, key_warning FROM contacts WHERE id = ?1",
+        let (name, verified, unread, blocked, timer_secs, key_warning, accent_hue, wallpaper): (
+            String,
+            bool,
+            i64,
+            bool,
+            u32,
+            bool,
+            Option<u16>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT name, verified, unread, blocked, timer_secs, key_warning, accent_hue, wallpaper
+                 FROM contacts WHERE id = ?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get::<_, Option<u16>>(6).ok().flatten().filter(|h| *h < 360),
+                        r.get(7)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or(ClientError::UnknownContact)?;
@@ -2023,6 +2083,8 @@ impl Actor {
             unread,
             blocked,
             timer_secs,
+            accent_hue,
+            wallpaper: look::parse(wallpaper.as_deref()),
             key_warning,
             unblock_pending: conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE contact = ?1 AND mine = 1 AND kind = 'mailbox'

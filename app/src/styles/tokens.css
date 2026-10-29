@@ -405,6 +405,25 @@
   --shadow-3: 0 0 0 1px rgb(17 17 20 / 0.1), 0 24px 56px -20px rgb(17 17 20 / 0.3);
 }
 
+/* Pure black (OLED) in dark mode, any style (milestone 4.5): backgrounds go to black, the
+   ambient glow goes out, and surfaces stay just visible against it. */
+:root[data-theme="dark"][data-black="true"] {
+  --bg-0: #000;
+  --bg-1: #000;
+  --bg-2: #050506;
+  --surface-1: #0c0c0f;
+  --surface-2: #131317;
+  --surface-3: #1a1a1f;
+  --surface-glass: rgb(255 255 255 / 0.05);
+  --surface-glass-strong: rgb(255 255 255 / 0.08);
+  --received-bg: #16161a;
+  --ambient-a: transparent;
+  --ambient-b: transparent;
+  --ambient-c: transparent;
+  --ambient-d: transparent;
+  --noise-opacity: 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Accent presets – drive the sent-bubble gradient and accent colour   */
 /* Every stop keeps #fff text ≥ 4.5:1 (checked incl. interpolation).   */

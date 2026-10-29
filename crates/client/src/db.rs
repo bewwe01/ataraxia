@@ -117,6 +117,14 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE reactions_v4 RENAME TO reactions;
      -- The contact a key-change warning is about: accepting merges exactly that one (P6-1).
      ALTER TABLE contacts ADD COLUMN key_warning_of INTEGER;",
+    // 5: chat wallpapers and per-chat colour (milestone 4.5, ADR-0019). A wallpaper photo is
+    // kept here, encrypted with the rest; owner 0 is the default wallpaper, else a contact id.
+    "ALTER TABLE contacts ADD COLUMN accent_hue INTEGER;
+     ALTER TABLE contacts ADD COLUMN wallpaper TEXT;
+     CREATE TABLE wallpaper_photos (owner INTEGER PRIMARY KEY, mime TEXT NOT NULL, data BLOB NOT NULL);
+     -- A chat's photo goes with the chat, however it is deleted.
+     CREATE TRIGGER contact_wallpaper_gone AFTER DELETE ON contacts
+       BEGIN DELETE FROM wallpaper_photos WHERE owner = OLD.id; END;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

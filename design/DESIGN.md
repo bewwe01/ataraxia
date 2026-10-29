@@ -42,9 +42,11 @@ Attributes on `<html>` drive everything; components only read tokens.
 |---|---|---|
 | `data-style` | `aurora` (default) · `ink` | Theme: "Aurora Glass" / "Ink & Signal" |
 | `data-theme` | `dark` (default) · `light` (`system` resolves via `prefers-color-scheme`) | Mode |
-| `data-accent` | `aurora` · `lagoon` · `ember` | Accent |
-| `data-bubble` | `gradient` (shown as "Default") · `soft` · `minimal` | Bubble style |
-| `data-text-size` | `sm` · `md` · `lg` · `xl` (scale 0.9 / 1 / 1.12 / 1.28) | Text size |
+| `data-accent` | `aurora` · `lagoon` · `ember` · `custom` (app only, ADR-0019: one hue, colours computed and contrast-checked in `color.ts`, set as inline custom properties) | Accent |
+| `data-black` | `true` · `false` (app only; only with `data-theme="dark"`) | Pure black (OLED) |
+| `data-bubble` | `gradient` (shown as "Gradient") · `soft` ("Solid") · `minimal` | Message bubbles |
+| `data-text-size` | `sm` · `md` · `lg` · `xl` (scale 0.9 / 1 / 1.12 / 1.28) | Message text size |
+| `data-density` | `regular` · `compact` (app only) | Spacing |
 | `data-motion` | `full` · `reduced` | Reduce motion (OR'd with the OS preference) |
 
 What Ink & Signal changes: no ambient mesh or grain; no backdrop blur; solid sent bubbles (`--sent-ink` per accent); radii tightened (cards 14px, buttons 10px); primary buttons become "paper" (text-1 on bg); glows removed; a 2px cyan→violet `--signal-line` at the top of the window. In Ink, "Default" bubble style means solid; Soft and Minimal still change the shape.
@@ -145,6 +147,8 @@ Evidence is in [`CHECKS.md`](CHECKS.md). Summary of the last run:
 | `callContent()`, `.transport-chip`, `.call-ctl` | `<CallScreen>`, `<TransportChip>`, `<CallControls>` | Direct chip always names who sees the IP |
 | `.call-min`, `.call-bubble` (app only, ADR-0018) | `<CallScreen>` minimize, `<CallBubble>` | Arrow at the top left; the bubble is a 120×168 card (their picture or avatar, time, End) dragged with `transform` only, snapping to the nearer side; no transition with reduced motion |
 | `.call-state`, `.share-sheet`, `.stream-volume` (app only, ADR-0018) | `<CallScreen>` pills, `<ShareSheet>`, stream volume | Mute, deafen and sharing are icon + words in a glass pill, the same on both ends; the quality bubble is a radio list (Smooth 1080p60, Light 720p30); the volume bar sets only the shared screen's sound |
+| `.swatches`, `.swatch`, `.hue-dot` (app only, ADR-0019) | `<HuePicker>` | Twelve named hue swatches plus a slider for any hue, saved when let go; "App accent" (×) first for a chat's own colour; the checked swatch has a ring, not only a colour |
+| `.wp-tiles`, `.wp-tile`, `.chat-wallpaper`, `.look-preview` (app only, ADR-0019) | `<WallpaperPicker>`, `<ChatWallpaper>`, `<LookPreview>` | None/Default, six token-drawn presets (Dusk, Aurora, Grid, Dots, Waves, Paper) or a photo, with Dim (0–80 %) and Blur (0–24 px); the wallpaper sits behind the chat at `z-index: -1` inside an isolated `.chat-screen` |
 | `.dialog`, `.scrim`, `.hold-btn` | `<Dialog>`, `<AlertDialog>`, `<HoldToConfirm>` | focus trap in the app |
 | Mobile shell: `.m-appbar`, `.m-topbar`, `.m-nav`, `.m-fab` | `<AppBar>`, `<TopBar>`, `<BottomNav>`, `<Fab>` | |
 | Desktop shell: `.rail`, `.pane-list`, `.resizer`, `.pane-main`, `.pane-info` | `<Rail>`, `<ListPane>`, `<PaneResizer>`, `<MainPane>`, `<InfoPanel>` | info panel overlays below 1180px |

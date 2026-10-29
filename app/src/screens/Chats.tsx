@@ -5,6 +5,8 @@ import { EDIT_WINDOW_MS, ipc, IpcError, timerName, timerShort, type ContactView,
 import { Avatar, Banner, Icon, TopBar, VerifiedMark, timeLabel, useDialogKeys } from "../ui";
 import { SWIPE_AT_PX, useBubbleGestures } from "../gestures";
 import { calls } from "../calls";
+import { bubbleVars } from "../color";
+import { ChatWallpaper } from "../wallpaper";
 
 export type Nav = (to: Route) => void;
 export type Route =
@@ -735,7 +737,12 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
   }
 
   return (
-    <div className="m-screen chat-screen">
+    <div
+      className="m-screen chat-screen"
+      data-own-colour={contact.accentHue != null ? "" : undefined}
+      style={contact.accentHue != null ? bubbleVars(contact.accentHue) : undefined}
+    >
+      <ChatWallpaper contact={contact} />
       <header className="chat-hdr glass">
         <button className="icon-btn" type="button" aria-label="Back to chats" onClick={() => nav({ screen: "chats" })}><Icon name="back" /></button>
         <button className="who" type="button" onClick={() => nav({ screen: "contact", contact: contact.id })} aria-label={`${contact.name}, view profile`}>

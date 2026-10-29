@@ -373,6 +373,19 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 
 **Not done.** Screen sharing from Android (the WebView has no `getDisplayMedia`; it would need native capture), group calls, Direct and LAN mode for calls (dropped by the owner, 2026-10-29: they would show the IP to the contact), desktop call audio routing, and the packet-capture test of INV-NET-1 with two real devices.
 
+### ADR-0019: Look: accent, pure black, bubbles, text size and wallpapers (milestone 4.5). **Accepted (owner request, 2026-10-29).**
+**Context.** The owner asked for more ways to change how Veil looks: any accent colour, a pure black dark mode, bubble styles, text size, denser chats and chat wallpapers, including a wallpaper per chat and the user's own photo. Most of this is a display preference. A photo is not: it is the user's own content and must not be stored in the clear (rule 6). Any colour the user picks must still meet the contrast rules (DESIGN §5), and nothing about the look may leave the device.
+
+**Decision.**
+- *Display preferences stay in the webview:* theme, mode, accent (three presets or a custom hue), pure black, bubble style, text size, spacing and reduced motion are kept in `localStorage` as before (DESIGN §8). They are attributes on `<html>` (`data-accent="custom"`, `data-black`, `data-density`) read by tokens. They say nothing about the user's contacts or messages.
+- *Colours are computed and checked, not picked freely:* `app/src/color.ts` turns one hue into the bubble gradient and the accent. It lowers the lightness until white text keeps 4.5:1 on every gradient stop and on the colours between them, and moves the accent until it keeps 4.5:1 on the hardest dark and light panel. This was checked for all 360 hues in both themes (worst cases 4.50:1). A colour enters CSS only as a custom property set through the CSSOM (allowed under `style-src 'self'`).
+- *Wallpapers live in the encrypted database:* the default wallpaper is a setting, a chat's own is a `contacts` column, and photos are rows in `wallpaper_photos` (migration 5). All of these sit in SQLCipher with the rest. A trigger deletes a chat's photo with the chat. The stored form is `<preset|photo>:<dim>:<blur>`, parsed strictly on read, and anything malformed reads as no wallpaper.
+- *Photos are checked in Rust:* the webview redraws a picked photo on a canvas, at most 1600 px on its long side, and saves it as JPEG. This also strips its metadata (location, camera). Rust then refuses anything over 3 MiB, or whose first bytes are not JPEG, PNG or WebP, so an SVG or script never becomes a wallpaper. A photo goes back to the webview as a `data:` URL of the checked type (`img-src data:` was already allowed). Its base64 alphabet cannot break out of the CSS `url("…")` it is placed in.
+- *Per-chat colour:* a hue (0–359) in `contacts.accent_hue`, applied to that chat's sent bubbles with the same checked colours.
+- *Never sent:* none of this is part of any message or signal, and the contact cannot tell which wallpaper or colour you picked (tested by `wallpapers_and_chat_colours`).
+
+**Consequences.** One more table and two columns, and four IPC commands (`wallpaper`, `set_wallpaper`, `wallpaper_photo`, `set_chat_accent`). Erasing Veil removes wallpapers with the database. A wallpaper photo is decrypted into webview memory while a chat shows it, as attachments already are.
+
 ## 7. Distribution (recorded owner request)
 
 The final step, after all phases pass the code-reviewer gate, is a GitHub Actions workflow that builds the Android **APK** and publishes it to this repository's **GitHub Releases**. Details:

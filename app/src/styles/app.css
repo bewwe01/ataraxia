@@ -196,3 +196,56 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 .share-option input { width: 22px; height: 22px; flex: none; accent-color: var(--accent); cursor: pointer; }
 .share-sheet .btn { margin-top: var(--space-2); }
 .call-ctl .icon-btn.accept { background: var(--call-accept); color: var(--on-media); }
+
+/* ---- Milestone 4.5, Look (ADR-0019) ---- */
+
+/* Compact spacing: messages sit closer together. */
+:root[data-density="compact"] .msgs { gap: 1px; }
+:root[data-density="compact"] .msg + .msg.in:not(.cont),
+:root[data-density="compact"] .msg + .msg.out:not(.cont) { margin-top: var(--space-1); }
+:root[data-density="compact"] .msg .bubble { padding-top: 6px; padding-bottom: 6px; }
+
+/* A chat's own colour: its sent bubbles re-derive their background from the chat's hues. */
+.chat-screen[data-own-colour] { --sent-gradient: linear-gradient(135deg, var(--sent-a) 0%, var(--sent-b) 58%, var(--sent-c) 100%); --sent-bg: var(--sent-gradient); }
+:root[data-bubble="soft"] .chat-screen[data-own-colour],
+:root[data-bubble="minimal"] .chat-screen[data-own-colour] { --sent-bg: var(--sent-solid); }
+
+/* Chat wallpaper: a layer behind the messages. Presets are drawn from theme tokens; a photo
+   comes as --wp-photo. Blur and dim are the user's; the dim is a black veil. */
+/* The chat screen (already positioned) is its own stacking context, so the wallpaper at -1 sits
+   above the app background and below everything in the chat, without moving anything. */
+.chat-screen { isolation: isolate; }
+.chat-wallpaper { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
+.chat-wallpaper::before { content: ""; position: absolute; inset: calc(-2 * var(--wp-blur, 0px)); filter: blur(var(--wp-blur, 0px)); background: var(--bg-1); }
+.chat-wallpaper::after { content: ""; position: absolute; inset: 0; background: var(--media-backdrop); opacity: var(--wp-dim, 0); }
+.chat-wallpaper[data-wp="photo"]::before { background: var(--wp-photo) center / cover no-repeat, var(--bg-1); }
+.chat-wallpaper[data-wp="dusk"]::before { background: linear-gradient(165deg, color-mix(in srgb, var(--aurora-indigo) 34%, var(--bg-1)), var(--bg-1) 55%, color-mix(in srgb, var(--aurora-warm) 22%, var(--bg-1))); }
+.chat-wallpaper[data-wp="aurora"]::before { background: radial-gradient(60% 45% at 15% 10%, color-mix(in srgb, var(--aurora-violet) 38%, transparent), transparent), radial-gradient(55% 40% at 90% 85%, color-mix(in srgb, var(--aurora-cyan) 30%, transparent), transparent), var(--bg-1); }
+.chat-wallpaper[data-wp="grid"]::before { background: linear-gradient(var(--border-subtle) 1px, transparent 1px) 0 0 / 28px 28px, linear-gradient(90deg, var(--border-subtle) 1px, transparent 1px) 0 0 / 28px 28px, var(--bg-1); }
+.chat-wallpaper[data-wp="dots"]::before { background: radial-gradient(var(--border-strong) 1.2px, transparent 1.6px) 0 0 / 20px 20px, var(--bg-1); }
+.chat-wallpaper[data-wp="waves"]::before { background: repeating-radial-gradient(circle at 50% 120%, transparent 0 22px, var(--border-subtle) 22px 23px), var(--bg-1); }
+.chat-wallpaper[data-wp="paper"]::before { background: linear-gradient(180deg, var(--surface-1), var(--bg-2)); }
+
+
+/* Look pickers (M4.5, ADR-0019): hue swatches, wallpaper tiles, a small live preview. */
+.swatches { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.swatch { position: relative; width: var(--tap-min); height: var(--tap-min); display: grid; place-items: center; }
+.swatch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.swatch span { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; box-shadow: inset 0 0 0 1px var(--border-subtle); color: var(--text-2); }
+.swatch.none span { background: var(--surface-2); }
+.swatch input:checked + span { box-shadow: 0 0 0 2px var(--bg-1), 0 0 0 4px var(--text-1); }
+.swatch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 4px; }
+.hue-dot { width: 24px; height: 24px; border-radius: 50%; flex: none; box-shadow: inset 0 0 0 1px var(--border-subtle); }
+.range-label { min-width: 3em; font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--text-2); }
+
+.wp-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: var(--space-2); }
+.wp-tile { position: relative; display: flex; flex-direction: column; align-items: center; gap: 4px; min-height: var(--tap-min); }
+.wp-tile input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; z-index: 1; }
+.wp-tile input:disabled { cursor: progress; }
+.wp-thumb { position: relative; isolation: isolate; width: 100%; aspect-ratio: 3 / 4; border-radius: var(--radius-md); overflow: hidden; background: var(--bg-1); box-shadow: inset 0 0 0 1px var(--border-subtle); display: grid; place-items: center; color: var(--text-3); }
+.wp-thumb .chat-wallpaper { z-index: -1; }
+.wp-tile input:checked ~ .wp-thumb { box-shadow: 0 0 0 2px var(--bg-1), 0 0 0 4px var(--text-1); }
+.wp-tile input:focus-visible ~ .wp-thumb { outline: 2px solid var(--focus); outline-offset: 4px; }
+.wp-name { font-size: var(--text-xs); color: var(--text-2); }
+
+.look-preview { position: relative; isolation: isolate; overflow: hidden; border-radius: var(--radius-lg); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-2); background: var(--bg-1); box-shadow: inset 0 0 0 1px var(--border-subtle); pointer-events: none; }

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { forgetWallpapers, refreshWallpaper } from "./wallpaper";
 import { ipc, onChange, type AppState, type ContactView, type Me } from "./ipc";
 import { Chat, ChatList, type Route } from "./screens/Chats";
 import { AddContact, ContactProfile } from "./screens/Contacts";
@@ -83,11 +84,13 @@ export function App() {
   useEffect(() => {
     if (state !== "unlocked") return;
     refresh();
+    void refreshWallpaper();
     let off: (() => void) | undefined;
     void onChange((kind, contact) => {
       if (kind === "locked") {
         // The session that carried the call's signaling is gone.
         calls.drop();
+        forgetWallpapers();
         // Drop everything shown while unlocked, previews included.
         setContacts([]);
         setMe(null);

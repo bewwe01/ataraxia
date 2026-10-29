@@ -615,6 +615,34 @@ async fn call_signals(c: State<'_, Client>) -> Res<Vec<veil_client::service::Cal
     c.call_signals().await.map_err(err)
 }
 
+/// The default chat wallpaper (milestone 4.5).
+#[tauri::command]
+async fn wallpaper(c: State<'_, Client>) -> Res<Option<veil_client::service::WallpaperView>> {
+    c.wallpaper().await.map_err(err)
+}
+
+/// Sets or clears the default wallpaper (`contact` null) or one chat's. A photo comes as base64.
+#[tauri::command]
+async fn set_wallpaper(
+    c: State<'_, Client>,
+    contact: Option<i64>,
+    wallpaper: Option<veil_client::service::WallpaperInput>,
+) -> Res<()> {
+    c.set_wallpaper(contact, wallpaper).await.map_err(err)
+}
+
+/// A wallpaper photo as a `data:` URL, for display only.
+#[tauri::command]
+async fn wallpaper_photo(c: State<'_, Client>, contact: Option<i64>) -> Res<Option<String>> {
+    c.wallpaper_photo(contact).await.map_err(err)
+}
+
+/// A chat's own bubble colour (hue), or null for the app's accent.
+#[tauri::command]
+async fn set_chat_accent(c: State<'_, Client>, contact: i64, hue: Option<u16>) -> Res<()> {
+    c.set_chat_accent(contact, hue).await.map_err(err)
+}
+
 /// A line in the chat saying how a call went (kept on this device only).
 #[tauri::command]
 async fn call_log(
@@ -757,6 +785,10 @@ pub fn run() {
             call_send,
             call_signals,
             call_log,
+            wallpaper,
+            set_wallpaper,
+            wallpaper_photo,
+            set_chat_accent,
             call_audio,
             cancel_call_notice,
             me,

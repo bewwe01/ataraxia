@@ -1,7 +1,9 @@
 import { noteEraseIncomplete } from "../notices";
 import { useEffect, useState, type FormEvent } from "react";
 import { ipc, IpcError, type Me, type NativeInfo, type NotifySettings, type PrivacyView, type SecretKind, type SecurityView } from "../ipc";
-import { applyAppearance, loadAppearance, type Accent, type Appearance, type Mode, type Style } from "../settings";
+import { applyAppearance, isDark, loadAppearance, type Accent, type Appearance, type Bubble, type Density, type Mode, type Style, type TextSize } from "../settings";
+import { HuePicker, LookPreview, WallpaperPicker } from "../components/Look";
+import { useChatWallpaper } from "../wallpaper";
 import { Banner, Icon, SecretField, Segmented, ToggleRow, TopBar } from "../ui";
 import type { Nav } from "./Chats";
 import { checkSecret, KIND_HINT, kindName } from "./Onboarding";
@@ -224,6 +226,7 @@ function BiometricForm({ sec, onDone, onCancel }: { sec: SecurityView; onDone: (
 
 export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLocked: () => void }) {
   const [a, setA] = useState<Appearance>(loadAppearance());
+  const wallpaper = useChatWallpaper(null);
   const [sec, setSec] = useState<SecurityView | null>(null);
   const [native, setNative] = useState<NativeInfo | null>(null);
   const [privacy, setPrivacy] = useState<PrivacyView | null>(null);
@@ -415,12 +418,35 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
           </div>
           <div className="field">
             <span className="label">Accent</span>
-            <Segmented<Accent> name="accent" label="Accent" value={a.accent} options={[["aurora", "Aurora"], ["lagoon", "Lagoon"], ["ember", "Ember"]]} onChange={(accent) => update({ ...a, accent })} />
+            <Segmented<Accent> name="accent" label="Accent" value={a.accent} options={[["aurora", "Aurora"], ["lagoon", "Lagoon"], ["ember", "Ember"], ["custom", "Custom"]]} onChange={(accent) => update({ ...a, accent })} />
           </div>
+          {a.accent === "custom" ? (
+            <HuePicker name="accent-hue" label="Custom accent" value={a.hue} onChange={(hue) => update({ ...a, hue: hue ?? a.hue })} />
+          ) : null}
+          <div className="field">
+            <span className="label">Message bubbles</span>
+            <Segmented<Bubble> name="bubble" label="Message bubbles" value={a.bubble} options={[["gradient", "Gradient"], ["soft", "Solid"], ["minimal", "Minimal"]]} onChange={(bubble) => update({ ...a, bubble })} />
+          </div>
+          <div className="field">
+            <span className="label">Message text size</span>
+            <Segmented<TextSize> name="text-size" label="Message text size" value={a.textSize} options={[["sm", "Small"], ["md", "Default"], ["lg", "Large"], ["xl", "Larger"]]} onChange={(textSize) => update({ ...a, textSize })} />
+          </div>
+          <div className="field">
+            <span className="label">Spacing</span>
+            <Segmented<Density> name="density" label="Spacing" value={a.density} options={[["regular", "Regular"], ["compact", "Compact"]]} onChange={(density) => update({ ...a, density })} />
+          </div>
+          <LookPreview w={wallpaper.w} photoUrl={wallpaper.photoUrl} />
         </section>
         <div className="group card">
+          {isDark(a) ? (
+            <ToggleRow id="black" icon="moon" title="Pure black" sub="Black backgrounds in dark mode; saves power on OLED screens." checked={a.black} onChange={(v) => update({ ...a, black: v })} />
+          ) : null}
           <ToggleRow id="motion" icon="sparkle" title="Reduce motion" checked={a.reduceMotion} onChange={(v) => update({ ...a, reduceMotion: v })} />
         </div>
+        <h3 className="group-title">Chat wallpaper</h3>
+        <section className="card stack">
+          <WallpaperPicker contact={null} value={wallpaper.w} photoUrl={wallpaper.photoUrl} />
+        </section>
 
         <h3 className="group-title">About</h3>
         <section className="card stack-sm">
