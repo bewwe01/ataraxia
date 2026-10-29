@@ -2,6 +2,39 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Look: review round 1 and its fixes (2026-10-29)
+
+Round 1 of the review gate failed on one High finding: LK-1, meta text on custom colours at 3.64:1. All thirteen findings (LK-1 to LK-13) were fixed in this round.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 232 passed, 0 failed
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 20 files clean
+# contrast: worst white 5.4293, meta 4.5001, accentDark 4.5127, accentLight 4.5002
+# ✓ built in 1.63s
+$ (design/tools) node check.mjs
+# PASS
+```
+
+- **LK-1, LK-12:** `color.ts` now also checks meta text (white at 86 %) on every bubble colour, and the accent against pure black's `--surface-3`. `app/scripts/contrast-check.mjs` runs from `pnpm lint` and fails below 4.5:1 for any of the 360 hues.
+- **LK-11:** new test `tests/look.rs` `a_key_change_keeps_the_chats_look`. After accepting a reinstalled contact's new key, the chat keeps its colour, its photo wallpaper and the photo.
+- **LK-7:** `wallpapers_are_checked` now also refuses a PNG as a new photo.
+
+In Chromium against the IPC mock:
+- **Hue slider:**
+  - With "App accent" chosen, 16 presses of Tab through the profile made 0 `set_chat_accent` calls.
+  - One arrow key on the slider made 1 call.
+- **Leaving a photo wallpaper:**
+  - Choosing Paper over a chat's photo made 0 `set_wallpaper` calls and kept the photo. It showed "Remove your photo wallpaper?"
+  - Remove then deleted the photo.
+- **Oversized file:** a 26 MiB pick showed "This picture is too large" without being decoded.
+- No console errors.
+
 ## Look: accent, pure black, bubbles, text size, wallpapers (2026-10-29)
 
 Milestone 4.5, first part (ADR-0019). Wallpapers and chat colours stay on the device, in the encrypted database.

@@ -120,7 +120,12 @@ export function App() {
     }).then((u) => {
       off = u;
     });
-    return () => off?.();
+    return () => {
+      off?.();
+      // Leaving "unlocked" by any path drops the wallpaper photos, whether or not the
+      // "locked" event was still heard.
+      forgetWallpapers();
+    };
   }, [state, refresh, refreshState, setTypingFor]);
 
   if (fatal) return <div className="app-error"><Banner tone="danger" icon="alert-triangle"><p>{fatal}</p></Banner></div>;

@@ -4799,3 +4799,198 @@ $ cargo test -p veil-core --lib ice         # 15 passed, 0 failed (incl. arbitra
 - **IPC:** it only uses `ipc.callAudio`, through `ipc.ts`, with no direct `invoke`. Nothing new reaches the network, and no key material, paths or plaintext reach the webview.
 - **Docs:** ADR-0018 ("Fixed media sections", "Voice or video", "Camera in a voice call", "Minimize", the updated "Not done"), the DESIGN.md §6 row and the TEST_REPORT steps match the code, apart from CB-2's missing compatibility note and CB-6.
 - **Checks:** `pnpm -C app typecheck` and `lint` are clean, and the `veil-client` and `veil-core` ice tests pass.
+
+## Look (milestone 4.5) review, round 1 (2026-10-29)
+
+**Scope:** commit fdd85b5, 24 files, +1257/−19 lines. I reviewed every changed source, CSS and doc file and skipped the lockfiles. No files were edited.
+
+**Checks run**
+- `pnpm -C app typecheck`: passes (tsc, 0 errors). `app/` has no uncommitted changes, so this result applies to the commit.
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-client --test look`: `wallpapers_and_chat_colours` passes. **Caveat:** the working tree has uncommitted changes to `crates/client/src/{db.rs,service.rs,service/look.rs}`, `crates/core/src/content.rs` and a new `service/profile.rs`, apparently from another session. So this run tested the working tree, not exactly fdd85b5. All line numbers below are from the commit (`git show fdd85b5:<path>`).
+- I copied `color.ts` into the scratchpad and ran it with node to measure contrast for all 360 hues. The figures in LK-1 come from that.
+
+**Checked and found correct:**
+- **CSS/URL injection:** the `data:` URL uses only a MIME type from an allowlist plus the base64 alphabet. `--wp-dim` and `--wp-blur` are built from u8 values that Rust range-checks. Hues are bounded on read, in both Rust and `loadAppearance`.
+- **CSP:** custom properties are set through the CSSOM, which `style-src 'self'` allows, and `img-src data:` covers the CSS `background`.
+- **At rest:** the photo is in SQLCipher with `secure_delete = ON`, and the at-rest probe test passes.
+- **Nothing sent:** nothing reaches the contact or the relay.
+- **Atomicity:** the photo and the setting are written in one `atomically` SAVEPOINT.
+- **Trigger:** `contact_wallpaper_gone` fires from `delete_contact` and from the key-change merge. There is no `REPLACE INTO contacts` anywhere.
+- **Migration:** migration 5 runs inside BEGIN/COMMIT, and the generic `migrates_an_old_database_once` test covers it.
+- **Parsing and logic:** `parse` is strict, the `keep_photo` state machine is correct, and nothing on the boundary can panic. `WallpaperInput`'s Debug is redacted, and `Cmd` has no Debug.
+- **Design rules:** no raw colours in `app.css`, no new animations, and swatches and tiles are at least 44 px.
+
+---
+
+### LK-1: High. Text in sent bubbles fails 4.5:1 for 345 of 360 custom hues
+**Where:** `app/src/color.ts:42-50` (`bubbleLightness`), `:75`, `:90`. Related: `app/src/styles/tokens.css:210` (`--text-on-accent-2: rgb(255 255 255 / 0.86)`) and `base.css:381/389/419/433` (`.meta`, reply, file subtitle and voice duration in sent bubbles use `--sent-meta`).
+
+**Problem:**
+- `bubbleLightness` lowers the lightness only until **pure white** reaches 4.5:1. The chosen colours therefore sit right at the threshold (the report's worst case is 4.5007).
+- Timestamps, reply quotes, file sizes and voice durations in sent bubbles are 86 % white. On these computed colours they reach only **3.64:1** (worst case: hue 317). 345 of 360 hues fail.
+- The presets are fine: they range from 4.89 to 6.28.
+- So the commit's headline claims are false: "a custom colour cannot make text unreadable" in the commit message, and "keeps 4.5:1" in ADR-0019. Per-chat colours have the same problem, because they use `bubbleVars`.
+
+**Secondary point (medium confidence; I did not trace which elements use it):** in pure black, `--surface-3` is `#1a1a1f`, which is lighter than the "hardest" `DARK_BG` (16, 19, 49). The dark accent on it drops to 4.31:1.
+
+**Fix:** check the meta colour as well, and add the pure-black surfaces to the backgrounds the accent is checked against.
+```ts
+const META_ALPHA = 0.86; // --text-on-accent-2
+const meta = (c: Rgb) => mix(c, WHITE, META_ALPHA);
+if ([...cols, ...between].every((c) => contrast(WHITE, c) >= 4.5 && contrast(meta(c), c) >= 4.5)) return l;
+```
+For the accent, take the lightest dark candidate across `[DARK_BG, [26,26,31] /* black --surface-3 */]`. Then re-run the check for all 360 hues and record the new worst cases.
+
+### LK-2: Medium. The hue and level sliders save on unrelated key presses
+**Where:** `app/src/components/Look.tsx:52-53`, and `:132`, `:137` for Dim and Blur.
+
+**Problem:**
+- `onKeyUp` fires for **any** key. That includes the keyup of the **Tab** press that moves focus *onto* the slider, because keyup goes to the newly focused element.
+- In a contact's profile with "App accent" selected (`value === null`), `draft` defaults to 245. Tabbing through the page therefore calls `setChatAccent(id, 245)` and silently gives the chat an Indigo colour.
+- On Dim and Blur, Tab or Shift fires redundant `set_wallpaper` writes.
+- Separately, `onPointerUp` is the only commit path for a mouse drag. If the user releases the mouse outside the input, the commit can be lost and the slider shows a draft that was never saved, because `draft` resyncs only when `value` changes. Medium confidence: this depends on the engine's pointer-capture behaviour.
+
+**Fix:** commit on the native `change` event, which fires once when a drag or key step ends, and only if the value actually changed:
+```tsx
+const ref = useRef<HTMLInputElement>(null);
+useEffect(() => {
+  const el = ref.current; if (!el) return;
+  const commit = () => { const h = Number(el.value); if (h !== value) onChange(h); };
+  el.addEventListener("change", commit);
+  return () => el.removeEventListener("change", commit);
+}, [value, onChange]);
+// <input ref={ref} … onChange={(e) => setDraft(Number(e.target.value))} />  (drop onPointerUp/onKeyUp)
+```
+Do the same for `commitLevels`, skipping the save when `dim === value.dim && blur === value.blur`.
+
+### LK-3: Medium. Keyboard use of the wallpaper radio group deletes data and loses focus
+**Where:** `app/src/components/Look.tsx:107`, `:113`, `:119`.
+
+**Problem:**
+- Arrow keys in a native radio group fire `onChange` for each radio they land on. Each step saves immediately.
+- Arrowing off "Photo" onto a preset or onto None/Default **deletes the user's photo for good**, because Rust drops the `wallpaper_photos` row. Arrowing onto "Photo" opens the file chooser.
+- After every choice, `disabled={busy}` disables the focused radio. The browser then moves focus to `<body>`, so a keyboard or screen-reader user loses their place after each step.
+
+**Fix:**
+- Remove `disabled={busy}` and guard re-entry with a ref (`if (busyRef.current) return;`). Keep `aria-busy`.
+- Open the file chooser only from `onClick`, which also fires for Space, and not from `onChange`:
+```tsx
+<input type="radio" … checked={value?.photo === true} onChange={() => {}} onClick={() => file.current?.click()} />
+```
+- Before a preset or None replaces an existing photo, ask for confirmation, for example with the existing `<AlertDialog>`: "Remove your photo wallpaper?"
+
+### LK-4: Medium. System lines and day separators become unreadable over a photo
+**Where:** `app/src/styles/app.css:217-226`, with `base.css:359-360` (`.day-sep` and `.sys-msg` use `--surface-glass` and `--text-2`).
+
+**Problem:**
+- Dim can be 0, and the pill backgrounds are translucent: `rgb(20 23 56 / .62)` in Aurora dark, and only `rgb(255 255 255 / .05)` in the new pure-black block.
+- Over a bright photo, `--text-2` falls to about 2.5:1 in Aurora dark and close to 1:1 in pure black.
+- Light mode over a dark photo is about 4.3:1.
+- This affects call lines, timer notices and day separators. Received bubbles are opaque and are fine.
+
+**Fix:** give these pills an opaque token background whenever a wallpaper is present:
+```css
+.chat-screen:has(> .chat-wallpaper) :is(.sys-msg, .day-sep) { background: var(--surface-2); }
+```
+Alternatively, enforce a minimum dim for photos: for example `MIN_PHOTO_DIM = 20`, checked in `look::check` and used as the slider's `min`.
+
+### LK-5: Medium. No size limit before the webview decodes the picked photo
+**Where:** `app/src/wallpaper.tsx:88`.
+
+**Problem:**
+- `createImageBitmap(file)` decodes whatever the user picks, at full resolution.
+- A 100 MB file or a 20 000 × 20 000 PNG means gigabytes of RGBA memory and a webview OOM, which is likely on Android.
+- The Rust 3 MiB limit applies only after this step.
+- Also, transparent PNG areas come out black in the JPEG.
+
+**Fix:**
+```ts
+const MAX_PICK_BYTES = 25 * 1024 * 1024;
+if (file.size > MAX_PICK_BYTES) throw new Error("This picture is too large");
+```
+before decoding. Fill the canvas first with the theme background, e.g. `ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--bg-1"); ctx.fillRect(…)`, so no raw colour is introduced.
+
+### LK-6: Low. Photo buffers are not zeroized, unlike attachments
+**Where:** `crates/client/src/service/look.rs:92-100` (base64 `String` and decoded `Vec<u8>`), `:223-240` (BLOB `Vec<u8>` and data URL `String`).
+
+**Problem:** `app/src-tauri/src/lib.rs` (`Upload`, `Uploads::part`) keeps attachment plaintext in `Zeroizing` and grows buffers by hand so no unwiped copy is left behind. Wallpaper photos are user content but bypass this convention.
+
+**Fix:**
+- Decode into `Zeroizing::new(…decode(..)?)`.
+- Read the BLOB as `Zeroizing<Vec<u8>>`.
+- Build the URL into a pre-sized `Zeroizing<String>` using `STANDARD.encode_string(&*data, &mut out)`. The final IPC serialization copy is unavoidable, as it is for attachments.
+
+### LK-7: Low. The Rust boundary is looser than the ADR describes
+**Where:** `look.rs:61-66`, `:92`, and `app/src-tauri/src/lib.rs` (`set_wallpaper`).
+
+**Problem:**
+- The whole base64 string is deserialized from IPC JSON before the length check. Attachments use bounded `MAX_PART_CHARS` chunks instead.
+- Rust accepts PNG and WebP, but the webview only ever sends JPEG. The "metadata stripped" property therefore depends entirely on the webview.
+
+**Fix:** accept only `image/jpeg` in `image_mime` for new photos; keep reading the old formats if you want. Either note in ADR-0019 that the size limit applies after IPC deserialization, or route the photo through the existing chunked upload slot.
+
+### LK-8: Low. Clearing the cache on lock depends only on the `locked` event
+**Where:** `app/src/App.tsx:123`, `wallpaper.tsx:16-24`. Medium confidence on the event ordering.
+
+**Problem:**
+- Settings' Lock button runs `ipc.lock().then(onLocked)`, which calls `refreshState()`. Once the state becomes `"locked"`, the effect cleanup unsubscribes from `onChange`.
+- If the `locked` event arrives after that, `forgetWallpapers()` never runs. The photo `data:` URLs then stay in JS memory while Veil is locked.
+- Contact-keyed entries also survive the next unlock, because `refreshWallpaper` deletes only key `"0"`.
+- Separately, a `refreshWallpaper()` still in flight at lock time can write `global` after it was cleared.
+
+**Fix:**
+- In App.tsx, use `return () => { off?.(); forgetWallpapers(); };`.
+- In `refreshWallpaper`, replace `photos.delete("0")` with `photos.clear()`.
+- Guard `global` with a generation counter that `forgetWallpapers` increments: `const gen = ++epoch; const w = await ipc.wallpaper(); if (gen === epoch) global = w;`.
+
+### LK-9: Low. Failed photo fetches are cached for the rest of the session
+**Where:** `app/src/wallpaper.tsx:54-55`.
+
+**Problem:** `ipc.wallpaperPhoto(owner).catch(() => null)` is stored in `photos`. One transient error leaves that chat without its photo until the next save or lock.
+
+**Fix:**
+```ts
+p = ipc.wallpaperPhoto(owner).catch(() => { photos.delete(key); return null; });
+```
+
+### LK-10: Low. A per-chat colour forces a gradient in Ink
+**Where:** `app/src/styles/app.css:209`.
+
+**Problem:** `.chat-screen[data-own-colour] { --sent-bg: var(--sent-gradient) }` overrides Ink's `--sent-bg: var(--sent-ink)` from `tokens.css:343`. That breaks the DESIGN §2 rule that "Default" bubbles in Ink are solid.
+
+**Fix:** add after line 209:
+```css
+:root[data-style="ink"] .chat-screen[data-own-colour] { --sent-bg: var(--sent-ink); }
+```
+The soft and minimal rules on lines 210-211 must stay after it.
+
+### LK-11: Low. Accepting a key change silently drops the chat's look
+**Where:** `crates/client/src/service.rs:3872` (`accept_key_change`).
+
+**Problem:** the history moves to the new contact row. The old row is then deleted, and the trigger deletes its photo, so the chat's wallpaper and colour are lost without notice.
+
+**Fix:** before the `DELETE`, carry the look over:
+```sql
+UPDATE contacts SET accent_hue = COALESCE(accent_hue, (SELECT accent_hue FROM contacts WHERE id = ?1)),
+                    wallpaper  = COALESCE(wallpaper,  (SELECT wallpaper  FROM contacts WHERE id = ?1)) WHERE id = ?2;
+UPDATE OR IGNORE wallpaper_photos SET owner = ?2 WHERE owner = ?1;
+```
+Add a case for this to `tests/look.rs`.
+
+### LK-12: Low. The contrast guarantee has no committed test
+**Where:** `docs/TEST_REPORT.md` (the "contrast-check" entry) and `app/package.json`, which has no `test` script.
+
+**Problem:** the "all 360 hues, worst case 4.50" result cannot be reproduced from the repository. A test would have caught LK-1.
+
+**Fix:** add `app/scripts/contrast-check.mjs` or a vitest, and run it from `pnpm -C app lint` or CI. It should cover every hue for white text, meta text and the accent on the dark, light and black backgrounds.
+
+### LK-13: Low (nit). Two components now share the `.swatch` class
+**Where:** `design/DESIGN.md` §6 (new row, and the existing line 130 mapping `.swatch` to `<AccentSwatch>`), and `app/src/styles/app.css:233-238`, which overrides `base.css:279-286`.
+
+**Problem:** `.swatch` now maps to two components, which breaks the 1:1 rule.
+
+**Fix:** rename the new classes to `.hue-swatches` / `.hue-swatch`, or update the old row.
+
+---
+
+**Verdict: FAIL.** One High finding: LK-1, the meta-text contrast. Fixing LK-1 and adding LK-12's test is enough to clear the gate. LK-2 to LK-5 should go into the same round.

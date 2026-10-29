@@ -207,6 +207,7 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 
 /* A chat's own colour: its sent bubbles re-derive their background from the chat's hues. */
 .chat-screen[data-own-colour] { --sent-gradient: linear-gradient(135deg, var(--sent-a) 0%, var(--sent-b) 58%, var(--sent-c) 100%); --sent-bg: var(--sent-gradient); }
+:root[data-style="ink"] .chat-screen[data-own-colour] { --sent-bg: var(--sent-ink); }
 :root[data-bubble="soft"] .chat-screen[data-own-colour],
 :root[data-bubble="minimal"] .chat-screen[data-own-colour] { --sent-bg: var(--sent-solid); }
 
@@ -215,6 +216,9 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 /* The chat screen (already positioned) is its own stacking context, so the wallpaper at -1 sits
    above the app background and below everything in the chat, without moving anything. */
 .chat-screen { isolation: isolate; }
+/* Over a wallpaper (a bright photo, little dim), notices and day separators get an opaque
+   pill so their text keeps its contrast. */
+.chat-screen:has(> .chat-wallpaper) :is(.sys-msg, .day-sep) { background: var(--surface-2); }
 .chat-wallpaper { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
 .chat-wallpaper::before { content: ""; position: absolute; inset: calc(-2 * var(--wp-blur, 0px)); filter: blur(var(--wp-blur, 0px)); background: var(--bg-1); }
 .chat-wallpaper::after { content: ""; position: absolute; inset: 0; background: var(--media-backdrop); opacity: var(--wp-dim, 0); }
@@ -228,13 +232,13 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 
 
 /* Look pickers (M4.5, ADR-0019): hue swatches, wallpaper tiles, a small live preview. */
-.swatches { display: flex; flex-wrap: wrap; gap: var(--space-2); }
-.swatch { position: relative; width: var(--tap-min); height: var(--tap-min); display: grid; place-items: center; }
-.swatch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
-.swatch span { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; box-shadow: inset 0 0 0 1px var(--border-subtle); color: var(--text-2); }
-.swatch.none span { background: var(--surface-2); }
-.swatch input:checked + span { box-shadow: 0 0 0 2px var(--bg-1), 0 0 0 4px var(--text-1); }
-.swatch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 4px; }
+.hue-swatches { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.hue-swatch { position: relative; width: var(--tap-min); height: var(--tap-min); display: grid; place-items: center; }
+.hue-swatch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.hue-swatch span { width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center; box-shadow: inset 0 0 0 1px var(--border-subtle); color: var(--text-2); }
+.hue-swatch.none span { background: var(--surface-2); }
+.hue-swatch input:checked + span { box-shadow: 0 0 0 2px var(--bg-1), 0 0 0 4px var(--text-1); }
+.hue-swatch input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: 4px; }
 .hue-dot { width: 24px; height: 24px; border-radius: 50%; flex: none; box-shadow: inset 0 0 0 1px var(--border-subtle); }
 .range-label { min-width: 3em; font-size: var(--text-sm); font-weight: var(--weight-semibold); color: var(--text-2); }
 

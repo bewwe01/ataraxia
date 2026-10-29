@@ -4,6 +4,8 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { base64, ipc, type ContactView, type WallpaperInput, type WallpaperView } from "./ipc";
 
 let global: WallpaperView | null = null;
+/** Bumped on lock, so a read still in flight then cannot put anything back. */
+let epoch = 0;
 const listeners = new Set<() => void>();
 /** Photo `data:` URLs by owner ("0" default, else the contact id), until changed here. */
 const photos = new Map<string, Promise<string | null>>();
@@ -14,17 +16,22 @@ function emit() {
 
 /** Reads the default wallpaper again (after unlock, or after it changed). */
 export async function refreshWallpaper(): Promise<void> {
+  const gen = epoch;
+  let w: WallpaperView | null = null;
   try {
-    global = await ipc.wallpaper();
+    w = await ipc.wallpaper();
   } catch {
-    global = null;
+    w = null;
   }
-  photos.delete("0");
+  if (gen !== epoch) return;
+  global = w;
+  photos.clear();
   emit();
 }
 
 /** Forgets everything (Veil locked). */
 export function forgetWallpapers(): void {
+  epoch += 1;
   global = null;
   photos.clear();
   emit();
@@ -51,7 +58,11 @@ function photo(owner: number | null): Promise<string | null> {
   const key = owner === null ? "0" : String(owner);
   let p = photos.get(key);
   if (!p) {
-    p = ipc.wallpaperPhoto(owner).catch(() => null);
+    // A failed read is not kept: the next render tries again.
+    p = ipc.wallpaperPhoto(owner).catch(() => {
+      photos.delete(key);
+      return null;
+    });
     photos.set(key, p);
   }
   return p;
@@ -82,9 +93,14 @@ export function useChatWallpaper(contact: ContactView | null): { w: WallpaperVie
   return { w, photoUrl: w?.photo ? photoUrl : null };
 }
 
+const MAX_PICK_BYTES = 25 * 1024 * 1024;
+
 /** A picked photo, made small and stripped: redrawn at most 1600 px on its long side and saved
  *  as JPEG, which also drops its metadata (place, camera). Returns base64 for the IPC. */
 export async function preparePhoto(file: File): Promise<string> {
+  // Decoding is the costly part (a huge image can exhaust the webview's memory): refuse
+  // anything far larger than a phone photo before it starts.
+  if (file.size > MAX_PICK_BYTES) throw new Error("This picture is too large");
   const bitmap = await createImageBitmap(file);
   const scale = Math.min(1, 1600 / Math.max(bitmap.width, bitmap.height));
   const canvas = document.createElement("canvas");
@@ -92,6 +108,9 @@ export async function preparePhoto(file: File): Promise<string> {
   canvas.height = Math.max(1, Math.round(bitmap.height * scale));
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("This picture could not be read");
+  // Transparent areas take the theme's background, not JPEG's black.
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--bg-1").trim();
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   bitmap.close();
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));

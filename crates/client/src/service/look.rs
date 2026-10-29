@@ -6,6 +6,7 @@
 use base64::Engine as _;
 use rusqlite::OptionalExtension as _;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use super::{Actor, ChangeKind};
 use crate::{ClientError, Result};
@@ -70,7 +71,7 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
 /// A checked wallpaper and, for a new photo, its bytes and type.
 pub(super) struct Checked {
     view: Option<WallpaperView>,
-    photo: Option<(&'static str, Vec<u8>)>,
+    photo: Option<(&'static str, Zeroizing<Vec<u8>>)>,
     keep_photo: bool,
 }
 
@@ -92,13 +93,20 @@ pub(super) fn check(input: Option<WallpaperInput>) -> Result<Checked> {
             if b64.len() > MAX_PHOTO_BYTES / 3 * 4 + 4 {
                 return Err(ClientError::TooLarge);
             }
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(b64.as_bytes())
-                .map_err(|_| ClientError::BadInput)?;
+            let b64 = Zeroizing::new(b64);
+            let bytes = Zeroizing::new(
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64.as_bytes())
+                    .map_err(|_| ClientError::BadInput)?,
+            );
             if bytes.len() > MAX_PHOTO_BYTES {
                 return Err(ClientError::TooLarge);
             }
-            let mime = image_mime(&bytes).ok_or(ClientError::BadInput)?;
+            // New photos are JPEG only: the app redraws every photo as one, which is what
+            // strips its metadata (review LK-7). A stored PNG or WebP still reads back.
+            let mime = image_mime(&bytes)
+                .filter(|m| *m == "image/jpeg")
+                .ok_or(ClientError::BadInput)?;
             (None, Some((mime, bytes)))
         }
         (None, None, true) => (None, None),
@@ -198,7 +206,7 @@ impl Actor {
         if let Some((mime, bytes)) = &checked.photo {
             conn.execute(
                 "INSERT OR REPLACE INTO wallpaper_photos (owner, mime, data) VALUES (?1, ?2, ?3)",
-                rusqlite::params![owner, mime, bytes],
+                rusqlite::params![owner, mime, &**bytes],
             )?;
         } else if !checked.keep_photo {
             conn.execute("DELETE FROM wallpaper_photos WHERE owner = ?1", [owner])?;
@@ -220,22 +228,22 @@ impl Actor {
     /// The photo of the default wallpaper (`None`) or of a chat's, as a `data:` URL for display.
     pub(super) fn wallpaper_photo(&self, contact: Option<i64>) -> Result<Option<String>> {
         let owner = contact.unwrap_or(GLOBAL_OWNER);
-        let row: Option<(String, Vec<u8>)> = self
+        let row: Option<(String, Zeroizing<Vec<u8>>)> = self
             .s()?
             .db
             .conn()
             .query_row(
                 "SELECT mime, data FROM wallpaper_photos WHERE owner = ?1",
                 [owner],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, Zeroizing::new(r.get(1)?))),
             )
             .optional()?;
+        // The photo is the user's: no unwiped copies besides the URL the webview gets.
         Ok(row.and_then(|(mime, data)| {
             let mime = image_mime(&data).filter(|m| *m == mime)?;
-            Some(format!(
-                "data:{mime};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(data)
-            ))
+            let mut url = format!("data:{mime};base64,");
+            base64::engine::general_purpose::STANDARD.encode_string(&*data, &mut url);
+            Some(url)
         }))
     }
 
@@ -295,6 +303,8 @@ mod tests {
             check(Some(input(None, Some(&huge), false, 0, 0))).err(),
             Some(ClientError::TooLarge)
         );
+        // A PNG is an image, but new photos must be JPEG (the app's redrawn form).
+        assert!(check(Some(input(None, Some(b"\x89PNG\r\n\x1a\n...."), false, 0, 0))).is_err());
         assert_eq!(image_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
         assert_eq!(image_mime(b"\x89PNG\r\n\x1a\n...."), Some("image/png"));
     }

@@ -1,9 +1,10 @@
 // Colours from one hue (milestone 4.5, custom accent and per-chat colour). Every colour is
-// checked, not hoped for: white text on the sent bubble keeps at least 4.5:1 at every gradient
-// stop and between them, and the accent keeps 4.5:1 against the theme's background (WCAG AA,
-// DESIGN.md). Lightness steps down (or up) until the contrast holds.
+// checked, not hoped for: white text and the dimmer meta text (times, quotes, sizes) on the
+// sent bubble keep at least 4.5:1 at every gradient stop and between them, and the accent keeps
+// 4.5:1 against every panel it sits on (WCAG AA, DESIGN.md). Lightness steps down (or up) until
+// the contrast holds. `scripts/contrast-check.mjs` checks all 360 hues (run by `pnpm lint`).
 
-type Rgb = [number, number, number];
+export type Rgb = [number, number, number];
 
 function hsl(h: number, s: number, l: number): Rgb {
   const hue = ((h % 360) + 360) % 360;
@@ -28,39 +29,49 @@ export function contrast(a: Rgb, b: Rgb): number {
   return (hi + 0.05) / (lo + 0.05);
 }
 
-const WHITE: Rgb = [255, 255, 255];
-/** The hardest backgrounds accent text sits on: the lightest dark panel (Aurora dark --bg-2)
- *  and the darkest light one (Aurora light --bg-0). Pure black is easier than both. */
-const DARK_BG: Rgb = [16, 19, 49];
-const LIGHT_BG: Rgb = [231, 233, 245];
+export const WHITE: Rgb = [255, 255, 255];
+/** Meta text in sent bubbles is white at this opacity (`--text-on-accent-2`, the dimmer of the
+ *  two themes). */
+export const META_ALPHA = 0.86;
+/** The hardest backgrounds accent text sits on: the lightest dark panels (Aurora dark --bg-2,
+ *  and pure black's --surface-3) and the darkest light one (Aurora light --bg-0). */
+export const DARK_BGS: Rgb[] = [[16, 19, 49], [26, 26, 31]];
+export const LIGHT_BGS: Rgb[] = [[231, 233, 245]];
 
 const hex = ([r, g, b]: Rgb) => `#${[r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("")}`;
 const rgba = ([r, g, b]: Rgb, a: number) => `rgb(${r} ${g} ${b} / ${a})`;
-const mix = (a: Rgb, b: Rgb, t: number): Rgb => [0, 1, 2].map((i) => Math.round(a[i]! + (b[i]! - a[i]!) * t)) as Rgb;
+export const mix = (a: Rgb, b: Rgb, t: number): Rgb => [0, 1, 2].map((i) => Math.round(a[i]! + (b[i]! - a[i]!) * t)) as Rgb;
 
-/** The lightest lightness (from `start` down) at which white text on every colour, and on the
- *  colours between neighbours, keeps 4.5:1. */
+/** Meta text as it shows on bubble colour `c`. */
+export const meta = (c: Rgb): Rgb => mix(c, WHITE, META_ALPHA);
+/** Both text colours on a bubble colour keep 4.5:1. */
+export const readable = (c: Rgb): boolean => contrast(WHITE, c) >= 4.5 && contrast(meta(c), c) >= 4.5;
+
+/** The lightest lightness (from `start` down) at which white and meta text on every colour,
+ *  and on the colours between neighbours, keep 4.5:1. */
 function bubbleLightness(stops: { h: number; s: number }[], start: number): number {
   for (let l = start; l > 0.1; l -= 0.01) {
     const cols = stops.map((p) => hsl(p.h, p.s, l));
     const between = cols.slice(1).flatMap((c, i) => [0.25, 0.5, 0.75].map((t) => mix(cols[i]!, c, t)));
-    if ([...cols, ...between].every((c) => contrast(WHITE, c) >= 4.5)) return l;
+    if ([...cols, ...between].every(readable)) return l;
   }
   return 0.1;
 }
 
-/** An accent text colour readable on `bg`: lighter on dark backgrounds, darker on light ones. */
-function readableOn(h: number, s: number, bg: Rgb, dark: boolean): Rgb {
+/** An accent text colour readable on all of `bgs`: lighter on dark backgrounds, darker on
+ *  light ones. */
+function readableOn(h: number, s: number, bgs: Rgb[], dark: boolean): Rgb {
+  const ok = (c: Rgb) => bgs.every((bg) => contrast(c, bg) >= 4.5);
   if (dark) {
     for (let l = 0.62; l < 0.96; l += 0.01) {
       const c = hsl(h, s, l);
-      if (contrast(c, bg) >= 4.5) return c;
+      if (ok(c)) return c;
     }
     return hsl(h, s, 0.96);
   }
   for (let l = 0.45; l > 0.05; l -= 0.01) {
     const c = hsl(h, s, l);
-    if (contrast(c, bg) >= 4.5) return c;
+    if (ok(c)) return c;
   }
   return hsl(h, s, 0.05);
 }
@@ -87,7 +98,7 @@ export function bubbleVars(h: number): Record<string, string> {
 /** Everything a custom app accent sets, for the dark or light theme. */
 export function accentVars(h: number, dark: boolean): Record<string, string> {
   const bubbles = bubbleVars(h);
-  const accent = readableOn(h, 0.85, dark ? DARK_BG : LIGHT_BG, dark);
+  const accent = readableOn(h, 0.85, dark ? DARK_BGS : LIGHT_BGS, dark);
   const solid = hsl(h, 0.68, bubbleLightness([{ h, s: 0.68 }], 0.5));
   return {
     ...bubbles,

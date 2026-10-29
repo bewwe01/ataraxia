@@ -3867,6 +3867,19 @@ impl Actor {
                     "UPDATE messages SET contact = ?2 WHERE contact = ?1",
                     params![old, contact],
                 )?;
+                // The chat keeps its look: colour, wallpaper and its photo (review LK-11).
+                conn.execute(
+                    "UPDATE contacts SET
+                       accent_hue = coalesce(accent_hue, (SELECT accent_hue FROM contacts WHERE id = ?1)),
+                       wallpaper = coalesce(wallpaper, (SELECT wallpaper FROM contacts WHERE id = ?1))
+                     WHERE id = ?2",
+                    params![old, contact],
+                )?;
+                conn.execute(
+                    "UPDATE OR IGNORE wallpaper_photos SET owner = ?2 WHERE owner = ?1
+                     AND (SELECT wallpaper FROM contacts WHERE id = ?2) LIKE 'photo:%'",
+                    params![old, contact],
+                )?;
                 s.account.forget_contact(&addr).await?;
                 Self::queue_token_removal(&db, my_token)?;
                 conn.execute("DELETE FROM contacts WHERE id = ?1", [old])?;

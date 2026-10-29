@@ -146,3 +146,30 @@ async fn wallpapers_and_chat_colours() {
     c.set_wallpaper(None, None).await.unwrap();
     assert_eq!(c.wallpaper().await.unwrap(), None);
 }
+
+/// Accepting a key change keeps the chat's look (review LK-11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_change_keeps_the_chats_look() {
+    let r = relay().await;
+    let (alice, bob) = (user(&r, "Alice").await, user(&r, "Bob").await);
+    let (a_bob, _) = pair(&alice.client, &bob.client).await;
+    let c = &alice.client;
+    c.set_wallpaper(Some(a_bob.id), Some(photo())).await.unwrap();
+    c.set_chat_accent(a_bob.id, Some(120)).await.unwrap();
+
+    // Bob reinstalled: a new key under the same name.
+    let bob2 = user(&r, "Bob").await;
+    let (a_bob2, _) = pair(c, &bob2.client).await;
+    assert!(a_bob2.key_warning);
+    c.accept_key_change(a_bob2.id, a_bob.id).await.unwrap();
+    let view = c
+        .contacts()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == a_bob2.id)
+        .unwrap();
+    assert_eq!(view.accent_hue, Some(120));
+    assert!(view.wallpaper.is_some_and(|w| w.photo));
+    assert!(c.wallpaper_photo(Some(a_bob2.id)).await.unwrap().is_some());
+}
