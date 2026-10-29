@@ -40,8 +40,8 @@ export type MessageStatus = "sending" | "sent" | "failed" | "delivered" | "read"
 export interface MessageView {
   id: number;
   mine: boolean;
-  /** "timer" is a notice that the disappearing-message timer changed. */
-  kind: "text" | "timer" | "attachment";
+  /** "timer" is a notice that the disappearing-message timer changed; "call" a call line. */
+  kind: "text" | "timer" | "attachment" | "call";
   text: string;
   atMs: number;
   status: MessageStatus;
@@ -57,6 +57,17 @@ export interface MessageView {
   /** Can be replied to and reacted to. */
   actionable: boolean;
   attachment: AttachmentView | null;
+  /** For a call line: how the call went (kept on this device only). */
+  call: CallLogView | null;
+}
+
+export type CallOutcome = "ended" | "missed" | "declined" | "unanswered" | "busy" | "cancelled" | "failed";
+
+export interface CallLogView {
+  video: boolean;
+  outcome: CallOutcome;
+  /** How long it was connected (0 unless "ended"). */
+  durationSecs: number;
 }
 
 export interface AttachmentView {
@@ -226,6 +237,8 @@ export const ipc = {
   callSend: (contact: number, callId: string, kind: "offer" | "answer" | "hangup" | "busy", sdp: string | null = null) =>
     call<void>("call_send", { contact, callId, kind, sdp }),
   callSignals: () => call<CallSignal[]>("call_signals"),
+  callLog: (contact: number, outgoing: boolean, video: boolean, outcome: CallOutcome, secs: number) =>
+    call<void>("call_log", { contact, outgoing, video, outcome, secs }),
   callAudio: (active: boolean, speaker: boolean) => call<void>("call_audio", { active, speaker }),
   cancelCallNotice: () => call<void>("cancel_call_notice"),
   state: () => call<AppState>("app_state"),

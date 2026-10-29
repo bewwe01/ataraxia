@@ -77,6 +77,106 @@ impl core::fmt::Debug for CallSignal {
     }
 }
 
+/// A call line in a chat, as the UI shows it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallLogView {
+    pub video: bool,
+    /// `ended`, `missed`, `declined`, `unanswered`, `busy`, `cancelled` or `failed`.
+    pub outcome: String,
+    /// How long it was connected (0 unless `ended`).
+    pub duration_secs: u32,
+}
+
+const OUTCOMES: [&str; 7] = [
+    "ended",
+    "missed",
+    "declined",
+    "unanswered",
+    "busy",
+    "cancelled",
+    "failed",
+];
+/// Longer than any real call; a guard against nonsense from the UI.
+const MAX_CALL_SECS: u32 = 7 * 24 * 3600;
+
+/// How a call went, checked, as the UI reports it for the chat's call line.
+#[derive(Debug, Clone)]
+pub struct CallRecord {
+    outgoing: bool,
+    video: bool,
+    outcome: &'static str,
+    secs: u32,
+}
+
+impl CallRecord {
+    pub(crate) fn new(outgoing: bool, video: bool, outcome: &str, secs: u32) -> Result<Self> {
+        let outcome = OUTCOMES
+            .iter()
+            .copied()
+            .find(|o| *o == outcome)
+            .ok_or(ClientError::BadInput)?;
+        if secs > MAX_CALL_SECS {
+            return Err(ClientError::BadInput);
+        }
+        let secs = if outcome == "ended" { secs } else { 0 };
+        Ok(Self {
+            outgoing,
+            video,
+            outcome,
+            secs,
+        })
+    }
+
+    /// The stored form: `voice|video:outcome:secs`.
+    fn body(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            if self.video { "video" } else { "voice" },
+            self.outcome,
+            self.secs
+        )
+    }
+}
+
+/// A stored call line back into its view; `None` for anything malformed.
+pub(super) fn parse_log(body: &str) -> Option<CallLogView> {
+    let mut parts = body.splitn(3, ':');
+    let video = match parts.next()? {
+        "video" => true,
+        "voice" => false,
+        _ => return None,
+    };
+    let outcome = parts.next()?;
+    if !OUTCOMES.contains(&outcome) {
+        return None;
+    }
+    let duration_secs = parts.next()?.parse().ok()?;
+    Some(CallLogView {
+        video,
+        outcome: outcome.to_owned(),
+        duration_secs,
+    })
+}
+
+/// The chat list's one-line preview of a call line.
+pub(super) fn summary(body: &str, mine: bool) -> String {
+    let Some(c) = parse_log(body) else {
+        return "📞 Call".into();
+    };
+    let kind = if c.video { "video" } else { "voice" };
+    let what = match (c.outcome.as_str(), mine) {
+        ("ended", true) => "Outgoing",
+        ("ended", false) => "Incoming",
+        ("missed", _) => "Missed",
+        ("declined", _) => "Declined",
+        ("unanswered" | "busy", _) => "Unanswered",
+        ("cancelled", _) => "Cancelled",
+        _ => "Failed",
+    };
+    format!("📞 {what} {kind} call")
+}
+
 /// What the UI sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outgoing {
@@ -405,6 +505,35 @@ impl Actor {
                 .execute("DELETE FROM messages WHERE id = ?1 AND kind = 'control'", [row])?;
             Err(ClientError::Unreachable)
         }
+    }
+
+    /// Adds a call line to the chat with `contact`. It is local: nothing is sent, and it
+    /// disappears with the chat's timer like a message would.
+    pub(super) fn call_log(&self, contact: i64, rec: &CallRecord) -> Result<()> {
+        let s = self.s()?;
+        let timer: u32 =
+            s.db.conn()
+                .query_row("SELECT timer_secs FROM contacts WHERE id = ?1", [contact], |r| {
+                    r.get(0)
+                })
+                .map_err(|_| ClientError::UnknownContact)?;
+        let now = now_ms();
+        let expires = (timer > 0).then(|| now.saturating_add(i64::from(timer).saturating_mul(1000)));
+        s.db.conn().execute(
+            "INSERT INTO messages (contact, mine, kind, body, at_ms, status, expires_at_ms)
+             VALUES (?1, ?2, 'call', ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                contact,
+                rec.outgoing,
+                rec.body(),
+                now,
+                if rec.outgoing { "sent" } else { "received" },
+                expires
+            ],
+        )?;
+        self.emit(ChangeKind::Messages, Some(contact));
+        self.emit(ChangeKind::Contacts, Some(contact));
+        Ok(())
     }
 
     /// The signals that arrived since the last call; each is returned once. Offers and answers

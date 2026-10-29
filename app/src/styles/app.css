@@ -132,6 +132,13 @@ button.reply:not(:disabled):active { filter: brightness(0.92); }
 .emoji-custom-row .input input { width: 0; }
 .msg-dialog { max-width: calc(100vw - 2 * var(--space-4)); }
 
+/* Call lines in a chat: a system notice that calls back when tapped. */
+button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text-xs); min-height: var(--tap-min); }
+.sys-msg.call-line .call-line-time { color: var(--text-3); font-variant-numeric: tabular-nums; }
+.sys-msg.call-line.missed { color: var(--danger); }
+.sys-msg.call-line.missed .icon { color: var(--danger); }
+@media (hover: hover) { button.sys-msg.call-line:hover { background: var(--surface-glass-strong); } }
+
 /* Calls (ADR-0018, DESIGN.md CallScreen): over everything, full screen. */
 /* Minimize: an arrow at the top left of the call screen. */
 .call .call-min { position: absolute; z-index: 3; top: calc(env(safe-area-inset-top) + var(--space-3)); left: var(--space-3); color: var(--on-media); background: var(--call-glass); border: 1px solid var(--call-glass-line); }

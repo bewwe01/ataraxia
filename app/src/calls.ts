@@ -15,7 +15,7 @@
 // how the other side (and Rust) tells voice from video. The data channel
 // carries mute, deafen, camera and sharing state; it runs inside the call's DTLS, end to end.
 import { useSyncExternalStore } from "react";
-import { ipc, IpcError, type CallSetup, type CallSignal } from "./ipc";
+import { ipc, IpcError, type CallOutcome, type CallSetup, type CallSignal } from "./ipc";
 
 export type Phase = "incoming" | "calling" | "connecting" | "active" | "ended";
 
@@ -189,6 +189,23 @@ function ring(): () => void {
     navigator.vibrate?.(0);
     void ctx?.close().catch(() => undefined);
   };
+}
+
+/** How a call that is ending went, for its line in the chat. `why` is the reason end() was
+ *  given, `byUs` whether we ended it. */
+function outcomeOf(c: CallState, why: string, byUs: boolean): CallOutcome {
+  if (c.phase === "active") return "ended";
+  if (c.phase === "incoming") return why === "Declined" ? "declined" : "missed";
+  if (!c.outgoing) {
+    // Accepted, but it never connected.
+    if (why === "Call ended") return byUs ? "cancelled" : "missed";
+    return "failed";
+  }
+  if (why === "Busy") return "busy";
+  if (why === "No answer") return "unanswered";
+  // They hung up or declined while it rang; or we gave up before they answered.
+  if (why === "Call ended") return byUs ? "cancelled" : "unanswered";
+  return "failed";
 }
 
 class CallManager {
@@ -657,6 +674,10 @@ class CallManager {
     window.clearTimeout(this.ringTimer);
     window.clearInterval(this.keepAlive);
     if (tellThem) void ipc.callSend(c.contact, c.id, "hangup").catch(() => undefined);
+    // A line in the chat (this device only). When Veil locks, the session is gone and this
+    // fails quietly.
+    const secs = c.phase === "active" && c.startedAt !== null ? Math.max(0, Math.round((Date.now() - c.startedAt) / 1000)) : 0;
+    void ipc.callLog(c.contact, c.outgoing, c.video, outcomeOf(c, why, tellThem), secs).catch(() => undefined);
     this.channel = null;
     this.pc?.close();
     this.pc = null;

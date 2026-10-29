@@ -157,7 +157,7 @@ export function ChatList({ contacts, me, nav, typing }: { contacts: ContactView[
                       ) : c.keyWarning ? (
                         <span className="conv-preview warn"><Icon name="alert-triangle" className="icon-sm" />New safety number</span>
                       ) : (
-                        <span className="conv-preview">{c.blocked ? "Blocked" : c.lastText === null ? "No messages yet" : `${c.lastMine ? "You: " : ""}${c.lastText}`}</span>
+                        <span className="conv-preview">{c.blocked ? "Blocked" : c.lastText === null ? "No messages yet" : `${c.lastMine && !c.lastText.startsWith("📞") ? "You: " : ""}${c.lastText}`}</span>
                       )}
                       <span className="conv-flags">
                         {c.blocked ? <Icon name="ban" className="icon-sm" /> : null}
@@ -194,6 +194,52 @@ function TimerNotice({ m, name }: { m: MessageView; name: string }) {
       <Icon name="timer" />
       {secs === 0 ? `${who} turned off disappearing messages` : `${who} set disappearing messages to ${timerName(secs)}`}
     </div>
+  );
+}
+
+/** "2:05", "1:02:09": how long a call lasted. */
+function callLength(secs: number): string {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = String(secs % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
+}
+
+/** A call line: how a call went (this device's own record). Tapping it calls back. */
+function CallNotice({ m, contact }: { m: MessageView; contact: ContactView }) {
+  const c = m.call;
+  if (!c) return null;
+  const name = contact.name;
+  const kind = c.video ? "video" : "voice";
+  const Kind = c.video ? "Video" : "Voice";
+  const text =
+    c.outcome === "ended" ? `${m.mine ? "Outgoing" : "Incoming"} ${kind} call · ${callLength(c.durationSecs)}`
+    : c.outcome === "missed" ? `Missed ${kind} call`
+    : c.outcome === "declined" ? `Declined ${kind} call`
+    : c.outcome === "busy" ? `${name} was busy`
+    : c.outcome === "unanswered" ? `${Kind} call not answered`
+    : c.outcome === "cancelled" ? `Cancelled ${kind} call`
+    : `${Kind} call failed`;
+  const missed = c.outcome === "missed";
+  const icon = c.outcome === "ended" ? (c.video ? "video" : "phone") : "phone-off";
+  const body = (
+    <>
+      <Icon name={icon} />
+      <span>{text}</span>
+      <span className="call-line-time">{timeLabel(m.atMs)}</span>
+    </>
+  );
+  return contact.blocked ? (
+    <div className={`sys-msg call-line${missed ? " missed" : ""}`}>{body}</div>
+  ) : (
+    <button
+      type="button"
+      className={`sys-msg call-line${missed ? " missed" : ""}`}
+      aria-label={`${text}, ${timeLabel(m.atMs)}. Call ${name} back`}
+      onClick={() => void calls.start(contact.id, c.video)}
+    >
+      {body}
+    </button>
   );
 }
 
@@ -726,6 +772,8 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
         {messages.map((m) =>
           m.kind === "timer" ? (
             <TimerNotice key={m.id} m={m} name={contact.name} />
+          ) : m.kind === "call" ? (
+            <CallNotice key={m.id} m={m} contact={contact} />
           ) : (
             <MessageRow
               key={m.id}

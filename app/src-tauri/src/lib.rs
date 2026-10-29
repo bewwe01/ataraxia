@@ -615,6 +615,21 @@ async fn call_signals(c: State<'_, Client>) -> Res<Vec<veil_client::service::Cal
     c.call_signals().await.map_err(err)
 }
 
+/// A line in the chat saying how a call went (kept on this device only).
+#[tauri::command]
+async fn call_log(
+    c: State<'_, Client>,
+    contact: i64,
+    outgoing: bool,
+    video: bool,
+    outcome: String,
+    secs: u32,
+) -> Res<()> {
+    c.call_log(contact, outgoing, video, &outcome, secs)
+        .await
+        .map_err(err)
+}
+
 /// Phone audio for a call: communication mode, speaker or earpiece, screen kept on.
 #[tauri::command]
 async fn call_audio(app: AppHandle, active: bool, speaker: bool) {
@@ -741,6 +756,7 @@ pub fn run() {
             call_setup,
             call_send,
             call_signals,
+            call_log,
             call_audio,
             cancel_call_notice,
             me,

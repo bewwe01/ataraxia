@@ -44,7 +44,7 @@ pub use attachments::{
     AUTO_DOWNLOAD_PER_DAY, AUTO_DOWNLOAD_UNOPENED, AttachmentInput, AttachmentView, MAX_FILE,
     MAX_VOICE_BYTES, MAX_VOICE_MS,
 };
-pub use calls::{CallSetup, CallSignal, IceServerView};
+pub use calls::{CallLogView, CallSetup, CallSignal, IceServerView};
 
 /// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
@@ -185,6 +185,8 @@ pub struct MessageView {
     pub actionable: bool,
     /// For `attachment` messages: the photo, file or voice note.
     pub attachment: Option<AttachmentView>,
+    /// For `call` lines: how the call went (kept on this device only, never sent).
+    pub call: Option<CallLogView>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -387,6 +389,7 @@ enum Cmd {
     CallSetup(i64, Reply<CallSetup>),
     CallSend(i64, String, calls::Outgoing, Option<String>, Reply<()>),
     CallSignals(Reply<Vec<CallSignal>>),
+    CallLog(i64, calls::CallRecord, Reply<()>),
     PurgeAll(Zeroizing<String>, Reply<bool>),
     Privacy(Reply<PrivacyView>),
     SetPrivacy(PrivacyView, Reply<()>),
@@ -768,6 +771,20 @@ impl Client {
     pub async fn call_signals(&self) -> Result<Vec<CallSignal>> {
         ask!(self, CallSignals)
     }
+    /// Records how a call with `contact` went, as a line in that chat (this device only).
+    /// `outcome` is one of `ended`, `missed`, `declined`, `unanswered`, `busy`, `cancelled` or
+    /// `failed`; `secs` is how long it was connected.
+    pub async fn call_log(
+        &self,
+        contact: i64,
+        outgoing: bool,
+        video: bool,
+        outcome: &str,
+        secs: u32,
+    ) -> Result<()> {
+        let record = calls::CallRecord::new(outgoing, video, outcome, secs)?;
+        ask!(self, CallLog, contact, record)
+    }
     pub async fn privacy(&self) -> Result<PrivacyView> {
         ask!(self, Privacy)
     }
@@ -970,6 +987,11 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
     let body: String = r.get(2)?;
     let deleted: bool = r.get(8)?;
     let timer_secs = (kind == "timer").then(|| body.parse().unwrap_or(0));
+    let call = if kind == "call" {
+        calls::parse_log(&body)
+    } else {
+        None
+    };
     let reply = if r.get::<_, bool>(10)? {
         let qid: Option<i64> = r.get(11)?;
         let qdeleted: Option<bool> = r.get(14)?;
@@ -997,6 +1019,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         kind,
         at_ms: r.get(3)?,
         status: r.get(4)?,
+        call,
         timer_secs,
         expires_at_ms: r.get(6)?,
         reply,
@@ -1487,6 +1510,9 @@ impl Actor {
                 let res = self.call_send(c, &id, kind, sdp).await;
                 let _ = r.send(res);
             }
+            Cmd::CallLog(c, rec, r) => {
+                let _ = r.send(self.call_log(c, &rec));
+            }
             Cmd::CallSignals(r) => {
                 let res = self.call_signals().await;
                 let _ = r.send(res);
@@ -1946,11 +1972,17 @@ impl Actor {
             .query_row(
                 "SELECT CASE m.kind WHEN 'attachment' THEN CASE a.kind WHEN 'image' THEN '📷 Photo'
                    WHEN 'voice' THEN '🎤 Voice message' ELSE '📄 ' || coalesce(a.name, 'File') END ELSE m.body END,
-                 m.mine, m.at_ms FROM messages m LEFT JOIN attachments a ON a.message = m.id
-                 WHERE m.contact = ?1 AND m.kind IN ('text', 'attachment') AND m.deleted = 0
+                 m.mine, m.at_ms, m.kind FROM messages m LEFT JOIN attachments a ON a.message = m.id
+                 WHERE m.contact = ?1 AND m.kind IN ('text', 'attachment', 'call') AND m.deleted = 0
                  AND (m.expires_at_ms IS NULL OR m.expires_at_ms > ?2) ORDER BY m.id DESC LIMIT 1",
                 params![id, now_ms()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| {
+                    let (body, mine, at, kind): (String, bool, i64, String) =
+                        (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
+                    // A call line reads as what happened, not its stored form.
+                    let text = if kind == "call" { calls::summary(&body, mine) } else { body };
+                    Ok((text, mine, at))
+                },
             )
             .optional()?;
         let previous = if key_warning {
@@ -2004,7 +2036,7 @@ impl Actor {
     fn contacts(&self) -> Result<Vec<ContactView>> {
         let s = self.s()?;
         let mut stmt = s.db.conn().prepare(
-            "SELECT c.id FROM contacts c LEFT JOIN messages m ON m.contact = c.id AND m.kind IN ('text', 'timer', 'attachment')
+            "SELECT c.id FROM contacts c LEFT JOIN messages m ON m.contact = c.id AND m.kind IN ('text', 'timer', 'attachment', 'call')
              GROUP BY c.id ORDER BY max(coalesce(m.at_ms, c.added_ms)) DESC",
         )?;
         let ids = stmt
@@ -2020,7 +2052,7 @@ impl Actor {
             "SELECT {MESSAGE_COLUMNS} FROM messages m
              LEFT JOIN messages q ON q.id = (SELECT x.id FROM messages x WHERE x.contact = m.contact
                  AND x.msg_id = m.reply_to AND x.kind IN ('text', 'attachment') ORDER BY x.id LIMIT 1)
-             WHERE m.contact = ?1 AND m.kind IN ('text', 'timer', 'attachment') ORDER BY m.id DESC LIMIT 500"
+             WHERE m.contact = ?1 AND m.kind IN ('text', 'timer', 'attachment', 'call') ORDER BY m.id DESC LIMIT 500"
         ))?;
         // Expired rows are deleted by the tick (at most 5 s late); the UI hides them on time.
         let mut out = stmt
@@ -2753,7 +2785,7 @@ impl Actor {
         let contact: i64 =
             s.db.conn()
                 .query_row(
-                    "SELECT contact FROM messages WHERE id = ?1 AND kind IN ('text', 'timer', 'attachment')",
+                    "SELECT contact FROM messages WHERE id = ?1 AND kind IN ('text', 'timer', 'attachment', 'call')",
                     [message],
                     |r| r.get(0),
                 )

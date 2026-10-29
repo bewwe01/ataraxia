@@ -2,6 +2,39 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Call lines in the chat (2026-10-29)
+
+Owner request: call history as lines in the conversation (ADR-0018, "Call lines"). Each device records its own; nothing is sent.
+
+```text
+$ cargo fmt --all --check   # ok (after cargo fmt)
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 228 passed, 0 failed
+$ (app/src-tauri) cargo clippy --all-targets --locked -- -D warnings
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 17 files clean
+# ✓ built in 1.48s
+$ (design/tools) node check.mjs
+# PASS
+```
+
+New test: `tests/calls.rs` `call_lines_are_kept_in_the_chat`.
+- An outgoing video call (125 s) and an incoming missed voice call come back as call views; the missed one has no length.
+- Chat list previews: "📞 Outgoing video call" and "📞 Missed voice call".
+- Nothing reaches the other side.
+- Unknown outcomes, lengths over a week and unknown contacts are refused.
+- With disappearing messages on, a call line expires.
+
+In Chromium, with two app pages (the mock stores call lines as messages), three calls:
+- An answered voice call of 2 s: Alice shows "Outgoing voice call · 0:02", Bob "Incoming voice call · 0:02".
+- A video call Bob declined: Alice shows "Video call not answered", Bob "Declined video call".
+- A voice call Alice gave up on while it rang: Alice shows "Cancelled voice call", Bob "Missed voice call" (in the danger colour, and the word says it too).
+
+Tapping a line rang the other side again.
+
 ## Camera and bubble: review round 1 and its fixes (2026-10-28)
 
 The review was a **PASS**, with one Medium, five Lows and two nits (REVIEW_REPORT.md). All of them are fixed:

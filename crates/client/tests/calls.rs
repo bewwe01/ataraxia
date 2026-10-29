@@ -366,3 +366,100 @@ async fn an_offer_waits_for_the_turn_addresses() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(outsider.client.call_signals().await.unwrap().is_empty());
 }
+
+/// Call lines: each side keeps its own record of a call in the chat, nothing of it is sent, it
+/// shows in the chat list, follows the chat's disappearing timer, and nonsense is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_lines_are_kept_in_the_chat() {
+    let r = relay().await;
+    let (alice, bob) = (user(&r, "Alice").await, user(&r, "Bob").await);
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+
+    alice
+        .client
+        .call_log(a_bob.id, true, true, "ended", 125)
+        .await
+        .unwrap();
+    bob.client
+        .call_log(b_alice.id, false, false, "missed", 999)
+        .await
+        .unwrap();
+
+    let line = |msgs: Vec<veil_client::service::MessageView>| {
+        msgs.into_iter().find(|m| m.kind == "call").expect("a call line")
+    };
+    let a = line(alice.client.messages(a_bob.id).await.unwrap());
+    let c = a.call.as_ref().unwrap();
+    assert!(a.mine && c.video && c.outcome == "ended" && c.duration_secs == 125);
+    assert!(!a.actionable && a.text.is_empty());
+    let b = line(bob.client.messages(b_alice.id).await.unwrap());
+    let c = b.call.as_ref().unwrap();
+    // Only a connected call has a length.
+    assert!(!b.mine && !c.video && c.outcome == "missed" && c.duration_secs == 0);
+
+    let preview = |cs: Vec<veil_client::service::ContactView>| cs[0].last_text.clone().unwrap();
+    assert_eq!(
+        preview(alice.client.contacts().await.unwrap()),
+        "📞 Outgoing video call"
+    );
+    assert_eq!(
+        preview(bob.client.contacts().await.unwrap()),
+        "📞 Missed voice call"
+    );
+
+    // Nothing was sent: neither side has the other's line.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        alice
+            .client
+            .messages(a_bob.id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|m| m.kind == "call")
+            .count(),
+        1
+    );
+
+    // Refused: unknown outcomes, absurd lengths, unknown contacts.
+    for (outcome, secs) in [("hacked", 1), ("ended", 8 * 24 * 3600), ("", 0)] {
+        assert_eq!(
+            alice
+                .client
+                .call_log(a_bob.id, true, false, outcome, secs)
+                .await
+                .unwrap_err(),
+            ClientError::BadInput,
+            "{outcome}"
+        );
+    }
+    assert_eq!(
+        alice
+            .client
+            .call_log(9999, true, false, "ended", 1)
+            .await
+            .unwrap_err(),
+        ClientError::UnknownContact
+    );
+
+    // With disappearing messages on, call lines go too.
+    alice.client.set_timer(a_bob.id, 1).await.unwrap();
+    alice
+        .client
+        .call_log(a_bob.id, false, false, "declined", 0)
+        .await
+        .unwrap();
+    let declined = alice.client.messages(a_bob.id).await.unwrap();
+    assert!(
+        declined
+            .iter()
+            .any(|m| m.kind == "call" && m.expires_at_ms.is_some())
+    );
+    eventually(|| async {
+        let left = alice.client.messages(a_bob.id).await.unwrap();
+        left.iter()
+            .all(|m| m.call.as_ref().is_none_or(|c| c.outcome != "declined"))
+            .then_some(())
+    })
+    .await;
+}
