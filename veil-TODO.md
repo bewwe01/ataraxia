@@ -81,7 +81,7 @@ Small jobs with a big payoff.
 | ✅ | Replies, reactions, edit and delete | Checked by you, including swipe to reply and three reactions (preview.6). Preview.7: no more dots beside messages, hold instead. | ●●○○○ | — |
 | ✅ | Search messages | Checked by you on a Pixel. | ●●○○○ | — |
 | ✅ | Notifications | Checked by you: work while Veil runs, also in the background. Not after swiping Veil away (no Google push service, by design; you chose to leave it so). | ●●●●○ | — |
-| 🟡 | Scan QR with the camera | Verify-by-scan works. Invite scanning refused every invite in preview.6 (wrong prefix); fixed in preview.7, waiting for your test. | ●●●○○ | — |
+| ✅ | Scan QR with the camera | Checked by you: invites and verify-by-scan both work in the app. | ●●●○○ | — |
 | ✅ | Verify in person by scanning | Checked by you on a Pixel. | ●●○○○ | — |
 | ⬜ | Link previews | Off by default, made by the sender only. | ●●●○○ | 3 h |
 
