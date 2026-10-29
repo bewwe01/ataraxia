@@ -5133,3 +5133,163 @@ LK2-1 is High: custom-accent text still drops to 3.91:1 in the default Aurora da
 - **D.** Report only.
 
 Files: `/home/user/ataraxia/app/src/color.ts`, `/home/user/ataraxia/app/scripts/contrast-check.mjs`, `/home/user/ataraxia/app/src/components/Look.tsx`, `/home/user/ataraxia/app/src/styles/app.css`, `/home/user/ataraxia/crates/client/src/service/look.rs`, `/home/user/ataraxia/docs/REVIEW_REPORT.md`.
+
+## Look (milestone 4.5) review, round 3 (2026-10-29)
+
+**Verdict: PASS.** LK2-1 to LK2-5 are all fixed and every earlier LK fix still holds. There are no Critical or High findings. I found one Medium issue, LK3-1, which I recommend fixing before release: over a bright photo wallpaper, the in-chat banners, including the identity-key warning, become unreadable.
+
+**Scope:** fix commit 2af205b, on top of 503a6bb and fdd85b5. I read every changed file and edited nothing. Line numbers are from the working tree; they match the commit for every file cited below.
+
+The working tree also has uncommitted profile-picture work (ADR-0020). It does not touch `color.ts`, `contrast-check.mjs`, `Look.tsx` or the wallpaper rules:
+- `look.rs`: only `image_mime` changed, from private to `pub(super)`.
+- `app.css`: new rules appended at the end.
+- `Chats.tsx`: only the `<Avatar>` props.
+
+**Checks run**
+- `pnpm -C app lint`: passes. Output: `lint: 22 files clean`, then `contrast: worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001`.
+- `pnpm -C app typecheck`: passes, 0 errors.
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-client --test look`: 2 passed (`wallpapers_and_chat_colours`, `a_key_change_keeps_the_chats_look`).
+- Scratchpad runs on copies, with nothing in the repo touched:
+  - all 360 hues against `--surface-3` and against `--accent-soft` laid over every panel;
+  - chat text over a white or black photo at dim 0;
+  - a copy of `contrast-check.mjs` run against altered copies of `tokens.css`.
+
+### Status of the round 2 findings
+
+| ID | Status | Notes |
+|---|---|---|
+| LK2-1 | **Fixed** | `DARK_BGS` and `LIGHT_BGS` now hold every 6-digit `--bg-0..2` and `--surface-1..2` value of Aurora dark and light, Ink dark and light, and pure black. I checked all 22 values against `tokens.css`. The worst accent is now 4.5001 in both themes. The new check script does fail when a 6-digit panel is missing (tested: exit 1). It has gaps, see LK3-2. |
+| LK2-2 | **Fixed** | Choosing a file is now its own button, "Use a photo…" / "Choose another photo…" (`Look.tsx:175`). The "Your photo" radio only selects (`onChange` does nothing) and is shown only while a photo is in use. Arrow keys no longer reach anything that opens a file chooser. |
+| LK2-3 | **Fixed** | The photo's base64 is wrapped in `Zeroizing` right in the `match` (`look.rs:90`). The `TooLarge` return, the decode error and the `_ =>` arm now all wipe it. The `data:` URL is sized up front with `base64::encoded_len(.., true)` plus the prefix. `encode_string` writes exactly that many bytes, so the string is never reallocated. If the length calculation overflowed, the photo would come back as `None` with no error; at 3 MiB that cannot happen. |
+| LK2-4 | **Fixed** | "Keep photo" puts focus back on the element that had it (`back` ref, `:123`, `:185`). "Remove" moves focus to the radio just chosen (`:190`). A slider let go during another save now shows the saved value again (`:131-135`). One remaining focus drop is on the new button, see LK3-3. |
+| LK2-5 | **Fixed** | Specificity checked. `.chat-screen:has(> .chat-wallpaper) .sys-msg.warning` is (0,4,0), above the base rule (0,3,0). The hover rule is (0,5,1), above `button.sys-msg.call-line:hover` (0,3,1). One note: no TSX renders `.sys-msg.warning` today (only `sys-msg` and `sys-msg call-line` at `Chats.tsx:195,235,239`), so the warning rule has no effect yet. That is harmless. |
+
+### Earlier fixes, re-checked
+- **LK-1, LK-12:** the lint check passes; worst meta 4.5001, worst white 5.43.
+- **LK-2:** `useSliderCommit` and the skip-if-unchanged checks are unchanged.
+- **LK-3:** the radios stay enabled, a ref guards against two saves at once, and leaving a photo asks first.
+- **LK-4:** holds for notices and day separators, but other chat elements have the same problem (LK3-1).
+- **LK-5:** `MAX_PICK_BYTES`, the 25 MiB limit, is still in place, and the canvas is still filled with `--bg-1` before drawing (`wallpaper.tsx:96,112`).
+- **LK-6, LK-7:** the photo is still wiped and must still be JPEG.
+- **LK-8, LK-9:** the cache epoch, `forgetWallpapers()` (App.tsx:94,128), and deleting a failed entry (`wallpaper.tsx:52,63`) are all present.
+- **LK-10:** the Ink override is present (`app.css:210`).
+- **LK-11:** the key-change carry-over SQL is present (`service.rs:3994`).
+- **LK-13:** the `.hue-swatch*` classes are present.
+
+All still hold.
+
+### New findings
+
+#### LK3-1: Medium. Over a photo wallpaper, chat banners and pure-black glass become unreadable [HIGH]
+**Where:**
+- The fix goes in `app/src/styles/app.css:221-223`.
+- Affected elements: `app/src/screens/Chats.tsx:746` (`.chat-hdr.glass`), `:771` (ConnectionBar), `:772` (KeyWarning), `:773-776` (info banner with the "Compare safety numbers" link).
+- Their backgrounds: `base.css:327`, `:329`, `:340`, `:461` and `tokens.css:417-418`.
+
+**Problem:**
+- `.chat-wallpaper` covers all of `.chat-screen` (`inset: 0`), so the header, the banners and the composer all sit on the photo.
+- The LK-4 fix made only `.sys-msg` and `.day-sep` opaque. Banner tints are translucent: `--warning-soft` is 14 % in dark mode and `--accent-soft` is 10–18 %. Pure black's glass is 5–8 % white.
+- Measured at dim 0, which is the default:
+
+  | Element | Background | Contrast |
+  |---|---|---|
+  | KeyWarning heading "Is this really X?" (`--warning`), dark | white photo | 1.43:1 |
+  | KeyWarning body text, dark | white photo | 1.79:1 |
+  | Info banner text, light | black photo | 2.11:1 |
+  | Header name and composer text, pure black | white photo | 1.11:1 |
+  | Header text, Aurora dark | white photo | 4.44:1 |
+
+- KeyWarning is the INV-ID-2 identity-key prompt. A security warning the user cannot read in their own chat matters in this app.
+- This dates from fdd85b5 and is the same class as LK-4 (which was Medium), so I rate it Medium.
+
+**Fix:** put the same opaque base under each tint, as LK2-5 did:
+```css
+.chat-screen:has(> .chat-wallpaper) > .banner.info,
+.chat-screen:has(> .chat-wallpaper) > [role="alert"] > .banner.info { background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--bg-1); }
+.chat-screen:has(> .chat-wallpaper) > [role="alert"] > .banner.warning,
+.chat-screen:has(> .chat-wallpaper) > .conn-bar.reconnecting { background: linear-gradient(var(--warning-soft), var(--warning-soft)), var(--bg-1); }
+.chat-screen:has(> .chat-wallpaper) > .chat-hdr { background: var(--bg-2); }
+.chat-screen:has(> .chat-wallpaper) .composer .box { background: var(--surface-1); }
+```
+Also extend the DESIGN.md §6 wallpaper row ("over a wallpaper, notices and day separators get an opaque pill") to cover banners, the header and the composer.
+
+#### LK3-2: Low. The token check skips any panel not written as 6-digit hex, and never checks the theme [HIGH]
+**Where:** `app/scripts/contrast-check.mjs:12-14`.
+
+**Problem:**
+- The pattern `/--(?:bg-[0-2]|surface-[12]):\s*(#[0-9a-fA-F]{6})/` silently skips any value in another form. In my tests the script still exited 0 when Aurora `--surface-2` was written as `#2a5`, `rgb(38 42 92)` or `var(--surface-3)`.
+- It already skips two panels today: pure black `--bg-0` and `--bg-1` are `#000`. They are harmless, being the darkest panels, but they show the gap.
+- Dark and light are merged into one `known` list. So a light panel set to a dark-list colour passes (tested: setting Ink light `--surface-1` to `#1e2250` exits 0), although the light accent is never checked against it.
+- ADR-0019 says the check "fails if color.ts misses one". That is true only for 6-digit hex.
+
+**Fix:** match every declaration of these tokens, refuse any value that is not hex, and check it against the list for its own theme:
+```js
+const hexRgb = (v) => { const m = v.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i); if (!m) return null;
+  const h = m[1].length === 3 ? [...m[1]].map((c) => c + c).join("") : m[1]; return rgb(`#${h}`); };
+const bad = [];
+for (const [, sel, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+  const dark = !/data-theme="light"/.test(sel);
+  for (const [, tok, val] of body.matchAll(/--(bg-\d+|surface-[12]):\s*([^;]+);/g)) {
+    const c = hexRgb(val.trim());
+    const list = (dark ? DARK_BGS : LIGHT_BGS).map((x) => x.join(","));
+    if (!c || !list.includes(c.join(","))) bad.push(`${sel.trim()} --${tok}: ${val.trim()}`);
+  }
+}
+if (bad.length) { console.error(`contrast: panels not covered by color.ts:\n${bad.join("\n")}`); process.exit(1); }
+```
+Add `[0, 0, 0]` to `DARK_BGS` so pure black `--bg-0` and `--bg-1` are listed.
+
+#### LK3-3: Low. Disabling the photo button while it saves loses keyboard focus [MEDIUM]
+**Where:** `app/src/components/Look.tsx:175`.
+
+**Problem:**
+- When the file chooser closes, focus returns to the button.
+- `pick()` then calls `save()`, which sets `busy`. The button becomes disabled while it has focus, and browsers move focus to `<body>`.
+- This is the same pattern that `Look.tsx:90-91` and LK-3 removed from the radios.
+- I have not checked WebKitGTK's exact blur behaviour, hence MEDIUM confidence.
+
+**Fix:**
+```tsx
+<button className="btn btn-secondary btn-block" type="button" aria-disabled={busy}
+  onClick={() => { if (!saving.current) file.current?.click(); }}>
+```
+
+#### LK3-4: Low. "Remove" fails silently while another save is running [HIGH]
+**Where:** `app/src/components/Look.tsx:186-190`, and `:104-105`.
+
+**Problem:**
+- The radios stay enabled during a save, for example while a new photo uploads, so the photo prompt can still be opened and "Remove" clicked.
+- `apply(p)` reaches `save()`, which returns at once because `saving.current` is set.
+- The dialog closes as if the photo were removed, but it is not. There is no message, and `.then` still moves focus to radio `p`, which is unchecked.
+
+**Fix:** have `save` report whether it ran, and move focus only on success:
+```tsx
+async function save(f: () => Promise<void>): Promise<boolean> {
+  if (saving.current) { setError("Wait for the current change to finish."); return false; }
+  … try { await f(); return true; } catch (e) { …; return false; } finally { … }
+}
+// Remove:
+void apply(p).then((ok) => { if (ok) document.querySelector<HTMLInputElement>(`input[name="${name}"][value="${p}"]`)?.focus(); else back.current?.focus(); });
+```
+
+### Also checked and found correct
+- **`color.ts`:**
+  - No accent text sits on `--surface-3`. I grepped every `color: var(--accent)` rule; on Aurora dark `--surface-3` the accent would be 3.87:1, but nothing puts it there.
+  - Accent on `--accent-soft` measures as low as 3.83:1, but every such use is an icon (`.row-icon.accent`, `.ficon`, `.banner.info > .icon`), which needs only 3:1. `.chip.accent` is not used in any TSX.
+- **`contrast-check.mjs`:** it reads `src/styles/tokens.css`, which matches `design/tokens.css` apart from font URLs. It runs before the hue loop and exits 1 when a 6-digit panel is missing.
+- **`Look.tsx`:**
+  - "Keep photo" focuses synchronously, before the banner unmounts, so focus is not lost on the way.
+  - The selector in `querySelector` is built only from `wp-<number>` and the preset union, so it cannot be injected.
+  - The slider reset compares against the saved `value`, so it cannot overwrite a newer value.
+- **`look.rs`:** nothing new is logged, nothing panics, and nothing is indexed on IPC input.
+
+### Verdict: **PASS**
+There are no Critical or High findings. LK3-1 should be fixed before release, because over a bright photo it hides the identity-key warning. LK3-2 to LK3-4 can follow.
+
+### Action options
+- **A.** Fix LK3-1 to LK3-4.
+- **B (recommended).** Fix LK3-1 and LK3-2, then re-run `pnpm -C app lint`.
+- **C.** Fix specific items.
+- **D.** Report only. The gate passes as it stands.
+
+Files: `/home/user/ataraxia/app/src/styles/app.css`, `/home/user/ataraxia/app/scripts/contrast-check.mjs`, `/home/user/ataraxia/app/src/components/Look.tsx`, `/home/user/ataraxia/app/src/color.ts`, `/home/user/ataraxia/app/src/screens/Chats.tsx`, `/home/user/ataraxia/app/src/styles/base.css`, `/home/user/ataraxia/app/src/styles/tokens.css`, `/home/user/ataraxia/crates/client/src/service/look.rs`.

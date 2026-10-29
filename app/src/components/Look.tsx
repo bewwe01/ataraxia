@@ -101,15 +101,21 @@ export function WallpaperPicker({ contact, value, photoUrl }: { contact: number 
   }, [value?.dim, value?.blur]);
   const name = contact === null ? "wp-default" : `wp-${contact}`;
 
-  async function save(f: () => Promise<void>) {
-    if (saving.current) return;
+  /** Runs one save at a time; says whether it ran and worked. */
+  async function save(f: () => Promise<void>): Promise<boolean> {
+    if (saving.current) {
+      setError("Wait for the current change to finish.");
+      return false;
+    }
     saving.current = true;
     setError(null);
     setBusy(true);
     try {
       await f();
+      return true;
     } catch (e) {
       setError(e instanceof IpcError || e instanceof Error ? e.message : "The wallpaper could not be set");
+      return false;
     } finally {
       saving.current = false;
       setBusy(false);
@@ -172,7 +178,8 @@ export function WallpaperPicker({ contact, value, photoUrl }: { contact: number 
           </label>
         ) : null}
       </div>
-      <button className="btn btn-secondary btn-block" type="button" disabled={busy} onClick={() => file.current?.click()}>
+      {/* aria-disabled, not disabled: disabling the focused button would drop focus (LK3-3). */}
+      <button className="btn btn-secondary btn-block" type="button" aria-disabled={busy} onClick={() => { if (!saving.current) file.current?.click(); }}>
         <Icon name="image" />{value?.photo ? "Choose another photo…" : "Use a photo…"}
       </button>
       <input ref={file} type="file" accept="image/jpeg,image/png,image/webp" hidden onChange={(e) => void pick(e)} />
@@ -187,7 +194,10 @@ export function WallpaperPicker({ contact, value, photoUrl }: { contact: number 
                 const p = replacing;
                 setReplacing(null);
                 // The photo's tile goes away: focus moves to the choice just made.
-                void apply(p).then(() => document.querySelector<HTMLInputElement>(`input[name="${name}"][value="${p}"]`)?.focus());
+                void apply(p).then((ok) => {
+                  if (ok) document.querySelector<HTMLInputElement>(`input[name="${name}"][value="${p}"]`)?.focus();
+                  else back.current?.focus();
+                });
               }}>Remove</button>
             </div>
           </Banner>

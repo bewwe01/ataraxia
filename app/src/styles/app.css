@@ -221,6 +221,15 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 .chat-screen:has(> .chat-wallpaper) :is(.sys-msg, .day-sep) { background: var(--surface-2); }
 .chat-screen:has(> .chat-wallpaper) .sys-msg.warning { background: linear-gradient(var(--warning-soft), var(--warning-soft)), var(--surface-2); }
 @media (hover: hover) { .chat-screen:has(> .chat-wallpaper) button.sys-msg.call-line:hover { background: var(--surface-3); } }
+/* The rest of the chat's chrome sits on the wallpaper too: tints get an opaque base, so the
+   key-change warning and the header stay readable over any photo (review LK3-1). */
+.chat-screen:has(> .chat-wallpaper) > .chat-hdr { background: var(--bg-2); }
+.chat-screen:has(> .chat-wallpaper) .banner.info { background: linear-gradient(var(--accent-soft), var(--accent-soft)), var(--bg-1); }
+.chat-screen:has(> .chat-wallpaper) .banner.warning,
+.chat-screen:has(> .chat-wallpaper) > .conn-bar.reconnecting { background: linear-gradient(var(--warning-soft), var(--warning-soft)), var(--bg-1); }
+.chat-screen:has(> .chat-wallpaper) .banner.danger { background: linear-gradient(var(--danger-soft), var(--danger-soft)), var(--bg-1); }
+.chat-screen:has(> .chat-wallpaper) .composer .box { background: var(--surface-1); }
+.chat-screen:has(> .chat-wallpaper) .composer.recording-bar { background: var(--bg-2); }
 .chat-wallpaper { position: absolute; inset: 0; z-index: -1; overflow: hidden; pointer-events: none; }
 .chat-wallpaper::before { content: ""; position: absolute; inset: calc(-2 * var(--wp-blur, 0px)); filter: blur(var(--wp-blur, 0px)); background: var(--bg-1); }
 .chat-wallpaper::after { content: ""; position: absolute; inset: 0; background: var(--media-backdrop); opacity: var(--wp-dim, 0); }

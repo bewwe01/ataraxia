@@ -2,6 +2,31 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Look: review round 3 (PASS) and its follow-up fixes (2026-10-29)
+
+Round 3 of the review gate passed: no Critical or High findings. Its one Medium and three Low findings (LK3-1 to LK3-4) are fixed here as well.
+
+```text
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 20 files clean
+# contrast: 25 panels; worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001
+# ✓ built in 1.56s
+```
+
+- **LK3-1:** over a wallpaper, the chat header, banners (including the key-change warning), the connection bar, the recording bar and the composer field are now opaque.
+- **LK3-2:** the token check reads all 25 panel declarations, per theme, and refuses any value that is not hex. Two negative runs on copies of `tokens.css`:
+  - Ink light `--surface-2` set to a dark colour: "panels not covered by color.ts: … --surface-2: #1e2250", exit 1.
+  - A panel written as `rgb(30 34 80)` is reported the same way.
+- **LK3-3:** the photo button uses `aria-disabled`, so it keeps focus while saving.
+- **LK3-4:** a "Remove" that cannot run during another save says so, and focus goes back.
+- In Chromium, all the earlier checks still pass:
+  - Tab makes 0 saves.
+  - Arrow keys open 0 file choosers.
+  - Nothing is removed before confirming.
+  - A 26 MiB file is refused.
+  - No console errors.
+
 ## Look: review round 2 and its fixes (2026-10-29)
 
 Round 2 of the review gate failed on one High finding, LK2-1: the custom accent was checked against too few panels and dropped to 3.91:1 on Aurora dark `--surface-2`. All five findings (LK2-1 to LK2-5) were fixed in this round.

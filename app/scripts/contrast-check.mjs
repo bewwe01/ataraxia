@@ -6,16 +6,31 @@ import { accentVars, bubbleVars, contrast, DARK_BGS, LIGHT_BGS, meta, mix, WHITE
 
 const rgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
 
-// Every panel in tokens.css that accent text can sit on must be in color.ts's lists, so a
-// new or changed token cannot slip past this check (review LK2-1).
-const css = readFileSync(new URL("../src/styles/tokens.css", import.meta.url), "utf8");
-const panels = [...css.matchAll(/--(?:bg-[0-2]|surface-[12]):\s*(#[0-9a-fA-F]{6})/g)].map((m) => rgb(m[1]));
-const known = [...DARK_BGS, ...LIGHT_BGS].map((c) => c.join(","));
-const missing = panels.filter((c) => !known.includes(c.join(",")));
-if (missing.length) {
-  console.error(`contrast: panels in tokens.css missing from color.ts: ${missing.map((c) => c.join(",")).join(" ")}`);
+// Every panel in tokens.css that accent text can sit on must be in color.ts's list for its own
+// theme, and must be written as hex so this can tell (reviews LK2-1, LK3-2).
+const css = readFileSync(new URL("../src/styles/tokens.css", import.meta.url), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+const hexRgb = (v) => {
+  const m = v.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (!m) return null;
+  const h = m[1].length === 3 ? [...m[1]].map((c) => c + c).join("") : m[1];
+  return rgb(`#${h}`);
+};
+const has = (list, c) => list.some((x) => x.join(",") === c.join(","));
+const uncovered = [];
+let panels = 0;
+for (const [, sel, body] of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+  const dark = !/data-theme="light"/.test(sel);
+  for (const [, tok, val] of body.matchAll(/--(bg-\d+|surface-[12]):\s*([^;]+);/g)) {
+    panels += 1;
+    const c = hexRgb(val.trim());
+    if (!c || !has(dark ? DARK_BGS : LIGHT_BGS, c)) uncovered.push(`${sel.trim()} --${tok}: ${val.trim()}`);
+  }
+}
+if (!panels || uncovered.length) {
+  console.error(`contrast: panels not covered by color.ts:\n${uncovered.join("\n") || "(none found: tokens.css not parsed)"}`);
   process.exit(1);
 }
+
 const worst = { white: 99, meta: 99, accentDark: 99, accentLight: 99 };
 const bubble = (c) => {
   worst.white = Math.min(worst.white, contrast(WHITE, c));
@@ -36,7 +51,7 @@ for (let h = 0; h < 360; h++) {
   }
 }
 const fails = Object.entries(worst).filter(([, v]) => v < 4.5);
-console.log(`contrast: worst ${Object.entries(worst).map(([k, v]) => `${k} ${v.toFixed(4)}`).join(", ")}`);
+console.log(`contrast: ${panels} panels; worst ${Object.entries(worst).map(([k, v]) => `${k} ${v.toFixed(4)}`).join(", ")}`);
 if (fails.length) {
   console.error(`contrast: below 4.5:1: ${fails.map(([k]) => k).join(", ")}`);
   process.exit(1);
