@@ -50,7 +50,7 @@ My recommended order, one milestone at a time. Each one: I build it, test it, ru
 | ✅ | Milestone 2: everyday messaging | Replies, reactions, edit and delete, search, QR scan, verify by scan. Checked by you on a Pixel; swipe-to-reply and three reactions follow in preview.6. | ●●●○○ | — |
 | ✅ | Milestone 3: photos, files and voice notes | Photos and files checked by you on a Pixel (preview.5). | ●●●○○ | — |
 | ✅ | Milestone 4: notifications | Checked by you: work while Veil runs, also in the background. Not after swiping Veil away; you decided against push (2026-10-28), so that stays as is. | ●●●●○ | — |
-| ⬜ | Milestone 4.5: make it yours | Your request (2026-10-28): colours and look, profile picture and name shown to contacts, per-chat touches, and small preferences. Plan below, waiting for your picks. Review gate for the profile part. | ●●●○○ | 2–4 sessions |
+| 🟡 | Milestone 4.5: make it yours | Your request (2026-10-28). Look and Profile are built and in the next build for you to try; Preferences is next. | ●●●○○ | 2–4 sessions |
 | ⬜ | Milestone 5: metadata privacy | Mailbox rotation and unlinkable sending, then Tor or proxy support. Review gate. | ●●●●○ | 2–3 sessions |
 | 🟡 | Milestone 6: calls | Checked by you (preview.8): voice, video, screen sharing, mute and deafen, inside and outside the tailnet. Preview.9 adds the camera in voice calls and the call bubble. Left: call history. Direct mode dropped (it would show your IP to the contact). | ●●●●● | 3–5 h left |
 | ⬜ | Milestone 7: backup and more platforms | Encrypted backup and restore, Windows Hello, Linux AppImage/.deb. | ●●●●○ | 2–3 sessions |
@@ -99,17 +99,17 @@ Phase 6 of the original plan.
 
 ## Make it yours (Milestone 4.5)
 
-Brainstorm for your request; nothing built yet. Tell me what to keep, drop or add.
+Look (review gate passed) and Profile (review gate running) are built: try them in the next build. Preferences comes next.
 
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
-| ⬜ | Accent colour picker | Any colour, not just three. Veil adjusts it so text stays readable (contrast check). | ●●○○○ | 2 h |
-| ⬜ | Bubble colours and chat wallpaper | Your bubble colour or gradient. Wallpaper from presets or your own photo, kept encrypted on the device, with dim and blur. | ●●●○○ | 3–4 h |
-| ⬜ | More looks | Pure-black (AMOLED) dark mode, follow the system's light/dark, text size, compact or roomy spacing, bubble roundness. | ●●○○○ | 2–3 h |
-| ⬜ | Per-chat colour and wallpaper | Give a conversation its own colour or wallpaper; only you see it. | ●●○○○ | 2 h |
-| ⬜ | Profile picture | Pick and crop a photo. It goes to your contacts end-to-end encrypted, never in the clear to the relay. Metadata stripped, size capped. Choose who sees it: all contacts, or nobody. Needs a protocol addition and a review gate. | ●●●●○ | 1 session |
-| ⬜ | Name and short status | Change your display name and an optional one-line status; sent to contacts like the picture. | ●●●○○ | part of profile |
-| ⬜ | Nicknames and pictures for contacts | Rename a contact or give them a picture only you see; it overrides theirs. | ●●○○○ | 2 h |
+| 🟡 | Accent colour picker | Built: Settings → Appearance → Accent → Custom. Twelve swatches or any hue; Veil adjusts it so text stays readable (checked for every hue on every panel). Try it. | ●●○○○ | 2 h |
+| 🟡 | Bubble colours and chat wallpaper | Built: Gradient, Solid or Minimal bubbles; wallpapers from six presets or your own photo (encrypted on the device, metadata stripped) with dim and blur. Try it. | ●●●○○ | 3–4 h |
+| 🟡 | More looks | Built: pure black dark mode, follow system, four text sizes, compact spacing. Try it. | ●●○○○ | 2–3 h |
+| 🟡 | Per-chat colour and wallpaper | Built: in a contact's page, Chat colour and Chat wallpaper; only you see them. Try it. | ●●○○○ | 2 h |
+| 🟡 | Profile picture | Built: Settings → Profile. Pick and crop; sent end-to-end encrypted, never to the relay in the clear. Who sees it: all contacts, verified contacts or nobody (default), and you can hide it from one contact. Review gate running. | ●●●●○ | 1 session |
+| 🟡 | Name and short status | Built: your name and a one-line status reach your contacts. A contact can never take the name of another of your contacts. Contacts on older builds simply do not see it. | ●●●○○ | part of profile |
+| 🟡 | Nicknames and pictures for contacts | Built: a nickname or a picture only you see, in the contact's page; “Use their name” goes back to theirs. | ●●○○○ | 2 h |
 | ⬜ | Your own quick reactions | Choose the six emoji in the reaction bar. | ●○○○○ | 1 h |
 | ⬜ | Auto-lock time | 1, 5, 15 or 60 minutes instead of always 5. | ●○○○○ | 1 h |
 | ⬜ | Small preferences | Enter sends or adds a line (desktop), 12 or 24 hour clock, haptics on or off, default screen-share quality, ringtone from a few built-in sounds. | ●●○○○ | 2–3 h |
