@@ -52,7 +52,7 @@ My recommended order, one milestone at a time. Each one: I build it, test it, ru
 | ✅ | Milestone 4: notifications | Checked by you: work while Veil runs, also in the background. Not after swiping Veil away; you decided against push (2026-10-28), so that stays as is. | ●●●●○ | — |
 | ⬜ | Milestone 4.5: make it yours | Your request (2026-10-28): colours and look, profile picture and name shown to contacts, per-chat touches, and small preferences. Plan below, waiting for your picks. Review gate for the profile part. | ●●●○○ | 2–4 sessions |
 | ⬜ | Milestone 5: metadata privacy | Mailbox rotation and unlinkable sending, then Tor or proxy support. Review gate. | ●●●●○ | 2–3 sessions |
-| 🟡 | Milestone 6: calls | Built for your tailnet (preview.8): voice, video, screen sharing, mute and deafen. Review gate passed (round 2). Waiting for your phone test. Still to do: calls with people outside your tailnet (pick an option), then Direct mode. | ●●●●● | 1–2 sessions left |
+| 🟡 | Milestone 6: calls | Checked by you (preview.8): voice, video, screen sharing, mute and deafen, inside and outside the tailnet. Preview.9 adds the camera in voice calls and the call bubble. Left: Direct mode and call history. | ●●●●● | 3–5 h left |
 | ⬜ | Milestone 7: backup and more platforms | Encrypted backup and restore, Windows Hello, Linux AppImage/.deb. | ●●●●○ | 2–3 sessions |
 | ⬜ | Milestone 8: hardening before 1.0 | App tests and accessibility, extra failure tests, cargo vet for the app, final review gate (Phase 8). | ●●●●○ | 1–2 sessions |
 | ⬜ | After 1.0 | Multiple relays, phone + PC on one account, group chats, macOS/iOS, translations, update check, post-quantum TLS. Each is big; we pick per need. | ●●●●● | — |
@@ -164,5 +164,5 @@ Things only you can do.
 | | Feature | Notes | Difficulty | ETA |
 |---|---|---|---|---|
 | ⬜ | Protect the release settings in GitHub | release environment, tag rule. I'll walk you through it. | — | 5 min |
-| ⬜ | Run the relay on your Pi | Confirms the arm64 build works. | — | 30–60 min |
-| ⬜ | Try the app on your phone and PC | Tell me what breaks. | — | 15 min |
+| ✅ | Run the relay on your Pi | Running on your Pi, reached over Tailscale and Funnel. | — | — |
+| ✅ | Try the app on your phone and PC | You test every preview on your Pixel and Windows. | — | — |
