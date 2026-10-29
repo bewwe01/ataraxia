@@ -37,6 +37,7 @@ use crate::db::{Db, SqlBackend};
 mod attachments;
 mod calls;
 mod look;
+mod profile;
 mod watcher;
 use crate::relay::{Relay, split_host_port};
 use crate::unlock::{self, SecretKind};
@@ -47,6 +48,7 @@ pub use attachments::{
 };
 pub use calls::{CallLogView, CallSetup, CallSignal, IceServerView};
 pub use look::{WallpaperInput, WallpaperView};
+pub use profile::{PictureVisibility, ProfileView};
 
 /// Lock after this long without user activity.
 pub const AUTO_LOCK: Duration = Duration::from_mins(5);
@@ -143,6 +145,17 @@ pub struct ContactView {
     pub accent_hue: Option<u16>,
     /// This chat's own wallpaper, or `None` for the default. Local only.
     pub wallpaper: Option<WallpaperView>,
+    /// The name they chose, when it is not the one shown (a nickname, or a name another
+    /// contact already has).
+    pub their_name: Option<String>,
+    /// Their one-line status, if they set one.
+    pub status: Option<String>,
+    /// `name` is a nickname the user chose.
+    pub nickname: bool,
+    /// Changes whenever their picture does; `None` without one (fetch it with `picture`).
+    pub picture: Option<String>,
+    /// The user's picture is hidden from this contact.
+    pub picture_hidden: bool,
     /// This contact arrived with the same name as an existing one: possibly someone who
     /// reinstalled Veil, possibly an impostor. Shown until the safety number is verified or
     /// the user dismisses it (INV-ID-2).
@@ -400,6 +413,14 @@ enum Cmd {
     SetWallpaper(Option<i64>, Option<WallpaperInput>, Reply<()>),
     WallpaperPhoto(Option<i64>, Reply<Option<String>>),
     SetChatAccent(i64, Option<u16>, Reply<()>),
+    Profile(Reply<ProfileView>),
+    SetProfile(String, String, Reply<()>),
+    SetMyPicture(Option<String>, Reply<()>),
+    SetPictureVisibility(PictureVisibility, Reply<()>),
+    SetPictureHidden(i64, bool, Reply<()>),
+    SetContactPicture(i64, Option<String>, Reply<()>),
+    SetNickname(i64, Option<String>, Reply<()>),
+    Picture(Option<i64>, Reply<Option<String>>),
     PurgeAll(Zeroizing<String>, Reply<bool>),
     Privacy(Reply<PrivacyView>),
     SetPrivacy(PrivacyView, Reply<()>),
@@ -796,6 +817,38 @@ impl Client {
     /// A chat's own bubble colour (hue 0–359), or `None` for the app's accent.
     pub async fn set_chat_accent(&self, contact: i64, hue: Option<u16>) -> Result<()> {
         ask!(self, SetChatAccent, contact, hue)
+    }
+    /// The user's own profile: name, status, picture and who sees it (ADR-0020).
+    pub async fn profile(&self) -> Result<ProfileView> {
+        ask!(self, Profile)
+    }
+    /// Changes the user's name and status; contacts are told.
+    pub async fn set_profile(&self, name: String, status: String) -> Result<()> {
+        ask!(self, SetProfile, name, status)
+    }
+    /// Sets (base64 JPEG, PNG or WebP) or removes the user's picture.
+    pub async fn set_my_picture(&self, picture: Option<String>) -> Result<()> {
+        ask!(self, SetMyPicture, picture)
+    }
+    /// Who sees the user's picture.
+    pub async fn set_picture_visibility(&self, v: PictureVisibility) -> Result<()> {
+        ask!(self, SetPictureVisibility, v)
+    }
+    /// Hides the user's picture from one contact, whatever the setting.
+    pub async fn set_picture_hidden(&self, contact: i64, hidden: bool) -> Result<()> {
+        ask!(self, SetPictureHidden, contact, hidden)
+    }
+    /// A picture for a contact that only the user sees.
+    pub async fn set_contact_picture(&self, contact: i64, picture: Option<String>) -> Result<()> {
+        ask!(self, SetContactPicture, contact, picture)
+    }
+    /// A name for a contact that only the user sees, or `None` for the name they chose.
+    pub async fn set_nickname(&self, contact: i64, nickname: Option<String>) -> Result<()> {
+        ask!(self, SetNickname, contact, nickname)
+    }
+    /// A picture to show as a `data:` URL: the user's own (`None`) or a contact's.
+    pub async fn picture(&self, contact: Option<i64>) -> Result<Option<String>> {
+        ask!(self, Picture, contact)
     }
     /// Records how a call with `contact` went, as a line in that chat (this device only).
     /// `outcome` is one of `ended`, `missed`, `declined`, `unanswered`, `busy`, `cancelled` or
@@ -1250,6 +1303,9 @@ impl Actor {
             // (review M1R2-4).
             if retry {
                 self.retry_failed().await;
+                // Profile changes that did not go out yet, or that a contact is now due
+                // (verified, unblocked, a warning resolved).
+                self.sync_profiles(None).await;
             }
             self.retry_turn_lookup().await;
             self.wake_transfers();
@@ -1330,6 +1386,14 @@ impl Actor {
                 | Cmd::CallSend(..)
                 | Cmd::SetPrivacy(..)
                 | Cmd::Typing(..)
+                | Cmd::SetWallpaper(..)
+                | Cmd::SetChatAccent(..)
+                | Cmd::SetProfile(..)
+                | Cmd::SetMyPicture(..)
+                | Cmd::SetPictureVisibility(..)
+                | Cmd::SetPictureHidden(..)
+                | Cmd::SetContactPicture(..)
+                | Cmd::SetNickname(..)
         ) {
             self.last_activity = Instant::now();
         }
@@ -1421,7 +1485,9 @@ impl Actor {
                 let _ = r.send(self.search(&q));
             }
             Cmd::VerifyScanned(c, code, r) => {
-                let _ = r.send(self.verify_scanned(c, &code));
+                let res = self.verify_scanned(c, &code);
+                let _ = r.send(res);
+                self.sync_profiles(Some(c)).await;
             }
             Cmd::Notify(r) => {
                 let res = self.s().map(|s| NotifyView {
@@ -1511,7 +1577,10 @@ impl Actor {
                 let _ = r.send(self.safety(c));
             }
             Cmd::SetVerified(c, v, r) => {
-                let _ = r.send(self.set_verified(c, v));
+                let res = self.set_verified(c, v);
+                let _ = r.send(res);
+                // "Verified contacts" may now see the picture, or no longer.
+                self.sync_profiles(Some(c)).await;
             }
             Cmd::Rename(c, n, r) => {
                 let _ = r.send(self.rename(c, &n));
@@ -1548,6 +1617,34 @@ impl Actor {
             }
             Cmd::SetChatAccent(c, h, r) => {
                 let _ = r.send(self.set_chat_accent(c, h));
+            }
+            Cmd::Profile(r) => {
+                let _ = r.send(self.profile());
+            }
+            Cmd::SetProfile(n, st, r) => {
+                let res = self.set_profile(&n, &st).await;
+                let _ = r.send(res);
+            }
+            Cmd::SetMyPicture(p, r) => {
+                let res = self.set_my_picture(p).await;
+                let _ = r.send(res);
+            }
+            Cmd::SetPictureVisibility(v, r) => {
+                let res = self.set_picture_visibility(v).await;
+                let _ = r.send(res);
+            }
+            Cmd::SetPictureHidden(c, h, r) => {
+                let res = self.set_picture_hidden(c, h).await;
+                let _ = r.send(res);
+            }
+            Cmd::SetContactPicture(c, p, r) => {
+                let _ = r.send(self.set_contact_picture(c, p.as_deref()));
+            }
+            Cmd::SetNickname(c, n, r) => {
+                let _ = r.send(self.set_nickname(c, n.as_deref()));
+            }
+            Cmd::Picture(c, r) => {
+                let _ = r.send(self.picture(c));
             }
             Cmd::CallLog(c, rec, r) => {
                 let _ = r.send(self.call_log(c, &rec));
@@ -2070,9 +2167,15 @@ impl Actor {
         } else {
             None
         };
+        let profile = profile::contact_profile(conn, id, &name)?;
         Ok(ContactView {
             previous,
             id,
+            their_name: profile.their_name,
+            status: profile.status,
+            nickname: profile.nickname,
+            picture: profile.picture,
+            picture_hidden: profile.picture_hidden,
             initials: initials(&name),
             hue: id.rem_euclid(8),
             name,
@@ -2223,7 +2326,7 @@ impl Actor {
             return Err(ClientError::BadInput);
         }
         let n = self.s()?.db.conn().execute(
-            "UPDATE contacts SET name = ?2 WHERE id = ?1",
+            "UPDATE contacts SET name = ?2, nickname = 1 WHERE id = ?1",
             params![contact, name],
         )?;
         if n == 0 {
@@ -2573,6 +2676,17 @@ impl Actor {
     /// retried like a message. Returns the row; the caller delivers it once its own
     /// transaction is committed (no relay I/O inside a savepoint).
     async fn queue_control(&self, contact: i64, body: Body, expires_at_ms: Option<i64>) -> Result<i64> {
+        self.queue_control_as(contact, body, expires_at_ms, "").await
+    }
+
+    /// [`Self::queue_control`], with a tag in the row's body so a later one can replace it.
+    async fn queue_control_as(
+        &self,
+        contact: i64,
+        body: Body,
+        expires_at_ms: Option<i64>,
+        tag: &str,
+    ) -> Result<i64> {
         let s = self.s()?;
         let (address, blocked): (String, bool) = s.db.conn().query_row(
             "SELECT address, blocked FROM contacts WHERE id = ?1",
@@ -2593,8 +2707,8 @@ impl Actor {
         // go out after that message is gone (review M2-3).
         s.db.conn().execute(
             "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope, expires_at_ms)
-             VALUES (?1, 1, 'control', '', ?2, 'sending', ?3, ?4)",
-            params![contact, now_ms(), envelope, expires_at_ms],
+             VALUES (?1, 1, 'control', ?5, ?2, 'sending', ?3, ?4)",
+            params![contact, now_ms(), envelope, expires_at_ms, tag],
         )?;
         Ok(s.db.conn().last_insert_rowid())
     }
@@ -3362,6 +3476,7 @@ impl Actor {
                 }
             }
             Body::Call(c) => self.receive_call(contact, sent_at_ms, c)?,
+            Body::Profile(p) => self.receive_profile(contact, &p)?,
             // A new delivery token for this contact (they unblocked us). Moving to another
             // relay is not supported, so such an update is ignored.
             // Only a newer one (by their clock) counts, as for timers (review M1R2-1).

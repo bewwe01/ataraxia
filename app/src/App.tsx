@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { forgetWallpapers, refreshWallpaper } from "./wallpaper";
+import { forgetPictures } from "./pictures";
 import { ipc, onChange, type AppState, type ContactView, type Me } from "./ipc";
 import { Chat, ChatList, type Route } from "./screens/Chats";
 import { AddContact, ContactProfile } from "./screens/Contacts";
@@ -125,6 +126,7 @@ export function App() {
       // Leaving "unlocked" by any path drops the wallpaper photos, whether or not the
       // "locked" event was still heard.
       forgetWallpapers();
+      forgetPictures();
     };
   }, [state, refresh, refreshState, setTypingFor]);
 

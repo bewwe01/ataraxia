@@ -3,6 +3,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { ipc, IpcError, type Me, type NativeInfo, type NotifySettings, type PrivacyView, type SecretKind, type SecurityView } from "../ipc";
 import { applyAppearance, isDark, loadAppearance, type Accent, type Appearance, type Bubble, type Density, type Mode, type Style, type TextSize } from "../settings";
 import { HuePicker, LookPreview, WallpaperPicker } from "../components/Look";
+import { ProfileCard } from "../components/Profile";
 import { useChatWallpaper } from "../wallpaper";
 import { Banner, Icon, SecretField, Segmented, ToggleRow, TopBar } from "../ui";
 import type { Nav } from "./Chats";
@@ -314,6 +315,9 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
             <p className="hint">Relay · <span className="mono-wrap">{me.relay}</span> · {me.connection}</p>
           </section>
         ) : null}
+
+        <h3 className="group-title">Profile</h3>
+        <ProfileCard onChanged={() => undefined} />
 
         <h3 className="group-title">Security</h3>
         {note ? <Banner tone="neutral" icon="check"><p>{note}</p></Banner> : null}

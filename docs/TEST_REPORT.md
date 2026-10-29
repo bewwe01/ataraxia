@@ -2,6 +2,62 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Profile: picture, name, status, who sees the picture, nicknames (2026-10-29)
+
+Milestone 4.5, second part (ADR-0020). Owner request: a profile picture with a setting for who can see it.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 238 passed, 0 failed
+$ (app/src-tauri) cargo clippy -- -D warnings
+#     Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 36s
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 22 files clean
+# contrast: 25 panels; worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001
+# ✓ built in 1.58s
+$ (design/tools) node check.mjs
+# PASS
+```
+
+New tests:
+- `content::tests::profiles_are_checked` (core):
+  - a profile with the largest picture round-trips;
+  - an empty name is allowed, and the receiver keeps its own;
+  - refused: a name over 64 characters, bidi overrides, a status over 140 characters or with a line break, an empty picture, and one over 48 KiB.
+- `service::profile` unit tests:
+  - pictures must be JPEG, PNG or WebP by their first bytes, valid base64, and no more than 48 KiB;
+  - an unknown visibility setting reads as "nobody";
+  - the hash of what was sent length-prefixes each field.
+- `tests/profile.rs` `profiles_reach_contacts_as_the_user_chose`, two clients through a real relay:
+  - Bob first knows Alice as "Contact …", then sees her name and status. He gets no picture, because nobody sees it by default.
+  - With "verified contacts", Bob gets the picture only after Alice verifies him.
+  - Hiding it from Bob takes it off his screen, and showing it again brings it back.
+  - Setting "Nobody" takes it back again.
+  - A nickname wins over her name, and her name shows beside it. Clearing the nickname goes back to her name.
+  - A picture only Bob sees replaces hers on his side.
+  - Refused: an SVG, a picture over 48 KiB, unknown contacts, and an empty nickname.
+  - After lock, the picture is not found in the clear on either side.
+- `tests/profile.rs` `a_contact_cannot_take_another_contacts_name`:
+  - Mallory sets her name to " bob " while Alice has a contact "Bob". Alice keeps calling her Mallory, with "bob" shown beside it.
+  - An older profile revision, sent raw, changes nothing.
+
+Bug found by these tests and fixed: hiding the picture re-sent the profile under the same revision, which the receiver ignored as old. Every send now gets a new revision.
+
+In Chromium against the IPC mock:
+- Name and status were saved.
+- A 3000×2000 photo was cropped (dragged, zoomed 2×) and saved as a 512×512 JPEG of 6927 bytes.
+- "Verified" was saved as the visibility.
+- On the contact page:
+  - The nickname "Bobby" showed with "Calls themself 'Bob Marley'" and the status.
+  - "Hide my picture" was saved.
+  - "Use their name" switched the name to Bob Marley.
+  - A picture only the user sees showed in the profile and in the chat header.
+- No console errors.
+
 ## Look: review round 3 (PASS) and its follow-up fixes (2026-10-29)
 
 Round 3 of the review gate passed: no Critical or High findings. Its one Medium and three Low findings (LK3-1 to LK3-4) are fixed here as well.

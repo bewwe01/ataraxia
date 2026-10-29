@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { INVITE_PREFIX, ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
-import { Banner, Icon, QrCode, Segmented, TopBar } from "../ui";
+import { Avatar, Banner, Icon, QrCode, Segmented, ToggleRow, TopBar } from "../ui";
+import { PictureCropper } from "../components/Profile";
+import { preparePicture, type Crop } from "../pictures";
 import { Scanner } from "../components/Scanner";
 import { HuePicker, WallpaperPicker } from "../components/Look";
 import { useChatWallpaper } from "../wallpaper";
@@ -104,6 +106,9 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const wallpaper = useChatWallpaper(contact);
+  const [picked, setPicked] = useState<File | null>(null);
+  const pictureFile = useRef<HTMLInputElement>(null);
+  useEffect(() => setName(contact.name), [contact.name]);
   const [verifyMode, setVerifyMode] = useState<"show" | "scan">("show");
   const [verifyResult, setVerifyResult] = useState<null | "match" | "mismatch">(null);
   const deleteBtn = useRef<HTMLButtonElement>(null);
@@ -172,11 +177,18 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   async function rename(e: FormEvent) {
     e.preventDefault();
     try {
-      await ipc.rename(contact.id, name.trim());
+      await ipc.setNickname(contact.id, name.trim());
       onChanged();
     } catch (err) {
       setError(err instanceof IpcError ? err.message : "Could not rename");
     }
+  }
+
+  async function localPicture(c: Crop) {
+    const f = picked;
+    setPicked(null);
+    if (!f) return;
+    await act(async () => ipc.setContactPicture(contact.id, await preparePicture(f, c)), "Could not set the picture");
   }
 
   return (
@@ -184,6 +196,12 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
       <TopBar title={contact.name} onBack={() => nav({ screen: "chat", contact: contact.id })} />
       <div className="m-body">
         <div className="safety">
+          <div className="stack-sm contact-head">
+            <Avatar initials={contact.initials} hue={contact.hue} size="xxl" owner={contact.id} picture={contact.picture} />
+            <h2>{contact.name}</h2>
+            {contact.theirName ? <p className="hint">Calls themself “{contact.theirName}”</p> : null}
+            {contact.status ? <p className="their-status">{contact.status}</p> : null}
+          </div>
           <KeyWarning contact={contact} nav={nav} onChanged={onChanged} />
           {contact.verified ? (
             <Banner tone="neutral" icon="shield-check"><strong>Verified</strong><p>If this number ever changes, Veil treats them as a new, unverified contact and never sends to the old conversation silently.</p></Banner>
@@ -223,11 +241,32 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
           </div>
           <form className="stack" onSubmit={(e) => void rename(e)}>
             <div className="field">
-              <label htmlFor="cname">Name (only on this device)</label>
+              <label htmlFor="cname">Nickname (only on this device)</label>
               <div className="input"><input id="cname" maxLength={64} value={name} onChange={(e) => setName(e.target.value)} /></div>
             </div>
-            <button className="btn btn-secondary btn-block" type="submit">Save name</button>
+            <button className="btn btn-secondary btn-block" type="submit">Save nickname</button>
+            {contact.nickname && contact.theirName ? (
+              <button className="btn btn-ghost btn-block" type="button" disabled={busy} onClick={() => void act(() => ipc.setNickname(contact.id, null), "Could not change the name")}>
+                Use their name, “{contact.theirName}”
+              </button>
+            ) : null}
           </form>
+
+          <div className="field">
+            <span className="label">Picture only you see</span>
+            <div className="banner-actions">
+              <button className="btn btn-secondary" type="button" disabled={busy} onClick={() => pictureFile.current?.click()}><Icon name="image" />Choose picture</button>
+              {contact.picture?.startsWith("l") ? (
+                <button className="btn btn-danger-ghost" type="button" disabled={busy} onClick={() => void act(() => ipc.setContactPicture(contact.id, null), "Could not remove the picture")}>Remove</button>
+              ) : null}
+            </div>
+            <input ref={pictureFile} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) setPicked(f); }} />
+            {picked ? <PictureCropper file={picked} onDone={(c) => void localPicture(c)} onCancel={() => setPicked(null)} /> : null}
+            <p className="hint">Shown instead of theirs, on this device only. They are not told.</p>
+          </div>
+          <div className="group card">
+            <ToggleRow id="hide-picture" icon="eye-off" title={`Hide my picture from ${contact.name}`} sub="Whatever Settings says, they do not get your picture. If they had it, it is taken back from their screen." checked={contact.pictureHidden} disabled={busy} onChange={(v) => void act(() => ipc.setPictureHidden(contact.id, v), "Could not change this")} />
+          </div>
 
           <div className="field">
             <span className="label">Disappearing messages</span>

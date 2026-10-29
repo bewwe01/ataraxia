@@ -643,6 +643,57 @@ async fn set_chat_accent(c: State<'_, Client>, contact: i64, hue: Option<u16>) -
     c.set_chat_accent(contact, hue).await.map_err(err)
 }
 
+/// The user's own profile (ADR-0020).
+#[tauri::command]
+async fn profile(c: State<'_, Client>) -> Res<veil_client::service::ProfileView> {
+    c.profile().await.map_err(err)
+}
+
+/// Changes the user's name and status; contacts are told, end-to-end encrypted.
+#[tauri::command]
+async fn set_profile(c: State<'_, Client>, name: String, status: String) -> Res<()> {
+    c.set_profile(name, status).await.map_err(err)
+}
+
+/// Sets (base64 JPEG) or removes the user's picture.
+#[tauri::command]
+async fn set_my_picture(c: State<'_, Client>, picture: Option<String>) -> Res<()> {
+    c.set_my_picture(picture).await.map_err(err)
+}
+
+/// Who sees the user's picture.
+#[tauri::command]
+async fn set_picture_visibility(
+    c: State<'_, Client>,
+    visibility: veil_client::service::PictureVisibility,
+) -> Res<()> {
+    c.set_picture_visibility(visibility).await.map_err(err)
+}
+
+/// Hides the user's picture from one contact.
+#[tauri::command]
+async fn set_picture_hidden(c: State<'_, Client>, contact: i64, hidden: bool) -> Res<()> {
+    c.set_picture_hidden(contact, hidden).await.map_err(err)
+}
+
+/// A picture for a contact that only the user sees.
+#[tauri::command]
+async fn set_contact_picture(c: State<'_, Client>, contact: i64, picture: Option<String>) -> Res<()> {
+    c.set_contact_picture(contact, picture).await.map_err(err)
+}
+
+/// A name for a contact that only the user sees, or null for the one they chose.
+#[tauri::command]
+async fn set_nickname(c: State<'_, Client>, contact: i64, nickname: Option<String>) -> Res<()> {
+    c.set_nickname(contact, nickname).await.map_err(err)
+}
+
+/// A picture as a `data:` URL, for display only: the user's own (null) or a contact's.
+#[tauri::command]
+async fn picture(c: State<'_, Client>, contact: Option<i64>) -> Res<Option<String>> {
+    c.picture(contact).await.map_err(err)
+}
+
 /// A line in the chat saying how a call went (kept on this device only).
 #[tauri::command]
 async fn call_log(
@@ -789,6 +840,14 @@ pub fn run() {
             set_wallpaper,
             wallpaper_photo,
             set_chat_accent,
+            profile,
+            set_profile,
+            set_my_picture,
+            set_picture_visibility,
+            set_picture_hidden,
+            set_contact_picture,
+            set_nickname,
+            picture,
             call_audio,
             cancel_call_notice,
             me,

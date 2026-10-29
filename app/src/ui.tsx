@@ -1,6 +1,7 @@
 // UI primitives ported from design/proto/ui.js (DESIGN.md §6). All text is rendered as React
 // text nodes; nothing is ever inserted as HTML.
 import { useEffect, type ReactNode, type RefObject } from "react";
+import { usePicture } from "./pictures";
 
 export function Icon({ name, className = "" }: { name: string; className?: string }) {
   return (
@@ -27,10 +28,13 @@ export function Logo({ className = "" }: { className?: string }) {
   );
 }
 
-export function Avatar({ initials, hue, size = "" }: { initials: string; hue: number; size?: string }) {
+/** Initials on a colour, or the picture when there is one: `owner` null is the user's own,
+ *  `picture` the token from the view (ADR-0020). */
+export function Avatar({ initials, hue, size = "", owner, picture = null }: { initials: string; hue: number; size?: string; owner?: number | null; picture?: string | null }) {
+  const url = usePicture(owner ?? null, owner === undefined ? null : picture);
   return (
     <span className={`avatar ${size} hue-${hue}`} aria-hidden="true">
-      <span className="face">{initials}</span>
+      <span className="face">{url ? <img src={url} alt="" draggable={false} /> : initials}</span>
     </span>
   );
 }

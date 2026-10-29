@@ -59,7 +59,7 @@ impl core::fmt::Debug for WallpaperInput {
 }
 
 /// The image type, by its first bytes; anything else is refused.
-fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+pub(super) fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     match bytes {
         [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
         [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),

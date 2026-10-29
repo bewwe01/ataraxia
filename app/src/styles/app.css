@@ -264,3 +264,14 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 .wp-name { font-size: var(--text-xs); color: var(--text-2); }
 
 .look-preview { position: relative; isolation: isolate; overflow: hidden; border-radius: var(--radius-lg); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-2); background: var(--bg-1); box-shadow: inset 0 0 0 1px var(--border-subtle); pointer-events: none; }
+
+/* Profile pictures (M4.5, ADR-0020): the picture fills the avatar's circle. */
+.avatar .face img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
+.profile-head { display: flex; align-items: center; gap: var(--space-4); }
+.cropper { align-items: center; }
+.crop-view { position: relative; width: 240px; height: 240px; margin: 0 auto; overflow: hidden; border-radius: 50%; background: var(--surface-2); touch-action: none; cursor: grab; box-shadow: inset 0 0 0 1px var(--border-subtle); }
+.crop-view:focus-visible { outline: 2px solid var(--focus); outline-offset: 4px; }
+.crop-view img { position: absolute; top: 0; left: 0; transform-origin: 0 0; max-width: none; pointer-events: none; -webkit-user-select: none; user-select: none; }
+.cropper .range { width: 100%; }
+.their-status { font-size: var(--text-sm); color: var(--text-2); text-align: center; overflow-wrap: anywhere; }
+.contact-head { display: flex; flex-direction: column; align-items: center; text-align: center; }

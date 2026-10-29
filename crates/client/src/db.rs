@@ -125,6 +125,27 @@ const MIGRATIONS: &[&str] = &[
      -- A chat's photo goes with the chat, however it is deleted.
      CREATE TRIGGER contact_wallpaper_gone AFTER DELETE ON contacts
        BEGIN DELETE FROM wallpaper_photos WHERE owner = OLD.id; END;",
+    // 6: profiles (milestone 4.5, ADR-0020). `nickname` marks a name the user chose, which a
+    // contact's own name never replaces; names we made up ("Contact 1a2b") are not nicknames.
+    // `profile_sent` is a hash of what this contact last got from us. Pictures: owner 0 is
+    // ours; otherwise `local` 0 is the contact's own, 1 the one only we see.
+    "ALTER TABLE contacts ADD COLUMN nickname INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE contacts ADD COLUMN profile_name TEXT;
+     ALTER TABLE contacts ADD COLUMN profile_status TEXT;
+     ALTER TABLE contacts ADD COLUMN profile_rev INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE contacts ADD COLUMN picture_hidden INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE contacts ADD COLUMN profile_sent BLOB;
+     UPDATE contacts SET nickname = 1 WHERE name NOT LIKE 'Contact %' AND name != 'New contact';
+     CREATE TABLE pictures (
+       owner INTEGER NOT NULL,
+       local INTEGER NOT NULL,
+       mime TEXT NOT NULL,
+       data BLOB NOT NULL,
+       rev INTEGER NOT NULL,
+       PRIMARY KEY (owner, local)
+     );
+     CREATE TRIGGER contact_pictures_gone AFTER DELETE ON contacts
+       BEGIN DELETE FROM pictures WHERE owner = OLD.id; END;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

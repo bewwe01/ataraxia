@@ -386,6 +386,32 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 
 **Consequences.** One more table and two columns, and four IPC commands (`wallpaper`, `set_wallpaper`, `wallpaper_photo`, `set_chat_accent`). Erasing Veil removes wallpapers with the database. A wallpaper photo is decrypted into webview memory while a chat shows it, as attachments already are.
 
+### ADR-0020: Profiles: name, status, picture, and who sees the picture (milestone 4.5). **Accepted (owner request, 2026-10-29).**
+**Context.** The owner asked for a profile picture, with a setting for who can see it, a name and a one-line status shown to contacts, and nicknames and pictures for contacts that only the user sees. Until now a contact's name was whatever the invite carried, or a made-up "Contact 1a2b" on the accepting side. A picture is the user's own content: it must not reach the relay in the clear (rule 3), nor be stored in the clear (rule 6). Names also matter for safety: the key-change warning compares names (INV-ID-2), so a contact must not be able to take another contact's name.
+
+**Decision.**
+- *A new content type, no new cryptography:* `Content::Profile { rev, name, status, picture? }` (PROTOCOL §7) goes over the existing session, sealed like every message.
+  - The picture is inline: a JPEG the app redraws to at most 512 px and 48 KiB (`MAX_PICTURE_LEN`), so it fits one message even in the `PreKey` phase. This needs no blob upload and no new key handling.
+  - It is queued through the retried control-message path; a newer profile replaces one still waiting to go out.
+- *Each contact gets their own copy:* the client keeps a hash of what each contact last got (`contacts.profile_sent`).
+  - It sends again when that hash changes: a new name or status, a new picture, a change of who sees it, the contact being verified or hidden, or a key-change warning being resolved.
+  - This is checked after each change and on every retry tick (each minute).
+  - The picture goes only to contacts allowed by the setting: all contacts, verified contacts, or nobody (the default). It never goes to a contact hidden in their profile, nor to a contact with an unresolved key-change warning (possibly an impostor).
+  - A contact who loses access gets a profile without a picture, and their app deletes the one it had.
+- *Ordering:* every send carries a new revision, later than the last and than the clock. A receiver ignores any revision not above the last one it stored (a replay, or a message overtaken in transit).
+- *Names:*
+  - A received name is cleaned like any display name.
+  - It replaces the shown name only when the user has not set a nickname, and only when no other contact already has that name under `name_key` (case, spacing and invisible characters folded).
+  - Otherwise the contact's own name is shown beside the user's one as "Calls themself …".
+  - Migration 6 treats existing names as nicknames, except the made-up ones, so nothing the user named is renamed.
+- *Local pictures and nicknames* stay on the device. They show instead of the contact's own and are never sent.
+- *Storage:* pictures live in the SQLCipher `pictures` table (owner 0 is the user), with a trigger that deletes them along with their contact. The webview gets `data:` URLs for display, cached by a token that changes with the picture, and dropped on lock.
+
+**Consequences.**
+- Contacts on older versions drop the new message: its `oneof` tag is unknown, which canonical decoding refuses. The contact sees no profile and nothing breaks.
+- Taking a picture back cannot erase a copy someone kept. The setting's help text says so.
+- A profile costs one message per contact per change. With a picture, that is about 48 KiB per contact, padded into the 64 KiB bucket.
+
 ## 7. Distribution (recorded owner request)
 
 The final step, after all phases pass the code-reviewer gate, is a GitHub Actions workflow that builds the Android **APK** and publishes it to this repository's **GitHub Releases**. Details:

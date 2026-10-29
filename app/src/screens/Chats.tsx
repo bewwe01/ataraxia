@@ -146,7 +146,7 @@ export function ChatList({ contacts, me, nav, typing }: { contacts: ContactView[
                     c.unread ? `${c.unread} unread` : "",
                   ].filter(Boolean).join(", ")}
                 >
-                  <Avatar initials={c.initials} hue={c.hue} />
+                  <Avatar initials={c.initials} hue={c.hue} owner={c.id} picture={c.picture} />
                   <div className="conv-main">
                     <div className="conv-top">
                       <span className="conv-name">{c.name}</span>
@@ -746,7 +746,7 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
       <header className="chat-hdr glass">
         <button className="icon-btn" type="button" aria-label="Back to chats" onClick={() => nav({ screen: "chats" })}><Icon name="back" /></button>
         <button className="who" type="button" onClick={() => nav({ screen: "contact", contact: contact.id })} aria-label={`${contact.name}, view profile`}>
-          <Avatar initials={contact.initials} hue={contact.hue} />
+          <Avatar initials={contact.initials} hue={contact.hue} owner={contact.id} picture={contact.picture} />
           <span className="who-text">
             <span className="who-name">{contact.name}<VerifiedMark verified={contact.verified} /><TimerChip secs={contact.timerSecs} /></span>
             <span className="who-sub">

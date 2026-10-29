@@ -31,6 +31,16 @@ export interface ContactView {
   accentHue: number | null;
   /** This chat's own wallpaper, or null for the default. */
   wallpaper: WallpaperView | null;
+  /** The name they chose, when another one is shown (a nickname, or a name already taken). */
+  theirName: string | null;
+  /** Their one-line status. */
+  status: string | null;
+  /** `name` is a nickname the user chose. */
+  nickname: boolean;
+  /** Changes when their picture does (fetch it with `picture`); null without one. */
+  picture: string | null;
+  /** The user's picture is hidden from this contact. */
+  pictureHidden: boolean;
   /** Arrived with the same name as an existing contact, under a different key. */
   keyWarning: boolean;
   /** Unblocked, but they have not received their new address yet. */
@@ -84,6 +94,17 @@ export interface WallpaperInput {
   keepPhoto: boolean;
   dim: number;
   blur: number;
+}
+
+/** Who sees the user's picture (ADR-0020). */
+export type PictureVisibility = "all" | "verified" | "nobody";
+
+export interface ProfileView {
+  name: string;
+  status: string;
+  /** Changes when the picture does; null without one. */
+  picture: string | null;
+  visibility: PictureVisibility;
 }
 
 export type CallOutcome = "ended" | "missed" | "declined" | "unanswered" | "busy" | "cancelled" | "failed";
@@ -268,6 +289,16 @@ export const ipc = {
   /** A `data:` URL of the wallpaper photo, for display. */
   wallpaperPhoto: (contact: number | null) => call<string | null>("wallpaper_photo", { contact }),
   setChatAccent: (contact: number, hue: number | null) => call<void>("set_chat_accent", { contact, hue }),
+  profile: () => call<ProfileView>("profile"),
+  setProfile: (name: string, status: string) => call<void>("set_profile", { name, status }),
+  /** Base64 of a small JPEG (see `preparePicture`), or null to remove it. */
+  setMyPicture: (picture: string | null) => call<void>("set_my_picture", { picture }),
+  setPictureVisibility: (visibility: PictureVisibility) => call<void>("set_picture_visibility", { visibility }),
+  setPictureHidden: (contact: number, hidden: boolean) => call<void>("set_picture_hidden", { contact, hidden }),
+  setContactPicture: (contact: number, picture: string | null) => call<void>("set_contact_picture", { contact, picture }),
+  setNickname: (contact: number, nickname: string | null) => call<void>("set_nickname", { contact, nickname }),
+  /** A picture as a `data:` URL: the user's own (null) or a contact's. */
+  picture: (contact: number | null) => call<string | null>("picture", { contact }),
   callLog: (contact: number, outgoing: boolean, video: boolean, outcome: CallOutcome, secs: number) =>
     call<void>("call_log", { contact, outgoing, video, outcome, secs }),
   callAudio: (active: boolean, speaker: boolean) => call<void>("call_audio", { active, speaker }),

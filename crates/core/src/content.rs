@@ -31,6 +31,10 @@ const MAX_REKEY_LINK: usize = 512;
 const MAX_REKEY_SEALED: usize = 8 * 1024;
 const MAX_RELAY_URL: usize = 200;
 const MAX_TIMER_SECS: u32 = 4 * 7 * 24 * 3600;
+const MAX_STATUS_CHARS: usize = 140;
+/// A profile picture travels inside the message, so it must fit in one even while the session
+/// is in its `PreKey` phase (see [`MAX_BODY_LEN`]); the app sends a small JPEG well under this.
+pub const MAX_PICTURE_LEN: usize = 48 * 1024;
 
 /// Top-level message.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -42,7 +46,7 @@ pub struct Content {
     /// Sender's clock, milliseconds. Display only; never trusted for security.
     #[prost(uint64, tag = "2")]
     pub sent_at_ms: u64,
-    #[prost(oneof = "Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21")]
+    #[prost(oneof = "Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22")]
     pub body: Option<Body>,
 }
 
@@ -74,6 +78,8 @@ pub enum Body {
     MailboxUpdate(MailboxUpdate),
     #[prost(message, tag = "21")]
     SessionReset(SessionReset),
+    #[prost(message, tag = "22")]
+    Profile(Profile),
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -172,6 +178,22 @@ pub struct Typing {
 pub struct TimerUpdate {
     #[prost(uint32, tag = "1")]
     pub seconds: u32,
+}
+
+/// The sender's own name, status and (when the sender shows it to this contact) picture
+/// (ADR-0020). Each one replaces the last; `rev` orders them, since envelopes can arrive out
+/// of order. No picture means none, or not shown to this contact.
+#[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
+pub struct Profile {
+    #[prost(uint64, tag = "1")]
+    pub rev: u64,
+    #[prost(string, tag = "2")]
+    pub name: String,
+    #[prost(string, tag = "3")]
+    pub status: String,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    pub picture: Option<Vec<u8>>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -341,6 +363,13 @@ impl Content {
                     r.link.len() <= MAX_REKEY_LINK && r.sealed_package.len() <= MAX_REKEY_SEALED
                 })
             }
+            Body::Profile(p) => {
+                ensure(p.name.chars().count() <= MAX_NAME_CHARS && !has_control(&p.name))?;
+                ensure(p.status.chars().count() <= MAX_STATUS_CHARS && !has_control(&p.status))?;
+                opt(p.picture.as_ref(), |b| {
+                    !b.is_empty() && b.len() <= MAX_PICTURE_LEN
+                })
+            }
             Body::MailboxUpdate(m) => {
                 ensure(m.new_mailbox_id.len() == 32 && m.new_delivery_token.len() == 32)?;
                 opt(m.relay_url.as_ref(), |u| {
@@ -439,6 +468,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn profiles_are_checked() {
+        let profile = |name: &str, status: &str, picture: Option<usize>| Content {
+            id: vec![1; 16],
+            sent_at_ms: 0,
+            body: Some(Body::Profile(Profile {
+                rev: 1,
+                name: name.into(),
+                status: status.into(),
+                picture: picture.map(|n| vec![0xFF; n]),
+            })),
+        };
+        let ok = profile("Alice", "On holiday 🌴", Some(MAX_PICTURE_LEN));
+        assert_eq!(ok.validate(), Ok(()));
+        assert_eq!(Content::decode_strict(&ok.encode()).ok(), Some(ok));
+        assert_eq!(profile("Alice", "", None).validate(), Ok(()));
+        // No name: the receiver keeps the one it has.
+        assert_eq!(profile("", "", None).validate(), Ok(()));
+        for bad in [
+            profile(&"a".repeat(65), "", None),
+            profile("Al\u{202E}ice", "", None),
+            profile("Alice", &"s".repeat(141), None),
+            profile("Alice", "line\nbreak", None),
+            profile("Alice", "", Some(0)),
+            profile("Alice", "", Some(MAX_PICTURE_LEN + 1)),
+        ] {
+            assert_eq!(bad.validate(), Err(CoreError::Malformed));
+        }
+    }
+
+    #[test]
     fn size_limit_checked_before_parsing() {
         assert_eq!(
             Content::decode_strict(&vec![0u8; MAX_CONTENT_LEN + 1]),
@@ -510,5 +569,6 @@ crate::redacted_debug!(
     ContactIntro,
     RekeyInvite,
     MailboxUpdate,
-    SessionReset
+    SessionReset,
+    Profile
 );

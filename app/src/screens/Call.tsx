@@ -232,7 +232,7 @@ function CallBubble({ call, name, contact, status, picture, onExpand }: {
         {picture ? (
           <StreamVideo stream={picture} className="call-bubble-video" label={`${name}'s video`} />
         ) : contact ? (
-          <Avatar initials={contact.initials} hue={contact.hue} size="lg" />
+          <Avatar initials={contact.initials} hue={contact.hue} size="lg" owner={contact.id} picture={contact.picture} />
         ) : null}
         <span className="call-bubble-time" aria-hidden="true">
           {call.muted || call.deafened ? <Icon name={call.deafened ? "headphones-off" : "mic-off"} /> : null}
@@ -342,7 +342,7 @@ export function CallScreen({ call, contact }: { call: CallState; contact: Contac
     <div className="stack center call-id">
       <span className="levels">
         {call.phase === "ended" || call.phase === "active" ? null : (<><i></i><i></i><i></i></>)}
-        {contact ? <Avatar initials={contact.initials} hue={contact.hue} size="xxl" /> : null}
+        {contact ? <Avatar initials={contact.initials} hue={contact.hue} size="xxl" owner={contact.id} picture={contact.picture} /> : null}
       </span>
       <span className="call-name">{name}</span>
       <span className="call-time" role="timer" aria-live="off">{status}</span>
