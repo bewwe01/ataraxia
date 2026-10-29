@@ -39,6 +39,8 @@ export interface ContactView {
   nickname: boolean;
   /** Changes when their picture does (fetch it with `picture`); null without one. */
   picture: string | null;
+  /** The picture shown is one the user gave them (only the user sees it). */
+  localPicture: boolean;
   /** The user's picture is hidden from this contact. */
   pictureHidden: boolean;
   /** Arrived with the same name as an existing contact, under a different key. */
@@ -55,7 +57,8 @@ export interface MessageView {
   id: number;
   mine: boolean;
   /** "timer" is a notice that the disappearing-message timer changed; "call" a call line. */
-  kind: "text" | "timer" | "attachment" | "call";
+  /** "renamed": the contact changed their name ("old\nnew" in `text`, a local line). */
+  kind: "text" | "timer" | "attachment" | "call" | "renamed";
   text: string;
   atMs: number;
   status: MessageStatus;

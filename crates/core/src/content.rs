@@ -194,6 +194,10 @@ pub struct Profile {
     pub status: String,
     #[prost(bytes = "vec", optional, tag = "4")]
     pub picture: Option<Vec<u8>>,
+    /// Zeros that make every profile the same size, with or without a picture, so the
+    /// envelope's size does not tell the relay who may see it. Ignored on receipt.
+    #[prost(bytes = "vec", tag = "5")]
+    pub pad: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -366,9 +370,13 @@ impl Content {
             Body::Profile(p) => {
                 ensure(p.name.chars().count() <= MAX_NAME_CHARS && !has_control(&p.name))?;
                 ensure(p.status.chars().count() <= MAX_STATUS_CHARS && !has_control(&p.status))?;
-                opt(p.picture.as_ref(), |b| {
-                    !b.is_empty() && b.len() <= MAX_PICTURE_LEN
-                })
+                opt(p.picture.as_ref(), |b| !b.is_empty())?;
+                let picture = p.picture.as_ref().map_or(0, Vec::len);
+                ensure(
+                    picture
+                        .checked_add(p.pad.len())
+                        .is_some_and(|n| n <= MAX_PICTURE_LEN),
+                )
             }
             Body::MailboxUpdate(m) => {
                 ensure(m.new_mailbox_id.len() == 32 && m.new_delivery_token.len() == 32)?;
@@ -477,6 +485,7 @@ pub(crate) mod tests {
                 name: name.into(),
                 status: status.into(),
                 picture: picture.map(|n| vec![0xFF; n]),
+                pad: Vec::new(),
             })),
         };
         let ok = profile("Alice", "On holiday 🌴", Some(MAX_PICTURE_LEN));
@@ -485,6 +494,16 @@ pub(crate) mod tests {
         assert_eq!(profile("Alice", "", None).validate(), Ok(()));
         // No name: the receiver keeps the one it has.
         assert_eq!(profile("", "", None).validate(), Ok(()));
+        // Padding fills up to the picture limit, never past it.
+        let mut padded = profile("Alice", "", Some(100));
+        if let Some(Body::Profile(p)) = padded.body.as_mut() {
+            p.pad = vec![0; MAX_PICTURE_LEN - 100];
+        }
+        assert_eq!(padded.validate(), Ok(()));
+        if let Some(Body::Profile(p)) = padded.body.as_mut() {
+            p.pad.push(0);
+        }
+        assert_eq!(padded.validate(), Err(CoreError::Malformed));
         for bad in [
             profile(&"a".repeat(65), "", None),
             profile("Al\u{202E}ice", "", None),

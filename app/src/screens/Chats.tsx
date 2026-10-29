@@ -188,6 +188,17 @@ const STATUS: Record<MessageView["status"], [string, string] | null> = {
   received: null,
 };
 
+/** A contact's shown name changed because they changed theirs (local line, ADR-0020). */
+function RenameNotice({ m }: { m: MessageView }) {
+  const [from = "", to = ""] = m.text.split("\n");
+  return (
+    <div className="sys-msg">
+      <Icon name="edit" />
+      {`“${from}” changed their name to “${to}”`}
+    </div>
+  );
+}
+
 function TimerNotice({ m, name }: { m: MessageView; name: string }) {
   const secs = m.timerSecs ?? 0;
   const who = m.mine ? "You" : name;
@@ -781,6 +792,8 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
             <TimerNotice key={m.id} m={m} name={contact.name} />
           ) : m.kind === "call" ? (
             <CallNotice key={m.id} m={m} contact={contact} />
+          ) : m.kind === "renamed" ? (
+            <RenameNotice key={m.id} m={m} />
           ) : (
             <MessageRow
               key={m.id}

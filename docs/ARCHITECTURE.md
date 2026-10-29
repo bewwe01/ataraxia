@@ -392,16 +392,24 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 **Decision.**
 - *A new content type, no new cryptography:* `Content::Profile { rev, name, status, picture? }` (PROTOCOL §7) goes over the existing session, sealed like every message.
   - The picture is inline: a JPEG the app redraws to at most 512 px and 48 KiB (`MAX_PICTURE_LEN`), so it fits one message even in the `PreKey` phase. This needs no blob upload and no new key handling.
+  - Rust accepts only a JPEG of at most 1024 px a side, from the user and from contacts, read from its start-of-frame header. A few kilobytes that declare a huge image could otherwise make the webview decode gigabytes on every unlock (review PR-1). JPEG-only also means the metadata-stripping redraw cannot be skipped.
+  - Every profile is padded with zeros to the same size, so the envelope bucket does not tell the relay who may see the picture (review PR-5).
   - It is queued through the retried control-message path; a newer profile replaces one still waiting to go out.
 - *Each contact gets their own copy:* the client keeps a hash of what each contact last got (`contacts.profile_sent`).
   - It sends again when that hash changes: a new name or status, a new picture, a change of who sees it, the contact being verified or hidden, or a key-change warning being resolved.
-  - This is checked after each change and on every retry tick (each minute).
-  - The picture goes only to contacts allowed by the setting: all contacts, verified contacts, or nobody (the default). It never goes to a contact hidden in their profile, nor to a contact with an unresolved key-change warning (possibly an impostor).
+  - This is checked after each change and on every retry tick (each minute). A round for all contacts sends to at most 4, chosen at random, so a change does not deposit into every contact's mailbox in one burst (review PR-5).
+  - A contact is due again when the profile sent to them was given up on after `MAX_ATTEMPTS`, and when they are blocked (a queued profile is dropped) and then unblocked, so taking the picture back is never lost (reviews PR-3, PR-4).
+  - The picture goes only to contacts allowed by the setting: all contacts, verified contacts, or nobody (the default). It never goes to a contact hidden in their profile. A contact with an unresolved key-change warning (possibly an impostor) gets no profile at all.
+  - Accepting a key change carries the user's choices about that person (picture hidden, nickname, local picture) to the new key (review PR-2).
   - A contact who loses access gets a profile without a picture, and their app deletes the one it had.
 - *Ordering:* every send carries a new revision, later than the last and than the clock. A receiver ignores any revision not above the last one it stored (a replay, or a message overtaken in transit).
 - *Names:*
   - A received name is cleaned like any display name.
-  - It replaces the shown name only when the user has not set a nickname, and only when no other contact already has that name under `name_key` (case, spacing and invisible characters folded).
+  - It replaces the shown name only when the user has not set a nickname, and only when no other contact has that name, shown or self-chosen, under `name_key`.
+    - `name_key` folds case, spacing, fullwidth forms, Cyrillic and Greek letters that look Latin, common accents, 0/o and 1/l/i (review PR-6).
+    - It is not a full UTS #39 confusables skeleton; the safety number stays the real check.
+  - A name that is adopted is written into the chat as a local line ("“Mallory” changed their name to “Mal”"), so a rename is never silent.
+  - The name a contact introduced themselves with is kept as their own name. The key-change warning compares it as well as the shown name, so a nickname cannot hide a contact from that check.
   - Otherwise the contact's own name is shown beside the user's one as "Calls themself …".
   - Migration 6 treats existing names as nicknames, except the made-up ones, so nothing the user named is renamed.
 - *Local pictures and nicknames* stay on the device. They show instead of the contact's own and are never sent.
@@ -410,7 +418,8 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 **Consequences.**
 - Contacts on older versions drop the new message: its `oneof` tag is unknown, which canonical decoding refuses. The contact sees no profile and nothing breaks.
 - Taking a picture back cannot erase a copy someone kept. The setting's help text says so.
-- A profile costs one message per contact per change. With a picture, that is about 48 KiB per contact, padded into the 64 KiB bucket.
+- A profile costs one message per contact per change, padded to the 64 KiB bucket, with or without a picture. A change reaches N contacts over about N/4 minutes.
+- A revision must never go backwards: a receiver ignores revisions it has passed. A future backup must include `profile.rev`, and a restore must clear `profile_sent` (review PR-12).
 
 ## 7. Distribution (recorded owner request)
 

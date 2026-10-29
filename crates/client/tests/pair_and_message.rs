@@ -103,10 +103,12 @@ async fn two_clients_pair_and_talk() {
     assert_eq!(alice.state().await.unwrap(), AppState::New);
 
     alice
-        .setup(input(&r, "Alice", "correct horse battery"))
+        .setup(input(&r, "Alice Liddell", "correct horse battery"))
         .await
         .unwrap();
-    bob.setup(input(&r, "Bob", "tr0ub4dor and three")).await.unwrap();
+    bob.setup(input(&r, "Bob Marley the Second", "tr0ub4dor and three"))
+        .await
+        .unwrap();
     assert_eq!(
         alice
             .setup(input(&r, "A", "correct horse battery"))
@@ -122,7 +124,7 @@ async fn two_clients_pair_and_talk() {
     assert!(bob.accept_invite(inv.link.clone()).await.is_err());
 
     let a_contact = eventually(|| async { alice.contacts().await.unwrap().into_iter().next() }).await;
-    assert_eq!(a_contact.name, "Bob");
+    assert_eq!(a_contact.name, "Bob Marley the Second");
     assert!(!a_contact.verified);
 
     let sa = alice.safety(a_contact.id).await.unwrap();
@@ -211,7 +213,14 @@ async fn two_clients_pair_and_talk() {
     alice.lock().await.unwrap();
     bob.lock().await.unwrap();
     for d in [da.path(), db.path()] {
-        for needle in [secret.as_bytes(), b"copy that", b"Alice", b"Bob"] {
+        // Long names: a three-byte needle like "Bob" turns up by chance in ~150 KB of
+        // ciphertext a few times in a hundred runs.
+        for needle in [
+            secret.as_bytes(),
+            b"copy that",
+            b"Alice Liddell",
+            b"Bob Marley the Second",
+        ] {
             assert!(!file_contains(d, needle), "plaintext found at rest");
         }
     }

@@ -154,6 +154,8 @@ pub struct ContactView {
     pub nickname: bool,
     /// Changes whenever their picture does; `None` without one (fetch it with `picture`).
     pub picture: Option<String>,
+    /// The picture shown is one the user gave them (only the user sees it).
+    pub local_picture: bool,
     /// The user's picture is hidden from this contact.
     pub picture_hidden: bool,
     /// This contact arrived with the same name as an existing one: possibly someone who
@@ -389,6 +391,8 @@ enum Cmd {
     #[cfg(feature = "test-hooks")]
     HiddenRows(i64, Reply<i64>),
     #[cfg(feature = "test-hooks")]
+    GiveUpProfiles(i64, Reply<i64>),
+    #[cfg(feature = "test-hooks")]
     RawUpload(Vec<u8>, Reply<Vec<u8>>),
     #[cfg(feature = "test-hooks")]
     AttachmentBlob(i64, Reply<Vec<u8>>),
@@ -415,10 +419,10 @@ enum Cmd {
     SetChatAccent(i64, Option<u16>, Reply<()>),
     Profile(Reply<ProfileView>),
     SetProfile(String, String, Reply<()>),
-    SetMyPicture(Option<String>, Reply<()>),
+    SetMyPicture(Option<Zeroizing<String>>, Reply<()>),
     SetPictureVisibility(PictureVisibility, Reply<()>),
     SetPictureHidden(i64, bool, Reply<()>),
-    SetContactPicture(i64, Option<String>, Reply<()>),
+    SetContactPicture(i64, Option<Zeroizing<String>>, Reply<()>),
     SetNickname(i64, Option<String>, Reply<()>),
     Picture(Option<i64>, Reply<Option<String>>),
     PurgeAll(Zeroizing<String>, Reply<bool>),
@@ -721,6 +725,12 @@ impl Client {
     pub async fn hidden_rows(&self, contact: i64) -> Result<i64> {
         ask!(self, HiddenRows, contact)
     }
+    /// Tests only: marks profiles waiting to go out to a contact as given up (as after
+    /// `MAX_ATTEMPTS` failed deposits). Returns how many there were.
+    #[cfg(feature = "test-hooks")]
+    pub async fn give_up_profiles(&self, contact: i64) -> Result<i64> {
+        ask!(self, GiveUpProfiles, contact)
+    }
     /// Tests only: uploads any bytes as a blob (full-size chunks but the last) and returns its
     /// id, for crafting `Attachment` messages a hostile contact could send.
     /// Tests only: the blob id an attachment is (being) uploaded under.
@@ -827,7 +837,7 @@ impl Client {
         ask!(self, SetProfile, name, status)
     }
     /// Sets (base64 JPEG, PNG or WebP) or removes the user's picture.
-    pub async fn set_my_picture(&self, picture: Option<String>) -> Result<()> {
+    pub async fn set_my_picture(&self, picture: Option<Zeroizing<String>>) -> Result<()> {
         ask!(self, SetMyPicture, picture)
     }
     /// Who sees the user's picture.
@@ -839,7 +849,7 @@ impl Client {
         ask!(self, SetPictureHidden, contact, hidden)
     }
     /// A picture for a contact that only the user sees.
-    pub async fn set_contact_picture(&self, contact: i64, picture: Option<String>) -> Result<()> {
+    pub async fn set_contact_picture(&self, contact: i64, picture: Option<Zeroizing<String>>) -> Result<()> {
         ask!(self, SetContactPicture, contact, picture)
     }
     /// A name for a contact that only the user sees, or `None` for the name they chose.
@@ -1046,6 +1056,48 @@ fn name_key(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+        .chars()
+        .map(fold_lookalike)
+        .collect()
+}
+
+/// Folds a lowercase letter into the Latin letter it looks like, so "Вob", "Ｂob", "Böb" and
+/// "B0b" compare equal to "bob" (review PR-6). Not a full Unicode confusables skeleton (UTS #39):
+/// it covers fullwidth forms, the Cyrillic and Greek letters that look Latin, common accents,
+/// and 0/o, 1/l/i. The safety number stays the real check (INV-ID-2).
+fn fold_lookalike(c: char) -> char {
+    // Fullwidth ASCII (U+FF01–FF5E) to ASCII, then lowercased.
+    let c = match u32::from(c) {
+        n @ 0xFF01..=0xFF5E => n
+            .checked_sub(0xFEE0)
+            .and_then(char::from_u32)
+            .map_or(c, |a| a.to_ascii_lowercase()),
+        _ => c,
+    };
+    match c {
+        'а' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'α' => 'a',
+        'в' | 'β' => 'b',
+        'с' | 'ç' | 'ć' | 'č' | 'ϲ' => 'c',
+        'ԁ' | 'ď' => 'd',
+        'е' | 'ё' | 'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ε' | '3' => 'e',
+        'һ' | 'н' => 'h',
+        'і' | 'ї' | 'ì' | 'í' | 'î' | 'ï' | 'ι' | '1' | 'l' | '|' | 'ӏ' => 'i',
+        'ј' => 'j',
+        'к' | 'κ' => 'k',
+        'м' | 'μ' => 'm',
+        'п' | 'η' | 'ñ' | 'ń' => 'n',
+        'о' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ο' | 'σ' | '0' => 'o',
+        'р' | 'ρ' => 'p',
+        'ѕ' | 'š' | 'ś' | '5' | '$' => 's',
+        'т' | 'τ' => 't',
+        'ù' | 'ú' | 'û' | 'ü' | 'υ' => 'u',
+        'ν' | 'ѵ' => 'v',
+        'ш' | 'ω' => 'w',
+        'х' | 'χ' => 'x',
+        'у' | 'ý' | 'ÿ' | 'γ' => 'y',
+        'ž' | 'ź' | 'ż' => 'z',
+        other => other,
+    }
 }
 
 /// The columns [`message_row`] reads, from `messages m` (with the quoted message as `q`).
@@ -1089,7 +1141,8 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
     Ok(MessageView {
         id: r.get(0)?,
         mine: r.get(1)?,
-        text: if kind == "text" && !deleted {
+        // A "renamed" line carries "<old name>\n<new name>" (local, never sent).
+        text: if (kind == "text" || kind == "renamed") && !deleted {
             body
         } else {
             String::new()
@@ -1561,6 +1614,18 @@ impl Actor {
                 });
                 let _ = r.send(res);
             }
+            #[cfg(feature = "test-hooks")]
+            Cmd::GiveUpProfiles(c, r) => {
+                let res = self.s().and_then(|s| {
+                    let n = s.db.conn().execute(
+                        "UPDATE messages SET status = 'failed', attempts = ?2
+                         WHERE contact = ?1 AND kind = 'control' AND body = 'profile'",
+                        params![c, MAX_ATTEMPTS],
+                    )?;
+                    Ok(i64::try_from(n).unwrap_or(i64::MAX))
+                });
+                let _ = r.send(res);
+            }
             Cmd::MarkRead(c, r) => {
                 let res = self.mark_read(c).await;
                 let _ = r.send(res);
@@ -1638,7 +1703,7 @@ impl Actor {
                 let _ = r.send(res);
             }
             Cmd::SetContactPicture(c, p, r) => {
-                let _ = r.send(self.set_contact_picture(c, p.as_deref()));
+                let _ = r.send(self.set_contact_picture(c, p));
             }
             Cmd::SetNickname(c, n, r) => {
                 let _ = r.send(self.set_nickname(c, n.as_deref()));
@@ -2094,6 +2159,8 @@ impl Actor {
         })
     }
 
+    // One query per part of the view; splitting it would only scatter them.
+    #[allow(clippy::too_many_lines)]
     fn contact_view(db: &Db, id: i64) -> Result<ContactView> {
         let conn = db.conn();
         let (name, verified, unread, blocked, timer_secs, key_warning, accent_hue, wallpaper): (
@@ -2175,6 +2242,7 @@ impl Actor {
             status: profile.status,
             nickname: profile.nickname,
             picture: profile.picture,
+            local_picture: profile.local_picture,
             picture_hidden: profile.picture_hidden,
             initials: initials(&name),
             hue: id.rem_euclid(8),
@@ -2217,7 +2285,7 @@ impl Actor {
             "SELECT {MESSAGE_COLUMNS} FROM messages m
              LEFT JOIN messages q ON q.id = (SELECT x.id FROM messages x WHERE x.contact = m.contact
                  AND x.msg_id = m.reply_to AND x.kind IN ('text', 'attachment') ORDER BY x.id LIMIT 1)
-             WHERE m.contact = ?1 AND m.kind IN ('text', 'timer', 'attachment', 'call') ORDER BY m.id DESC LIMIT 500"
+             WHERE m.contact = ?1 AND m.kind IN ('text', 'timer', 'attachment', 'call', 'renamed') ORDER BY m.id DESC LIMIT 500"
         ))?;
         // Expired rows are deleted by the tick (at most 5 s late); the UI hides them on time.
         let mut out = stmt
@@ -2961,7 +3029,7 @@ impl Actor {
         let contact: i64 =
             s.db.conn()
                 .query_row(
-                    "SELECT contact FROM messages WHERE id = ?1 AND kind IN ('text', 'timer', 'attachment', 'call')",
+                    "SELECT contact FROM messages WHERE id = ?1 AND kind IN ('text', 'timer', 'attachment', 'call', 'renamed')",
                     [message],
                     |r| r.get(0),
                 )
@@ -3253,21 +3321,37 @@ impl Actor {
                 // The contact this one may replace: the oldest with the same name. Accepting
                 // the warning merges exactly that one (P6-1).
                 let clash: Option<i64> = if intro.display_name.is_some() {
-                    let mut stmt =
-                        s.db.conn()
-                            .prepare("SELECT id, name FROM contacts WHERE address != ?1 ORDER BY id")?;
+                    // Their shown name or the one they chose: a nickname must not hide a
+                    // contact from this check (review PR-2 round, INV-ID-2).
+                    let mut stmt = s.db.conn().prepare(
+                        "SELECT id, name, profile_name FROM contacts WHERE address != ?1 ORDER BY id",
+                    )?;
                     let rows = stmt
                         .query_map([from.as_str()], |r| {
-                            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                            ))
                         })?
                         .collect::<core::result::Result<Vec<_>, _>>()?;
                     rows.into_iter()
-                        .find(|(_, n)| name_key(n) == key)
-                        .map(|(id, _)| id)
+                        .find(|(_, n, p)| {
+                            name_key(n) == key || p.as_deref().is_some_and(|p| name_key(p) == key)
+                        })
+                        .map(|(id, _, _)| id)
                 } else {
                     None
                 };
                 let id = self.upsert_contact(from.as_str(), &name, &mailbox, &token, &arr32(&my_token)?)?;
+                // The name they introduced themselves with is the name they chose, kept
+                // beside any nickname the user gives them later.
+                if intro.display_name.is_some() {
+                    s.db.conn().execute(
+                        "UPDATE contacts SET profile_name = ?2 WHERE id = ?1 AND profile_name IS NULL",
+                        params![id, name],
+                    )?;
+                }
                 if let Some(old) = clash {
                     s.db.conn().execute(
                         "UPDATE contacts SET key_warning = 1, key_warning_of = ?2 WHERE id = ?1",
@@ -3855,12 +3939,16 @@ impl Actor {
                 Self::queue_token_removal(&s.db, &my_token)?;
                 // An unblock update still waiting to go out names the token withdrawn here.
                 Self::drop_pending_mailbox_updates(&s.db, contact)?;
+                // So does a profile still waiting: it may carry a picture the user takes back
+                // while they are blocked. Unblocking sends them what is current (review PR-3).
+                profile::forget_sent(s.db.conn(), contact)?;
                 Ok(())
             })
             .await?;
             self.flush_token_removals().await;
         } else {
             self.unblock(contact, &address).await?;
+            self.sync_profiles(Some(contact)).await;
         }
         self.emit(ChangeKind::Contacts, Some(contact));
         Ok(())
@@ -3982,19 +4070,8 @@ impl Actor {
                     "UPDATE messages SET contact = ?2 WHERE contact = ?1",
                     params![old, contact],
                 )?;
-                // The chat keeps its look: colour, wallpaper and its photo (review LK-11).
-                conn.execute(
-                    "UPDATE contacts SET
-                       accent_hue = coalesce(accent_hue, (SELECT accent_hue FROM contacts WHERE id = ?1)),
-                       wallpaper = coalesce(wallpaper, (SELECT wallpaper FROM contacts WHERE id = ?1))
-                     WHERE id = ?2",
-                    params![old, contact],
-                )?;
-                conn.execute(
-                    "UPDATE OR IGNORE wallpaper_photos SET owner = ?2 WHERE owner = ?1
-                     AND (SELECT wallpaper FROM contacts WHERE id = ?2) LIKE 'photo:%'",
-                    params![old, contact],
-                )?;
+                // The chat keeps its look and the user's choices about this person.
+                profile::carry_over(conn, *old, contact)?;
                 s.account.forget_contact(&addr).await?;
                 Self::queue_token_removal(&db, my_token)?;
                 conn.execute("DELETE FROM contacts WHERE id = ?1", [old])?;

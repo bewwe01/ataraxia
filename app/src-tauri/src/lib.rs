@@ -658,7 +658,8 @@ async fn set_profile(c: State<'_, Client>, name: String, status: String) -> Res<
 /// Sets (base64 JPEG) or removes the user's picture.
 #[tauri::command]
 async fn set_my_picture(c: State<'_, Client>, picture: Option<String>) -> Res<()> {
-    c.set_my_picture(picture).await.map_err(err)
+    // The user's picture: wiped once handed on (review PR-9).
+    c.set_my_picture(picture.map(Zeroizing::new)).await.map_err(err)
 }
 
 /// Who sees the user's picture.
@@ -679,7 +680,9 @@ async fn set_picture_hidden(c: State<'_, Client>, contact: i64, hidden: bool) ->
 /// A picture for a contact that only the user sees.
 #[tauri::command]
 async fn set_contact_picture(c: State<'_, Client>, contact: i64, picture: Option<String>) -> Res<()> {
-    c.set_contact_picture(contact, picture).await.map_err(err)
+    c.set_contact_picture(contact, picture.map(Zeroizing::new))
+        .await
+        .map_err(err)
 }
 
 /// A name for a contact that only the user sees, or null for the one they chose.

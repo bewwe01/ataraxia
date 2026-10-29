@@ -56,10 +56,13 @@ export function PictureCropper({ file, onDone, onCancel }: { file: File; onDone:
 
   return (
     <div className="cropper stack-sm" role="group" aria-label="Crop your picture">
+      <p id="crop-hint" className="hint">Drag, or use the arrow keys, to move the picture; the circle is what contacts see.</p>
       <div
         className="crop-view"
+        role="group"
         tabIndex={0}
-        aria-label="Picture position: drag, or use the arrow keys"
+        aria-label="Picture position"
+        aria-describedby="crop-hint"
         onPointerDown={onDown}
         onPointerMove={onMove}
         onPointerUp={() => { drag.current = null; }}

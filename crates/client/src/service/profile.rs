@@ -11,8 +11,10 @@ use sha2::{Digest as _, Sha256};
 use veil_core::content::{Body, MAX_PICTURE_LEN, Profile};
 
 use super::look::image_mime;
-use super::{Actor, ChangeKind, clean_name, clean_name_long, name_key};
+use super::{Actor, ChangeKind, MAX_ATTEMPTS, clean_name, clean_name_long, name_key, rng};
 use crate::{ClientError, Result, now_ms};
+use rand::seq::SliceRandom as _;
+use zeroize::Zeroizing;
 
 pub const MAX_STATUS: usize = 140;
 const STATUS_KEY: &str = "profile.status";
@@ -22,6 +24,12 @@ const REV_KEY: &str = "profile.rev";
 const ME: i64 = 0;
 /// The tag on a queued profile message, so a newer one replaces it.
 const TAG: &str = "profile";
+/// A picture's longest side. Anything larger could make the webview decode a huge image from
+/// a few kilobytes (review PR-1); the app sends 512 px.
+pub const MAX_PICTURE_SIDE: u16 = 1024;
+/// Contacts sent a changed profile per round: a change reaches everyone over a few minutes
+/// rather than as one burst that links all their mailboxes at the relay (review PR-5).
+const PER_ROUND: usize = 4;
 
 /// Who sees the user's picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,19 +69,57 @@ pub struct ProfileView {
     pub visibility: PictureVisibility,
 }
 
-/// A picture from the webview: base64 of a JPEG, PNG or WebP of at most [`MAX_PICTURE_LEN`].
-fn decode_picture(b64: &str) -> Result<(&'static str, Vec<u8>)> {
+/// Width and height from a JPEG's start-of-frame segment; `None` if there is none or the
+/// segments do not add up.
+fn jpeg_dims(b: &[u8]) -> Option<(u16, u16)> {
+    let mut i = 2usize; // after FF D8
+    while let (Some(&0xFF), Some(&m)) = (b.get(i), b.get(i.checked_add(1)?)) {
+        let at = |k: usize| b.get(i.checked_add(k)?).copied();
+        let len = usize::from(u16::from_be_bytes([at(2)?, at(3)?]));
+        if matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+            let h = u16::from_be_bytes([at(5)?, at(6)?]);
+            let w = u16::from_be_bytes([at(7)?, at(8)?]);
+            return Some((w, h));
+        }
+        i = i.checked_add(2)?.checked_add(len)?;
+    }
+    None
+}
+
+/// A picture we accept, from the user or a contact: a JPEG (the app's redrawn, metadata-free
+/// form) of at most [`MAX_PICTURE_LEN`] bytes and [`MAX_PICTURE_SIDE`] pixels a side.
+fn picture_ok(b: &[u8]) -> bool {
+    b.len() <= MAX_PICTURE_LEN
+        && image_mime(b) == Some("image/jpeg")
+        && jpeg_dims(b).is_some_and(|(w, h)| w > 0 && h > 0 && w <= MAX_PICTURE_SIDE && h <= MAX_PICTURE_SIDE)
+}
+
+/// A picture from the webview, as base64 (see [`picture_ok`]). Wiped on every path.
+fn decode_picture(b64: &str) -> Result<Zeroizing<Vec<u8>>> {
     if b64.len() > MAX_PICTURE_LEN / 3 * 4 + 4 {
         return Err(ClientError::TooLarge);
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64.as_bytes())
-        .map_err(|_| ClientError::BadInput)?;
+    let bytes = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|_| ClientError::BadInput)?,
+    );
     if bytes.len() > MAX_PICTURE_LEN {
         return Err(ClientError::TooLarge);
     }
-    let mime = image_mime(&bytes).ok_or(ClientError::BadInput)?;
-    Ok((mime, bytes))
+    if !picture_ok(&bytes) {
+        return Err(ClientError::BadInput);
+    }
+    Ok(bytes)
+}
+
+/// A picture as a `data:` URL, sized up front so no unwiped copies are left behind.
+fn data_url(mime: &str, data: &[u8]) -> Option<String> {
+    let prefix = format!("data:{mime};base64,");
+    let mut url = String::with_capacity(prefix.len().checked_add(base64::encoded_len(data.len(), true)?)?);
+    url.push_str(&prefix);
+    base64::engine::general_purpose::STANDARD.encode_string(data, &mut url);
+    Some(url)
 }
 
 /// The cache key the webview gets for a picture row.
@@ -81,21 +127,24 @@ fn token(local: bool, rev: i64) -> String {
     format!("{}{rev}", if local { "l" } else { "p" })
 }
 
-/// What one contact gets from us.
-struct Outgoing {
-    name: String,
-    status: String,
-    picture: Option<Vec<u8>>,
+/// A stored picture: its type, bytes and revision.
+type PictureRow = (String, Zeroizing<Vec<u8>>, i64);
+
+/// What one contact gets from us; the picture by its hash (it is read once per round).
+struct Outgoing<'a> {
+    name: &'a str,
+    status: &'a str,
+    picture: Option<&'a [u8; 32]>,
 }
 
-impl Outgoing {
+impl Outgoing<'_> {
     fn digest(&self) -> Vec<u8> {
         let mut h = Sha256::new();
         for part in [self.name.as_bytes(), self.status.as_bytes()] {
             h.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
             h.update(part);
         }
-        match &self.picture {
+        match self.picture {
             Some(p) => {
                 h.update([1]);
                 h.update(p);
@@ -129,7 +178,7 @@ impl Actor {
         Ok(rev)
     }
 
-    fn picture_row(&self, owner: i64, local: bool) -> Result<Option<(String, Vec<u8>, i64)>> {
+    fn picture_row(&self, owner: i64, local: bool) -> Result<Option<PictureRow>> {
         Ok(self
             .s()?
             .db
@@ -137,7 +186,7 @@ impl Actor {
             .query_row(
                 "SELECT mime, data, rev FROM pictures WHERE owner = ?1 AND local = ?2",
                 params![owner, local],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, Zeroizing::new(r.get(1)?), r.get(2)?)),
             )
             .optional()?)
     }
@@ -169,9 +218,9 @@ impl Actor {
     }
 
     /// Sets (base64) or removes (`None`) the user's picture, and tells contacts who see it.
-    pub(super) async fn set_my_picture(&self, picture: Option<String>) -> Result<()> {
+    pub(super) async fn set_my_picture(&self, picture: Option<Zeroizing<String>>) -> Result<()> {
         let rev = i64::try_from(self.bump_rev()?).unwrap_or(i64::MAX);
-        self.store_picture(ME, false, picture.as_deref(), rev)?;
+        self.store_picture(ME, false, picture, rev)?;
         self.emit(ChangeKind::Contacts, None);
         self.sync_profiles(None).await;
         Ok(())
@@ -199,7 +248,7 @@ impl Actor {
     }
 
     /// A picture for a contact that only the user sees; it shows instead of theirs.
-    pub(super) fn set_contact_picture(&self, contact: i64, picture: Option<&str>) -> Result<()> {
+    pub(super) fn set_contact_picture(&self, contact: i64, picture: Option<Zeroizing<String>>) -> Result<()> {
         self.known(contact)?;
         self.store_picture(contact, true, picture, now_ms())?;
         self.emit(ChangeKind::Contacts, Some(contact));
@@ -219,15 +268,18 @@ impl Actor {
                 )?;
             }
             None => {
-                conn.execute("UPDATE contacts SET nickname = 0 WHERE id = ?1", [contact])?;
                 let theirs: Option<String> = conn.query_row(
                     "SELECT profile_name FROM contacts WHERE id = ?1",
                     [contact],
                     |r| r.get(0),
                 )?;
-                if let Some(theirs) = theirs {
-                    self.adopt_name(contact, &theirs)?;
+                // Only when their name can be shown: otherwise the nickname stays a nickname,
+                // and the user is told (review PR-15).
+                let theirs = theirs.ok_or(ClientError::BadInput)?;
+                if !self.adopt_name(contact, &theirs, false)? {
+                    return Err(ClientError::NameTaken);
                 }
+                conn.execute("UPDATE contacts SET nickname = 0 WHERE id = ?1", [contact])?;
             }
         }
         self.emit(ChangeKind::Contacts, Some(contact));
@@ -249,14 +301,14 @@ impl Actor {
         }
     }
 
-    fn store_picture(&self, owner: i64, local: bool, b64: Option<&str>, rev: i64) -> Result<()> {
+    fn store_picture(&self, owner: i64, local: bool, b64: Option<Zeroizing<String>>, rev: i64) -> Result<()> {
         let conn = self.s()?.db.conn();
         match b64 {
             Some(b64) => {
-                let (mime, bytes) = decode_picture(b64)?;
+                let bytes = decode_picture(&b64)?;
                 conn.execute(
-                    "INSERT OR REPLACE INTO pictures (owner, local, mime, data, rev) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![owner, local, mime, bytes, rev],
+                    "INSERT OR REPLACE INTO pictures (owner, local, mime, data, rev) VALUES (?1, ?2, 'image/jpeg', ?3, ?4)",
+                    params![owner, local, &**bytes, rev],
                 )?;
             }
             None => {
@@ -279,17 +331,16 @@ impl Actor {
                 None => self.picture_row(c, false)?,
             },
         };
+        // Checked again on the way out, so a row stored by an older build cannot get through.
         Ok(row.and_then(|(mime, data, _)| {
-            let mime = image_mime(&data).filter(|m| *m == mime)?;
-            Some(format!(
-                "data:{mime};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(data)
-            ))
+            (mime == "image/jpeg" && picture_ok(&data))
+                .then(|| data_url(&mime, &data))
+                .flatten()
         }))
     }
 
     /// A contact's profile (inside `process`'s transaction). Older revisions are ignored; a
-    /// picture that is not an image is dropped.
+    /// picture that is not a small JPEG is dropped (review PR-1).
     pub(super) fn receive_profile(&self, contact: i64, p: &Profile) -> Result<()> {
         let rev = i64::try_from(p.rev).unwrap_or(i64::MAX);
         let conn = self.s()?.db.conn();
@@ -306,12 +357,11 @@ impl Actor {
             "UPDATE contacts SET profile_name = ?2, profile_status = ?3 WHERE id = ?1",
             params![contact, (!name.is_empty()).then_some(&name), status],
         )?;
-        let picture = p.picture.as_deref().and_then(|b| image_mime(b).map(|m| (m, b)));
-        match picture {
-            Some((mime, bytes)) => {
+        match p.picture.as_deref().filter(|b| picture_ok(b)) {
+            Some(bytes) => {
                 conn.execute(
-                    "INSERT OR REPLACE INTO pictures (owner, local, mime, data, rev) VALUES (?1, 0, ?2, ?3, ?4)",
-                    params![contact, mime, bytes, rev],
+                    "INSERT OR REPLACE INTO pictures (owner, local, mime, data, rev) VALUES (?1, 0, 'image/jpeg', ?2, ?3)",
+                    params![contact, bytes, rev],
                 )?;
             }
             None => {
@@ -323,49 +373,91 @@ impl Actor {
                 r.get(0)
             })?;
         if !nickname && !name.is_empty() {
-            self.adopt_name(contact, &name)?;
+            self.adopt_name(contact, &name, true)?;
         }
         self.emit(ChangeKind::Contacts, Some(contact));
         Ok(())
     }
 
-    /// Shows a contact under the name they chose, unless another contact already has it: then
-    /// the name stays, and the profile shows theirs beside it (a contact cannot pass as another).
-    fn adopt_name(&self, contact: i64, name: &str) -> Result<()> {
+    /// Shows a contact under the name they chose, unless it looks like another contact's
+    /// name, shown or self-chosen (`name_key` folds case, spacing and look-alike letters): then
+    /// the name stays, and the profile shows theirs beside it, so a contact cannot pass as
+    /// another (review PR-6). A change of shown name is written into the chat as a line when
+    /// `announce`, so it is never silent. Returns whether the name is now shown.
+    fn adopt_name(&self, contact: i64, name: &str, announce: bool) -> Result<bool> {
         let conn = self.s()?.db.conn();
         let key = name_key(name);
-        let mut stmt = conn.prepare("SELECT name FROM contacts WHERE id != ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT name FROM contacts WHERE id != ?1
+             UNION ALL SELECT profile_name FROM contacts WHERE id != ?1 AND profile_name IS NOT NULL",
+        )?;
         let taken = stmt
             .query_map([contact], |r| r.get::<_, String>(0))?
             .filter_map(core::result::Result::ok)
             .any(|n| name_key(&n) == key);
-        if !taken {
-            conn.execute(
-                "UPDATE contacts SET name = ?2 WHERE id = ?1",
-                params![contact, name],
-            )?;
+        if taken {
+            return Ok(false);
         }
-        Ok(())
+        let old: String =
+            conn.query_row("SELECT name FROM contacts WHERE id = ?1", [contact], |r| r.get(0))?;
+        if old == name {
+            return Ok(true);
+        }
+        conn.execute(
+            "UPDATE contacts SET name = ?2 WHERE id = ?1",
+            params![contact, name],
+        )?;
+        if announce {
+            // A local line (never sent): "<old> is now called <new>".
+            conn.execute(
+                "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 0, 'renamed', ?2, ?3, 'received')",
+                params![contact, format!("{old}\n{name}"), now_ms()],
+            )?;
+            self.emit(ChangeKind::Messages, Some(contact));
+        }
+        Ok(true)
     }
 
     /// Sends each contact (or one) our profile, if it changed since they last got it. Each
-    /// gets the picture only if they may see it. Runs after changes and on every retry tick.
+    /// gets the picture only if they may see it. Runs after changes and on every retry tick;
+    /// a round for all contacts sends to at most [`PER_ROUND`] of them, in random order.
     pub(super) async fn sync_profiles(&self, only: Option<i64>) {
-        let Ok(due) = self.profiles_due(only) else { return };
+        let Ok(mut due) = self.profiles_due(only) else {
+            return;
+        };
         if due.is_empty() {
             return;
         }
+        if only.is_none() {
+            due.shuffle(&mut rng());
+            due.truncate(PER_ROUND);
+        }
+        let Ok(s) = self.s() else { return };
+        let name = s.name.clone();
+        let Ok(status) = self.setting_str(STATUS_KEY) else {
+            return;
+        };
+        let Ok(picture) = self.picture_row(ME, false) else {
+            return;
+        };
         // Every send is a new revision: what one contact gets can change (the picture shown
         // or taken back) without the profile itself changing.
         let Ok(rev) = self.bump_rev() else { return };
-        for (contact, out, digest) in due {
+        for (contact, shows, digest) in due {
+            let picture = picture
+                .as_ref()
+                .filter(|_| shows)
+                .map(|(_, data, _)| data.to_vec());
+            // Every profile is padded to the same size, so the envelope's size does not tell the
+            // relay who may see the picture (review PR-5).
+            let pad = vec![0u8; MAX_PICTURE_LEN.saturating_sub(picture.as_ref().map_or(0, Vec::len))];
             let body = Body::Profile(Profile {
                 rev,
-                name: out.name,
-                status: out.status,
-                picture: out.picture,
+                name: name.clone(),
+                status: status.clone(),
+                picture,
+                pad,
             });
-            let Ok(s) = self.s() else { return };
             // A newer profile replaces one still waiting to go out.
             let _ = s.db.conn().execute(
                 "DELETE FROM messages WHERE contact = ?1 AND mine = 1 AND kind = 'control' AND body = ?2",
@@ -382,54 +474,106 @@ impl Actor {
         }
     }
 
-    /// The contacts whose copy of our profile is out of date, with what they should have.
-    fn profiles_due(&self, only: Option<i64>) -> Result<Vec<(i64, Outgoing, Vec<u8>)>> {
+    /// The contacts whose copy of our profile is out of date: whether each may see the
+    /// picture, and the digest of what they should have.
+    fn profiles_due(&self, only: Option<i64>) -> Result<Vec<(i64, bool, Vec<u8>)>> {
         let s = self.s()?;
         let name = s.name.clone();
         let status = self.setting_str(STATUS_KEY)?;
         let visibility = self.visibility()?;
-        let picture = self.picture_row(ME, false)?.map(|(_, data, _)| data);
+        // The picture is hashed once per round, not copied per contact (review PR-7).
+        let picture: Option<[u8; 32]> = self
+            .picture_row(ME, false)?
+            .map(|(_, data, _)| Sha256::digest(&*data).into());
         // Nothing to say yet: no name, status or picture was ever set.
         if name.is_empty() && status.is_empty() && picture.is_none() {
             return Ok(Vec::new());
         }
+        // A contact with an unresolved key-change warning gets nothing (they may be an
+        // impostor; review PR-11); one whose last profile was given up on is due again, so a
+        // picture taken back is never left on their screen (review PR-4).
         let mut stmt = s.db.conn().prepare(
-            "SELECT id, verified, picture_hidden, key_warning, profile_sent FROM contacts
-             WHERE blocked = 0 AND (?1 IS NULL OR id = ?1)",
+            "SELECT c.id, c.verified, c.picture_hidden,
+               CASE WHEN EXISTS (SELECT 1 FROM messages m WHERE m.contact = c.id AND m.mine = 1
+                 AND m.kind = 'control' AND m.body = ?2 AND m.attempts >= ?3) THEN NULL ELSE c.profile_sent END
+             FROM contacts c WHERE c.blocked = 0 AND c.key_warning = 0 AND (?1 IS NULL OR c.id = ?1)",
         )?;
         let rows = stmt
-            .query_map([only], |r| {
+            .query_map(params![only, TAG, MAX_ATTEMPTS], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, bool>(1)?,
                     r.get::<_, bool>(2)?,
-                    r.get::<_, bool>(3)?,
-                    r.get::<_, Option<Vec<u8>>>(4)?,
+                    r.get::<_, Option<Vec<u8>>>(3)?,
                 ))
             })?
             .collect::<core::result::Result<Vec<_>, _>>()?;
         let mut due = Vec::new();
-        for (id, verified, hidden, key_warning, sent) in rows {
-            // Never to someone who may be an impostor (an unresolved key-change warning).
+        for (id, verified, hidden, sent) in rows {
             let shows = !hidden
-                && !key_warning
                 && match visibility {
                     PictureVisibility::All => true,
                     PictureVisibility::Verified => verified,
                     PictureVisibility::Nobody => false,
                 };
-            let out = Outgoing {
-                name: name.clone(),
-                status: status.clone(),
-                picture: picture.clone().filter(|_| shows),
-            };
-            let digest = out.digest();
+            let digest = Outgoing {
+                name: &name,
+                status: &status,
+                picture: picture.as_ref().filter(|_| shows),
+            }
+            .digest();
             if sent.as_deref() != Some(digest.as_slice()) {
-                due.push((id, out, digest));
+                due.push((id, shows, digest));
             }
         }
         Ok(due)
     }
+}
+
+/// After the user accepted a key change (`old` merged into `new`): the chat keeps its look
+/// (colour, wallpaper and its photo; review LK-11) and the user's choices about this person
+/// (picture hidden from them, nickname, the picture only the user sees; review PR-2).
+pub(super) fn carry_over(conn: &rusqlite::Connection, old: i64, contact: i64) -> Result<()> {
+    // The chat keeps its look: colour, wallpaper and its photo (review LK-11).
+    conn.execute(
+        "UPDATE contacts SET
+           accent_hue = coalesce(accent_hue, (SELECT accent_hue FROM contacts WHERE id = ?1)),
+           wallpaper = coalesce(wallpaper, (SELECT wallpaper FROM contacts WHERE id = ?1))
+         WHERE id = ?2",
+        params![old, contact],
+    )?;
+    // The user's choices about this person: whether they see the user's
+    // picture, the nickname and the picture only the user sees (review PR-2).
+    conn.execute(
+        "UPDATE contacts SET
+           picture_hidden = picture_hidden OR (SELECT picture_hidden FROM contacts WHERE id = ?1),
+           name = CASE WHEN (SELECT nickname FROM contacts WHERE id = ?1) = 1
+                       THEN (SELECT name FROM contacts WHERE id = ?1) ELSE name END,
+           nickname = nickname OR (SELECT nickname FROM contacts WHERE id = ?1)
+         WHERE id = ?2",
+        params![old, contact],
+    )?;
+    conn.execute(
+        "UPDATE OR IGNORE pictures SET owner = ?2 WHERE owner = ?1 AND local = 1",
+        params![old, contact],
+    )?;
+    conn.execute(
+        "UPDATE OR IGNORE wallpaper_photos SET owner = ?2 WHERE owner = ?1
+         AND (SELECT wallpaper FROM contacts WHERE id = ?2) LIKE 'photo:%'",
+        params![old, contact],
+    )?;
+    Ok(())
+}
+
+/// Forgets what a contact was last sent and drops a profile still waiting to go out to them,
+/// so the next round sends what is current.
+pub(super) fn forget_sent(conn: &rusqlite::Connection, contact: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM messages WHERE contact = ?1 AND mine = 1 AND kind = 'control' AND body = ?2",
+        params![contact, TAG],
+    )?;
+    conn.execute("UPDATE contacts SET profile_sent = NULL WHERE id = ?1", [contact])?;
+    Ok(())
 }
 
 /// The profile part of a contact's view.
@@ -438,6 +582,7 @@ pub(super) struct ContactProfile {
     pub status: Option<String>,
     pub nickname: bool,
     pub picture: Option<String>,
+    pub local_picture: bool,
     pub picture_hidden: bool,
 }
 
@@ -460,6 +605,7 @@ pub(super) fn contact_profile(conn: &rusqlite::Connection, id: i64, shown: &str)
         status: status.filter(|st| !st.is_empty()),
         nickname,
         picture: picture.map(|(local, rev)| token(local, rev)),
+        local_picture: picture.is_some_and(|(local, _)| local),
         picture_hidden,
     })
 }
@@ -468,15 +614,55 @@ pub(super) fn contact_profile(conn: &rusqlite::Connection, id: i64, shown: &str)
 mod tests {
     use super::*;
 
+    /// A JPEG start: SOI, an APP0 segment, then a start-of-frame of `w` × `h`.
+    pub(crate) fn jpeg(w: u16, h: u16) -> Vec<u8> {
+        let mut b = vec![
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0, 0, 0xFF, 0xC0, 0x00, 0x11, 8,
+        ];
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        b
+    }
+
     #[test]
     fn pictures_are_checked() {
-        let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-        assert!(decode_picture(&b64(&[0xFF, 0xD8, 0xFF, 0xE0, 1, 2])).is_ok());
-        assert_eq!(decode_picture(&b64(b"<svg/>")).err(), Some(ClientError::BadInput));
+        let enc = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        assert_eq!(jpeg_dims(&jpeg(512, 384)), Some((512, 384)));
+        assert!(decode_picture(&enc(&jpeg(512, 512))).is_ok());
+        assert!(decode_picture(&enc(&jpeg(1024, 1))).is_ok());
+        // A few bytes that would make the webview decode a gigabyte (review PR-1).
+        assert_eq!(
+            decode_picture(&enc(&jpeg(60000, 60000))).err(),
+            Some(ClientError::BadInput)
+        );
+        assert_eq!(
+            decode_picture(&enc(&jpeg(1025, 10))).err(),
+            Some(ClientError::BadInput)
+        );
+        assert_eq!(
+            decode_picture(&enc(&jpeg(0, 10))).err(),
+            Some(ClientError::BadInput)
+        );
+        // No frame header, not a JPEG, or not base64.
+        assert_eq!(
+            decode_picture(&enc(&[0xFF, 0xD8, 0xFF, 0xE0, 1, 2])).err(),
+            Some(ClientError::BadInput)
+        );
+        assert_eq!(
+            decode_picture(&enc(b"\x89PNG\r\n\x1a\n....")).err(),
+            Some(ClientError::BadInput)
+        );
+        assert_eq!(decode_picture(&enc(b"<svg/>")).err(), Some(ClientError::BadInput));
         assert_eq!(decode_picture("not base64!").err(), Some(ClientError::BadInput));
-        let mut big = vec![0xFF, 0xD8, 0xFF];
+        let mut big = jpeg(10, 10);
         big.resize(MAX_PICTURE_LEN + 1, 0);
-        assert_eq!(decode_picture(&b64(&big)).err(), Some(ClientError::TooLarge));
+        assert_eq!(decode_picture(&enc(&big)).err(), Some(ClientError::TooLarge));
+        // Segment lengths that run off the end never panic.
+        for cut in 0..jpeg(5, 5).len() {
+            let _ = jpeg_dims(&jpeg(5, 5)[..cut]);
+        }
+        assert_eq!(jpeg_dims(&[0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xFF]), None);
     }
 
     #[test]
@@ -489,17 +675,23 @@ mod tests {
 
     #[test]
     fn digests_tell_what_was_sent() {
-        let o = |name: &str, status: &str, picture: Option<&[u8]>| Outgoing {
-            name: name.into(),
-            status: status.into(),
-            picture: picture.map(<[u8]>::to_vec),
+        let zero = [0u8; 32];
+        let o = |name: &'static str, status: &'static str, picture: Option<&'static [u8; 32]>| Outgoing {
+            name,
+            status,
+            picture,
         };
         let a = o("Al", "ice", None).digest();
         assert_ne!(a, o("Ali", "ce", None).digest(), "fields are length-prefixed");
         assert_ne!(
             a,
-            o("Al", "ice", Some(b"")).digest(),
-            "an empty picture is still one"
+            Outgoing {
+                name: "Al",
+                status: "ice",
+                picture: Some(&zero)
+            }
+            .digest(),
+            "a picture counts"
         );
         assert_eq!(a, o("Al", "ice", None).digest());
     }

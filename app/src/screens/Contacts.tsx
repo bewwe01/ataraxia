@@ -108,7 +108,11 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   const wallpaper = useChatWallpaper(contact);
   const [picked, setPicked] = useState<File | null>(null);
   const pictureFile = useRef<HTMLInputElement>(null);
-  useEffect(() => setName(contact.name), [contact.name]);
+  // A name arriving from them must not overwrite a nickname being typed (review PR-16).
+  const nameEdited = useRef(false);
+  useEffect(() => {
+    if (!nameEdited.current) setName(contact.name);
+  }, [contact.name]);
   const [verifyMode, setVerifyMode] = useState<"show" | "scan">("show");
   const [verifyResult, setVerifyResult] = useState<null | "match" | "mismatch">(null);
   const deleteBtn = useRef<HTMLButtonElement>(null);
@@ -178,6 +182,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
     e.preventDefault();
     try {
       await ipc.setNickname(contact.id, name.trim());
+      nameEdited.current = false;
       onChanged();
     } catch (err) {
       setError(err instanceof IpcError ? err.message : "Could not rename");
@@ -196,13 +201,14 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
       <TopBar title={contact.name} onBack={() => nav({ screen: "chat", contact: contact.id })} />
       <div className="m-body">
         <div className="safety">
+          {/* Security notices first: nothing a contact writes sits above them (review PR-11). */}
+          <KeyWarning contact={contact} nav={nav} onChanged={onChanged} />
           <div className="stack-sm contact-head">
             <Avatar initials={contact.initials} hue={contact.hue} size="xxl" owner={contact.id} picture={contact.picture} />
             <h2>{contact.name}</h2>
             {contact.theirName ? <p className="hint">Calls themself “{contact.theirName}”</p> : null}
-            {contact.status ? <p className="their-status">{contact.status}</p> : null}
+            {contact.status ? <p className="their-status">Status: “{contact.status}”</p> : null}
           </div>
-          <KeyWarning contact={contact} nav={nav} onChanged={onChanged} />
           {contact.verified ? (
             <Banner tone="neutral" icon="shield-check"><strong>Verified</strong><p>If this number ever changes, Veil treats them as a new, unverified contact and never sends to the old conversation silently.</p></Banner>
           ) : (
@@ -242,7 +248,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
           <form className="stack" onSubmit={(e) => void rename(e)}>
             <div className="field">
               <label htmlFor="cname">Nickname (only on this device)</label>
-              <div className="input"><input id="cname" maxLength={64} value={name} onChange={(e) => setName(e.target.value)} /></div>
+              <div className="input"><input id="cname" maxLength={64} value={name} onChange={(e) => { nameEdited.current = true; setName(e.target.value); }} /></div>
             </div>
             <button className="btn btn-secondary btn-block" type="submit">Save nickname</button>
             {contact.nickname && contact.theirName ? (
@@ -256,7 +262,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
             <span className="label">Picture only you see</span>
             <div className="banner-actions">
               <button className="btn btn-secondary" type="button" disabled={busy} onClick={() => pictureFile.current?.click()}><Icon name="image" />Choose picture</button>
-              {contact.picture?.startsWith("l") ? (
+              {contact.localPicture ? (
                 <button className="btn btn-danger-ghost" type="button" disabled={busy} onClick={() => void act(() => ipc.setContactPicture(contact.id, null), "Could not remove the picture")}>Remove</button>
               ) : null}
             </div>

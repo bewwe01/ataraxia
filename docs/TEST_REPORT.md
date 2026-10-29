@@ -2,6 +2,50 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Profile: review round 1 and its fixes (2026-10-29)
+
+Round 1 of the review gate failed on two High findings: PR-1, a contact could store a picture that decodes to gigabytes, and PR-2, accepting a key change dropped "Hide my picture". All 16 findings (PR-1 to PR-16) were fixed in this round.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 242 passed, 0 failed
+$ (app/src-tauri) cargo fmt --check; cargo clippy -- -D warnings
+#     Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.24s
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 22 files clean
+# contrast: 25 panels; worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001
+# ✓ built in 1.70s
+```
+
+New and changed tests:
+- **Unit:**
+  - `service::profile::pictures_are_checked`: JPEG only, at most 1024 px a side read from the start-of-frame header. 60000 × 60000, 1025 px, 0 px, PNG and SVG are refused, and truncated headers never panic.
+  - `content::tests::profiles_are_checked`: the padding may fill the picture limit and never pass it.
+  - `db::tests::migrates_a_version_5_database`: only "Contact xxxx" and "New contact" are not nicknames ("Contact lens shop" is one), rows are kept, and pictures go with their contact.
+- **Integration (`tests/profile.rs`, 5 tests):**
+  - `a_contact_cannot_take_another_contacts_name` adds a 60000 px picture from a hostile contact, which is dropped.
+  - `lookalike_names_are_refused_and_renames_are_shown`:
+    - "Вob", "Ｂob", "B0b", "Böb" and "bob" are refused while Bob (nicknamed "Bobby") exists.
+    - A real rename leaves a line in the chat.
+    - "Use their name" on a taken name fails with `NameTaken` and keeps the nickname.
+  - `key_changes_keep_the_users_choices`:
+    - Nothing goes to a contact with a key warning.
+    - Accepting the key change keeps the picture hidden, the nickname and the local picture, and the picture stays away.
+    - A dismissed warning makes them an ordinary contact.
+  - `a_picture_taken_back_always_leaves`:
+    - A picture queued while offline, then a block, then "Nobody", then an unblock: the picture leaves Bob's screen.
+    - A taking-back that was given up on (test hook `give_up_profiles`) is sent again on the next round.
+- **Found by the new tests and fixed:** a nickname hid a contact from the name-based key-change warning, because only the shown name was compared. The warning now also compares the name the contact chose, and the name from their invite is kept as that.
+- **Changed:** `pair_and_message::two_clients_pair_and_talk` now uses long names ("Alice Liddell", "Bob Marley the Second"). It failed once in this round because "Bob", three bytes, appeared by chance in about 150 KB of ciphertext. Six diagnostic runs found no match in any file, and the expected chance rate is about 2–4% per run. The at-rest assertion is unchanged.
+
+Not fixed here: `veil-relay` `logs::relay_logs_nothing_about_clients` failed once and passed on 3 reruns. It is outside this change; its short needles (for example the 5-digit port) can appear by chance.
+
+In Chromium, the profile and look runs still pass, with no console errors.
+
 ## Profile: picture, name, status, who sees the picture, nicknames (2026-10-29)
 
 Milestone 4.5, second part (ADR-0020). Owner request: a profile picture with a setting for who can see it.

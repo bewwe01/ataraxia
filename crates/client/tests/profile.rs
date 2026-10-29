@@ -12,22 +12,43 @@ mod common;
 use base64::Engine as _;
 use common::*;
 use veil_client::ClientError;
-use veil_client::service::{ContactView, PictureVisibility};
+use veil_client::service::{Client, ContactView, PictureVisibility};
 use veil_core::content::{Body, Profile};
 use zeroize::Zeroizing;
 
-const JPEG: &[u8] = &[
-    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1,
-];
 const PICTURE_MARK: &[u8] = b"profile-picture-at-rest-probe";
 
-fn picture(mark: &[u8]) -> String {
-    let mut b = JPEG.to_vec();
+/// The start of a `w` × `h` JPEG (SOI, APP0, start of frame), then `mark`.
+fn jpeg(w: u16, h: u16, mark: &[u8]) -> Vec<u8> {
+    let mut b = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0, 0, 0xFF, 0xC0, 0x00, 0x11, 8,
+    ];
+    b.extend_from_slice(&h.to_be_bytes());
+    b.extend_from_slice(&w.to_be_bytes());
+    b.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
     b.extend_from_slice(mark);
-    base64::engine::general_purpose::STANDARD.encode(b)
+    b
 }
 
-async fn view(c: &veil_client::service::Client, id: i64) -> ContactView {
+fn b64(bytes: &[u8]) -> Zeroizing<String> {
+    Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn picture(mark: &[u8]) -> Zeroizing<String> {
+    b64(&jpeg(512, 512, mark))
+}
+
+fn profile(rev: u64, name: &str, picture: Option<Vec<u8>>) -> Body {
+    Body::Profile(Profile {
+        rev,
+        name: name.into(),
+        status: String::new(),
+        picture,
+        pad: Vec::new(),
+    })
+}
+
+async fn view(c: &Client, id: i64) -> ContactView {
     c.contacts()
         .await
         .unwrap()
@@ -37,7 +58,7 @@ async fn view(c: &veil_client::service::Client, id: i64) -> ContactView {
 }
 
 /// Waits until `f` holds for the contact's view.
-async fn until(c: &veil_client::service::Client, id: i64, f: impl Fn(&ContactView) -> bool) -> ContactView {
+async fn until(c: &Client, id: i64, f: impl Fn(&ContactView) -> bool) -> ContactView {
     eventually(|| async {
         let v = view(c, id).await;
         f(&v).then_some(v)
@@ -98,30 +119,37 @@ async fn profiles_reach_contacts_as_the_user_chose() {
     assert_eq!(view(b, b_alice.id).await.name, "Alice B");
 
     // A picture only Bob sees replaces hers on his side, and is never sent.
-    let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nlocal");
-    b.set_contact_picture(b_alice.id, Some(png)).await.unwrap();
+    b.set_contact_picture(b_alice.id, Some(picture(b"local")))
+        .await
+        .unwrap();
     assert!(
         b.picture(Some(b_alice.id))
             .await
             .unwrap()
             .unwrap()
-            .starts_with("data:image/png;")
+            .starts_with("data:image/jpeg;")
     );
-    assert!(view(b, b_alice.id).await.picture.unwrap().starts_with('l'));
+    assert!(view(b, b_alice.id).await.local_picture);
     b.set_contact_picture(b_alice.id, None).await.unwrap();
-    assert!(view(b, b_alice.id).await.picture.is_none());
+    let v = view(b, b_alice.id).await;
+    assert!(v.picture.is_none() && !v.local_picture);
 
-    // Refused: not an image, too big, unknown contacts, an empty nickname.
-    let svg = base64::engine::general_purpose::STANDARD.encode(b"<svg onload=alert(1)>");
-    assert_eq!(
-        a.set_my_picture(Some(svg)).await.unwrap_err(),
-        ClientError::BadInput
-    );
-    let mut big = JPEG.to_vec();
+    // Refused: not a JPEG (an SVG, a PNG), one that declares a huge size (review PR-1), too
+    // many bytes, unknown contacts, an empty nickname.
+    for bad in [
+        b"<svg onload=alert(1)>".to_vec(),
+        b"\x89PNG\r\n\x1a\n....".to_vec(),
+        jpeg(60000, 60000, b""),
+    ] {
+        assert_eq!(
+            a.set_my_picture(Some(b64(&bad))).await.unwrap_err(),
+            ClientError::BadInput
+        );
+    }
+    let mut big = jpeg(10, 10, b"");
     big.resize(veil_core::content::MAX_PICTURE_LEN + 1, 0);
-    let big = base64::engine::general_purpose::STANDARD.encode(big);
     assert_eq!(
-        a.set_my_picture(Some(big)).await.unwrap_err(),
+        a.set_my_picture(Some(b64(&big))).await.unwrap_err(),
         ClientError::TooLarge
     );
     assert_eq!(
@@ -159,6 +187,7 @@ async fn a_contact_cannot_take_another_contacts_name() {
     );
     let (a_bob, _) = pair(&alice.client, &bob.client).await;
     let (a_mal, m_alice) = pair(&alice.client, &mallory.client).await;
+    let a = &alice.client;
     assert_eq!(a_bob.name, "Bob");
 
     // Mallory renames herself "bob": Alice keeps calling her Mallory, and says so.
@@ -167,30 +196,171 @@ async fn a_contact_cannot_take_another_contacts_name() {
         .set_profile(" bob ".into(), String::new())
         .await
         .unwrap();
-    let v = until(&alice.client, a_mal.id, |v| v.their_name.is_some()).await;
+    let v = until(a, a_mal.id, |v| v.their_name.is_some()).await;
     assert_eq!(
         (v.name.as_str(), v.their_name.as_deref()),
         ("Mallory", Some("bob"))
     );
 
-    // An older profile (a replay, or one overtaken in transit) changes nothing.
+    // A picture that declares 60000 × 60000 pixels is dropped on arrival (review PR-1).
+    let huge = profile(u64::MAX - 1, "bob", Some(jpeg(60000, 60000, b"bomb")));
     mallory
         .client
-        .raw_send(
-            m_alice.id,
-            vec![9; 16],
-            Body::Profile(Profile {
-                rev: 1,
-                name: "Old".into(),
-                status: "old".into(),
-                picture: None,
-            }),
-        )
+        .raw_send(m_alice.id, vec![8; 16], huge)
+        .await
+        .unwrap();
+    mallory.client.send(m_alice.id, "bomb sent".into()).await.unwrap();
+    arrives(a, a_mal.id, "bomb sent").await;
+    assert!(view(a, a_mal.id).await.picture.is_none());
+
+    // An older profile (a replay, or one overtaken in transit) changes nothing.
+    let old = Body::Profile(Profile {
+        rev: 1,
+        name: "Old".into(),
+        status: "old".into(),
+        picture: None,
+        pad: Vec::new(),
+    });
+    mallory
+        .client
+        .raw_send(m_alice.id, vec![9; 16], old)
         .await
         .unwrap();
     mallory.client.send(m_alice.id, "after".into()).await.unwrap();
-    arrives(&alice.client, a_mal.id, "after").await;
-    let v = view(&alice.client, a_mal.id).await;
+    arrives(a, a_mal.id, "after").await;
+    let v = view(a, a_mal.id).await;
     assert_eq!(v.their_name.as_deref(), Some("bob"));
     assert!(v.status.is_none());
+}
+
+/// Look-alike letters do not get a contact another contact's name, and a name that changes is
+/// written into the chat (review PR-6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookalike_names_are_refused_and_renames_are_shown() {
+    let r = relay().await;
+    let (alice, bob, mallory) = (
+        user(&r, "Alice").await,
+        user(&r, "Bob").await,
+        user(&r, "Mallory").await,
+    );
+    let (a_bob, _) = pair(&alice.client, &bob.client).await;
+    let (a_mal, _) = pair(&alice.client, &mallory.client).await;
+    let (ali, bo, mal) = (&alice.client, &bob.client, &mallory.client);
+    // Bob's own name counts as taken even under a nickname.
+    bo.set_profile("Bob".into(), String::new()).await.unwrap();
+    until(ali, a_bob.id, |v| v.status.is_none() && v.name == "Bob").await;
+    ali.set_nickname(a_bob.id, Some("Bobby".into())).await.unwrap();
+    for fake in ["Вob", "Ｂob", "B0b", "Böb", "bob"] {
+        mal.set_profile(fake.into(), String::new()).await.unwrap();
+        let v = until(ali, a_mal.id, |v| v.their_name.as_deref() == Some(fake)).await;
+        assert_eq!(v.name, "Mallory", "{fake} was adopted");
+    }
+    // A real rename is shown, and written into the chat.
+    mal.set_profile("Mal".into(), String::new()).await.unwrap();
+    until(ali, a_mal.id, |v| v.name == "Mal").await;
+    let lines: Vec<String> = ali
+        .messages(a_mal.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|x| x.kind == "renamed")
+        .map(|x| x.text)
+        .collect();
+    assert_eq!(lines, ["Mallory\nMal"]);
+    // "Use their name" refuses a name another contact has, and keeps the nickname (PR-15).
+    ali.set_nickname(a_mal.id, Some("M".into())).await.unwrap();
+    mal.set_profile("Bobby".into(), String::new()).await.unwrap();
+    until(ali, a_mal.id, |v| v.their_name.as_deref() == Some("Bobby")).await;
+    assert_eq!(
+        ali.set_nickname(a_mal.id, None).await.unwrap_err(),
+        ClientError::NameTaken
+    );
+    let v = view(ali, a_mal.id).await;
+    assert!(v.nickname && v.name == "M");
+}
+
+/// The picture never reaches a contact with an unresolved key-change warning, nor one the user
+/// hid it from, even after accepting their new key (reviews PR-2, PR-8, PR-11).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_changes_keep_the_users_choices() {
+    let r = relay().await;
+    let (alice, bob) = (user(&r, "Alice").await, user(&r, "Bob").await);
+    let (a_bob, _) = pair(&alice.client, &bob.client).await;
+    let a = &alice.client;
+    a.set_my_picture(Some(picture(b"kc"))).await.unwrap();
+    a.set_picture_visibility(PictureVisibility::All).await.unwrap();
+    a.set_picture_hidden(a_bob.id, true).await.unwrap();
+    a.set_nickname(a_bob.id, Some("Bobby".into())).await.unwrap();
+    a.set_contact_picture(a_bob.id, Some(picture(b"mine")))
+        .await
+        .unwrap();
+
+    // Bob reinstalled: a new key under the same name. Nothing goes to the new key while the
+    // warning stands, not even the name.
+    let bob2 = user(&r, "Bob").await;
+    let (a_bob2, b2_alice) = pair(a, &bob2.client).await;
+    assert!(a_bob2.key_warning);
+    a.set_picture_hidden(a_bob2.id, false).await.unwrap(); // a sync round for them
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let v = view(&bob2.client, b2_alice.id).await;
+    assert!(v.picture.is_none() && v.name.starts_with("Contact "));
+
+    // "It's them": the choices about Bob carry over, so he still does not get the picture.
+    a.accept_key_change(a_bob2.id, a_bob.id).await.unwrap();
+    let v = view(a, a_bob2.id).await;
+    assert!(v.picture_hidden && v.nickname && v.name == "Bobby" && v.local_picture);
+    a.set_profile("Alice A".into(), String::new()).await.unwrap();
+    let v = until(&bob2.client, b2_alice.id, |v| v.name == "Alice A").await;
+    assert!(
+        v.picture.is_none(),
+        "picture reached a contact it was hidden from"
+    );
+
+    // A warning dismissed (kept apart, not merged): from then on they are a contact like any
+    // other, and get the picture as the setting says.
+    let bob3 = user(&r, "Bob").await;
+    let (a_bob3, b3_alice) = pair(a, &bob3.client).await;
+    assert!(a_bob3.key_warning);
+    a.dismiss_key_warning(a_bob3.id).await.unwrap();
+    a.set_picture_hidden(a_bob3.id, false).await.unwrap();
+    until(&bob3.client, b3_alice.id, |v| v.picture.is_some()).await;
+}
+
+/// A picture taken back while a contact is blocked, or whose taking back was given up on,
+/// still leaves their screen (reviews PR-3, PR-4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_picture_taken_back_always_leaves() {
+    let r = relay().await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let bob = user(&r, "Bob").await;
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    let (a, b) = (&alice.client, &bob.client);
+    a.set_my_picture(Some(picture(b"tb"))).await.unwrap();
+    a.set_picture_visibility(PictureVisibility::All).await.unwrap();
+    until(b, b_alice.id, |v| v.picture.is_some()).await;
+
+    // A new picture queued while offline; Bob blocked; taken back; unblocked: it leaves, and
+    // the queued one never arrives.
+    hop.cut();
+    online(a, false).await;
+    a.set_my_picture(Some(picture(b"tb2"))).await.unwrap();
+    a.set_blocked(a_bob.id, true).await.unwrap();
+    a.set_picture_visibility(PictureVisibility::Nobody).await.unwrap();
+    hop.restore();
+    online(a, true).await;
+    a.set_blocked(a_bob.id, false).await.unwrap();
+    until(b, b_alice.id, |v| v.picture.is_none()).await;
+
+    // Taken back while offline, and that update given up on: the next round sends it again.
+    a.set_picture_visibility(PictureVisibility::All).await.unwrap();
+    until(b, b_alice.id, |v| v.picture.is_some()).await;
+    hop.cut();
+    online(a, false).await;
+    a.set_picture_visibility(PictureVisibility::Nobody).await.unwrap();
+    assert_eq!(a.give_up_profiles(a_bob.id).await.unwrap(), 1);
+    hop.restore();
+    online(a, true).await;
+    a.set_picture_hidden(a_bob.id, false).await.unwrap(); // a sync round for Bob
+    until(b, b_alice.id, |v| v.picture.is_none()).await;
 }

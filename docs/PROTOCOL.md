@@ -243,7 +243,7 @@ Defined in `crates/wire` (shared by client and relay).
 | `ContactIntro` | `mailbox_id`, `delivery_token`, `display_name?`, `invite_id?` + `invite_proof?` (both or neither), `rekey?` | §3, §4 |
 | `MailboxUpdate` | `new_mailbox_id`, `new_token`, `relay?` | §2 |
 | `SessionReset` | — | after restore (§12) |
-| `Profile` | `rev`, `name (≤ 64 chars, may be empty)`, `status (≤ 140 chars)`, `picture? (JPEG, PNG or WebP, ≤ 48 KiB)` | ADR-0020. Each replaces the last if its `rev` is higher. `picture` is present only for contacts the sender shows it to; absent means none. Control and bidi characters are refused. Older apps drop it (unknown `oneof` tag). |
+| `Profile` | `rev`, `name (≤ 64 chars, may be empty)`, `status (≤ 140 chars)`, `picture? (JPEG ≤ 1024 px a side)`, `pad (zeros; picture + pad ≤ 48 KiB)` | ADR-0020. Each replaces the last if its `rev` is higher. `picture` is present only for contacts the sender shows it to; absent means none. Senders pad every profile to the same size. A receiver drops a picture that is not a JPEG of at most 1024 px a side, checked by its start-of-frame header before anything decodes it. Control and bidi characters are refused. Older apps drop it (unknown `oneof` tag). |
 
 Every message has a random 16-byte `id`, and `sent_at` is set by the sender but **never trusted for ordering security**. Duplicate `id`s are ignored (idempotent processing; libsignal already rejects ciphertext replays).
 

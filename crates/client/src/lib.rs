@@ -65,6 +65,8 @@ pub enum ClientError {
     UnknownContact,
     #[error("This picture is too large")]
     TooLarge,
+    #[error("Another contact already has that name")]
+    NameTaken,
     #[error("Message failed")]
     Protocol,
 }

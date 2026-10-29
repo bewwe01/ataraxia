@@ -135,7 +135,7 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE contacts ADD COLUMN profile_rev INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE contacts ADD COLUMN picture_hidden INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE contacts ADD COLUMN profile_sent BLOB;
-     UPDATE contacts SET nickname = 1 WHERE name NOT LIKE 'Contact %' AND name != 'New contact';
+     UPDATE contacts SET nickname = 1 WHERE NOT (name GLOB 'Contact ????' AND length(name) = 12) AND name != 'New contact';
      CREATE TABLE pictures (
        owner INTEGER NOT NULL,
        local INTEGER NOT NULL,
@@ -424,6 +424,67 @@ mod tests {
     }
 
     /// A preview.5 vault (version 3) keeps its reactions and then takes several per person.
+    #[test]
+    fn migrates_a_version_5_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("veil.db");
+        let key = [7u8; 32];
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex(&key).as_str()))
+                .unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            for m in &MIGRATIONS[..5] {
+                conn.execute_batch(&format!("BEGIN; {m} COMMIT;")).unwrap();
+            }
+            conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+            for (n, name) in [
+                "Contact 1a2b",
+                "New contact",
+                "Bob",
+                "Contact lens shop",
+                "contact abcd",
+            ]
+            .iter()
+            .enumerate()
+            {
+                conn.execute(
+                    "INSERT INTO contacts (address, name, mailbox, token, my_token, added_ms, wallpaper)
+                     VALUES (?1, ?2, x'00', x'00', x'00', 1, 'dots:0:0')",
+                    rusqlite::params![n.to_string(), name],
+                )
+                .unwrap();
+            }
+        }
+        let db = Db::open(&path, &key).unwrap();
+        let c = db.conn();
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(usize::try_from(v).unwrap(), MIGRATIONS.len());
+        // Only the names Veil made up are not nicknames (review PR-10); the rest of the row
+        // is kept.
+        let rows: Vec<(String, bool, Option<String>)> = c
+            .prepare("SELECT name, nickname, wallpaper FROM contacts ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<core::result::Result<_, _>>()
+            .unwrap();
+        let nick: Vec<bool> = rows.iter().map(|r| r.1).collect();
+        assert_eq!(nick, [false, false, true, true, true]);
+        assert!(rows.iter().all(|r| r.2.as_deref() == Some("dots:0:0")));
+        // A contact's pictures go with it.
+        c.execute(
+            "INSERT INTO pictures (owner, local, mime, data, rev) VALUES (3, 0, 'image/jpeg', x'ff', 1), (3, 1, 'image/jpeg', x'ff', 1)",
+            [],
+        )
+        .unwrap();
+        c.execute("DELETE FROM contacts WHERE id = 3", []).unwrap();
+        let n: i64 = c
+            .query_row("SELECT count(*) FROM pictures", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
     #[test]
     fn migrates_a_version_3_database() {
         let dir = tempfile::tempdir().unwrap();

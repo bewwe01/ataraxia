@@ -12,13 +12,12 @@ export function forgetPictures(): void {
 
 /** A picture's URL: the user's own (`owner` null) or a contact's, for the given token. */
 export function usePicture(owner: number | null, token: string | null): string | null {
-  const [url, setUrl] = useState<string | null>(null);
+  // Keyed, so an avatar that moves to another contact never shows the previous one's picture
+  // while the new one loads (review PR-13).
+  const key = token ? `${owner ?? "me"}:${token}` : null;
+  const [state, setState] = useState<{ key: string; url: string | null } | null>(null);
   useEffect(() => {
-    if (!token) {
-      setUrl(null);
-      return;
-    }
-    const key = `${owner ?? "me"}:${token}`;
+    if (!key) return;
     let p = cache.get(key);
     if (!p) {
       p = ipc.picture(owner).catch(() => {
@@ -29,13 +28,13 @@ export function usePicture(owner: number | null, token: string | null): string |
     }
     let live = true;
     void p.then((u) => {
-      if (live) setUrl(u);
+      if (live) setState({ key, url: u });
     });
     return () => {
       live = false;
     };
-  }, [owner, token]);
-  return token ? url : null;
+  }, [owner, key]);
+  return key && state?.key === key ? state.url : null;
 }
 
 /** The largest file the webview will try to decode at all. */

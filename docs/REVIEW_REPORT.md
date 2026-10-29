@@ -5293,3 +5293,306 @@ There are no Critical or High findings. LK3-1 should be fixed before release, be
 - **D.** Report only. The gate passes as it stands.
 
 Files: `/home/user/ataraxia/app/src/styles/app.css`, `/home/user/ataraxia/app/scripts/contrast-check.mjs`, `/home/user/ataraxia/app/src/components/Look.tsx`, `/home/user/ataraxia/app/src/color.ts`, `/home/user/ataraxia/app/src/screens/Chats.tsx`, `/home/user/ataraxia/app/src/styles/base.css`, `/home/user/ataraxia/app/src/styles/tokens.css`, `/home/user/ataraxia/crates/client/src/service/look.rs`.
+
+## Profile (milestone 4.5) review, round 1 (2026-10-29)
+
+**Scope:** commit 7fea537, 22 files, +1437/−18. I read all of it, plus the code it touches: the key-change merge, block and unblock, `deliver`, `retry_failed`, the tick loop, `name_key` and `clean_name`, the migration runner, look.rs (the LK-6 and LK-7 standard), the CSP and the padding buckets. I edited no files.
+
+**Verdict: FAIL.** There are 2 High, 6 Medium and 8 Low findings.
+
+**Commands run:**
+- `cargo test --offline -p veil-core --lib content`: 8 passed.
+- `cargo test --offline -p veil-client --test profile`: 2 passed.
+- `pnpm -C app typecheck`: 0 errors.
+- `pnpm -C app lint`: 22 files clean; contrast OK.
+- `cargo fmt --all --check`: clean.
+
+---
+
+## Findings
+
+### PR-1: High [HIGH that the check is missing; MEDIUM on how hard it crashes]. A hostile contact can store an image "bomb" that the webview decodes on every unlock
+**Where:**
+- `crates/client/src/service/profile.rs:309`, `receive_profile`
+- `crates/client/src/service/look.rs:61-68`, `image_mime`
+- `crates/core/src/content.rs:366-371`
+
+**Problem:**
+- On receive, the only check is the magic bytes and ≤ 48 KiB. JPEG, PNG and WebP are all accepted, and the image's dimensions are never read.
+- A 48 KiB lossless WebP of a single colour can declare 16383×16383, which is about 1 GiB of RGBA once decoded. A truncated JPEG can declare up to 65535×65535.
+- The picture is stored, then rendered as an `<img src="data:…">` in the chat list (`Chats.tsx:149`), the chat header, the call screen and the contact page. That happens on every unlock.
+- If the WebKitGTK or Android WebView renderer runs out of memory, the UI crashes again after every unlock. The user cannot even reach the contact to block or delete them.
+- Our own app only ever sends a 512 px JPEG (`pictures.ts:69`). Rust still accepts PNG and WebP for the user's own picture (`decode_picture`, `profile.rs:75`), so stripping metadata depends entirely on the webview. This is the LK-7 parity gap.
+
+**Fix:**
+- Accept only JPEG for profile pictures, both when setting our own and when receiving one.
+- Parse the JPEG SOF header in Rust and refuse anything over 1024×1024. A received picture that fails the check is dropped, the same as a non-image.
+- Update PROTOCOL §7 to "JPEG ≤ 1024 px, ≤ 48 KiB". Optionally tighten `content.rs` validation the same way.
+
+```rust
+/// Width and height from a baseline/progressive JPEG's SOF segment; None if malformed.
+fn jpeg_dims(b: &[u8]) -> Option<(u16, u16)> {
+    let mut i = 2usize; // after FFD8
+    while let (Some(&0xFF), Some(&m)) = (b.get(i), b.get(i + 1)) {
+        let len = usize::from(u16::from_be_bytes([*b.get(i + 2)?, *b.get(i + 3)?]));
+        if matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+            let h = u16::from_be_bytes([*b.get(i + 5)?, *b.get(i + 6)?]);
+            let w = u16::from_be_bytes([*b.get(i + 7)?, *b.get(i + 8)?]);
+            return Some((w, h));
+        }
+        i = i.checked_add(2)?.checked_add(len)?;
+    }
+    None
+}
+const MAX_PICTURE_SIDE: u16 = 1024;
+fn profile_picture_ok(b: &[u8]) -> bool {
+    image_mime(b) == Some("image/jpeg")
+        && jpeg_dims(b).is_some_and(|(w, h)| w > 0 && h > 0 && w <= MAX_PICTURE_SIDE && h <= MAX_PICTURE_SIDE)
+}
+```
+- Use this in `decode_picture` (for owner `ME`) and at `profile.rs:309`:
+  `p.picture.as_deref().filter(|b| profile_picture_ok(b)).map(|b| ("image/jpeg", b))`
+- Add a unit test with a JPEG header that declares 60000×60000.
+
+### PR-2: High [HIGH]. Accepting a key change drops "Hide my picture from …", so the picture goes to someone the user hid it from
+**Where:** `crates/client/src/service.rs:3985-3998` (`accept_key_change`), together with `profile.rs:412-420`.
+
+**Problem:**
+- The merge carries the accent and wallpaper over to the new contact (LK-11), but not `picture_hidden`, `nickname`, or the local picture.
+- The local picture is in `pictures` with owner = old and local = 1. The `contact_pictures_gone` trigger deletes it with the old row.
+- The merge then sets `key_warning = 0`. On the next retry tick, `profiles_due` sees the new row with `picture_hidden = 0`. Under "All contacts" the picture is sent straight away; under "Verified" it is sent as soon as the user verifies.
+- The user confirmed "It's them", so this is the same person they explicitly hid the picture from. INV-CONT-3 ("minus any hidden from") is violated.
+- The user's nickname for that person is also lost.
+
+**Fix:** inside the same `atomically` block, before `DELETE FROM contacts WHERE id = ?1`:
+```rust
+conn.execute(
+    "UPDATE contacts SET
+       picture_hidden = picture_hidden OR (SELECT picture_hidden FROM contacts WHERE id = ?1),
+       name = CASE WHEN (SELECT nickname FROM contacts WHERE id = ?1) = 1
+                   THEN (SELECT name FROM contacts WHERE id = ?1) ELSE name END,
+       nickname = nickname OR (SELECT nickname FROM contacts WHERE id = ?1)
+     WHERE id = ?2",
+    params![old, contact],
+)?;
+conn.execute(
+    "UPDATE OR IGNORE pictures SET owner = ?2 WHERE owner = ?1 AND local = 1",
+    params![old, contact],
+)?;
+```
+Add a test to `contacts_and_privacy::accepting_a_key_change_moves_the_old_conversation`, or to `profile.rs`: hide the picture from Bob, set "All", Bob re-pairs, accept the key change, and check that Bob never receives the picture.
+
+### PR-3: Medium [HIGH]. A picture queued before blocking is delivered after unblocking, even if access was taken back in between
+**Where:**
+- `crates/client/src/service.rs:3850-3860` (`set_blocked`)
+- `profile.rs:396-398` (`WHERE blocked = 0`)
+- the tick at `service.rs:1303-1308` (`retry_failed` runs before `sync_profiles`)
+
+**Problem:**
+- Blocking only drops pending mailbox updates. A profile row that carries the picture and is still `sending` or `failed` stays queued.
+- While the contact is blocked, `profiles_due` skips them. So switching to "Nobody", or hiding the picture from them, never replaces that row.
+- After unblocking, the next tick's `retry_failed` delivers the stale row, which still has the picture. Only then does `sync_profiles` queue the profile without it.
+- The contact receives the picture bytes after the user revoked access.
+
+**Fix:** when blocking, inside the existing `atomically` block:
+```rust
+s.db.conn().execute(
+    "DELETE FROM messages WHERE contact = ?1 AND mine = 1 AND kind = 'control' AND body = 'profile'",
+    [contact],
+)?;
+s.db.conn().execute("UPDATE contacts SET profile_sent = NULL WHERE id = ?1", [contact])?;
+```
+Also call `self.sync_profiles(Some(contact)).await` at the end of `unblock`. Add a test for block → set Nobody → unblock.
+
+### PR-4: Medium [HIGH]. A profile that gives up after `MAX_ATTEMPTS` is never sent again, so a revocation can be lost for good
+**Where:** `profile.rs:374-381`, `service.rs:59` and `:3084-3087`.
+
+**Problem:**
+- `profile_sent` is written when the profile is queued, not when it is delivered.
+- If the deposit fails 20 times (for example the mailbox is full or the token is rejected while the contact is away), `retry_failed` stops trying.
+- `profiles_due` still sees a matching digest, so nothing is sent again until the profile itself changes.
+- If the lost row was the one without the picture ("Nobody", or hidden from them), the contact keeps showing the picture indefinitely.
+
+**Fix:** in `profiles_due`, treat a contact as due when their last profile was abandoned:
+```sql
+SELECT id, verified, picture_hidden, key_warning,
+       CASE WHEN EXISTS (SELECT 1 FROM messages m WHERE m.contact = contacts.id AND m.kind = 'control'
+                         AND m.body = 'profile' AND m.attempts >= ?2) THEN NULL ELSE profile_sent END
+FROM contacts WHERE blocked = 0 AND (?1 IS NULL OR id = ?1)
+```
+Bind `MAX_ATTEMPTS` as `?2`. Alternatively, clear `profile_sent` when the attempt limit is reached.
+
+### PR-5: Medium [HIGH]. What the relay learns is not documented, and the bucket size reveals who can see the picture
+**Where:** `profile.rs:361-382`, ADR-0020 "Consequences", `docs/THREAT_MODEL.md:52,72`.
+
+**Problem:**
+- A profile with the picture fills the 64 KiB bucket; one without it fits in 1 or 4 KiB. The relay can therefore tell, mailbox by mailbox, which contacts are allowed to see the picture, and when that changes.
+- Every profile change, and the first tick after upgrading (`profile_sent` is NULL everywhere), deposits into **every** contact's mailbox in one burst over one connection. That links all of the user's contact mailboxes at once. Ordinary chatting only leaks this gradually.
+- ADR-0020 only says "about 48 KiB per contact" and does not mention either leak.
+
+**Fix:**
+- At minimum, add both points to ADR-0020 "Consequences" and to the THREAT_MODEL §4 traffic-analysis row.
+- Preferably, pad every `Profile` to the 64 KiB bucket, for example with a new `bytes pad = 5` field the receiver ignores. Then the bucket no longer reveals visibility.
+- Spread the fan-out over a few retry ticks with random jitter, for example by limiting `sync_profiles(None)` to K contacts per tick in random order.
+
+### PR-6: Medium [HIGH]. A contact can now rename itself at any time, silently, into a look-alike of another contact (INV-ID-2)
+**Where:**
+- `profile.rs:334-349` (`adopt_name`)
+- `service.rs:1044-1049` (`name_key`)
+- `profile.rs:325-327`
+
+**Problem:**
+- `name_key` folds only case and whitespace, so "Вob" (Cyrillic В), "Ｂob" (fullwidth) or "B0b" all pass. INV-ID-2 accepted look-alike letters as a limit only at arrival time.
+- Profiles add a new path: an established contact with no warning can take a look-alike name at any later time, and nothing in the chat says so.
+- `adopt_name` checks only other contacts' *shown* names. If the real Bob is shown under the nickname "Bobby", Mallory can take "Bob", which is Bob's real self-chosen name (`profile_name`).
+
+**Fix:**
+- Build `name_key` on NFKC normalisation plus a UTS #39 confusable skeleton, for example `unicode_security::confusable_detection::skeleton`. This also strengthens the arrival check at `service.rs:3252`.
+- In `adopt_name`, also compare against the other contacts' `profile_name`:
+  `SELECT name FROM contacts WHERE id != ?1 UNION ALL SELECT profile_name FROM contacts WHERE id != ?1 AND profile_name IS NOT NULL`
+- When an adopted name changes, add a local system line to the chat ("Mallory now calls themself …"), as Signal does. Then a rename is never silent.
+- Update INV-ID-2 accordingly.
+
+### PR-7: Medium [HIGH]. Every retry tick reads the picture and copies it once per contact, even when nothing changed
+**Where:** `profile.rs:386-432` (`:391` and `:424`), called from `service.rs:1306` every minute.
+
+**Problem:**
+- Every minute, `profiles_due` reads the picture BLOB, then clones it for every contact. The `.clone().filter(..)` runs even when the contact may not see the picture.
+- It then hashes name, status and picture for every contact: N × 48 KiB of allocation and SHA-256 per minute. For 500 contacts that is about 24 MiB.
+- Each copy is freed without being wiped (see PR-9). This also blocks the single-threaded actor.
+
+**Fix:**
+- Hash the picture once per call: `let pic_hash = picture.as_ref().map(|p| Sha256::digest(p))`.
+- Have `Outgoing::digest` take `Option<&[u8; 32]>` and set `picture: None` in `due`.
+- Load the BLOB as `Zeroizing<Vec<u8>>` only inside `sync_profiles`, and only when a due contact may see it.
+- Optionally skip the whole scan unless a "profile generation" counter, bumped by every relevant change, differs from the last scan.
+
+### PR-8: Medium [HIGH]. Parts of INV-CONT-3 are claimed but not tested (CLAUDE.md rule 9)
+**Where:** `docs/INVARIANTS.md` (INV-CONT-3), `crates/client/tests/profile.rs`, `crates/client/src/db.rs` tests.
+
+**Problem:** no test covers:
+- "never a contact with an unresolved key-change warning";
+- blocked contacts;
+- the key-change merge (PR-2);
+- the abandoned-row case (PR-4);
+- migration 6 (the nickname heuristic, and v5 → v6 keeping data).
+
+**Fix:**
+- Add `profile::no_picture_to_a_contact_with_a_key_warning`: re-pair under the same name, set "All", check that no picture arrives, then dismiss the warning and check that it does.
+- Add tests for block → revoke → unblock, and for the merge.
+- Add `db::tests::migrates_a_version_5_database`: "Contact 1a2b" and "New contact" get `nickname = 0`, "Bob" gets 1, and the `pictures` trigger deletes a contact's pictures.
+
+### PR-9: Low [HIGH]. Picture buffers are not wiped, below the LK-6 / LK2-3 standard
+**Where:**
+- `profile.rs:65-77` (base64 `String` and decoded `Vec`)
+- `:132-143` and `:274-289` (BLOB `Vec`; the URL is built by `format!` with an `encode()` temporary, so two copies are left unwiped and not pre-sized)
+- `:391` and `:424` (per-contact clones)
+- `app/src-tauri/src/lib.rs` `set_my_picture` and `set_contact_picture` (`Option<String>`)
+
+**Fix:**
+- Mirror `look.rs:90-100` and `:231-250`: wrap the base64 in `Zeroizing` before any check, decode into `Zeroizing<Vec<u8>>`, and read BLOBs as `Zeroizing<Vec<u8>>`.
+- Build the URL like this:
+  `let mut url = String::with_capacity(prefix.len().checked_add(base64::encoded_len(data.len(), true)?)?); url.push_str(&prefix); STANDARD.encode_string(&*data, &mut url);`
+- Take `Zeroizing<String>` in the Tauri commands.
+
+### PR-10: Low [MEDIUM]. Migration 6's nickname heuristic is too broad, and it is untested
+**Where:** `crates/client/src/db.rs:138`.
+
+**Problem:**
+- `name NOT LIKE 'Contact %'` is case-insensitive and matches any prefix. So a name the user chose, such as "contact Dave" or "Contact lens shop", is not marked as a nickname and may later be replaced by the contact's own name.
+- The made-up name is always exactly "Contact " followed by 4 characters (`service.rs:2474-2479`).
+
+**Fix:** `UPDATE contacts SET nickname = 1 WHERE NOT (name GLOB 'Contact ????' AND length(name) = 12) AND name != 'New contact';`. Add a test (see PR-8).
+
+### PR-11: Low [MEDIUM]. A contact's status sits directly above the security banners and can imitate them; name and status also go to possible impostors
+**Where:** `app/src/screens/Contacts.tsx:199-204`, and `profile.rs:412-425`.
+
+**Problem:**
+- A status such as "✓ Verified, safety number matches" renders right above `<KeyWarning>` and the Verified banner.
+- Separately, a contact with an unresolved key-change warning still receives the user's name and status. The status is new user content that the invite never carried.
+
+**Fix:**
+- Render the status with a label and quotes, as `theirName` already is: `<p className="their-status">Status: “{contact.status}”</p>`. Place `contact-head` after `<KeyWarning>`.
+- In `profiles_due`, skip `key_warning` contacts entirely (`if key_warning { continue; }`), so the full profile goes out once the warning is resolved.
+
+### PR-12: Low [LOW]. Old profile revisions could block a revocation if the stored revision is ever lost
+**Where:** `profile.rs:125-130`, `:294-302`.
+
+**Problem:**
+- A receiver ignores any `rev` that is not above the one it stored. A sender's revision is `max(last + 1, now_ms)`.
+- If `profile.rev` is ever lost while the contacts' copies remain (a future backup restore, PROTOCOL §12 "contents: … contacts"), or if a revision was once issued with a clock far in the future, every later profile is ignored. That includes the one that takes the picture away.
+- Restore does not exist yet, so this is forward-looking.
+
+**Fix:**
+- Include `profile.rev` in the backup.
+- On restore, set `profile_sent = NULL`.
+- Document in ADR-0020 that a revision must never go backwards.
+
+### PR-13: Low [HIGH]. `usePicture` briefly shows the previous owner's picture when `owner` changes
+**Where:** `app/src/pictures.ts:14-39`.
+
+**Problem:** when the same `<Avatar>` instance moves to another contact (the chat header when switching chats), the old `url` state is returned until the new promise resolves.
+
+**Fix:**
+```ts
+const [state, setState] = useState<{ key: string; url: string | null } | null>(null);
+// in the effect: void p.then((u) => { if (live) setState({ key, url: u }); });
+const key = token ? `${owner ?? "me"}:${token}` : null;
+return key && state?.key === key ? state.url : null;
+```
+
+### PR-14: Low [MEDIUM]. Accessibility: the crop area has `aria-label` but no role
+**Where:** `app/src/components/Profile.tsx:59-68`.
+
+**Problem:** a focusable `<div tabIndex={0} aria-label=…>` without a role fails axe's `aria-prohibited-attr` rule.
+
+**Fix:** add `role="group"`, and point `aria-describedby` at a visible hint: `<p id="crop-hint" className="hint">Drag, or use the arrow keys, to move the picture.</p>`.
+
+### PR-15: Low [MEDIUM]. "Use their name" does nothing visible when the name is taken
+**Where:** `profile.rs:221-231`.
+
+**Problem:** `nickname = 0` is written first. If `adopt_name` then refuses the name, the old nickname text stays as a non-nickname, and the button disappears. The user's nickname is then silently replaced by the next profile the contact sends.
+
+**Fix:** have `adopt_name` return whether it adopted the name. If it did not, keep `nickname = 1` and return `ClientError::BadInput`, so the UI shows "Another contact already has that name".
+
+### PR-16: Low [HIGH]. Code quality in the contact page
+**Where:** `app/src/screens/Contacts.tsx:259`, `:111`.
+
+**Problem:**
+- `contact.picture?.startsWith("l")` depends on Rust's private token format (`profile.rs:80-82`).
+- `useEffect(() => setName(contact.name), [contact.name])` overwrites a nickname the user is typing whenever the contact's profile arrives.
+
+**Fix:**
+- Add `localPicture: boolean` to `ContactView` and `ipc.ts`, and use it instead of the token prefix.
+- Only reset the field when it is not focused or not edited, for example by tracking a `dirty` ref.
+
+---
+
+## Checked and found correct
+- **No new cryptography.** `Content::Profile` travels over the existing sealed session. The picture is never sent to the relay outside the session.
+- **Size and strict decoding.** The picture is ≤ 48 KiB, which with name and status stays inside `MAX_BODY_LEN`.
+- **`Profile` debug output.** `Profile` has a redacting `Debug` (`redacted_debug!` and `skip_debug`).
+- **Name and status validation in core.** Core validates name (≤ 64 chars), status (≤ 140) and an empty picture. It also rejects control and bidi characters (U+202A–E, U+2066–9, LRM/RLM).
+- **Name and status cleaning in the client.** The client also cleans names with `clean_name`/`is_invisible`, which covers U+061C, Cf blocks and tags. Both are rendered as React text nodes; there is no HTML sink.
+- **No panics on the boundary.** `u64` → `i64` conversions saturate, there is no indexing or unwrap, and a hostile `rev = u64::MAX` only freezes the sender's own profile.
+- **Replay and ordering.** Updates are guarded by `profile_rev < ?`, and libsignal rejects ciphertext replays. The test shows an older raw `rev` changes nothing.
+- **Per-send revision.** One revision per sync round fixes the re-send-under-the-same-revision bug.
+- **Deleting a superseded queued profile is safe for the ratchet.** The receiver derives and stores a skipped message key: libsignal allows up to 25,000 forward jumps and keeps 2,000 skipped keys. Every PreKey-phase message carries the full PreKey header. The intro is still delivered first (`deliver` with `intro_pending`). The pattern already exists (`drop_pending_mailbox_updates`, and the merge deleting control rows). Search only covers `kind = 'text'`, so the `'profile'` tag in `body` is never shown.
+- **Blocked contacts are skipped** by `profiles_due`, `queue_control_as`, `deliver` and `retry_failed`. PR-3 is about stale rows only.
+- **Default visibility is "nobody"**, and an unknown setting also reads as "nobody". The picture is not sent to a hidden contact or to one with a key warning (in normal flow), and is sent again on verify or unverify.
+- **CSP and XSS.** `img-src 'self' data: blob:` was already allowed. The MIME type in the `data:` URL comes from the magic bytes and is checked again when read back, so SVG and HTML are impossible. An `<img>` cannot run script.
+- **At rest.** Pictures live in SQLCipher. The integration test finds no plaintext after lock on either side. Nothing is logged, and there are no temp files.
+- **Migration 6.** It runs in one transaction with `user_version`. The new columns have defaults. The `pictures` primary key is `(owner, local)`, and a trigger deletes pictures with their contact. Owner 0 cannot collide with a rowid. Fresh installs work.
+- **Digest.** Fields are length-prefixed and the picture has a presence byte. The unit test covers both.
+- **Webview cache.** It is cleared on every path out of "unlocked" (`App.tsx` cleanup), and rejected promises are evicted. Tokens change with every picture.
+- **Cropper math.** With `transform-origin: 0 0`, `translate(V/2 − cx·s, V/2 − cy·s) scale(s)` maps the centre to the middle of the view. The clamp keeps the square inside the image, the crop is `{cx − side/2, cy − side/2, side}`, and `preparePicture` redraws it, which strips metadata. There is a 25 MiB pick cap, a `--bg-1` fill (a token, not a raw colour), and quality steps down until the JPEG fits.
+- **Design.** The only animation is the image `transform` in the cropper, with no transitions. Only tokens are used, except layout px sizes. Buttons use `.btn` and `ToggleRow`, so targets are ≥ 44 px. Inputs have labels, the zoom slider has `aria-valuetext`, the avatar `<img>` has `alt=""` inside `aria-hidden`, and errors use `role="alert"`.
+- **IPC.** All of it goes through `ipc.ts`, with matching Tauri commands, and only display data is returned (a token or a `data:` URL).
+
+**Verdict: FAIL.** PR-1 and PR-2 are High and must be fixed before re-review. The Medium findings PR-3 to PR-8 should be fixed in the same round.
+
+**Next steps:**
+- (A) Fix all findings; recommended for a FAIL.
+- (B) Fix the High and Medium findings only (PR-1 to PR-8).
+- (C) Fix specific findings.
+- (D) Keep this as a report only.
