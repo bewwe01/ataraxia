@@ -1,8 +1,9 @@
 // The user's profile in Settings, and the picture cropper it and the contact profile share
-// (milestone 4.5, ADR-0020). Pictures go to Rust as small JPEGs (`preparePicture`).
+// (milestone 4.5, ADR-0020). Pictures go to Rust as small JPEGs (`preparePicture`), or as
+// GIFs kept as they are (`prepareGif`).
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent } from "react";
 import { IpcError, ipc, type PictureVisibility, type ProfileView } from "../ipc";
-import { centreCrop, preparePicture, type Crop } from "../pictures";
+import { centreCrop, isGifFile, prepareGif, preparePicture, type Crop } from "../pictures";
 import { Avatar, Icon, Segmented } from "../ui";
 
 const VIEW = 240;
@@ -161,6 +162,12 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
   }
 
   if (!p) return null;
+  /** A GIF is used as it is (it stays animated); anything else is cropped first. */
+  async function choose(f: File) {
+    if (await isGifFile(f)) await act(async () => ipc.setMyPicture(await prepareGif(f)), "Could not set the picture");
+    else setPicked(f);
+  }
+
   return (
     <section className="card stack">
       <div className="profile-head">
@@ -175,7 +182,7 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
             </button>
           ) : null}
         </div>
-        <input ref={file} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) setPicked(f); }} />
+        <input ref={file} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void choose(f); }} />
       </div>
       {picked ? <PictureCropper file={picked} onDone={(c) => void crop(c)} onCancel={() => setPicked(null)} /> : null}
       <form className="stack-sm" onSubmit={(e) => void save(e)}>

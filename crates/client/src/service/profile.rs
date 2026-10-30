@@ -86,16 +86,118 @@ fn jpeg_dims(b: &[u8]) -> Option<(u16, u16)> {
     None
 }
 
-/// A picture we accept, from the user or a contact: a JPEG (the app's redrawn, metadata-free
-/// form) of at most [`MAX_PICTURE_LEN`] bytes and [`MAX_PICTURE_SIDE`] pixels a side.
-fn picture_ok(b: &[u8]) -> bool {
-    b.len() <= MAX_PICTURE_LEN
-        && image_mime(b) == Some("image/jpeg")
-        && jpeg_dims(b).is_some_and(|(w, h)| w > 0 && h > 0 && w <= MAX_PICTURE_SIDE && h <= MAX_PICTURE_SIDE)
+/// An animated picture's frames, at most.
+const MAX_GIF_FRAMES: u32 = 100;
+/// All frames' canvases together, in pixels: what a browser may hold decoded (64 MiB RGBA).
+const MAX_GIF_PIXELS: u64 = 16 * 1024 * 1024;
+
+fn le16(b: &[u8], i: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([*b.get(i)?, *b.get(i.checked_add(1)?)?]))
 }
 
-/// A picture from the webview, as base64 (see [`picture_ok`]). Wiped on every path.
-fn decode_picture(b64: &str) -> Result<Zeroizing<Vec<u8>>> {
+/// The end of a run of GIF data sub-blocks starting at `i` (after its 0 terminator).
+fn gif_sub_blocks(b: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        let len = usize::from(*b.get(i)?);
+        i = i.checked_add(1)?;
+        if len == 0 {
+            return Some(i);
+        }
+        i = i.checked_add(len)?;
+    }
+}
+
+/// A GIF rebuilt from only what draws it: header, screen, colour tables, frames, their
+/// timing and the loop count. Comments and other extensions, which can carry metadata
+/// (XMP, software, text), are dropped. `None` if malformed, or larger than
+/// [`MAX_PICTURE_SIDE`] a side, [`MAX_GIF_FRAMES`] frames or [`MAX_GIF_PIXELS`] in all, so a
+/// few kilobytes cannot make the webview decode a huge animation.
+fn gif_clean(b: &[u8]) -> Option<Vec<u8>> {
+    let ok_side = |v: u16| v > 0 && v <= MAX_PICTURE_SIDE;
+    if !(b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a")) {
+        return None;
+    }
+    let (w, h) = (le16(b, 6)?, le16(b, 8)?);
+    if !ok_side(w) || !ok_side(h) {
+        return None;
+    }
+    let flags = *b.get(10)?;
+    // A colour table's size: 3 × 2^(n + 1) bytes, n being the flag's low 3 bits.
+    let table = |f: u8| if f & 0x80 != 0 { 6usize << (f & 7) } else { 0 };
+    let mut i = 13usize.checked_add(table(flags))?;
+    let mut out = b.get(..i)?.to_vec();
+    let screen = u64::from(w).checked_mul(u64::from(h))?;
+    let (mut frames, mut pixels) = (0u32, 0u64);
+    loop {
+        match *b.get(i)? {
+            0x3B => {
+                out.push(0x3B);
+                return (frames > 0).then_some(out);
+            }
+            0x21 => {
+                let label = *b.get(i.checked_add(1)?)?;
+                let end = gif_sub_blocks(b, i.checked_add(2)?)?;
+                let keep = match label {
+                    // Graphic control: frame timing and transparency.
+                    0xF9 => true,
+                    // Application: only the loop count.
+                    0xFF => b.get(i.checked_add(2)?..i.checked_add(14)?) == Some(b"\x0BNETSCAPE2.0"),
+                    _ => false,
+                };
+                if keep {
+                    out.extend_from_slice(b.get(i..end)?);
+                }
+                i = end;
+            }
+            0x2C => {
+                let (left, top) = (le16(b, i.checked_add(1)?)?, le16(b, i.checked_add(3)?)?);
+                let (fw, fh) = (le16(b, i.checked_add(5)?)?, le16(b, i.checked_add(7)?)?);
+                let fits = |at: u16, len: u16, max: u16| at.checked_add(len).is_some_and(|e| e <= max);
+                if !ok_side(fw) || !ok_side(fh) || !fits(left, fw, w) || !fits(top, fh, h) {
+                    return None;
+                }
+                frames = frames.checked_add(1)?;
+                pixels = pixels.checked_add(screen)?;
+                if frames > MAX_GIF_FRAMES || pixels > MAX_GIF_PIXELS {
+                    return None;
+                }
+                let lct = table(*b.get(i.checked_add(9)?)?);
+                // Descriptor, local colour table, LZW code size, then the image data.
+                let data = i.checked_add(10)?.checked_add(lct)?;
+                if !(2..=8).contains(b.get(data)?) {
+                    return None;
+                }
+                let end = gif_sub_blocks(b, data.checked_add(1)?)?;
+                out.extend_from_slice(b.get(i..end)?);
+                i = end;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// A picture we accept, from the user or a contact, with its type and the bytes to keep: a
+/// JPEG (the app's redrawn, metadata-free form) or a GIF (rebuilt by [`gif_clean`]), of at
+/// most [`MAX_PICTURE_LEN`] bytes and [`MAX_PICTURE_SIDE`] pixels a side.
+fn accept_picture(b: &[u8]) -> Option<(&'static str, Zeroizing<Vec<u8>>)> {
+    if b.len() > MAX_PICTURE_LEN {
+        return None;
+    }
+    if image_mime(b) == Some("image/jpeg") {
+        let (w, h) = jpeg_dims(b)?;
+        let side = |v: u16| v > 0 && v <= MAX_PICTURE_SIDE;
+        return (side(w) && side(h)).then(|| ("image/jpeg", Zeroizing::new(b.to_vec())));
+    }
+    gif_clean(b).map(|g| ("image/gif", Zeroizing::new(g)))
+}
+
+/// A stored picture still passes the checks, and is what it says it is.
+fn picture_ok(mime: &str, b: &[u8]) -> bool {
+    accept_picture(b).is_some_and(|(m, kept)| m == mime && *kept == b)
+}
+
+/// A picture from the webview, as base64 (see [`accept_picture`]). Wiped on every path.
+fn decode_picture(b64: &str) -> Result<(&'static str, Zeroizing<Vec<u8>>)> {
     if b64.len() > MAX_PICTURE_LEN / 3 * 4 + 4 {
         return Err(ClientError::TooLarge);
     }
@@ -107,10 +209,7 @@ fn decode_picture(b64: &str) -> Result<Zeroizing<Vec<u8>>> {
     if bytes.len() > MAX_PICTURE_LEN {
         return Err(ClientError::TooLarge);
     }
-    if !picture_ok(&bytes) {
-        return Err(ClientError::BadInput);
-    }
-    Ok(bytes)
+    accept_picture(&bytes).ok_or(ClientError::BadInput)
 }
 
 /// A picture as a `data:` URL, sized up front so no unwiped copies are left behind.
@@ -305,10 +404,10 @@ impl Actor {
         let conn = self.s()?.db.conn();
         match b64 {
             Some(b64) => {
-                let bytes = decode_picture(&b64)?;
+                let (mime, bytes) = decode_picture(&b64)?;
                 conn.execute(
-                    "INSERT OR REPLACE INTO pictures (owner, local, mime, data, rev) VALUES (?1, ?2, 'image/jpeg', ?3, ?4)",
-                    params![owner, local, &**bytes, rev],
+                    "INSERT OR REPLACE INTO pictures (owner, local, mime, data, rev) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![owner, local, mime, &**bytes, rev],
                 )?;
             }
             None => {
@@ -332,15 +431,16 @@ impl Actor {
             },
         };
         // Checked again on the way out, so a row stored by an older build cannot get through.
-        Ok(row.and_then(|(mime, data, _)| {
-            (mime == "image/jpeg" && picture_ok(&data))
-                .then(|| data_url(&mime, &data))
-                .flatten()
-        }))
+        Ok(
+            row.and_then(|(mime, data, _)| {
+                picture_ok(&mime, &data).then(|| data_url(&mime, &data)).flatten()
+            }),
+        )
     }
 
     /// A contact's profile (inside `process`'s transaction). Older revisions are ignored; a
-    /// picture that is not a small JPEG is dropped (review PR-1).
+    /// picture that is not a small JPEG or GIF is dropped (review PR-1), and a GIF's metadata
+    /// is dropped from it.
     pub(super) fn receive_profile(&self, contact: i64, p: &Profile) -> Result<()> {
         let rev = i64::try_from(p.rev).unwrap_or(i64::MAX);
         let conn = self.s()?.db.conn();
@@ -357,11 +457,11 @@ impl Actor {
             "UPDATE contacts SET profile_name = ?2, profile_status = ?3 WHERE id = ?1",
             params![contact, (!name.is_empty()).then_some(&name), status],
         )?;
-        match p.picture.as_deref().filter(|b| picture_ok(b)) {
-            Some(bytes) => {
+        match p.picture.as_deref().and_then(accept_picture) {
+            Some((mime, bytes)) => {
                 conn.execute(
-                    "INSERT OR REPLACE INTO pictures (owner, local, mime, data, rev) VALUES (?1, 0, 'image/jpeg', ?2, ?3)",
-                    params![contact, bytes, rev],
+                    "INSERT OR REPLACE INTO pictures (owner, local, mime, data, rev) VALUES (?1, 0, ?2, ?3, ?4)",
+                    params![contact, mime, &**bytes, rev],
                 )?;
             }
             None => {
@@ -663,6 +763,75 @@ mod tests {
             let _ = jpeg_dims(&jpeg(5, 5)[..cut]);
         }
         assert_eq!(jpeg_dims(&[0xFF, 0xD8, 0xFF, 0xE0, 0xFF, 0xFF]), None);
+    }
+
+    /// A GIF of `w` × `h` with `frames` 1 × 1 frames, and the given extensions before them.
+    pub(crate) fn gif(w: u16, h: u16, frames: usize, extensions: &[&[u8]]) -> Vec<u8> {
+        let mut b = b"GIF89a".to_vec();
+        b.extend_from_slice(&w.to_le_bytes());
+        b.extend_from_slice(&h.to_le_bytes());
+        b.extend_from_slice(&[0x80, 0, 0, 0xFF, 0xFF, 0xFF, 0, 0, 0]);
+        for e in extensions {
+            b.extend_from_slice(e);
+        }
+        for _ in 0..frames {
+            b.extend_from_slice(&[0x21, 0xF9, 4, 4, 10, 0, 0, 0]);
+            b.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0]);
+        }
+        b.push(0x3B);
+        b
+    }
+
+    #[test]
+    fn gifs_are_checked_and_stripped() {
+        const LOOP: &[u8] = b"\x21\xFF\x0BNETSCAPE2.0\x03\x01\x00\x00\x00";
+        const COMMENT: &[u8] = b"\x21\xFE\x0Ashot by me\x00";
+        const XMP: &[u8] = b"\x21\xFF\x0BXMP DataXMP\x05where\x00";
+        let plain = gif(64, 64, 3, &[LOOP]);
+        let (mime, kept) = accept_picture(&plain).unwrap();
+        assert_eq!((mime, kept.as_slice()), ("image/gif", plain.as_slice()));
+        assert!(picture_ok("image/gif", &plain));
+        assert!(!picture_ok("image/jpeg", &plain));
+        // Metadata goes, the picture and its loop stay.
+        let tagged = gif(64, 64, 3, &[COMMENT, LOOP, XMP]);
+        let (_, kept) = accept_picture(&tagged).unwrap();
+        assert_eq!(kept.as_slice(), plain.as_slice());
+        assert!(!picture_ok("image/gif", &tagged), "stored GIFs are already clean");
+        // Refused: a huge canvas, too many frames (or pixels), a frame outside the canvas, no
+        // frame, an unknown block, a bad code size.
+        assert!(gif_clean(&gif(60000, 60000, 1, &[])).is_none());
+        assert!(gif_clean(&gif(1025, 1, 1, &[])).is_none());
+        assert!(gif_clean(&gif(10, 10, 101, &[])).is_none());
+        assert!(
+            gif_clean(&gif(1024, 1024, 17, &[])).is_none(),
+            "17 Mpx of canvases"
+        );
+        assert!(gif_clean(&gif(1024, 1024, 16, &[])).is_some());
+        assert!(gif_clean(&gif(1, 1, 0, &[])).is_none());
+        let mut outside = gif(1, 1, 1, &[]);
+        outside[30] = 1; // the frame's top edge at 1, on a 1-pixel canvas
+        assert!(gif_clean(&outside).is_none());
+        let mut odd = gif(4, 4, 1, &[]);
+        odd.insert(19, 0x99);
+        assert!(gif_clean(&odd).is_none());
+        let mut code = gif(4, 4, 1, &[]);
+        code[37] = 12;
+        assert!(gif_clean(&code).is_none());
+        // Every truncation is refused without a panic.
+        let full = gif(8, 8, 2, &[LOOP, COMMENT]);
+        for cut in 0..full.len() {
+            assert!(gif_clean(&full[..cut]).is_none());
+        }
+        // From the webview too.
+        let enc = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+        assert_eq!(
+            decode_picture(&enc(&tagged)).unwrap().1.as_slice(),
+            plain.as_slice()
+        );
+        assert_eq!(
+            decode_picture(&enc(&gif(2000, 10, 1, &[]))).err(),
+            Some(ClientError::BadInput)
+        );
     }
 
     #[test]

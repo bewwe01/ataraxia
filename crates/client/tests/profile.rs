@@ -364,3 +364,41 @@ async fn a_picture_taken_back_always_leaves() {
     a.set_picture_hidden(a_bob.id, false).await.unwrap(); // a sync round for Bob
     until(b, b_alice.id, |v| v.picture.is_none()).await;
 }
+
+/// An animated GIF works as a picture; its metadata never leaves the device (ADR-0020).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn animated_gifs_arrive_without_their_metadata() {
+    let r = relay().await;
+    let (alice, bob) = (user(&r, "Alice").await, user(&r, "Bob").await);
+    let (_, b_alice) = pair(&alice.client, &bob.client).await;
+    let (a, b) = (&alice.client, &bob.client);
+    let frame = [0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0];
+    let mut gif = b"GIF89a\x02\x00\x02\x00\x80\x00\x00\xFF\xFF\xFF\x00\x00\x00".to_vec();
+    gif.extend_from_slice(b"\x21\xFF\x0BNETSCAPE2.0\x03\x01\x00\x00\x00");
+    let clean_len = gif.len() + 2 * (8 + frame.len()) + 1;
+    gif.extend_from_slice(b"\x21\xFE\x12gif-metadata-probe\x00");
+    for _ in 0..2 {
+        gif.extend_from_slice(&[0x21, 0xF9, 4, 4, 10, 0, 0, 0]);
+        gif.extend_from_slice(&frame);
+    }
+    gif.push(0x3B);
+
+    a.set_my_picture(Some(b64(&gif))).await.unwrap();
+    a.set_picture_visibility(PictureVisibility::All).await.unwrap();
+    until(b, b_alice.id, |v| v.picture.is_some()).await;
+    let url = b.picture(Some(b_alice.id)).await.unwrap().unwrap();
+    let got = base64::engine::general_purpose::STANDARD
+        .decode(url.strip_prefix("data:image/gif;base64,").unwrap())
+        .unwrap();
+    assert_eq!(got.len(), clean_len);
+    assert!(got.starts_with(b"GIF89a") && !got.windows(18).any(|w| w == b"gif-metadata-probe"));
+    // A local GIF for a contact works the same way.
+    b.set_contact_picture(b_alice.id, Some(b64(&gif))).await.unwrap();
+    assert!(
+        b.picture(Some(b_alice.id))
+            .await
+            .unwrap()
+            .unwrap()
+            .starts_with("data:image/gif;")
+    );
+}

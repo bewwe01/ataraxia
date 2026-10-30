@@ -2,6 +2,41 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Profile: animated GIF pictures (2026-10-30)
+
+Owner request: GIF support for profile pictures (ADR-0020).
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 244 passed, 0 failed
+$ (app/src-tauri) cargo fmt --check; cargo clippy -- -D warnings
+#     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 01s
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 22 files clean
+# contrast: 25 panels; worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001
+# ✓ built in 2.30s
+$ (design/tools) node check.mjs
+# PASS
+```
+
+New tests:
+- `service::profile::gifs_are_checked_and_stripped`:
+  - A 3-frame looping GIF is accepted unchanged.
+  - The same GIF with a comment and an XMP block comes back byte-for-byte equal to the plain one, so the metadata is dropped and the loop is kept.
+  - Refused: a 60000 px or 1025 px canvas, 101 frames, 17 frames of 1024 × 1024 (over 16 Mpx), no frame, a frame outside the canvas, an unknown block, and a bad LZW code size.
+  - Every truncation is refused without a panic.
+- `tests/profile.rs` `animated_gifs_arrive_without_their_metadata`: Alice sets a 2-frame GIF with a comment. Bob receives an `image/gif` picture of exactly the cleaned length, without the comment. A local GIF for a contact works too.
+
+In Chromium against the IPC mock:
+- A GIF skips the cropper, and the avatar shows `data:image/gif`.
+- A 60 KB GIF shows "GIFs must be under 48 KB".
+- With Reduce motion on, the avatar shows the first frame (`data:image/png`).
+- No console errors.
+
 ## Profile: review round 1 and its fixes (2026-10-29)
 
 Round 1 of the review gate failed on two High findings: PR-1, a contact could store a picture that decodes to gigabytes, and PR-2, accepting a key change dropped "Hide my picture". All 16 findings (PR-1 to PR-16) were fixed in this round.

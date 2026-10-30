@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { INVITE_PREFIX, ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
 import { Avatar, Banner, Icon, QrCode, Segmented, ToggleRow, TopBar } from "../ui";
 import { PictureCropper } from "../components/Profile";
-import { preparePicture, type Crop } from "../pictures";
+import { isGifFile, prepareGif, preparePicture, type Crop } from "../pictures";
 import { Scanner } from "../components/Scanner";
 import { HuePicker, WallpaperPicker } from "../components/Look";
 import { useChatWallpaper } from "../wallpaper";
@@ -196,6 +196,12 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
     await act(async () => ipc.setContactPicture(contact.id, await preparePicture(f, c)), "Could not set the picture");
   }
 
+  /** A GIF is used as it is (it stays animated); anything else is cropped first. */
+  async function choose(f: File) {
+    if (await isGifFile(f)) await act(async () => ipc.setContactPicture(contact.id, await prepareGif(f)), "Could not set the picture");
+    else setPicked(f);
+  }
+
   return (
     <div className="m-screen push">
       <TopBar title={contact.name} onBack={() => nav({ screen: "chat", contact: contact.id })} />
@@ -266,7 +272,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
                 <button className="btn btn-danger-ghost" type="button" disabled={busy} onClick={() => void act(() => ipc.setContactPicture(contact.id, null), "Could not remove the picture")}>Remove</button>
               ) : null}
             </div>
-            <input ref={pictureFile} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) setPicked(f); }} />
+            <input ref={pictureFile} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void choose(f); }} />
             {picked ? <PictureCropper file={picked} onDone={(c) => void localPicture(c)} onCancel={() => setPicked(null)} /> : null}
             <p className="hint">Shown instead of theirs, on this device only. They are not told.</p>
           </div>

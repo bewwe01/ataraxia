@@ -27,14 +27,50 @@ export function usePicture(owner: number | null, token: string | null): string |
       cache.set(key, p);
     }
     let live = true;
-    void p.then((u) => {
-      if (live) setState({ key, url: u });
-    });
+    void p
+      .then((u) => (u && isGif(u) && reducedMotion() ? stillFrame(u) : u))
+      .then((u) => {
+        if (live) setState({ key, url: u });
+      });
     return () => {
       live = false;
     };
   }, [owner, key]);
   return key && state?.key === key ? state.url : null;
+}
+
+const isGif = (url: string) => url.startsWith("data:image/gif;");
+const reducedMotion = () => document.documentElement.dataset["motion"] === "reduced";
+
+/** An animated picture's first frame, for reduced motion (DESIGN.md §4). */
+async function stillFrame(url: string): Promise<string | null> {
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(img, 0, 0);
+    return canvas.toDataURL("image/png");
+  } catch {
+    return null;
+  }
+}
+
+/** A GIF, by its first bytes: kept as it is (animated), never redrawn or cropped. */
+export async function isGifFile(file: File): Promise<boolean> {
+  const head = new Uint8Array(await file.slice(0, 6).arrayBuffer());
+  return String.fromCharCode(...head).startsWith("GIF8");
+}
+
+/** A GIF picture as base64, as it is: Rust checks it and drops its metadata. Too large
+ *  ones are refused here, since a GIF cannot be made smaller without re-encoding it. */
+export async function prepareGif(file: File): Promise<string> {
+  if (file.size > MAX_PICTURE_BYTES) throw new Error("GIFs must be under 48 KB");
+  return base64(new Uint8Array(await file.arrayBuffer()));
 }
 
 /** The largest file the webview will try to decode at all. */
