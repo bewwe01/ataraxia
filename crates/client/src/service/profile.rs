@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use veil_core::content::{Body, MAX_PICTURE_LEN, Profile};
 
 use super::look::image_mime;
-use super::{Actor, ChangeKind, MAX_ATTEMPTS, clean_name, clean_name_long, name_key, rng};
+use super::{Actor, ChangeKind, MAX_ATTEMPTS, clean_name, clean_name_long, names_clash, rng};
 use crate::{ClientError, Result, now_ms};
 use rand::seq::SliceRandom as _;
 use zeroize::Zeroizing;
@@ -72,8 +72,8 @@ pub struct ProfileView {
     pub visibility: PictureVisibility,
 }
 
-/// Width and height from a JPEG's start-of-frame segment; `None` unless the file reaches it
-/// through only the segments a frame header may follow. Strict on purpose: decoders skip stray
+/// Width and height from a JPEG's start-of-frame segment; `None` unless the file reaches its
+/// first scan through only the segments a frame header may follow and come before a scan. Strict on purpose: decoders skip stray
 /// bytes and parameterless markers (`TEM`, `RSTn`) that a lenient walk would read as a length,
 /// so a lenient walk could see a decoy frame size while the decoder sees the real, huge one
 /// (review PR2-1). Anything unusual is refused.
@@ -82,6 +82,7 @@ fn jpeg_dims(b: &[u8]) -> Option<(u16, u16)> {
         return None;
     }
     let mut i = 2usize;
+    let mut dims = None;
     loop {
         let at = |k: usize| b.get(i.checked_add(k)?).copied();
         if at(0)? != 0xFF {
@@ -92,20 +93,31 @@ fn jpeg_dims(b: &[u8]) -> Option<(u16, u16)> {
             return None;
         }
         match at(1)? {
-            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+            // One frame header only, and the walk goes on to the first scan, so nothing
+            // between them can redefine the frame for a decoder that would allow it (PR3-3).
+            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF if dims.is_none() => {
                 let h = u16::from_be_bytes([at(5)?, at(6)?]);
                 let w = u16::from_be_bytes([at(7)?, at(8)?]);
-                return Some((w, h));
+                dims = Some((w, h));
+            }
+            // The first scan: the frame is settled. A progressive JPEG's scans are each a pass
+            // over the image, so their number is capped too.
+            0xDA => {
+                let rest = b.get(i..)?;
+                let scans = rest.windows(2).filter(|w| *w == [0xFF, 0xDA]).count();
+                return dims.filter(|_| scans <= MAX_JPEG_SCANS);
             }
             // APPn, DQT, DHT, DRI, COM, DAC: what may come before the frame header.
             0xE0..=0xEF | 0xDB | 0xC4 | 0xDD | 0xFE | 0xCC => {}
-            // Fill bytes, stuffed zeros, TEM, RSTn, SOI, EOI, SOS before the frame: refused.
+            // Fill bytes, stuffed zeros, TEM, RSTn, SOI, EOI, a second frame: refused.
             _ => return None,
         }
         i = i.checked_add(2)?.checked_add(len)?;
     }
 }
 
+/// A JPEG's scans, at most (a progressive one has about ten).
+const MAX_JPEG_SCANS: usize = 64;
 /// An animated picture's frames, at most.
 const MAX_GIF_FRAMES: u32 = 100;
 /// All frames' canvases together, in pixels: what a browser may hold decoded (16 MiB RGBA,
@@ -530,13 +542,12 @@ impl Actor {
     }
 
     /// Shows a contact under the name they chose, unless it looks like another contact's
-    /// name, shown or self-chosen (`name_key` folds case, spacing and look-alike letters): then
+    /// name, shown or self-chosen (`names_clash` folds case, spacing and look-alike letters): then
     /// the name stays, and the profile shows theirs beside it, so a contact cannot pass as
     /// another (review PR-6). A change of shown name is written into the chat as a line when
     /// `announce`, so it is never silent. Returns whether the name is now shown.
     fn adopt_name(&self, contact: i64, name: &str, announce: bool) -> Result<bool> {
         let conn = self.s()?.db.conn();
-        let key = name_key(name);
         let mut stmt = conn.prepare(
             "SELECT name FROM contacts WHERE id != ?1
              UNION ALL SELECT profile_name FROM contacts WHERE id != ?1 AND profile_name IS NOT NULL",
@@ -544,7 +555,7 @@ impl Actor {
         let taken = stmt
             .query_map([contact], |r| r.get::<_, String>(0))?
             .filter_map(core::result::Result::ok)
-            .any(|n| name_key(&n) == key);
+            .any(|n| names_clash(&n, name));
         if taken {
             return Ok(false);
         }
@@ -781,8 +792,14 @@ mod tests {
         b.extend_from_slice(&h.to_be_bytes());
         b.extend_from_slice(&w.to_be_bytes());
         b.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        b.extend_from_slice(&SOS);
         b
     }
+
+    /// A scan header for three components, then a little entropy data and the end.
+    const SOS: [u8; 18] = [
+        0xFF, 0xDA, 0x00, 0x0C, 3, 1, 0, 2, 0x11, 3, 0x11, 0, 0x3F, 0, 0x12, 0x34, 0xFF, 0xD9,
+    ];
 
     #[test]
     fn pictures_are_checked() {
@@ -832,6 +849,20 @@ mod tests {
             b.splice(2..2, [0xFF, bad, 0x00, 0x04, 0, 0]);
             assert_eq!(jpeg_dims(&b), None, "{bad:02X}");
         }
+        // A second frame header before the scan, or no scan at all: refused (PR3-3).
+        let one = jpeg(10, 10);
+        let mut two = one[..one.len() - SOS.len()].to_vec();
+        two.extend_from_slice(&jpeg(60000, 60000)[2..]);
+        assert_eq!(jpeg_dims(&two), None);
+        assert_eq!(jpeg_dims(&one[..one.len() - SOS.len()]), None);
+        // At most 64 scans.
+        let mut many = jpeg(10, 10);
+        for _ in 0..63 {
+            many.extend_from_slice(&SOS[..14]);
+        }
+        assert_eq!(jpeg_dims(&many), Some((10, 10)));
+        many.extend_from_slice(&SOS[..14]);
+        assert_eq!(jpeg_dims(&many), None);
         // Segment lengths that run off the end never panic.
         for cut in 0..jpeg(5, 5).len() {
             let _ = jpeg_dims(&jpeg(5, 5)[..cut]);

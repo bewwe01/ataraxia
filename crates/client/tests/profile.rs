@@ -26,6 +26,8 @@ fn jpeg(w: u16, h: u16, mark: &[u8]) -> Vec<u8> {
     b.extend_from_slice(&h.to_be_bytes());
     b.extend_from_slice(&w.to_be_bytes());
     b.extend_from_slice(&[3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+    // The first scan, then the mark as entropy data.
+    b.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x0C, 3, 1, 0, 2, 0x11, 3, 0x11, 0, 0x3F, 0]);
     b.extend_from_slice(mark);
     b
 }
@@ -361,12 +363,24 @@ async fn a_picture_taken_back_always_leaves() {
     online(a, false).await;
     a.set_picture_visibility(PictureVisibility::Nobody).await.unwrap();
     assert_eq!(a.give_up_profiles(a_bob.id, 0).await.unwrap(), 1);
+    let given_up = a.profile_rows(Some(a_bob.id)).await.unwrap();
     a.set_picture_hidden(a_bob.id, false).await.unwrap(); // a sync round for Bob
-    // Still one row (given up, then aged past the pause by the hook).
-    assert_eq!(a.give_up_profiles(a_bob.id, 7 * 3600 * 1000).await.unwrap(), 1);
+    assert_eq!(
+        a.profile_rows(Some(a_bob.id)).await.unwrap(),
+        given_up,
+        "re-queued at once"
+    );
+    a.give_up_profiles(a_bob.id, 7 * 3600 * 1000).await.unwrap();
+    a.set_picture_hidden(a_bob.id, false).await.unwrap(); // a round after the pause
+    let fresh = a.profile_rows(Some(a_bob.id)).await.unwrap();
+    // A new row (SQLite may reuse the id; its first deposit just failed, as we are offline),
+    // not the given-up one.
+    assert!(
+        fresh.len() == 1 && fresh[0].1 < 20,
+        "not re-queued after the pause: {given_up:?} -> {fresh:?}"
+    );
     hop.restore();
     online(a, true).await;
-    a.set_picture_hidden(a_bob.id, false).await.unwrap(); // a sync round for Bob
     until(b, b_alice.id, |v| v.picture.is_none()).await;
 }
 
@@ -431,14 +445,27 @@ async fn a_picture_taken_back_never_arrives_with_many_contacts() {
         .await;
     }
 
+    // Offline: a picture for everyone, in two rounds (four, then the rest), so every friend
+    // has a row with the picture waiting; then taken back. More friends are due than one
+    // round sends to, so two of them get no new row this time.
     hop.cut();
     online(a, false).await;
     a.set_my_picture(Some(picture(b"many"))).await.unwrap();
     a.set_picture_visibility(PictureVisibility::All).await.unwrap();
+    a.set_picture_visibility(PictureVisibility::All).await.unwrap();
+    assert_eq!(
+        a.profile_rows(None).await.unwrap().len(),
+        others.len(),
+        "all queued with the picture"
+    );
     a.set_picture_visibility(PictureVisibility::Nobody).await.unwrap();
     hop.restore();
     online(a, true).await;
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    within(std::time::Duration::from_secs(20), || async {
+        a.profile_rows(None).await.unwrap().is_empty().then_some(())
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     for (u, id) in &others {
         assert!(
             view(&u.client, *id).await.picture.is_none(),

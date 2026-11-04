@@ -164,8 +164,10 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
   if (!p) return null;
   /** A GIF is used as it is (it stays animated); anything else is cropped first. */
   async function choose(f: File) {
-    if (await sendsAsGif(f)) await act(async () => ipc.setMyPicture(await prepareGif(f)), "Could not set the picture");
-    else setPicked(f);
+    // A GIF Rust refuses (too many frames, say) can still be used as a still (PR3-5).
+    if (!(await sendsAsGif(f)) || !(await act(async () => ipc.setMyPicture(await prepareGif(f)), "Could not set the picture"))) {
+      setPicked(f);
+    }
   }
 
   return (

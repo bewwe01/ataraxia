@@ -2,6 +2,38 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Profile: review round 3 and its fixes (2026-11-04)
+
+Round 3 of the review gate failed on one High finding. PR3-1: the round 2 look-alike fold had made name comparison case-sensitive for names containing I or L, so "ALICE" no longer clashed with "Alice". All seven findings (PR3-1 to PR3-7) were fixed in this round.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 246 passed, 0 failed
+$ (app/src-tauri) cargo fmt --check; cargo clippy -- -D warnings
+#     Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.19s
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 22 files clean
+# contrast: 25 panels; worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001
+# ✓ built in 1.66s
+```
+
+- **PR3-1:** names are compared on two keys, a case-insensitive one and a case-keeping one where I, l, 1 and | look-alikes are one symbol. A match on either is a clash.
+  - These now clash: Ian/ian, Alice/ALICE, Bill/BILL, Lily/lily, Lars/LARS, Ivan/Іvan (Cyrillic І), Ian/İan and Al/AI.
+  - These stay apart: Ian/Lan and Al/Ai.
+  - All the round 2 pairs still hold.
+- **PR3-2:** both round 2 tests now catch their regression. Checked by reverting each fix:
+  - Without `forget_sent` for contacts left out of a round, `a_picture_taken_back_never_arrives_with_many_contacts` fails with "a taken-back picture arrived". All 6 friends now hold a queued row with the picture before it is taken back, and the test waits until no profile row is left.
+  - Without the 6 h pause, `a_picture_taken_back_always_leaves` fails with "re-queued at once". It now compares the queued rows before and after (new hook `profile_rows`).
+- **PR3-3:** the JPEG walk goes on to the first scan and refuses a second frame header before it, and a JPEG with more than 64 scans is refused. Unit tests cover a second frame, a missing scan, and 64 vs 65 scans.
+- **PR3-4:** in Chromium, turning Reduce motion on switched the visible GIF avatar to a PNG still without navigating away.
+- **PR3-5:** a GIF that Rust refuses now falls back to the cropper.
+- **PR3-6, PR3-7:** INV-CONT-3 and the misplaced doc comment are fixed.
+- **Relay test:** `veil-relay` `logs::relay_logs_nothing_about_clients` failed once more in this round (and once in round 1), then passed 15 reruns. Cause: its identifier check searched every log line, including the test's own canary line. That line carries a timestamp, in which "777" or the 5-digit port can turn up by chance. It now searches the relay's own lines only. Every relay line is still checked, and the test still fails if the relay logs anything at all during a session.
+
 ## Profile: review round 2 and its fixes (2026-11-04)
 
 Round 2 of the review gate failed on two High findings: PR2-1, a JPEG could show a decoy size to the check, and PR2-2, the per-round cap left stale picture rows queued. All eight findings (PR2-1 to PR2-8) were fixed in this round.

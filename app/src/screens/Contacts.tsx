@@ -143,16 +143,19 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
     }
   }
 
-  async function act(f: () => Promise<void>, fallback: string) {
+  /** Runs `f`, showing its error; says whether it worked. */
+  async function act(f: () => Promise<void>, fallback: string): Promise<boolean> {
     setBusy(true);
     setError(null);
     try {
       await f();
       onChanged();
+      return true;
     } catch (err) {
       // A message from the webview side (a picture refused before it reaches Rust) is
       // shown too (review PR2-7).
       setError(err instanceof IpcError || err instanceof Error ? err.message : fallback);
+      return false;
     } finally {
       setBusy(false);
     }
@@ -200,8 +203,10 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
 
   /** A GIF is used as it is (it stays animated); anything else is cropped first. */
   async function choose(f: File) {
-    if (await sendsAsGif(f)) await act(async () => ipc.setContactPicture(contact.id, await prepareGif(f)), "Could not set the picture");
-    else setPicked(f);
+    // A GIF Rust refuses (too many frames, say) can still be used as a still (PR3-5).
+    if (!(await sendsAsGif(f)) || !(await act(async () => ipc.setContactPicture(contact.id, await prepareGif(f)), "Could not set the picture"))) {
+      setPicked(f);
+    }
   }
 
   return (

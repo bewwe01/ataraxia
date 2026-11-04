@@ -5830,3 +5830,205 @@ Export `MAX_PICTURE_BYTES` (or add a `gifFits(f)` helper), and have the Contacts
 - (B) Fix the High and Medium findings only (PR2-1 to PR2-4).
 - (C) Fix specific findings.
 - (D) Keep this as a report only.
+
+## Profile (milestone 4.5) review, round 3 (2026-11-04)
+
+**Scope:** commit a6ddbdb (the round 2 fixes), on top of a912d65 and b46f9c5. I read the whole diff and the code around it: `sync_profiles`, `profiles_due`, `forget_sent`, `deliver`, `retry_failed`, the tick and reconnect paths, `accept_picture`, `picture_ok`, `gif_clean`, `gif_sub_blocks`, `name_key` and its three callers (the arrival clash check at service.rs:3353-3375, `adopt_name` at profile.rs:537-547 and `warned_about` at service.rs:4133-4154), `clean_name`, `Profile` in core, `pictures.ts`, `Profile.tsx` and `Contacts.tsx`. I did not edit any files.
+
+**Note on the working tree:** `crates/core/src/{account,content,invite,lib}.rs` have uncommitted changes, and `crates/core/src/backup.rs` is untracked. These are unrelated ADR-0021 re-key work, not part of a6ddbdb. The commands below ran against the working tree as it is, and I did not review that work.
+
+**Commands run:**
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-client --test profile --lib`: lib 29 passed, profile 7 passed.
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-core --lib content`: 8 passed.
+- `pnpm -C app typecheck`: 0 errors.
+- `pnpm -C app lint`: 22 files clean; contrast OK.
+- I also copied `name_key`, `fold_cased`, `fold_lookalike` and `is_combining` from HEAD byte for byte into a scratch program, compiled it with `rustc` and ran it on name pairs (`/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/nk.rs`). The output is quoted under PR3-1.
+
+**Verdict: FAIL.** There is 1 High finding (PR3-1, a regression in the key-change name check brought in by the PR2-4 fix), plus 1 Medium, 4 Low and 1 Nit.
+
+---
+
+### Status of the round 2 findings
+
+| ID | Sev (r2) | Status | Notes |
+|---|---|---|---|
+| PR2-1 | High | **Fixed** | The walk is now strict: it requires `FF D8` at offset 0, an `FF` at every marker position, and a length ≥ 2. Only APPn, DQT, DHT, DRI, COM and DAC may come before SOF; `00`, `01`, `D0-D9`, `FF` fill bytes, SOS and JPGn are refused. I compared this with libjpeg-turbo's `jdmarker.c` (`first_marker`, `next_marker`, the length checks in `get_dqt`, `get_dht` and `get_dri`, and `JERR_SOF_DUPLICATE`). Every file the check accepts reaches the same first SOF in libjpeg. A second SOF later in the file makes libjpeg fail rather than use it, and a height of 0 (DNL) is refused by `side(v) > 0`. Tests cover the `FF 01` and `FF 00` decoys, fill bytes, RST0, SOS and EOI. One defence-in-depth gap remains for non-libjpeg decoders: PR3-3. |
+| PR2-2 | High | **Fixed in code; the test does not exercise it** | Due contacts left out of a round get `forget_sent`: their queued row is deleted and `profile_sent` is set to NULL, so they stay due. Each round marks the chosen contacts as sent (at queue time), so the due set shrinks by up to 4 per round, and nobody is starved. The new test passes without the fix, though: PR3-2. |
+| PR2-3 | Medium | **Fixed in code; the test does not exercise it** | `AND m.at_ms < now − 6 h` is correct. `at_ms` is the time the row was queued, and `deliver` never changes it, so the pause runs from queuing (about 5 h 40 min after the 20 one-minute retries). The assertion meant to prove "not re-queued at once" passes either way: PR3-2. |
+| PR2-4 | Medium | **Regressed** | The Greek capitals, `ı`, `ү`, `ԝ`, `օ`, small capitals, combining marks and the "Ian"/"Lan" separation are done. But folding I/l before lowercasing broke plain case-insensitivity for any name that contains i, I, l or L, and it lost the Cyrillic `І` look-alike. See PR3-1. |
+| PR2-5 | Low | **Fixed** | `at_end` and the offsets are correct. The GCE must be `21 F9 04 xx×4 00` (`end == i+8`). NETSCAPE must be `21 FF 0B "NETSCAPE2.0" 03 01 lo hi 00` (`end == i+19`). Anything else is refused, and the output is the canonical form, so `picture_ok`'s output == input check still holds. Every access goes through `get` or `checked_*`. ADR-0020 now documents that LZW padding and colour-table residue are not stripped. |
+| PR2-6 | Low | **Fixed** (one small part left) | `MAX_GIF_PIXELS = 4 Mpx`, with a test at 4 and 5 frames of 1024². Still frames are cached per `owner:token` and cleared in `forgetPictures`. Switching to reduced motion still applies only when an avatar remounts: PR3-4. |
+| PR2-7 | Low | **Fixed** | `sendsAsGif` catches read errors and sends a GIF over 48 KB to the cropper. Contacts' `act` now matches Profile's `errText`, since `IpcError extends Error`. |
+| PR2-8 | Low | **Fixed** | `impl Drop for Profile` zeroizes `picture` (`Option<Vec<u8>>`). It works with `prost::Message` and `Clone`, it compiles, and no code moves fields out of `Profile`. The per-contact copy in `sync_profiles` and the received `p` are both wiped when dropped. |
+
+---
+
+### New findings
+
+#### PR3-1: High [HIGH, checked by running the HEAD functions]. `name_key` is no longer case-insensitive for names with I or l, and Cyrillic `І` now gets past the check (INV-ID-2 regression)
+
+**Where:** `crates/client/src/service.rs:1054-1066` (`name_key`) and `:1081-1100` (`fold_cased`, the `'I' | 'l' | … => PIPE` arm). It is used by the arrival clash check (`:3353-3375`), `adopt_name` (`profile.rs:539-547`) and `warned_about` (`:4148-4154`).
+
+**Problem:**
+- `I` and `l` become PIPE before lowercasing, but `i` and `L` do not. So the case of an I or L now changes the key. Output of the HEAD functions:
+  - `Ian`/`ian`: false
+  - `Alice`/`ALICE`: false
+  - `Bill`/`BILL`: false
+  - `Nick`/`NICK`: false
+  - `Lily`/`lily`: false
+  - `Olga`/`OLGA`: false
+  - `Lars`/`lars`: false
+- In round 2 all of these matched, and both the doc comment ("case and spacing do not make it different") and ADR-0020 ("`name_key` folds case …") still say they do.
+- Cyrillic capital `І` (U+0406), the most common look-alike of Latin I, is not in the PIPE arm. It lowercases to `і` and then becomes `i`, while Latin `I` becomes PIPE. So `Ivan`/`Іvan` and `Ian`/`Іan` no longer match, although they did in round 2. `İ` (U+0130) and `Ⅰ` (U+2160) are also missed: `İ` lowercases to `i` + U+0307, after the combining marks have already been stripped.
+- Effect:
+  - A new contact named "ALICE" or "Іvan" (Cyrillic) arrives with no key-change warning beside the user's "Alice" or "Ivan".
+  - `adopt_name` lets an existing contact rename itself to "NICK" when "Nick" exists. The rename line is still written.
+- The root cause is that a single key cannot be both case-insensitive and treat I and l as the same: case-insensitive gives i≈I and l≈L, and I≈l then forces i≈L. The new test only checks pairs that avoid this, and no test compares case variants that contain I or L.
+
+**Fix:** compare two keys and treat a match on either as a clash.
+- Key 1: a case-insensitive key without the I/l fold.
+- Key 2: a key that keeps case and folds the I/l look-alikes.
+
+```rust
+/// Two names that the key-change warning treats as the same person.
+fn names_clash(a: &str, b: &str) -> bool {
+    let (a1, a2) = name_keys(a);
+    let (b1, b2) = name_keys(b);
+    a1 == b1 || a2 == b2
+}
+
+fn name_keys(name: &str) -> (String, String) {
+    let base: String = name.chars().filter(|c| !is_combining(*c))
+        .collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+    // 1: case-insensitive; no I/l fold, so "Ian" and "Lan" stay apart.
+    let caseless = base.chars().map(fold_fullwidth).collect::<String>().to_lowercase()
+        .chars().filter(|c| !is_combining(*c)).map(fold_lookalike).collect();
+    // 2: case kept; I, l, 1, |, Ι, І, Ӏ, Ⅰ, İ fold together, so "Ian" and "lan" match.
+    let visual = base.chars().map(fold_cased).map(fold_lookalike).collect();
+    (caseless, visual)
+}
+```
+- In `fold_cased`, add `'І' | 'Ⅰ' | 'İ'` to the PIPE arm, and move the fullwidth step into a `fold_fullwidth` helper.
+- Replace the three `name_key(x) == key` comparisons with `names_clash`. In SQL-free loops this is a straight swap.
+- Extend `names_fold_lookalikes_but_keep_different_names_apart` with these pairs, which must match: `("Ian","ian")`, `("Alice","ALICE")`, `("Bill","BILL")`, `("Ivan","Іvan")` (Cyrillic) and `("Ian","İan")`. `("Ian","Lan")` and `("Al","Ai")` must still differ.
+
+#### PR3-2: Medium [HIGH]. The tests added for PR2-2 and PR2-3 pass without their fixes (CLAUDE.md rule 9)
+
+**Where:** `crates/client/tests/profile.rs:413-448` (`a_picture_taken_back_never_arrives_with_many_contacts`) and `:360-366` (the pause part of `a_picture_taken_back_always_leaves`).
+
+**Problem (PR2-2 test):**
+- All six friends first receive "Alice A", so they all hold the no-picture digest. Visibility starts at Nobody, so `set_my_picture` changes no one's digest.
+- `All` then makes all 6 due; 4 get picture rows and 2 get none. `Nobody` makes due only those 4, whose stored digest now differs. The 2 left over already hold the current digest. Since 4 ≤ `PER_ROUND`, all 4 stale rows are replaced even without `forget_sent`.
+- Offline, no tick round runs between the two calls, because the tick's `sync_profiles(None)` needs an open relay. So the bug state (more than 4 contacts holding stale picture rows) is never reached.
+- The final check, "nobody has a picture", is also true when nothing is delivered at all.
+
+**Problem (PR2-3 test):**
+- `give_up_profiles` counts and updates every profile row for the contact. Without the pause, the `set_picture_hidden` round would DELETE the given-up row and queue a new one. That still leaves exactly one row, so the second hook call returns 1 either way.
+
+**Fix:**
+- PR2-2: before switching to `Nobody`, run a second round so every friend holds a picture row. For example, call `set_picture_visibility(All)` again, which makes the 2 left over due and queues them. Then, after `online(a, true)`, wait until Alice has no queued profile rows (a test hook that counts `kind='control' AND body='profile'` rows, or polling `hidden_rows`) before asserting. I reasoned that this test then fails without the fix, because the 2 contacts left out of the `Nobody` round would keep stale picture rows. Please confirm it by temporarily reverting the `forget_sent` loop.
+- PR2-3: assert that the row was not replaced. Have the hook return `(id, attempts)` of the existing row, or add a `profile_rows(contact) -> Vec<(i64, i64)>` hook. Then check that after the `set_picture_hidden` round the id is the same and `attempts >= MAX_ATTEMPTS`.
+
+#### PR3-3: Low [MEDIUM]. `jpeg_dims` stops at the first SOF; nothing stops a second frame header before the scan for decoders other than libjpeg
+
+**Where:** `crates/client/src/service/profile.rs:80-108`.
+
+**Problem:**
+- libjpeg-turbo (WebKitGTK, and Chromium in WebView2) rejects a duplicate SOF, so on those platforms the first SOF decides the size.
+- Round 2 also asked to "require exactly one SOF, and continue the walk to the first SOS". That was not done. On a decoder with different rules (Apple ImageIO under WKWebView, if macOS is a target), a second SOF between the first and SOS is untested ground.
+- The cap on the number of progressive scans (the CPU point raised in round 2) is also still open.
+
+**Fix:**
+- After the SOF, keep walking with the same allowed set, and return the dimensions only at the first SOS (`0xDA`). Refuse a second SOF.
+- Optionally, scan the rest of the file for `FF DA`, ignoring `FF 00`/`FF D0-D7` inside the entropy data, and refuse more than, say, 64 SOS markers.
+
+#### PR3-4: Low [HIGH]. A reduced-motion change still does not reach avatars that are already on screen
+
+**Where:** `app/src/pictures.ts:20-39`.
+
+**Problem:** `reducedMotion()` is read only inside the effect, and the effect depends on `[owner, key]`. Turning reduced motion on leaves visible GIF avatars animating until they remount.
+
+**Fix:** keep the raw URL in state and choose `still(key, u)` at render time from a `useMotion()` hook that subscribes to `data-motion` (`MutationObserver` on `documentElement`, attribute `data-motion`). Or add the motion value to the effect's dependencies.
+
+#### PR3-5: Low [MEDIUM]. A GIF under 48 KB that Rust refuses only shows an error, with no cropper fallback
+
+**Where:** `app/src/components/Profile.tsx:166-169`, `app/src/screens/Contacts.tsx:202-205`.
+
+**Problem:** the stricter rules (4 Mpx in all, so a 256² GIF may have at most 64 frames; canonical GCE and NETSCAPE only) refuse some ordinary GIFs. `sendsAsGif` sends only size failures to the cropper, so these users get "Could not set the picture" and no way to use the image as a still.
+
+**Fix:** on a `BadInput` refusal of a GIF, fall back to the cropper:
+```ts
+if (await sendsAsGif(f)) {
+  const ok = await act(async () => ipc.setMyPicture(await prepareGif(f)), "Could not set the picture");
+  if (!ok) setPicked(f);
+} else setPicked(f);
+```
+In Profile.tsx, `act` already returns a bool. Contacts would need its `act` to return one too.
+
+#### PR3-6: Low [HIGH]. INV-CONT-3 does not list the new test or the 6 h pause, and still says the picture is "a JPEG"
+
+**Where:** `docs/INVARIANTS.md:67`.
+
+**Fix:**
+- Add `profile::a_picture_taken_back_never_arrives_with_many_contacts` (after PR3-2) to the tested list.
+- Mention that a given-up profile is sent again after 6 h.
+- Change "a received picture is a JPEG of at most 1024 px" to "a JPEG or a rebuilt GIF of at most 1024 px a side and 4 Mpx of frames".
+
+#### PR3-7: Nit [HIGH]. A doc comment is on the wrong test
+
+**Where:** `crates/client/src/service.rs:4200-4203`.
+
+**Problem:** the new test was inserted between `legacy_warnings_merge_only_an_unambiguous_contact`'s doc comment ("Warnings raised before … (review P6R2-3)") and that test. The comment now describes `names_fold_lookalikes_but_keep_different_names_apart`.
+
+**Fix:** move the two `///` lines back above `fn legacy_warnings_merge_only_an_unambiguous_contact`.
+
+---
+
+### Checked and found correct
+- **`jpeg_dims`:**
+  - It cannot panic: it uses `get`, `checked_add` and `?` throughout.
+  - It always ends: `i` grows by at least 4 each step.
+  - The SOF field offsets (height at +5, width at +7) are correct.
+  - The SOF set excludes C4, C8 and CC.
+  - Because the strict walk is fail-closed, stored pictures from earlier builds that no longer pass are hidden by `picture_ok` on read.
+- **`forget_sent` for contacts left out of a round:**
+  - It runs only for `only.is_none()`.
+  - `self.s()` was moved up so the connection is available; no behaviour change.
+  - Nobody is starved. Chosen contacts get `profile_sent` set at queue time and leave the due set. Contacts left out stay due with NULL.
+  - A contact whose `queue_control_as` fails stays due and may take slots again, but random choice still reaches the others.
+  - Deleting a given-up row of a due contact is right, because a row that is due is out of date. The pause is skipped only when the digest really changed.
+  - The actor runs rounds one after another, and `deliver` is awaited inline, so a row is never deleted while it is being deposited.
+  - Blocked contacts are handled by `forget_sent` on block. Contacts with a key warning never had rows, because the warning is set at intro time.
+- **The 6 h pause SQL:** the parameter binding is correct (`?4 = now − 6 h`, `saturating_sub`). It matches `retry_failed`'s `attempts < MAX_ATTEMPTS`, and the test hook ages `at_ms` coherently.
+- **`fold_lookalike` and `fold_cased`:** no panics (no indexing; `checked_sub` and `unwrap_or`). PIPE (U+E000) is unchanged by lowercasing. `clean_name` already strips invisible characters (zero-width ones), so they cannot split a key.
+- **GIFs:**
+  - `at_end` arithmetic is checked.
+  - Malformed kept extensions are refused, not dropped, so output == input holds for stored pictures.
+  - Tests cover extra sub-blocks in GCE and NETSCAPE.
+- **`Drop for Profile`:** it matches the existing `Drop for RekeyInvite` and `MailboxUpdate` pattern, and `pad` holds only zeros.
+- **`pictures.ts`:**
+  - The `stills` cache is keyed like `cache` and cleared on lock.
+  - `stillFrame` failures resolve to null.
+  - `sendsAsGif` checks size before reading the file and catches read errors.
+  - `MAX_PICTURE_BYTES` is used only after the module has loaded.
+- **`Contacts.tsx`:** the `act` error text now matches Profile's `errText`. The only browser-side messages it can surface are app-written, with no secrets or paths.
+- **Docs:** ADR-0020 matches the code, except for the case-folding sentence (PR3-1). DESIGN.md's GIF fallback text matches the code.
+- **Checks:** typecheck and lint are clean, and every Rust test in scope passes.
+
+**Verdict: FAIL.** PR3-1 (High) must be fixed and re-reviewed. Please fix PR3-2 in the same round, because the two High fixes from round 2 currently have no test that catches their regression. PR3-3 to PR3-7 are optional.
+
+**Next steps:**
+- (A) Fix all findings; recommended for a FAIL.
+- (B) Fix PR3-1 and PR3-2 only, then re-review.
+
+Files referenced:
+- /home/user/ataraxia/crates/client/src/service.rs
+- /home/user/ataraxia/crates/client/src/service/profile.rs
+- /home/user/ataraxia/crates/client/tests/profile.rs
+- /home/user/ataraxia/crates/core/src/content.rs
+- /home/user/ataraxia/app/src/pictures.ts
+- /home/user/ataraxia/app/src/components/Profile.tsx
+- /home/user/ataraxia/app/src/screens/Contacts.tsx
+- /home/user/ataraxia/docs/INVARIANTS.md
+- /home/user/ataraxia/docs/ARCHITECTURE.md
+- /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/nk.rs (the check program for PR3-1)

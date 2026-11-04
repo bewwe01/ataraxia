@@ -1,7 +1,7 @@
 // Profile pictures on screen (milestone 4.5, ADR-0020). Rust keeps them in the encrypted
 // database and hands out `data:` URLs; a token from the views changes whenever a picture
 // does, so a cached URL is never stale. Dropped when Veil locks.
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { base64, ipc } from "./ipc";
 
 const cache = new Map<string, Promise<string | null>>();
@@ -17,6 +17,8 @@ export function usePicture(owner: number | null, token: string | null): string |
   // while the new one loads (review PR-13).
   const key = token ? `${owner ?? "me"}:${token}` : null;
   const [state, setState] = useState<{ key: string; url: string | null } | null>(null);
+  // Turning reduced motion on or off applies at once, not at the next remount (PR3-4).
+  const reduced = useSyncExternalStore(onMotionChange, reducedMotion);
   useEffect(() => {
     if (!key) return;
     let p = cache.get(key);
@@ -29,19 +31,25 @@ export function usePicture(owner: number | null, token: string | null): string |
     }
     let live = true;
     void p
-      .then((u) => (u && isGif(u) && reducedMotion() ? still(key, u) : u))
+      .then((u) => (u && isGif(u) && reduced ? still(key, u) : u))
       .then((u) => {
         if (live) setState({ key, url: u });
       });
     return () => {
       live = false;
     };
-  }, [owner, key]);
+  }, [owner, key, reduced]);
   return key && state?.key === key ? state.url : null;
 }
 
 const isGif = (url: string) => url.startsWith("data:image/gif;");
 const reducedMotion = () => document.documentElement.dataset["motion"] === "reduced";
+/** Calls `fn` when `data-motion` on <html> changes (settings.ts sets it). */
+function onMotionChange(fn: () => void): () => void {
+  const o = new MutationObserver(fn);
+  o.observe(document.documentElement, { attributes: true, attributeFilter: ["data-motion"] });
+  return () => o.disconnect();
+}
 
 /** Still frames, made once per picture (review PR2-6); dropped with the rest on lock. */
 const stills = new Map<string, Promise<string | null>>();

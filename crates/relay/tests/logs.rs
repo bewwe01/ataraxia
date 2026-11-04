@@ -184,6 +184,11 @@ async fn relay_logs_nothing_about_clients() {
         ("chunk size", "777".to_owned()),
         ("invite size", veil_wire::SEALED_INVITE_LEN.to_string()),
     ] {
-        assert!(!logs.contains(&needle), "{what} in relay logs:\n{logs}");
+        // Searched in the relay's own lines only: the test's canary line carries a timestamp,
+        // and a short needle ("777", a 5-digit port) turns up in one by chance now and then.
+        assert!(
+            !other.iter().any(|l| l.contains(&needle)),
+            "{what} in relay logs:\n{logs}"
+        );
     }
 }

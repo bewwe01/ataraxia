@@ -393,6 +393,8 @@ enum Cmd {
     #[cfg(feature = "test-hooks")]
     GiveUpProfiles(i64, i64, Reply<i64>),
     #[cfg(feature = "test-hooks")]
+    ProfileRows(Option<i64>, Reply<Vec<(i64, i64)>>),
+    #[cfg(feature = "test-hooks")]
     RawUpload(Vec<u8>, Reply<Vec<u8>>),
     #[cfg(feature = "test-hooks")]
     AttachmentBlob(i64, Reply<Vec<u8>>),
@@ -731,6 +733,12 @@ impl Client {
     pub async fn give_up_profiles(&self, contact: i64, age_ms: i64) -> Result<i64> {
         ask!(self, GiveUpProfiles, contact, age_ms)
     }
+    /// Tests only: profiles still waiting to go out (to one contact, or to any), as
+    /// `(row id, attempts)`.
+    #[cfg(feature = "test-hooks")]
+    pub async fn profile_rows(&self, contact: Option<i64>) -> Result<Vec<(i64, i64)>> {
+        ask!(self, ProfileRows, contact)
+    }
     /// Tests only: uploads any bytes as a blob (full-size chunks but the last) and returns its
     /// id, for crafting `Attachment` messages a hostile contact could send.
     /// Tests only: the blob id an attachment is (being) uploaded under.
@@ -1050,24 +1058,54 @@ fn notify_enabled(db: &Db) -> bool {
         .is_none_or(|v| v.as_slice() != [0])
 }
 
-/// A name compared for the key-change warning: case and spacing do not make it different.
-fn name_key(name: &str) -> String {
-    name.chars()
+/// Two names the key-change warning treats as possibly the same person: equal once case,
+/// spacing, accents and look-alike letters are folded. No single key can be both
+/// case-insensitive and treat capital I like lowercase l (then i would equal L, and "Ian"
+/// "Lan"), so two keys are compared and either matching is a clash (review PR3-1).
+fn names_clash(a: &str, b: &str) -> bool {
+    let (a1, a2) = name_keys(a);
+    let (b1, b2) = name_keys(b);
+    a1 == b1 || a2 == b2
+}
+
+/// The keys [`names_clash`] compares: one case-insensitive ("ALICE" is "Alice"), one keeping
+/// case with I, l, 1 and | as one symbol ("Ian" is "lan", but "Lan" is neither).
+fn name_keys(name: &str) -> (String, String) {
+    let base = name
+        .chars()
         .filter(|c| !is_combining(*c))
-        .map(fold_cased)
+        .map(fold_fullwidth)
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    // Lowercasing can add a combining mark (İ → i + U+0307), so they are dropped again.
+    let caseless = base
+        .chars()
+        .map(|c| fold_cased(c, false))
+        .collect::<String>()
         .to_lowercase()
         .chars()
+        .filter(|c| !is_combining(*c))
         .map(fold_lookalike)
-        .collect()
+        .collect();
+    let visual = base
+        .chars()
+        .map(|c| fold_lookalike(fold_cased(c, true)))
+        .collect();
+    (caseless, visual)
 }
 
-/// The one symbol capital I, lowercase l, 1 and | all fold to: they look alike, while i and
-/// L do not look like them, so "Ian" and "lan" match but "Ian" and "Lan" do not (review PR2-4).
+/// The one symbol capital I, lowercase l, 1, | and their look-alikes fold to in the visual key.
 const PIPE: char = '\u{E000}';
+
+/// Fullwidth ASCII (U+FF01–FF5E) to ASCII, keeping case.
+fn fold_fullwidth(c: char) -> char {
+    match u32::from(c) {
+        n @ 0xFF01..=0xFF5E => n.checked_sub(0xFEE0).and_then(char::from_u32).unwrap_or(c),
+        _ => c,
+    }
+}
 
 /// Combining marks (accents written as a separate character), which are dropped, so "Böb"
 /// written as "Bo" + U+0308 + "b" folds like "Böb".
@@ -1075,16 +1113,13 @@ fn is_combining(c: char) -> bool {
     matches!(u32::from(c), 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F)
 }
 
-/// The folds that depend on case, done before lowercasing: fullwidth forms to ASCII (keeping
-/// their case), the I/l family to [`PIPE`], and Greek capitals to the Latin capitals they look
-/// like (lowercased, they would look different: Η → η).
-fn fold_cased(c: char) -> char {
-    let c = match u32::from(c) {
-        n @ 0xFF01..=0xFF5E => n.checked_sub(0xFEE0).and_then(char::from_u32).unwrap_or(c),
-        _ => c,
-    };
+/// The folds that depend on case, done before lowercasing: Greek capitals to the Latin
+/// capitals they look like (lowercased, they would look different: Η → η), and with `pipe`,
+/// the I/l family to [`PIPE`].
+fn fold_cased(c: char, pipe: bool) -> char {
     match c {
-        'I' | 'l' | '1' | '|' | 'ӏ' | 'Ӏ' | 'ǀ' | 'Ι' | 'Ɩ' => PIPE,
+        'I' | 'l' | '1' | '|' | 'ӏ' | 'Ӏ' | 'ǀ' | 'Ι' | 'Ɩ' | 'І' | 'Ⅰ' | 'İ' if pipe => PIPE,
+        'Ι' => 'I',
         'Α' => 'A',
         'Β' => 'B',
         'Ε' => 'E',
@@ -1656,6 +1691,20 @@ impl Actor {
                         params![c, MAX_ATTEMPTS, age],
                     )?;
                     Ok(i64::try_from(n).unwrap_or(i64::MAX))
+                });
+                let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::ProfileRows(c, r) => {
+                let res = self.s().and_then(|s| {
+                    let mut st = s.db.conn().prepare(
+                        "SELECT id, attempts FROM messages WHERE kind = 'control' AND body = 'profile'
+                         AND envelope IS NOT NULL AND (?1 IS NULL OR contact = ?1) ORDER BY id",
+                    )?;
+                    let rows = st
+                        .query_map([c], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<core::result::Result<Vec<_>, _>>()?;
+                    Ok(rows)
                 });
                 let _ = r.send(res);
             }
@@ -3350,7 +3399,7 @@ impl Actor {
                 // Addresses are key hashes, so a changed key arrives as a new contact. One that
                 // takes the name of an existing contact gets a warning, never their history
                 // (INV-ID-2).
-                let key = name_key(&name);
+
                 // The contact this one may replace: the oldest with the same name. Accepting
                 // the warning merges exactly that one (P6-1).
                 let clash: Option<i64> = if intro.display_name.is_some() {
@@ -3370,7 +3419,7 @@ impl Actor {
                         .collect::<core::result::Result<Vec<_>, _>>()?;
                     rows.into_iter()
                         .find(|(_, n, p)| {
-                            name_key(n) == key || p.as_deref().is_some_and(|p| name_key(p) == key)
+                            names_clash(n, &name) || p.as_deref().is_some_and(|p| names_clash(p, &name))
                         })
                         .map(|(id, _, _)| id)
                 } else {
@@ -4145,13 +4194,12 @@ impl Actor {
             )?;
             return Ok(exists.then_some(old));
         }
-        let key = name_key(name);
         let same: Vec<i64> = conn
             .prepare("SELECT id, name FROM contacts WHERE id != ?1")?
             .query_map([contact], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
             .collect::<core::result::Result<Vec<_>, _>>()?
             .into_iter()
-            .filter(|(_, n)| name_key(n) == key)
+            .filter(|(_, n)| names_clash(n, name))
             .map(|(id, _)| id)
             .collect();
         Ok(match same.as_slice() {
@@ -4197,11 +4245,9 @@ mod tests {
         assert!(ipc.contains(&line), "app/src/ipc.ts must define {line}");
     }
 
-    /// Warnings raised before the warned-about contact was recorded (preview.5): only an
-    /// unambiguous name picks a contact (review P6R2-3).
     #[test]
     fn names_fold_lookalikes_but_keep_different_names_apart() {
-        let same = |a: &str, b: &str| name_key(a) == name_key(b);
+        let same = names_clash;
         for (a, b) in [
             ("Bob", " bob "),
             ("Bob", "Вob"),
@@ -4216,6 +4262,15 @@ mod tests {
             ("Ian", "lan"),
             ("Ian", "1an"),
             ("ibis", "ıbis"),
+            // Plain case changes (review PR3-1), and I look-alikes.
+            ("Ian", "ian"),
+            ("Alice", "ALICE"),
+            ("Bill", "BILL"),
+            ("Lily", "lily"),
+            ("Lars", "LARS"),
+            ("Ivan", "Іvan"),
+            ("Ian", "İan"),
+            ("Al", "AI"),
         ] {
             assert!(same(a, b), "{a} / {b}");
         }
@@ -4224,6 +4279,8 @@ mod tests {
         }
     }
 
+    /// Warnings raised before the warned-about contact was recorded (preview.5): only an
+    /// unambiguous name picks a contact (review P6R2-3).
     #[test]
     fn legacy_warnings_merge_only_an_unambiguous_contact() {
         let dir = tempfile::tempdir().unwrap();
