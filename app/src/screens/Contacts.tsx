@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { INVITE_PREFIX, ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
 import { Avatar, Banner, Icon, QrCode, Segmented, ToggleRow, TopBar } from "../ui";
 import { PictureCropper } from "../components/Profile";
-import { sendsAsGif, prepareGif, preparePicture, type Crop } from "../pictures";
+import { isGifFile, sendsAsGif, prepareGif, preparePicture, type Crop } from "../pictures";
 import { Scanner } from "../components/Scanner";
 import { HuePicker, WallpaperPicker } from "../components/Look";
 import { useChatWallpaper } from "../wallpaper";
@@ -209,7 +209,8 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
     if (!(await sendsAsGif(f)) || !(await act(async () => ipc.setContactPicture(contact.id, await prepareGif(f)), "Could not set the picture"))) {
       // Used as a still instead: the refusal is not an error to dwell on (review PR4-5).
       setError(null);
-      setGifHint(await sendsAsGif(f));
+      // Any GIF that ends up here becomes a still: say so, whatever the reason (PR5-2).
+      setGifHint(await isGifFile(f));
       setPicked(f);
     }
   }
@@ -285,12 +286,9 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
               ) : null}
             </div>
             <input ref={pictureFile} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void choose(f); }} />
-            {picked ? (
-            <>
-              {gifHint ? <p className="hint" role="status">This GIF can't be used as it is; it will be a still picture.</p> : null}
-              <PictureCropper file={picked} onDone={(c) => { setGifHint(false); void localPicture(c); }} onCancel={() => { setGifHint(false); setPicked(null); }} />
-            </>
-          ) : null}
+            {/* Always mounted, so screen readers announce the hint when it appears (PR5-4). */}
+            <p className="hint" role="status">{picked && gifHint ? "This GIF can't stay animated; it will be a still picture." : ""}</p>
+            {picked ? <PictureCropper file={picked} onDone={(c) => { setGifHint(false); void localPicture(c); }} onCancel={() => { setGifHint(false); setPicked(null); }} /> : null}
             <p className="hint">Shown instead of theirs, on this device only. They are not told.</p>
           </div>
           <div className="group card">

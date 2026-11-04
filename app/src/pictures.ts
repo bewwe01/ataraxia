@@ -83,7 +83,11 @@ async function stillFrame(url: string): Promise<string | null> {
 /** A GIF small enough to send as it is (animated, never redrawn or cropped). A larger GIF
  *  goes through the cropper and becomes a still JPEG (review PR2-7). */
 export async function sendsAsGif(file: File): Promise<boolean> {
-  if (file.size > MAX_PICTURE_BYTES) return false;
+  return file.size <= MAX_PICTURE_BYTES && (await isGifFile(file));
+}
+
+/** A GIF, by its first bytes, whatever its size. */
+export async function isGifFile(file: File): Promise<boolean> {
   try {
     const head = new Uint8Array(await file.slice(0, 6).arrayBuffer());
     return String.fromCharCode(...head).startsWith("GIF8");

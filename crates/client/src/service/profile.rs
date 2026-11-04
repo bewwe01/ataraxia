@@ -74,9 +74,9 @@ pub struct ProfileView {
 
 /// Width and height from a JPEG's start-of-frame segment; `None` unless the file reaches its
 /// first scan through only the segments a frame header may follow and come before a scan.
-/// Strict on purpose: decoders skip stray bytes and parameterless markers (`TEM`, `RSTn`) that a lenient walk would read as a length,
-/// so a lenient walk could see a decoy frame size while the decoder sees the real, huge one
-/// (review PR2-1). Anything unusual is refused.
+/// Strict on purpose: decoders skip stray bytes and parameterless markers (`TEM`, `RSTn`)
+/// that a lenient walk would read as a length, so a lenient walk could see a decoy frame
+/// size while the decoder sees the real, huge one (review PR2-1). Anything unusual is refused.
 fn jpeg_dims(b: &[u8]) -> Option<(u16, u16)> {
     if b.get(..2)? != [0xFF, 0xD8] {
         return None;

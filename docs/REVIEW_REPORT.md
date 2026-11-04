@@ -6209,3 +6209,203 @@ Files referenced:
 - /home/user/ataraxia/docs/ARCHITECTURE.md
 - /home/user/ataraxia/docs/INVARIANTS.md
 - /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r4/nk4.rs (the name-pair check program for PR4-1)
+
+## Profile (milestone 4.5) review, round 5 (2026-11-04)
+
+**Scope:** commit e5bd978, the round 4 fixes. I read the whole diff and the code it depends on:
+- `names_clash`, `name_keys`, `fold_cased`, `fold_lookalike`;
+- the barrier in the many-contacts test, plus the paths it relies on: `deliver`, the sync loop (`process` runs in relay `seq` order), and `receive` → `receive_profile`, which is synchronous;
+- `main.tsx`, `settings.ts` `applyAppearance`, and `pictures.ts` `sendsAsGif`;
+- the `choose` functions and the hint in `Profile.tsx` and `Contacts.tsx`;
+- the ADR-0020 and TEST_REPORT edits.
+
+I did not edit any repository files.
+
+**Working tree:** the tree has uncommitted backup work. It touches `service.rs` (backup commands, `sync_rekeys` in the tick and other hunks), `db.rs`, `lib.rs` and `crates/core`. I checked that the `names_clash`…`fold_lookalike` block is byte-identical to e5bd978. `service/profile.rs`, `tests/profile.rs` and all of `app/` are identical to the commit. So the cargo run below is a close proxy for the commit, but not an exact one. The app checks match the commit exactly.
+
+**Commands run:**
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-client --test profile --lib`: lib 29 passed, profile 7 passed (70.9 s).
+- `pnpm -C app typecheck`: 0 errors.
+- `pnpm -C app lint`: 22 files clean, contrast OK.
+- Name-pair programs, compiled with `rustc`:
+  - `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/main.rs` (binary `nk5`): the e5bd978 functions copied verbatim into `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/head.rs` (service.rs L1065-1177), plus round 2's `name_key`.
+  - `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/combo.rs`: pairs that combine a case change with an I/l swap.
+  - `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/fp.rs`: false-positive sweep over about 110 real names.
+  - `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/fix.rs`: the fix proposed for PR5-1.
+
+**Verdict: PASS.** No Critical or High findings. There is 1 Medium (PR5-1, an old gap that is not a regression), 1 Low and 2 Nits.
+
+---
+
+### Status of the round 4 findings
+
+| ID | Sev (r4) | Status | Notes |
+|---|---|---|---|
+| PR4-1 | High | **Fixed** | The visual key now folds I/l to PIPE, then lowercases, drops combining marks and folds look-alikes, exactly as asked (service.rs:1095-1103). All 21 earlier must-clash pairs and all 16 round 4 look-alike pairs clash: Alice/АIice, Paul/РauI, Carl/СarI, Michael/МichaeI, Olga/ОIga, Bill/ВiII, Kyle/КyIe, IAN/lАN, "Ian Smith"/"lan Ѕmith", "Ian Emile"/"lan Émile", Emil/ЕmiI, Ilya/lIya, and the rest. Extra probes also clash: ΑIice, ＡIice, A1ice, A\|ice, AӀice, Aǀice, AⅠice, AΙice, AІice, AƖice, Bi11, BiⅠⅠ, PhiI, NeiI, HoIIy, Ӏsla, ChIoe, СIara and ОIа. Must-differ pairs stay apart: Ian/Lan, Al/Ai, Lan/ian, Il/li, Bob/Rob, Anna/Hanna, Liam/Iiam, Lia/Iia, ill/LLL, Ian/Ivan, Liz/Iiz, Lee/Iee, Lucy/Iucy, Ilse/Llse, Eli/Ell, Ali/All, Bill/Bili, Ella/Eila, Ella/Elia, Leo/Ieo. Across about 110 real names, the only clashes are Il/ll/II and Dali/Dalí, both intended. Edge inputs run cleanly: "", " ", lone U+0301, "İ", U+FF5E, "ǅ", "ẞ", "ΐ", "ﬀ", doubled U+0307. There is no indexing. The unit test gains the pairs asked for. The doc comment and the ADR-0020 wording are updated. A remaining gap, not caused by this change, is PR5-1. |
+| PR4-2 | Low | **Fixed** | The message barrier is sound. When `profile_rows(None)` is empty, every profile row has been deposited (`deliver` sets `envelope = NULL` only after the deposit succeeds) or deleted. `a.send` deposits afterwards into the same mailbox, so the barrier text gets a higher relay `seq`. The sync loop runs `process` item by item in `seq` order, and `receive_profile` applies a picture in the same call. So once `arrives(.., "barrier")` holds, any stale picture is already in the view. A text message changes no picture, unlike the rename I suggested, so it cannot erase the evidence. The author reports the test fails with `forget_sent` reverted, and the reasoning above supports that. I could not re-run the mutation myself because I may not edit files. |
+| PR4-3 | Low | **Fixed** | `main.tsx:13` adds a module-level `change` listener on `(prefers-reduced-motion: reduce)`. It calls `applyAppearance(loadAppearance())`, which recomputes `data-motion`. The `MutationObserver` in `pictures.ts` then switches the avatars. `loadAppearance()` returns the last applied state, because `applyAppearance` always persists it. The app lives for the whole page, so the listener needs no cleanup. |
+| PR4-4 | Nit | **Partly fixed** (PR5-3) | The blank line at service.rs:3402 is gone. The `jpeg_dims` doc comment was re-split but not re-wrapped: profile.rs:77 is still 134 columns. |
+| PR4-5 | Nit | **Partly fixed** (PR5-2) | The error is cleared and a hint is shown, but only for GIFs of 48 KB or less. A larger GIF, the most common case, still becomes a still with no hint. |
+
+---
+
+### New findings
+
+#### PR5-1: Medium [HIGH, checked by running the e5bd978 functions]. A case change combined with an I/l swap still gets past both keys
+
+**Where:** `crates/client/src/service.rs:1065-1105` (`names_clash` / `name_keys`). It reaches all three callers.
+
+**Problem:**
+- Each key covers one kind of change: the caseless key covers a case change, the visual key an I/l swap.
+- Neither covers both at once. A name written in capitals with the I replaced by an l look-alike looks like "ALICE", and round 3 ruled that "ALICE" must clash with "Alice" (PR3-1). Yet it matches neither key.
+
+Output of `combo.rs` (`head` is e5bd978, `r2` is round 2's `name_key`):
+
+```
+ Alice / ALlCE  head=false r2=false
+ Alice / AL1CE  head=false r2=false
+ Alice / AL|CE  head=false r2=false
+ Alice / ALӀCE  head=false r2=false
+ Alice / ALⅠCE  head=false r2=false
+  Bill / BlLL   head=false r2=false
+  Phil / PHlL   head=false r2=false
+ Emily / EMlLY  head=false r2=false
+  Lily / LlLY   head=false r2=false
+ ALICE / ALlCE  head=true  r2=true    (same case: caught)
+ Alice / ALІCE  head=true             (Cyrillic І: caught, through lowercasing)
+```
+
+**Why Medium and not High:**
+- It is not a regression. No earlier round caught these pairs.
+- The forged name still shows a visible case difference from the contact it imitates.
+- ADR-0020 says the fold is not a full confusables skeleton, and the safety number stays the real check.
+- It is the same class as PR3-1, though, so it should be closed or documented.
+
+**Why two keys cannot close it:** look-alike matching is not transitive. "Alice" matches "ALICE" by case, "ALICE" matches "ALlCE" by glyph, but "Alice" and "ALlCE" share no key. Two keys cannot express that without also making "Ian" equal "Lan".
+
+**Fix:** add a third key, used only for names written in capitals. Checked in `fix.rs`:
+
+```rust
+const I_FAMILY: [char; 11] = ['l', '1', '|', 'ӏ', 'Ӏ', 'ǀ', 'Ɩ', 'Ⅰ', 'Ι', 'І', 'İ'];
+
+/// For a name written in capitals ("ALlCE"): its caseless key with every I look-alike read as I.
+fn caps_key(name: &str) -> Option<String> {
+    let caps = name.chars().all(|c| !c.is_lowercase() || I_FAMILY.contains(&c))
+        && name.chars().filter(|c| c.is_uppercase() && !I_FAMILY.contains(c)).count() >= 2;
+    caps.then(|| name_keys(&name.chars().map(|c| if I_FAMILY.contains(&c) { 'I' } else { c }).collect::<String>()).0)
+}
+
+fn names_clash(a: &str, b: &str) -> bool {
+    let ((a1, a2), (b1, b2)) = (name_keys(a), name_keys(b));
+    a1 == b1 || a2 == b2
+        || caps_key(a).is_some_and(|k| k == b1)
+        || caps_key(b).is_some_and(|k| k == a1)
+}
+```
+
+- With this change, every pair in the table clashes, and so do all 37 existing must-clash pairs.
+- Every must-differ pair stays apart, including Al/Ai, Ella/Eiia, LAN/ian and Lan/IAN. The `>= 2` capitals rule is what keeps "Al" from reading as "AI".
+- The 110-name sweep shows no new clashes.
+- Add `("Alice","ALlCE")`, `("Alice","AL1CE")` and `("Bill","BlLL")` to the must-clash pairs, and `("Ella","Eiia")` to the must-differ pairs.
+- If the team would rather not add the third key, write the limit into ADR-0020 and INV-ID-2 and add a test that pins the current behaviour. CLAUDE.md §9 requires one or the other.
+
+#### PR5-2: Low [HIGH]. The "will be a still" hint is missing for GIFs over 48 KB, the most common animated GIFs
+
+**Where:** `app/src/components/Profile.tsx:173` and `app/src/screens/Contacts.tsx:212`, together with `app/src/pictures.ts:85-93`.
+
+**Problem:**
+- `setGifHint(await sendsAsGif(f))` reuses `sendsAsGif`, which returns `false` for any file over `MAX_PICTURE_BYTES` (48 KB) before it looks at the header.
+- So an animated GIF over 48 KB opens the cropper with no hint, and silently becomes a still.
+- PR4-5 asked for a hint whenever a GIF falls back to the cropper, and the TEST_REPORT says it is done.
+- `sendsAsGif` is also called twice, so the file is read twice.
+
+**Fix:** in `pictures.ts`, split the header test out of `sendsAsGif`:
+
+```ts
+export async function isGif(file: File): Promise<boolean> {
+  try {
+    const head = new Uint8Array(await file.slice(0, 6).arrayBuffer());
+    return String.fromCharCode(...head).startsWith("GIF8");
+  } catch {
+    return false;
+  }
+}
+export async function sendsAsGif(file: File): Promise<boolean> {
+  return file.size <= MAX_PICTURE_BYTES && (await isGif(file));
+}
+```
+
+In both `choose` functions:
+
+```ts
+const gif = await isGif(f);
+if (!gif || f.size > MAX_PICTURE_BYTES || !(await act(...))) {
+  setError(null);
+  setGifHint(gif);
+  setPicked(f);
+}
+```
+
+This needs `MAX_PICTURE_BYTES` exported. Alternatively, keep `if (!(await sendsAsGif(f)) || …)` and only change the hint line to `setGifHint(await isGif(f))`. Optionally, word the hint by cause, for example "Too large to stay animated; it will be a still picture."
+
+#### PR5-3: Nit. The `jpeg_dims` doc line is still 134 columns
+
+**Where:** `crates/client/src/service/profile.rs:77`.
+
+**Fix:** re-wrap the comment to 110 columns:
+
+```
+/// Strict on purpose: decoders skip stray bytes and parameterless markers (`TEM`, `RSTn`)
+/// that a lenient walk would read as a length, so a lenient walk could see a decoy frame
+/// size while the decoder sees the real, huge one (review PR2-1). Anything unusual is refused.
+```
+
+#### PR5-4: Nit. The new JSX blocks are mis-indented, and the hint's live region may not be announced
+
+**Where:** `Profile.tsx:194-199` and `Contacts.tsx:288-293`.
+
+**Problem:**
+- The fragment is indented 12 spaces under a 6-space parent in Profile, and dedents below its siblings in Contacts.
+- `role="status"` is put on a `<p>` that is created together with its text. Some screen readers do not announce a live region that appears already filled.
+
+**Fix:**
+- Re-indent each fragment to its parent's level.
+- Keep a `<p className="hint" role="status">` always mounted and render only its text conditionally, for example `{gifHint ? "This GIF can't…" : ""}`.
+
+---
+
+### Checked and found correct
+- **`name_keys`:**
+  - The visual key's order is right: `fold_cased(c, true)` runs before `to_lowercase`, so `L` lowercases to `l` after the PIPE step and never becomes PIPE. PIPE (U+E000) is unchanged by lowercasing.
+  - The second `is_combining` pass removes the U+0307 that some lowercasing adds.
+  - The caseless key is unchanged.
+  - There are no new allocations per call beyond one `String`.
+- **The three callers** (arrival clash check, `warned_about`, `adopt_name`): unchanged and all use `names_clash`.
+- **Barrier test:** `others` now carries Alice's own contact id for `send`. `arrives` uses `eventually`, which waits up to 10 s. Each friend's assertion runs only after their barrier arrives.
+- **Reduced-motion listener:** the in-app setting still wins (`a.reduceMotion ||`). It adds no IPC beyond the existing `setDarkBars`, and no network requests.
+- **GIF fallback:** `setError(null)` clears the refusal before the cropper opens. A failure in the crop step still shows its error through `act`. The hint is cleared on both Done and Cancel.
+- **Docs:** the ADR-0020 bullet now describes the fold-then-lowercase key. TEST_REPORT has a round 4 entry with command output, though it overstates PR4-4 and PR4-5 (see PR5-2 and PR5-3).
+- **Checks:** the Rust tests in scope, typecheck and lint are all clean.
+
+**Verdict: PASS.** No Critical or High findings. PR5-1 (Medium) should be fixed or documented, following CLAUDE.md §9, before the milestone closes. PR5-2 to PR5-4 are optional.
+
+**Next steps:**
+- (B) Fix PR5-1 and PR5-2. Recommended.
+- (D) Merge as-is and track PR5-1 as a documented limit.
+
+Files referenced:
+- /home/user/ataraxia/crates/client/src/service.rs
+- /home/user/ataraxia/crates/client/src/service/profile.rs
+- /home/user/ataraxia/crates/client/tests/profile.rs
+- /home/user/ataraxia/app/src/main.tsx
+- /home/user/ataraxia/app/src/settings.ts
+- /home/user/ataraxia/app/src/pictures.ts
+- /home/user/ataraxia/app/src/components/Profile.tsx
+- /home/user/ataraxia/app/src/screens/Contacts.tsx
+- /home/user/ataraxia/docs/ARCHITECTURE.md
+- /home/user/ataraxia/docs/TEST_REPORT.md
+- /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/main.rs
+- /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/combo.rs
+- /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/fp.rs
+- /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/fix.rs
+- /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/head.rs

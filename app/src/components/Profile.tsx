@@ -3,7 +3,7 @@
 // GIFs kept as they are (`prepareGif`).
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent } from "react";
 import { IpcError, ipc, type PictureVisibility, type ProfileView } from "../ipc";
-import { centreCrop, sendsAsGif, prepareGif, preparePicture, type Crop } from "../pictures";
+import { centreCrop, isGifFile, sendsAsGif, prepareGif, preparePicture, type Crop } from "../pictures";
 import { Avatar, Icon, Segmented } from "../ui";
 
 const VIEW = 240;
@@ -170,7 +170,8 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
     if (!(await sendsAsGif(f)) || !(await act(async () => ipc.setMyPicture(await prepareGif(f)), "Could not set the picture"))) {
       // Used as a still instead: the refusal is not an error to dwell on (review PR4-5).
       setError(null);
-      setGifHint(await sendsAsGif(f));
+      // Any GIF that ends up here becomes a still: say so, whatever the reason (PR5-2).
+      setGifHint(await isGifFile(f));
       setPicked(f);
     }
   }
@@ -191,12 +192,9 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
         </div>
         <input ref={file} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void choose(f); }} />
       </div>
-      {picked ? (
-            <>
-              {gifHint ? <p className="hint" role="status">This GIF can't be used as it is; it will be a still picture.</p> : null}
-              <PictureCropper file={picked} onDone={(c) => { setGifHint(false); void crop(c); }} onCancel={() => { setGifHint(false); setPicked(null); }} />
-            </>
-          ) : null}
+      {/* Always mounted, so screen readers announce the hint when it appears (PR5-4). */}
+      <p className="hint" role="status">{picked && gifHint ? "This GIF can't stay animated; it will be a still picture." : ""}</p>
+      {picked ? <PictureCropper file={picked} onDone={(c) => { setGifHint(false); void crop(c); }} onCancel={() => { setGifHint(false); setPicked(null); }} /> : null}
       <form className="stack-sm" onSubmit={(e) => void save(e)}>
         <div className="field">
           <label htmlFor="my-name">Your name</label>

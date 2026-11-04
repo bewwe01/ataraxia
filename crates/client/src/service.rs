@@ -1063,9 +1063,32 @@ fn notify_enabled(db: &Db) -> bool {
 /// case-insensitive and treat capital I like lowercase l (then i would equal L, and "Ian"
 /// "Lan"), so two keys are compared and either matching is a clash (review PR3-1).
 fn names_clash(a: &str, b: &str) -> bool {
-    let (a1, a2) = name_keys(a);
-    let (b1, b2) = name_keys(b);
-    a1 == b1 || a2 == b2
+    let ((a1, a2), (b1, b2)) = (name_keys(a), name_keys(b));
+    a1 == b1 || a2 == b2 || caps_key(a).is_some_and(|k| k == b1) || caps_key(b).is_some_and(|k| k == a1)
+}
+
+/// Every look-alike of capital I (in either key's sense).
+const I_FAMILY: [char; 11] = ['l', '1', '|', 'ӏ', 'Ӏ', 'ǀ', 'Ɩ', 'Ⅰ', 'Ι', 'І', 'İ'];
+
+/// For a name written in capitals (`ALlCE`), its case-insensitive key with every I look-alike
+/// read as I: a case change and an I/l swap together are a third way to look like another name
+/// (review PR5-1). At least two other capitals, so "Al" is not read as "AI".
+fn caps_key(name: &str) -> Option<String> {
+    let caps = name.chars().all(|c| !c.is_lowercase() || I_FAMILY.contains(&c))
+        && name
+            .chars()
+            .filter(|c| c.is_uppercase() && !I_FAMILY.contains(c))
+            .count()
+            >= 2;
+    caps.then(|| {
+        name_keys(
+            &name
+                .chars()
+                .map(|c| if I_FAMILY.contains(&c) { 'I' } else { c })
+                .collect::<String>(),
+        )
+        .0
+    })
 }
 
 /// The keys [`names_clash`] compares: one case-insensitive ("ALICE" is "Alice"), and one where
@@ -4283,6 +4306,11 @@ mod tests {
             ("Paul", "РauI"),
             ("Ian Smith", "lan Ѕmith"),
             ("Ian Emile", "lan Émile"),
+            // A case change and an I/l swap together (review PR5-1).
+            ("Alice", "ALlCE"),
+            ("Alice", "AL1CE"),
+            ("Bill", "BlLL"),
+            ("Emily", "EMlLY"),
         ] {
             assert!(same(a, b), "{a} / {b}");
         }
@@ -4291,6 +4319,9 @@ mod tests {
             ("Al", "Ai"),
             ("Lan", "ian"),
             ("Il", "li"),
+            ("Ella", "Eiia"),
+            ("LAN", "ian"),
+            ("Lan", "IAN"),
             ("Bob", "Rob"),
             ("Anna", "Hanna"),
         ] {

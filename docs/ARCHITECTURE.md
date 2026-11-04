@@ -411,6 +411,7 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
     - `names_clash` compares two keys and treats a match on either as a clash (reviews PR-6, PR2-4, PR3-1):
       - a case-insensitive key, so "ALICE" clashes with "Alice";
       - a key in which capital I, lowercase l, 1, | and their Greek/Cyrillic look-alikes (Ι, І, Ӏ, İ, Ⅰ) become one symbol before case is folded, so "Ian" clashes with "lan" (and "АIice", with a Cyrillic А, with "Alice") while "Ian" and "Lan" stay apart (review PR4-1).
+      - for a name written in capitals, a third key that reads every I look-alike as I, so "ALlCE" (a case change and an I/l swap together) clashes with "Alice" (review PR5-1).
     - Both keys fold spacing, fullwidth forms, Cyrillic and Greek letters that look Latin (Greek capitals before lowercasing), small capitals, accents (precomposed or combining) and 0/o.
     - It is not a full UTS #39 confusables skeleton; the safety number stays the real check.
   - A name that is adopted is written into the chat as a local line ("“Mallory” changed their name to “Mal”"), so a rename is never silent.

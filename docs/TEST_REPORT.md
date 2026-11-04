@@ -2,6 +2,31 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Profile: review round 5 (PASS) and its follow-up fixes (2026-11-04)
+
+Round 5 of the review gate **passed**, with no Critical or High findings. Its Medium, Low and two Nit findings (PR5-1 to PR5-4) are fixed here as well.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 246 passed, 0 failed
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 22 files clean
+# ✓ built in 1.60s
+```
+
+- **PR5-1:** a third name key, for names written in capitals, reads every I look-alike as I.
+  - These now clash: Alice/ALlCE, Alice/AL1CE, Bill/BlLL and Emily/EMlLY.
+  - These stay apart: Ella/Eiia, LAN/ian, Lan/IAN, Al/Ai, Ian/Lan, Lan/ian and Il/li.
+  - Every earlier pair still holds.
+- **PR5-2:** the "will be a still" hint now shows for any GIF sent to the cropper, including those over 48 KB.
+- **PR5-3:** the `jpeg_dims` doc comment is rewrapped.
+- **PR5-4:** the hint's live region stays mounted, so screen readers announce it.
+- In Chromium, the GIF and profile runs pass with no console errors.
+
 ## Profile: review round 4 and its fixes (2026-11-04)
 
 Round 4 of the review gate failed on one High finding. PR4-1: the visual key was not lowercased, so an I/l swap combined with a Cyrillic or accented capital ("АIice") did not clash with "Alice". All five findings (PR4-1 to PR4-5) were fixed in this round.
