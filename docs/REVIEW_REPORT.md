@@ -6032,3 +6032,180 @@ Files referenced:
 - /home/user/ataraxia/docs/INVARIANTS.md
 - /home/user/ataraxia/docs/ARCHITECTURE.md
 - /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/nk.rs (the check program for PR3-1)
+
+## Profile (milestone 4.5) review, round 4 (2026-11-04)
+
+**Scope:** commit 519ced1, the round 3 fixes. I read the whole diff and the code around it:
+- `names_clash`, `name_keys`, `fold_fullwidth`, `fold_cased`, `fold_lookalike` and `is_combining`, plus their three callers: the arrival clash check (service.rs:3399-3428), `warned_about` (service.rs:4177-4209) and `adopt_name` (profile.rs:542-560);
+- `jpeg_dims`;
+- the `ProfileRows` and `GiveUpProfiles` hooks, and how `deliver` clears `envelope`;
+- the two strengthened integration tests and the relay logs test;
+- `pictures.ts`, `Profile.tsx`, `Contacts.tsx` and `settings.ts`;
+- the ADR-0020, INVARIANTS and DESIGN edits.
+
+I did not edit any repository files.
+
+**Working tree:** besides the core files from round 3, `crates/client/src/db.rs` now has uncommitted changes (unrelated backup work). `service.rs`, `service/profile.rs`, `tests/profile.rs`, `crates/relay` and `app/` are identical to 519ced1, so the commands below test the commit's code in those files.
+
+**Commands run:**
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-client --test profile --lib`: lib 29 passed, profile 7 passed (72.6 s).
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-relay --test logs`: 1 passed.
+- `pnpm -C app typecheck`: 0 errors.
+- `pnpm -C app lint`: 22 files clean; contrast OK.
+- `rustfmt --check --edition 2024 --config-path rustfmt.toml` on the changed Rust files: clean.
+- Name-pair check: I copied `names_clash`…`fold_lookalike` from 519ced1 byte for byte, plus round 2's `name_key` from a6ddbdb, into `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r4/nk4.rs`. I compiled it with `rustc` and ran it on name pairs. Output is quoted under PR4-1.
+
+**Verdict: FAIL.** There is 1 High finding (PR4-1). It is a new look-alike regression in the round 3 two-key design. There are also 2 Low findings and 2 Nits.
+
+---
+
+### Status of the round 3 findings
+
+| ID | Sev (r3) | Status | Notes |
+|---|---|---|---|
+| PR3-1 | High | **Fixed, with a new regression (PR4-1)** | Every pair round 3 asked for now clashes: Ian/ian, Alice/ALICE, Bill/BILL, Lily/lily, Lars/LARS, Ivan/Іvan, Ian/İan, Al/AI. Ian/Lan and Al/Ai stay apart. All three callers use `names_clash`. No panics: there is no indexing, and the fullwidth step uses `checked_sub` with `unwrap_or`. Empty, whitespace-only, lone-combining, `İ`, `ǅ` and `ẞ` inputs all run cleanly. Lowercasing `İ` can add a combining mark, so the caseless key drops combining marks again after lowercasing; that is correct. But the visual key is never lowercased, and `fold_lookalike` only maps lowercase letters. So a name that swaps I and l and also uses a Cyrillic capital or an accented capital now passes, where round 2 caught it. See PR4-1. |
+| PR3-2 | Medium | **Fixed** | PR2-2 test: the second `All` round queues the 2 friends left out of the first. The new assertion checks that all 6 have a waiting row. `Nobody` then leaves 2 stale picture rows that only `forget_sent` removes. The test waits until no profile rows are waiting, which needs those rows to be deposited or deleted. PR2-3 test: it compares `(id, attempts)` before and after the round. A replaced row would have attempts below 20, even if SQLite reused the id, so the comparison catches a missing pause. After the 7 h ageing it requires a fresh row (`attempts < 20`). The `ProfileRows` hook filters on `envelope IS NOT NULL`, which matches `deliver` (service.rs:3208 sets `envelope = NULL` when a deposit succeeds). A small timing gap remains: PR4-2. |
+| PR3-3 | Low | **Fixed** | A second frame header is refused: the guarded arm falls through to `_ => None`. Dimensions are returned only at the first SOS. A file with no SOS is refused. SOS before SOF gives `dims == None`, so it is refused. Counting scans with `windows(2)` over the rest of the file can only over-count, because entropy data stuffs `FF` as `FF 00` and fill bytes still end in `FF DA`. So the 64-scan cap fails closed. The test at 64 and 65 scans checks the boundary correctly. Nothing can panic: `b.get(i..)?` is safe because `at(0)` already succeeded. The test helper in `tests/profile.rs` now adds an SOS, and JPEGs the app redraws always contain one. |
+| PR3-4 | Low | **Fixed** (one gap, PR4-3) | `useSyncExternalStore(onMotionChange, reducedMotion)` is used correctly. The subscribe function sits at module level, so it is stable and does not resubscribe on each render. The snapshot is a primitive boolean. `reduced` is in the effect's dependencies, and the `live` guard is kept. Changing the in-app setting now reaches avatars already on screen. A change of the OS setting during a session still does not: PR4-3. |
+| PR3-5 | Low | **Fixed** | Both `choose` functions open the cropper when `sendsAsGif` is false or `act` fails. In Contacts, `act` now returns `Promise<boolean>`. The cropper uses `createImageBitmap`, which takes a GIF's first frame. One UX Nit: PR4-5. |
+| PR3-6 | Low | **Fixed** | INV-CONT-3 now says "a JPEG or a rebuilt GIF", gives the 100-frame and 4 Mpx limits and the 6 h resend, and lists both tests plus `animated_gifs_arrive_without_their_metadata`. |
+| PR3-7 | Nit | **Fixed** | The P6R2-3 doc comment is back above `legacy_warnings_merge_only_an_unambiguous_contact`. |
+
+**Relay logs test (`crates/relay/tests/logs.rs:185-192`): a legitimate fix, not a weakening.** `other` is every captured line except the test's own canary line. The test already asserts `other.is_empty()` just above, at L163-172, so the relay may log nothing at all during a session, and that check is unchanged. The needle loop now searches `other` instead of `logs`, so it only stops looking inside the canary line, which the test itself emits through `tracing::info!`. That line carries a microsecond timestamp, so "777" or a 5-digit port can match it by chance. A relay event could only be excluded if it contained the string `capture-canary-7e11`, which the relay never logs. Strictly, the needle loop is now redundant, because `other` is already asserted empty. The comment says it is kept for clarity, which is acceptable.
+
+---
+
+### New findings
+
+#### PR4-1: High [HIGH, checked by running the 519ced1 functions]. The visual key is not lowercased, so an I/l swap combined with a Cyrillic or accented capital no longer clashes (INV-ID-2 regression against round 2)
+
+**Where:** `crates/client/src/service.rs:1092-1095` (the `visual` key in `name_keys`), together with `fold_lookalike` at `:1144-1169`, which handles lowercase letters only. It reaches all three callers.
+
+**Problem:**
+- The caseless key can never match an I↔l swap, by design. The visual key catches I↔l, but it keeps case, and `fold_lookalike` only knows lowercase forms. So Cyrillic capitals are not folded in it: А В С Е К М О Р Т Х Ѕ Ј. Neither are accented Latin capitals (É, Ö and so on).
+- Only Greek capitals and `Н` get folded there, through `fold_cased`.
+- So a name needs only a look-alike capital (usually the initial) plus one I-for-l swap to get past both keys. Round 2's single key caught all of these.
+
+Output of the 519ced1 functions (`head`), round 2's `name_key` (`r2`) and the fix below (`fix`):
+
+```
+     Alice / АIice      head=false r2=true fix=true     (Cyrillic А, capital I for l)
+      Paul / РauI       head=false r2=true fix=true
+      Carl / СarI       head=false r2=true fix=true
+   Michael / МichaeI    head=false r2=true fix=true
+      Olga / ОIga       head=false r2=true fix=true
+      Bill / ВiII       head=false r2=true fix=true
+      Kyle / КyIe       head=false r2=true fix=true
+       IAN / lАN        head=false r2=true fix=true
+ Ian Smith / lan Ѕmith  head=false r2=true fix=true
+ Ian Emile / lan Émile  head=false r2=true fix=true
+       Ian / Lan        head=false r2=false fix=false  (still apart)
+        Al / Ai         head=false r2=false fix=false
+       Lan / ian        head=false r2=false fix=false
+        Il / li         head=false r2=false fix=false
+```
+
+- **Effect:** a contact with a new key can arrive named "АIice" or "РauI" beside the user's "Alice" or "Paul" and get no key-change warning. An existing contact can also rename itself into such a look-alike through `adopt_name`. This works for most names that contain an l or I and start with one of about a dozen common capitals. It is the same class of gap as PR3-1.
+- **Root cause:** the visual key skips the lowercase-then-fold step that round 2's key had. Round 2's key was right for I/l. Its only flaw was case-sensitivity, and the caseless key now covers that.
+
+**Fix:** make the visual key round 2's key: fold the I/l family to PIPE, then lowercase, drop combining marks and fold look-alikes. PIPE (U+E000) is unchanged by lowercasing. `L` becomes `l` only after the PIPE step, so "Ian" and "Lan" still differ.
+
+```rust
+let visual = base
+    .chars()
+    .map(|c| fold_cased(c, true))
+    .collect::<String>()
+    .to_lowercase()
+    .chars()
+    .filter(|c| !is_combining(*c))
+    .map(fold_lookalike)
+    .collect();
+```
+
+- I ran this change against every positive and negative pair in `names_fold_lookalikes_but_keep_different_names_apart`, and all hold. It also catches every pair in the table above.
+- Update the doc comments: the visual key is "case-folded after the I/l fold", not "keeping case". Update ADR-0020's "a case-keeping key" wording to match.
+- Add these test pairs that must clash: `("Alice","АIice")`, `("Paul","РauI")`, `("Ian Smith","lan Ѕmith")` and `("Ian Emile","lan Émile")`. Add `("Lan","ian")` and `("Il","li")` to the pairs that must differ.
+
+#### PR4-2: Low [MEDIUM]. The many-contacts test still uses a fixed 2 s sleep for its negative check
+
+**Where:** `crates/client/tests/profile.rs:462-472`.
+
+**Problem:**
+- Once Alice's queue is empty, the test sleeps 2 s and then asserts that no friend shows a picture.
+- Every friend had no picture before, so the assertion also holds if a stale picture was deposited but not yet fetched and applied.
+- On a slow CI runner the test could pass even with `forget_sent` reverted. This is the same kind of timing gap PR3-2 was about, though much narrower.
+
+**Fix:** replace the sleep with a barrier that follows the profiles in order.
+- After the queue empties, call `a.set_profile("Alice B".into(), String::new())`.
+- Then wait until each friend's `view(..).name == "Alice B"`, as in the setup loop above.
+- Messages within a session are processed in order, so a stale picture row deposited earlier is applied before the rename. Only then assert `picture.is_none()`.
+
+#### PR4-3: Low [HIGH]. A change of the OS reduced-motion setting during a session does not reach avatars
+
+**Where:** `app/src/pictures.ts:46-51` observes only `data-motion`. `app/src/settings.ts:85-86` reads `prefers-reduced-motion` once, when `applyAppearance` runs (at startup and on settings changes). Nothing listens for the media query changing.
+
+**Problem:**
+- PR3-4's fix and DESIGN.md say avatars switch "at once when the setting changes".
+- That holds for Veil's own setting. If the user turns on reduced motion in the OS while Veil runs, visible GIF avatars keep animating until Veil restarts or the user changes an appearance setting.
+- CLAUDE.md asks the app to respect `prefers-reduced-motion`. The code that sets `data-motion` predates this diff, but the new hook is the only consumer that must react at runtime.
+
+**Fix:** in `main.tsx`, re-apply the appearance when the OS setting changes:
+
+```ts
+window.matchMedia("(prefers-reduced-motion: reduce)")
+  .addEventListener("change", () => applyAppearance(loadAppearance()));
+```
+
+The `MutationObserver` in `pictures.ts` then picks up the change.
+
+#### PR4-4: Nit. A blank line left from the removed `let key` splits the INV-ID-2 comment, and one doc line is overlong
+
+**Where:**
+- `crates/client/src/service.rs:3399-3403`: the comment "Addresses are key hashes … (INV-ID-2)" is now followed by an empty line and reads as detached.
+- `crates/client/src/service/profile.rs:75-76`: the `jpeg_dims` doc comment line is about 130 characters, over the 110 `max_width`. rustfmt does not wrap comments, so it passes `--check`.
+
+**Fix:** delete the blank line at service.rs:3402. Re-wrap the `jpeg_dims` doc comment to 110 columns.
+
+#### PR4-5: Nit. When a refused GIF falls back to the cropper, the error stays on screen above it
+
+**Where:** `app/src/components/Profile.tsx:166-171`, `app/src/screens/Contacts.tsx:205-210`.
+
+**Problem:** `act` sets "Could not set the picture" (or Rust's message), and then the cropper opens. The user sees an error while being asked to crop, with no hint that the GIF will become a still. The error clears only when the crop succeeds.
+
+**Fix:** when the fallback opens the cropper, call `setError(null)`, and show a short hint in the cropper instead, for example "This GIF can't be used as it is; it will be a still picture."
+
+---
+
+### Checked and found correct
+- **`names_clash` callers:**
+  - Arrival: each existing contact's shown name and own name are compared with the incoming cleaned name. Only when `display_name` is set, as before.
+  - `warned_about`: the "only one match" rule is unchanged.
+  - `adopt_name`: checks both shown names and `profile_name`.
+  - Each call computes the incoming name's keys again per row. That costs O(contacts) allocations only, which is fine for a contact list.
+- **False positives:** Ian/Lan, Al/Ai, Lan/ian, Il/li, Liam/Iiam, Lia/Iia, ill/LLL, Bob/Rob and Anna/Hanna all stay apart under the 519ced1 code and under the PR4-1 fix.
+- **`fold_cased`:** the `if pipe` guard covers the whole or-pattern. Without the pipe fold, `'Ι' => 'I'` keeps Greek Iota equal to Latin I in the caseless key. `'І'`, `'Ⅰ'` and `'İ'` are handled through lowercasing in that key. Ⅰ (U+2160) lowercases to ⅰ (U+2170), which is not folded, so Ⅰ only clashes through the visual key. That is acceptable.
+- **`jpeg_dims`:** strict segment walk, a single SOF, ends at SOS, and the scan cap. It still always terminates (`i` grows by at least 4 each step). Stored pictures that no longer pass are hidden by `picture_ok` on read.
+- **Test hooks:** `ProfileRows` is behind `test-hooks`, uses bound parameters (`?1 IS NULL OR contact = ?1`) and returns only ids and attempts.
+- **`pictures.ts`:** one `MutationObserver` per mounted avatar, disconnected on unmount. The `stills` cache is still keyed and cleared on lock. No new IPC, no network requests, no `innerHTML`.
+- **Docs:** ADR-0020's JPEG text matches the code. Only the "case-keeping key" wording needs PR4-1's update. INV-CONT-3 and the DESIGN.md row match the behaviour.
+- **Checks:** the Rust tests in scope, typecheck, lint and rustfmt are all clean.
+
+**Verdict: FAIL.** PR4-1 is High and must be fixed and re-reviewed. The fix is a five-line change to the visual key plus test pairs. PR4-2 to PR4-5 are optional; PR4-2 is cheap and recommended in the same round.
+
+**Next steps:**
+- (A) Fix all findings; recommended for a FAIL.
+- (B) Fix PR4-1 (and PR4-2), then re-review.
+
+Files referenced:
+- /home/user/ataraxia/crates/client/src/service.rs
+- /home/user/ataraxia/crates/client/src/service/profile.rs
+- /home/user/ataraxia/crates/client/tests/profile.rs
+- /home/user/ataraxia/crates/relay/tests/logs.rs
+- /home/user/ataraxia/app/src/pictures.ts
+- /home/user/ataraxia/app/src/settings.ts
+- /home/user/ataraxia/app/src/main.tsx
+- /home/user/ataraxia/app/src/components/Profile.tsx
+- /home/user/ataraxia/app/src/screens/Contacts.tsx
+- /home/user/ataraxia/docs/ARCHITECTURE.md
+- /home/user/ataraxia/docs/INVARIANTS.md
+- /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r4/nk4.rs (the name-pair check program for PR4-1)

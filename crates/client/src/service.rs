@@ -1068,8 +1068,9 @@ fn names_clash(a: &str, b: &str) -> bool {
     a1 == b1 || a2 == b2
 }
 
-/// The keys [`names_clash`] compares: one case-insensitive ("ALICE" is "Alice"), one keeping
-/// case with I, l, 1 and | as one symbol ("Ian" is "lan", but "Lan" is neither).
+/// The keys [`names_clash`] compares: one case-insensitive ("ALICE" is "Alice"), and one where
+/// capital I, lowercase l, 1 and | become one symbol before case is folded ("Ian" is "lan",
+/// but "Lan" is neither).
 fn name_keys(name: &str) -> (String, String) {
     let base = name
         .chars()
@@ -1089,9 +1090,16 @@ fn name_keys(name: &str) -> (String, String) {
         .filter(|c| !is_combining(*c))
         .map(fold_lookalike)
         .collect();
+    // The I/l family becomes PIPE first, then the same lowercasing and folds: so an I/l swap
+    // with a Cyrillic or accented capital ("АIice") still clashes (review PR4-1).
     let visual = base
         .chars()
-        .map(|c| fold_lookalike(fold_cased(c, true)))
+        .map(|c| fold_cased(c, true))
+        .collect::<String>()
+        .to_lowercase()
+        .chars()
+        .filter(|c| !is_combining(*c))
+        .map(fold_lookalike)
         .collect();
     (caseless, visual)
 }
@@ -3399,7 +3407,6 @@ impl Actor {
                 // Addresses are key hashes, so a changed key arrives as a new contact. One that
                 // takes the name of an existing contact gets a warning, never their history
                 // (INV-ID-2).
-
                 // The contact this one may replace: the oldest with the same name. Accepting
                 // the warning merges exactly that one (P6-1).
                 let clash: Option<i64> = if intro.display_name.is_some() {
@@ -4271,10 +4278,22 @@ mod tests {
             ("Ivan", "Іvan"),
             ("Ian", "İan"),
             ("Al", "AI"),
+            // An I/l swap with a look-alike capital (review PR4-1).
+            ("Alice", "АIice"),
+            ("Paul", "РauI"),
+            ("Ian Smith", "lan Ѕmith"),
+            ("Ian Emile", "lan Émile"),
         ] {
             assert!(same(a, b), "{a} / {b}");
         }
-        for (a, b) in [("Ian", "Lan"), ("Al", "Ai"), ("Bob", "Rob"), ("Anna", "Hanna")] {
+        for (a, b) in [
+            ("Ian", "Lan"),
+            ("Al", "Ai"),
+            ("Lan", "ian"),
+            ("Il", "li"),
+            ("Bob", "Rob"),
+            ("Anna", "Hanna"),
+        ] {
             assert!(!same(a, b), "{a} / {b}");
         }
     }

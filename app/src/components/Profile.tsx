@@ -115,6 +115,8 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
   const [name, setName] = useState("");
   const [status, setStatus] = useState("");
   const [picked, setPicked] = useState<File | null>(null);
+  /** The cropper is showing a GIF that could not be used as it is. */
+  const [gifHint, setGifHint] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -166,6 +168,9 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
   async function choose(f: File) {
     // A GIF Rust refuses (too many frames, say) can still be used as a still (PR3-5).
     if (!(await sendsAsGif(f)) || !(await act(async () => ipc.setMyPicture(await prepareGif(f)), "Could not set the picture"))) {
+      // Used as a still instead: the refusal is not an error to dwell on (review PR4-5).
+      setError(null);
+      setGifHint(await sendsAsGif(f));
       setPicked(f);
     }
   }
@@ -186,7 +191,12 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
         </div>
         <input ref={file} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void choose(f); }} />
       </div>
-      {picked ? <PictureCropper file={picked} onDone={(c) => void crop(c)} onCancel={() => setPicked(null)} /> : null}
+      {picked ? (
+            <>
+              {gifHint ? <p className="hint" role="status">This GIF can't be used as it is; it will be a still picture.</p> : null}
+              <PictureCropper file={picked} onDone={(c) => { setGifHint(false); void crop(c); }} onCancel={() => { setGifHint(false); setPicked(null); }} />
+            </>
+          ) : null}
       <form className="stack-sm" onSubmit={(e) => void save(e)}>
         <div className="field">
           <label htmlFor="my-name">Your name</label>

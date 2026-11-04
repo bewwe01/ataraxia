@@ -107,6 +107,8 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   const [confirmDelete, setConfirmDelete] = useState(false);
   const wallpaper = useChatWallpaper(contact);
   const [picked, setPicked] = useState<File | null>(null);
+  /** The cropper is showing a GIF that could not be used as it is. */
+  const [gifHint, setGifHint] = useState(false);
   const pictureFile = useRef<HTMLInputElement>(null);
   // A name arriving from them must not overwrite a nickname being typed (review PR-16).
   const nameEdited = useRef(false);
@@ -205,6 +207,9 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
   async function choose(f: File) {
     // A GIF Rust refuses (too many frames, say) can still be used as a still (PR3-5).
     if (!(await sendsAsGif(f)) || !(await act(async () => ipc.setContactPicture(contact.id, await prepareGif(f)), "Could not set the picture"))) {
+      // Used as a still instead: the refusal is not an error to dwell on (review PR4-5).
+      setError(null);
+      setGifHint(await sendsAsGif(f));
       setPicked(f);
     }
   }
@@ -280,7 +285,12 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
               ) : null}
             </div>
             <input ref={pictureFile} type="file" accept="image/*" hidden onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) void choose(f); }} />
-            {picked ? <PictureCropper file={picked} onDone={(c) => void localPicture(c)} onCancel={() => setPicked(null)} /> : null}
+            {picked ? (
+            <>
+              {gifHint ? <p className="hint" role="status">This GIF can't be used as it is; it will be a still picture.</p> : null}
+              <PictureCropper file={picked} onDone={(c) => { setGifHint(false); void localPicture(c); }} onCancel={() => { setGifHint(false); setPicked(null); }} />
+            </>
+          ) : null}
             <p className="hint">Shown instead of theirs, on this device only. They are not told.</p>
           </div>
           <div className="group card">

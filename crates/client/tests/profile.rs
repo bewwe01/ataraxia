@@ -434,11 +434,11 @@ async fn a_picture_taken_back_never_arrives_with_many_contacts() {
     let mut others = Vec::new();
     for n in 0..6 {
         let u = user(&r, &format!("Friend {n}")).await;
-        let (_, theirs) = pair(a, &u.client).await;
-        others.push((u, theirs.id));
+        let (mine, theirs) = pair(a, &u.client).await;
+        others.push((u, theirs.id, mine.id));
     }
     a.set_profile("Alice A".into(), String::new()).await.unwrap();
-    for (u, id) in &others {
+    for (u, id, _) in &others {
         within(std::time::Duration::from_secs(150), || async {
             (view(&u.client, *id).await.name == "Alice A").then_some(())
         })
@@ -465,8 +465,12 @@ async fn a_picture_taken_back_never_arrives_with_many_contacts() {
         a.profile_rows(None).await.unwrap().is_empty().then_some(())
     })
     .await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    for (u, id) in &others {
+    // A barrier, not a sleep (review PR4-2): a message is applied after anything deposited
+    // before it, and (unlike a profile) changes no picture, so once every friend has it, a
+    // stale picture would be on their screen.
+    for (u, id, mine) in &others {
+        a.send(*mine, "barrier".into()).await.unwrap();
+        arrives(&u.client, *id, "barrier").await;
         assert!(
             view(&u.client, *id).await.picture.is_none(),
             "a taken-back picture arrived"

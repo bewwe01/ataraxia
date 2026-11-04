@@ -2,6 +2,34 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Profile: review round 4 and its fixes (2026-11-04)
+
+Round 4 of the review gate failed on one High finding. PR4-1: the visual key was not lowercased, so an I/l swap combined with a Cyrillic or accented capital ("АIice") did not clash with "Alice". All five findings (PR4-1 to PR4-5) were fixed in this round.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 246 passed, 0 failed
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 22 files clean
+# ✓ built in 1.53s
+```
+
+- **PR4-1:** the visual key now folds I/l to one symbol first, then lowercases and folds look-alikes.
+  - These now clash: Alice/АIice, Paul/РauI, "Ian Smith"/"lan Ѕmith" and "Ian Emile"/"lan Émile".
+  - These stay apart: Ian/Lan, Al/Ai, Lan/ian and Il/li.
+  - Every earlier pair still holds.
+- **PR4-2:** the many-contacts test no longer sleeps. It waits for a text message to each friend, which is processed after any stale profile and changes no picture.
+  - The barrier the review suggested, a rename, was tried first and rejected: with the fix reverted that test still passed, because the rename's own profile (with no picture) removed the stale picture before the check.
+  - With the message barrier, the test fails with `forget_sent` reverted and passes with it.
+- **PR4-3:** the OS reduced-motion setting is followed while Veil runs.
+- **PR4-5:** a GIF that falls back to the cropper clears the error and says it will be a still.
+- **PR4-4:** a stray blank line and a long doc line are fixed.
+- In Chromium, the GIF and profile runs pass with no console errors.
+
 ## Profile: review round 3 and its fixes (2026-11-04)
 
 Round 3 of the review gate failed on one High finding. PR3-1: the round 2 look-alike fold had made name comparison case-sensitive for names containing I or L, so "ALICE" no longer clashed with "Alice". All seven findings (PR3-1 to PR3-7) were fixed in this round.
