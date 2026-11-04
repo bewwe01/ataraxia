@@ -427,6 +427,37 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 - A profile costs one message per contact per change, padded to the 64 KiB bucket, with or without a picture. A change reaches N contacts over about N/4 minutes.
 - A revision must never go backwards: a receiver ignores revisions it has passed. A future backup must include `profile.rev`, and a restore must clear `profile_sent` (review PR-12).
 
+### ADR-0021: Encrypted backup and restore, and standing re-key invites (milestone 7). **Accepted (owner request, 2026-11-04).**
+**Context.** The owner asked for encrypted backup and restore, to move to a new phone or computer without losing chats. PROTOCOL §12 already sketched it: back up the identity, contacts and messages but never ratchet sessions, and re-key with every contact after a restore. Without a session, though, there is no way to reach a contact. A contact's sealed-sender envelope needs a session, and their prekeys were never on the relay (§3).
+
+**Decision.**
+- *Standing re-key invites (no new cryptography):*
+  - Each client gives each contact an ordinary Veil invite (PQXDH prekeys) in a new `Rekey` message over the existing session, soon after pairing and again before it runs out (400 days).
+  - The invite record names the one contact who may redeem it (`only_from`). `find_invite_for` skips such records, so the invite never creates a new contact. `consume_invite_if_proven` refuses anyone else.
+  - A received invite is kept only if its identity key is the sender's and it names our relay.
+  - The contact holds it in their encrypted database. It costs one signed prekey, one one-time EC prekey and one Kyber prekey per contact, kept until used or replaced.
+- *The backup (a composition of existing primitives):*
+  - `sqlcipher_export` of the database under a random key, with sessions, our prekeys and invites, pending envelopes and transfers in flight removed (`NOT_BACKED_UP`, `strip`).
+  - That key and the exported file are sealed with XChaCha20-Poly1305 STREAM (as attachments), under `Argon2id(backup code)`. The header is AAD on every chunk.
+  - Chunk 0 is a fixed marker, which tells a wrong code from a damaged file.
+  - The backup code is generated (160 bits, Crockford base32) rather than chosen, so a stolen file cannot be guessed offline. The phone-sized Argon2 cost is then enough, and a desktop backup opens on a phone.
+  - The code is shown once, kept in the encrypted database, and shown again only after the PIN or password. It never goes to the clipboard (rule 6).
+- *Restore:*
+  - Done on a new install, before setup.
+  - The relay must still accept the backed-up mailbox. The database is re-keyed into a new vault (new device secret, new PIN or password) and migrated.
+  - Each contact's re-key invite is redeemed. Our `ContactIntro` carries a fresh re-key invite for them.
+  - The contact's app sees a known contact (same identity key, so the same safety number and no key warning). It updates their mailbox details, marks what it had queued under the old session as failed, writes a "restored" line, and sends us a new re-key invite.
+  - Contacts without a re-key invite (paired before this, or never online since) are marked "needs a new invite" in their chat.
+- *Getting the file out:*
+  - Android saves through the system "Save as" screen; desktop writes to the Downloads folder. The webview gets only the file name.
+  - A restore's file goes from the webview to Rust in base64 parts, like an attachment. It is ciphertext under the code, at most 1 GiB, and wiped once used.
+
+**Consequences.**
+- A backup file plus its code is the account, so the UI says to keep them apart.
+- Messages sent to the user between the backup and the restore are lost: they were sealed for sessions the backup does not hold.
+- Keeping the old device in use after a restore makes both devices fight over the same mailbox. The restore screen says to stop using it. Linked devices (next milestone) are the proper way to use two devices.
+- On Android the backup passes through memory as one buffer (base64 over the plugin bridge), which is fine for typical sizes but not for very large ones. A streaming save is a follow-up.
+
 ## 7. Distribution (recorded owner request)
 
 The final step, after all phases pass the code-reviewer gate, is a GitHub Actions workflow that builds the Android **APK** and publishes it to this repository's **GitHub Releases**. Details:

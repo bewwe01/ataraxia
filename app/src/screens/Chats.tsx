@@ -199,6 +199,21 @@ function RenameNotice({ m }: { m: MessageView }) {
   );
 }
 
+/** Veil was restored from a backup, by them or by the user (local line, ADR-0021). */
+function RestoreNotice({ m, name }: { m: MessageView; name: string }) {
+  const text = !m.mine
+    ? `${name} restored Veil from a backup on a new device. Same safety number; messages you sent before this could not be read there.`
+    : m.text === "needs-invite"
+      ? `You restored Veil from a backup, but ${name} could not be reached. Ask them for a new invite.`
+      : "You restored Veil from a backup. Messages sent to you since the backup could not be read.";
+  return (
+    <div className={`sys-msg${m.mine && m.text === "needs-invite" ? " warning" : ""}`}>
+      <Icon name="refresh" />
+      {text}
+    </div>
+  );
+}
+
 function TimerNotice({ m, name }: { m: MessageView; name: string }) {
   const secs = m.timerSecs ?? 0;
   const who = m.mine ? "You" : name;
@@ -794,6 +809,8 @@ export function Chat({ contact, me, nav, version, typing, focus, onChanged }: { 
             <CallNotice key={m.id} m={m} contact={contact} />
           ) : m.kind === "renamed" ? (
             <RenameNotice key={m.id} m={m} />
+          ) : m.kind === "restored" ? (
+            <RestoreNotice key={m.id} m={m} name={contact.name} />
           ) : (
             <MessageRow
               key={m.id}

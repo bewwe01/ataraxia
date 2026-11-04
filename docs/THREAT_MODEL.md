@@ -7,7 +7,7 @@ Status: **Phase 1 draft, awaiting approval.** Every "protected" claim below poin
 | # | Asset | Where it lives |
 |---|---|---|
 | A1 | Message, attachment, voice-note and call **content** | device (encrypted at rest), relay/TURN (ciphertext only) |
-| A2 | **Long-term identity key** | device vault; encrypted backups |
+| A2 | **Long-term identity key** | device vault; encrypted backups (under a generated 160-bit backup code, ADR-0021: a backup file plus its code is the account, so the code is shown once and kept apart from the file) |
 | A3 | **Session state** (ratchet keys, SPQR state) | device vault |
 | A4 | **Social graph**: who talks to whom, when, how much | inferable from traffic; relay sees mailboxes |
 | A5 | **Network location** (IP address) of each user | visible to relay/TURN; to contacts in Direct mode |

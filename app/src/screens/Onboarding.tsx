@@ -1,6 +1,6 @@
 import { ERASE_INCOMPLETE, eraseWasIncomplete } from "../notices";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { ipc, IpcError, type SecretKind, type UnlockInfo } from "../ipc";
+import { ipc, IpcError, type RestoreView, type SecretKind, type UnlockInfo } from "../ipc";
 import { Banner, Icon, Logo, SecretField, Segmented } from "../ui";
 
 // Also enforced in Rust (crates/client/src/unlock.rs).
@@ -26,7 +26,7 @@ export function kindName(kind: SecretKind): string {
 }
 
 export function Setup({ onDone }: { onDone: () => void }) {
-  const [step, setStep] = useState<"welcome" | "form" | "honest">("welcome");
+  const [step, setStep] = useState<"welcome" | "form" | "honest" | "restore">("welcome");
   const [relay, setRelay] = useState("");
   const [pin, setPin] = useState("");
   const [name, setName] = useState("");
@@ -36,6 +36,7 @@ export function Setup({ onDone }: { onDone: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  if (step === "restore") return <Restore onDone={onDone} onBack={() => setStep("welcome")} />;
   if (step === "welcome") {
     return (
       <div className="m-screen full onb-screen">
@@ -49,6 +50,9 @@ export function Setup({ onDone }: { onDone: () => void }) {
           <div className="onb-actions">
             <button className="btn btn-primary btn-block" type="button" onClick={() => setStep("honest")}>
               Get started
+            </button>
+            <button className="btn btn-ghost btn-block" type="button" onClick={() => setStep("restore")}>
+              Restore from a backup
             </button>
           </div>
         </div>
@@ -262,6 +266,97 @@ export function Unlock({ onDone }: { onDone: () => void }) {
             <button className="btn btn-secondary btn-block" type="button" onClick={() => setConfirmReset(true)}>Start over…</button>
           )}
         </details>
+      </form>
+    </div>
+  );
+}
+
+/** Restoring from an encrypted backup instead of setting up (ADR-0021). */
+export function Restore({ onDone, onBack }: { onDone: () => void; onBack: () => void }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [code, setCode] = useState("");
+  const [kind, setKind] = useState<SecretKind>("pin");
+  const [pass, setPass] = useState("");
+  const [pass2, setPass2] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<RestoreView | null>(null);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setError(null);
+    const bad = checkSecret(kind, pass);
+    if (bad) return setError(bad);
+    if (pass !== pass2) return setError(kind === "pin" ? "The PINs do not match" : "The passwords do not match");
+    if (!file) return setError("Choose your backup file");
+    setBusy(true);
+    try {
+      setDone(await ipc.restore(file, code, kind, pass));
+      setPass("");
+      setPass2("");
+      setCode("");
+    } catch (err) {
+      setError(err instanceof IpcError ? err.message : "The restore failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (done) {
+    return (
+      <div className="m-screen full onb-screen">
+        <div className="onb welcome">
+          <div className="lock-hero">
+            <Logo className="lg" />
+            <h1 className="onb-title">Welcome back</h1>
+            <p className="muted">Your contacts and messages are back. Each contact you can reach is told you restored Veil; your safety numbers stay the same.</p>
+          </div>
+          {done.needInvite > 0 ? (
+            <Banner tone="warning" icon="alert-triangle">
+              <p>{done.needInvite === 1 ? "1 contact" : `${done.needInvite} contacts`} could not be reached from the backup. Ask them for a new invite; their chats say so.</p>
+            </Banner>
+          ) : null}
+          <div className="onb-actions">
+            <button className="btn btn-primary btn-block" type="button" onClick={onDone}>Open Veil</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="m-screen full onb-screen">
+      <form className="onb passphrase" autoComplete="off" onSubmit={(e) => void submit(e)}>
+        <div className="stack">
+          <h1 className="onb-title sm">Restore from a backup</h1>
+          <p className="muted">You need the backup file and the backup code Veil showed you when you made your first backup.</p>
+        </div>
+        <div className="field">
+          <span className="label">Backup file</span>
+          <label className="btn btn-secondary btn-block">
+            <Icon name="upload" />{file ? file.name : "Choose the backup file"}
+            <input type="file" accept=".vbak,application/octet-stream" className="sr-only" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+          </label>
+        </div>
+        <div className="field">
+          <label htmlFor="bcode">Backup code</label>
+          <div className="input mono"><input id="bcode" required spellCheck={false} autoCapitalize="characters" placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" value={code} onChange={(e) => setCode(e.target.value)} /></div>
+        </div>
+        <div className="field">
+          <span className="label">Unlock Veil on this device with</span>
+          <Segmented<SecretKind> name="rkind" label="Unlock Veil on this device with" value={kind} options={[["pin", "PIN"], ["password", "Password"]]} onChange={(k) => { setKind(k); setPass(""); setPass2(""); }} />
+          <p className="hint">{KIND_HINT[kind]}</p>
+        </div>
+        <SecretField id="rpp" label={kind === "pin" ? "New PIN" : "New password"} kind={kind} value={pass} onChange={setPass} autoComplete="new-password" />
+        <SecretField id="rpp2" label={kind === "pin" ? "Repeat PIN" : "Repeat password"} kind={kind} value={pass2} onChange={setPass2} autoComplete="new-password" />
+        <Banner tone="warning" icon="alert-triangle">
+          <p><b>Stop using the old device.</b> After this, only this one can read your new messages; messages sent to you since the backup are lost.</p>
+        </Banner>
+        {error ? <Banner tone="danger" icon="alert-circle"><p>{error}</p></Banner> : null}
+        <div className="onb-actions">
+          <button className="btn btn-primary btn-block" type="submit" disabled={busy}>{busy ? "Restoring…" : "Restore"}</button>
+          <button className="btn btn-ghost btn-block" type="button" disabled={busy} onClick={onBack}>Back</button>
+        </div>
       </form>
     </div>
   );

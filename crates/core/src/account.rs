@@ -105,6 +105,10 @@ struct InviteRecordPb {
     proof_key: Vec<u8>,
     #[prost(uint32, tag = "6")]
     mode: u32,
+    /// A re-key invite (ADR-0021): the address of the one contact who may redeem it. Empty for
+    /// an ordinary invite, which only a new contact may redeem.
+    #[prost(bytes = "vec", tag = "7")]
+    only_from: Vec<u8>,
 }
 
 impl Drop for InviteRecordPb {
@@ -275,6 +279,64 @@ impl<B: KvBackend> Account<B> {
         if ttl_secs == 0 || ttl_secs > MAX_TTL_SECS {
             return Err(CoreError::Malformed);
         }
+        self.issue_invite(
+            rng,
+            mode,
+            relay_url,
+            relay_spki_sha256,
+            mailbox_id,
+            delivery_token,
+            now,
+            ttl_secs,
+            None,
+        )
+        .await
+    }
+
+    /// A standing re-key invite for one existing contact (PROTOCOL §3, ADR-0021). It is handed
+    /// to them inside the E2EE session, never through the relay. If they lose their sessions
+    /// (a restore from backup) they redeem it to set up a new one with the same identity key.
+    /// Only `contact` can redeem it; it never creates a new contact.
+    ///
+    /// `rng` must be an OS-seeded CSPRNG, as for [`Self::create_invite`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_rekey_invite<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        contact: &Address,
+        relay_url: &str,
+        relay_spki_sha256: [u8; 32],
+        mailbox_id: [u8; 32],
+        delivery_token: [u8; 32],
+        now: u64,
+    ) -> Result<CreatedInvite> {
+        self.issue_invite(
+            rng,
+            InviteMode::Remote,
+            relay_url,
+            relay_spki_sha256,
+            mailbox_id,
+            delivery_token,
+            now,
+            crate::invite::REKEY_TTL_SECS,
+            Some(contact),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn issue_invite<R: Rng + CryptoRng>(
+        &self,
+        rng: &mut R,
+        mode: InviteMode,
+        relay_url: &str,
+        relay_spki_sha256: [u8; 32],
+        mailbox_id: [u8; 32],
+        delivery_token: [u8; 32],
+        now: u64,
+        ttl_secs: u64,
+        only_from: Option<&Address>,
+    ) -> Result<CreatedInvite> {
         let expires_at = now.checked_add(ttl_secs).ok_or(CoreError::Malformed)?;
         let invite = Invite::generate(
             rng,
@@ -327,6 +389,9 @@ impl<B: KvBackend> Account<B> {
             kyber_prekey_id: kyber_id,
             proof_key: invite.proof_key_bytes()?.to_vec(),
             mode: mode.to_u32(),
+            only_from: only_from
+                .map(|a| a.as_str().as_bytes().to_vec())
+                .unwrap_or_default(),
         };
 
         self.transact(async {
@@ -751,7 +816,9 @@ impl<B: KvBackend> Account<B> {
             for key in s.keys_with_prefix(keys::INVITE)? {
                 let Some(raw) = s.get(&key)? else { continue };
                 let rec = InviteRecordPb::decode(raw.as_slice()).map_err(|_| CoreError::Storage)?;
-                if rec.signed_prekey_id == signed_id
+                // A re-key invite never makes a new contact, whoever holds its link.
+                if rec.only_from.is_empty()
+                    && rec.signed_prekey_id == signed_id
                     && Some(rec.kyber_prekey_id) == kyber_id
                     && Some(rec.prekey_id) == pre_id
                 {
@@ -774,6 +841,10 @@ impl<B: KvBackend> Account<B> {
         let Some(raw) = rec else { return Ok(()) };
         let rec = InviteRecordPb::decode(raw.as_slice()).map_err(|_| CoreError::Storage)?;
         if now >= rec.expires_at {
+            return Err(CoreError::InviteInvalid);
+        }
+        // A re-key invite is consumed only by the contact it was made for.
+        if !rec.only_from.is_empty() && rec.only_from != Address::of(sender).as_str().as_bytes() {
             return Err(CoreError::InviteInvalid);
         }
         verify_proof(&rec.proof_key, id, sender, proof)?;
@@ -1432,6 +1503,101 @@ mod pairing_tests {
             assert!(after == before, "refused re-key intro changed state");
         }
         (Account::load(after).unwrap(), r)
+    }
+
+    fn text(body: &str) -> Content {
+        Content {
+            id: random_id(&mut rng()),
+            sent_at_ms: 1,
+            body: Some(Body::Text(crate::content::Text {
+                body: body.into(),
+                reply_to: None,
+                expire_timer_secs: None,
+            })),
+        }
+    }
+
+    /// ADR-0021: a re-key invite lets exactly the contact it was made for set up a new session
+    /// after losing theirs (a restore from backup), and nobody else.
+    #[test]
+    fn rekey_invites_serve_only_their_contact() {
+        let (alice, bob) = pair();
+        let (to_alice, to_bob) = (alice.identity.address(), bob.identity.address());
+        let rekey = block_on(bob.create_rekey_invite(
+            &mut rng(),
+            &to_alice,
+            "wss://r",
+            [3; 32],
+            [1; 32],
+            [2; 32],
+            NOW,
+        ))
+        .unwrap();
+
+        // A stranger holding the link cannot become a new contact with it.
+        let mallory = acc();
+        let red =
+            block_on(mallory.redeem_invite(&mut rng(), &rekey.invite, &rekey.sealed_package, fields(), NOW))
+                .unwrap();
+        let (bob, r) = open_checked(bob, &red.envelope, NOW);
+        assert_eq!(r.err(), Some(CoreError::UnknownSender));
+        assert_eq!(prekeys_present(&bob, &rekey), [true; 4]);
+
+        // Another contact of Bob's cannot consume it either.
+        let carol = acc();
+        let carol_inv = invite(&bob, 600);
+        let red = block_on(carol.redeem_invite(
+            &mut rng(),
+            &carol_inv.invite,
+            &carol_inv.sealed_package,
+            fields(),
+            NOW,
+        ))
+        .unwrap();
+        block_on(bob.open(&mut rng(), &red.envelope, NOW)).unwrap();
+        let foreign = rekey.invite.proof(carol.identity.public()).unwrap().to_vec();
+        let env =
+            block_on(carol.seal(&mut rng(), &to_bob, &rekey_intro(&rekey.invite.id, foreign), NOW)).unwrap();
+        let (bob, r) = open_checked(bob, &env, NOW);
+        assert_eq!(r.err(), Some(CoreError::InviteInvalid));
+        assert_eq!(prekeys_present(&bob, &rekey), [true; 4]);
+
+        // Alice loses her sessions (a restore keeps identities, never ratchets), as the
+        // restore does it: straight in the stored data.
+        let mut store = alice.into_backend();
+        let sessions = store.keys_with_prefix(keys::SESSION).unwrap();
+        assert!(!sessions.is_empty());
+        let drops: Vec<crate::store::Write> = sessions.into_iter().map(|k| (k, None)).collect();
+        store.apply(&drops).unwrap();
+        let alice = Account::load(store).unwrap();
+        assert!(block_on(alice.seal(&mut rng(), &to_bob, &text("lost"), NOW)).is_err());
+        // She redeems Bob's re-key invite: Bob takes it as a message from Alice, not a new
+        // contact, and the invite is used up.
+        let red =
+            block_on(alice.redeem_invite(&mut rng(), &rekey.invite, &rekey.sealed_package, fields(), NOW))
+                .unwrap();
+        assert_eq!(red.contact, to_bob);
+        match block_on(bob.open(&mut rng(), &red.envelope, NOW)).unwrap() {
+            Opened::Message { from, content } => {
+                assert_eq!(from, to_alice);
+                assert!(matches!(content.body, Some(Body::ContactIntro(_))));
+            }
+            Opened::NewContact { .. } => panic!("a re-key made a new contact"),
+        }
+        assert_eq!(prekeys_present(&bob, &rekey), [false; 4]);
+        // Both ways work on the new session.
+        let env = block_on(alice.seal(&mut rng(), &to_bob, &text("back"), NOW)).unwrap();
+        assert!(matches!(
+            block_on(bob.open(&mut rng(), &env, NOW)).unwrap(),
+            Opened::Message { .. }
+        ));
+        let env = block_on(bob.seal(&mut rng(), &to_alice, &text("welcome back"), NOW)).unwrap();
+        assert!(matches!(
+            block_on(alice.open(&mut rng(), &env, NOW)).unwrap(),
+            Opened::Message { .. }
+        ));
+        // It outlives an ordinary invite's week by far.
+        assert!(rekey.invite.expires_at >= NOW + 365 * 24 * 3600);
     }
 
     /// Review round 2, N3: a *known* contact redeeming one of our re-key invites

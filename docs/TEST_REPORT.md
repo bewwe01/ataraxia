@@ -2,6 +2,62 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Milestone 7: encrypted backup and restore (2026-11-04)
+
+Owner request: encrypted backup and restore (ADR-0021). Before the review gate.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 251 passed, 0 failed
+$ (app/src-tauri) cargo fmt --check; cargo clippy --all-targets -- -D warnings
+#     Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.99s
+$ (app/src-tauri) cargo test backup_file_dates
+# test result: ok. 1 passed
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 23 files clean
+# ✓ built in 1.57s
+$ (design/tools) node check.mjs
+# PASS
+```
+
+New tests:
+- **Core `backup`:**
+  - `backups_round_trip_and_detect_any_change`:
+    - round-trips sizes 1 B to 3 chunks;
+    - a file cut at a chunk boundary or by a byte, extended, or with any bit flipped (header included) is refused;
+    - damage past the marker is reported as damage, a wrong code as a wrong code.
+  - `kdf_parameters_are_bounded_before_argon2_runs`: m = 4 GiB, t = 1 and version 2 are all refused.
+  - `codes_are_typed_forgivingly_but_strictly_checked`: lowercase, spaces and O/I/L for 0/1 are accepted; a short code, U and é are refused.
+- **Core `account::pairing_tests::rekey_invites_serve_only_their_contact`:**
+  - a stranger holding Bob's re-key invite for Alice is an unknown sender;
+  - another contact, Carol, cannot consume it;
+  - Alice, with her sessions deleted, redeems it, Bob takes it as a message from Alice (not a new contact), and both directions work;
+  - it lasts over a year.
+- **Client `tests/backup.rs` `a_restored_backup_keeps_identity_contacts_and_history`**, through a real relay:
+  - Bob's re-key invite reaches Alice within seconds of pairing. Carol's never does: she locks first.
+  - The first backup returns the code (eight groups of four) and later ones do not. The file holds no message text and is handed over once. Showing the code again takes the password: a wrong one is refused.
+  - A fresh install refuses a wrong code (`BackupCode`), a damaged file and a non-backup (`BackupInvalid`), and stays new.
+  - The right code, typed in lowercase with spaces, restores: 2 contacts, 1 needing an invite (Carol, who is flagged so).
+  - History is back. Alice and Bob message both ways, Bob sees the same safety number with no key warning and a "restored" line, and he gives the restored Alice a new re-key invite.
+  - After locking, no message text is found anywhere on the new device, and no backup or restore file is left.
+
+Found and fixed while testing:
+- `sqlcipher_export` does not copy `PRAGMA user_version`, so the restored database re-ran its migrations and failed. The export now copies it.
+- A wrong code and a damaged one-chunk file looked the same, both failing authentication. Chunk 0 is now a fixed marker.
+
+In Chromium against the IPC mock:
+- **Settings → Backup:**
+  - "Make a backup" shows the saved file and the code once; the second backup shows no code.
+  - "Show my backup code" refuses a wrong PIN, keeps the form open, then shows the code.
+- **Onboarding → Restore:**
+  - a 2.5 MB file went in 3 parts, and a wrong code showed the error;
+  - the right code led to "Welcome back", naming 1 contact needing an invite.
+- No console errors.
+
 ## Profile: review round 5 (PASS) and its follow-up fixes (2026-11-04)
 
 Round 5 of the review gate **passed**, with no Critical or High findings. Its Medium, Low and two Nit findings (PR5-1 to PR5-4) are fixed here as well.

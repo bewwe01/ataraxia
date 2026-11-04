@@ -40,6 +40,8 @@ const TAG_LEN: usize = 16;
 pub const SEALED_PACKAGE_LEN: usize = NONCE_LEN + PACKAGE_PADDED_LEN + TAG_LEN;
 /// Maximum invite lifetime (PROTOCOL §14).
 pub const MAX_TTL_SECS: u64 = 7 * 24 * 3600;
+/// A re-key invite's lifetime (ADR-0021). Clients replace it well before it runs out.
+pub const REKEY_TTL_SECS: u64 = 400 * 24 * 3600;
 
 const SALT: &[u8] = b"veil/v1/invite";
 const INFO_KEY: &[u8] = b"veil/v1/invite-key";

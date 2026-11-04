@@ -275,3 +275,7 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 .cropper .range { width: 100%; }
 .their-status { font-size: var(--text-sm); color: var(--text-2); text-align: center; overflow-wrap: anywhere; }
 .contact-head { display: flex; flex-direction: column; align-items: center; text-align: center; }
+
+/* Backup (M7, ADR-0021): the backup code, large and in groups of four. */
+.backup-code { background: var(--surface-2); }
+.backup-code-text { font-size: var(--text-lg); letter-spacing: 0.04em; text-align: center; overflow-wrap: anywhere; color: var(--text-1); }

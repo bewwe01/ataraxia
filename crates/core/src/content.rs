@@ -46,7 +46,10 @@ pub struct Content {
     /// Sender's clock, milliseconds. Display only; never trusted for security.
     #[prost(uint64, tag = "2")]
     pub sent_at_ms: u64,
-    #[prost(oneof = "Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22")]
+    #[prost(
+        oneof = "Body",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23"
+    )]
     pub body: Option<Body>,
 }
 
@@ -80,6 +83,9 @@ pub enum Body {
     SessionReset(SessionReset),
     #[prost(message, tag = "22")]
     Profile(Profile),
+    /// A standing re-key invite for the recipient (ADR-0021), replacing any earlier one.
+    #[prost(message, tag = "23")]
+    Rekey(RekeyInvite),
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -377,6 +383,10 @@ impl Content {
                         .checked_add(p.pad.len())
                         .is_some_and(|n| n <= MAX_PICTURE_LEN),
                 )
+            }
+            Body::Rekey(r) => {
+                ensure(!r.link.is_empty() && r.link.len() <= MAX_REKEY_LINK)?;
+                ensure(!r.sealed_package.is_empty() && r.sealed_package.len() <= MAX_REKEY_SEALED)
             }
             Body::MailboxUpdate(m) => {
                 ensure(m.new_mailbox_id.len() == 32 && m.new_delivery_token.len() == 32)?;

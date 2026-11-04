@@ -37,6 +37,7 @@ macro_rules! redacted_debug {
 
 pub mod account;
 pub mod attachment;
+pub mod backup;
 pub mod content;
 pub mod envelope;
 pub mod error;

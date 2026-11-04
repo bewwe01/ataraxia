@@ -4,6 +4,7 @@ import { ipc, IpcError, type Me, type NativeInfo, type NotifySettings, type Priv
 import { applyAppearance, isDark, loadAppearance, type Accent, type Appearance, type Bubble, type Density, type Mode, type Style, type TextSize } from "../settings";
 import { HuePicker, LookPreview, WallpaperPicker } from "../components/Look";
 import { ProfileCard } from "../components/Profile";
+import { BackupCard } from "../components/Backup";
 import { useChatWallpaper } from "../wallpaper";
 import { Banner, Icon, SecretField, Segmented, ToggleRow, TopBar } from "../ui";
 import type { Nav } from "./Chats";
@@ -407,6 +408,13 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
               <ToggleRow id="receipts" icon="check-double" title="Read receipts" sub="On: contacts see when their messages reached you and when you read them, and you see the same from contacts who have it on. Off: neither." checked={privacy.readReceipts} onChange={(v) => void changePrivacy({ ...privacy, readReceipts: v })} />
               <ToggleRow id="typing" icon="keyboard" title="Typing indicators" sub="On: contacts see when you are typing, and you see the same from contacts who have it on." checked={privacy.typing} onChange={(v) => void changePrivacy({ ...privacy, typing: v })} />
             </div>
+          </>
+        ) : null}
+
+        {sec ? (
+          <>
+            <h3 className="group-title">Backup</h3>
+            <BackupCard kind={sec.kind} />
           </>
         ) : null}
 

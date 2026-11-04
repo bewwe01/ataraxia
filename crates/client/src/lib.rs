@@ -67,6 +67,10 @@ pub enum ClientError {
     TooLarge,
     #[error("Another contact already has that name")]
     NameTaken,
+    #[error("This backup code does not open this backup")]
+    BackupCode,
+    #[error("This is not a Veil backup, or it is damaged")]
+    BackupInvalid,
     #[error("Message failed")]
     Protocol,
 }

@@ -358,20 +358,10 @@ impl Uploads {
                 .decode(part.as_bytes())
                 .map_err(|_| ClientError::BadInput)?,
         );
-        let len = u.data.len().saturating_add(bytes.len());
-        if len > MAX_FILE {
+        if !append(&mut u.data, &bytes, MAX_FILE) {
             *slot = None;
             return Err(ClientError::BadInput);
         }
-        // Grow by hand so no reallocation leaves an unwiped copy behind.
-        if u.data.capacity() < len {
-            let mut bigger = Zeroizing::new(Vec::with_capacity(
-                len.max(u.data.capacity().saturating_mul(2)).min(MAX_FILE),
-            ));
-            bigger.extend_from_slice(&u.data);
-            u.data = bigger;
-        }
-        u.data.extend_from_slice(&bytes);
         Ok(())
     }
 
@@ -387,6 +377,154 @@ impl Uploads {
     fn clear(&self) {
         *self.slot() = None;
     }
+}
+
+/// Appends `bytes` to `data`, up to `cap` in all (false beyond it). Grows by hand so no
+/// reallocation leaves an unwiped copy behind.
+fn append(data: &mut Zeroizing<Vec<u8>>, bytes: &[u8], cap: usize) -> bool {
+    let len = data.len().saturating_add(bytes.len());
+    if len > cap {
+        return false;
+    }
+    if data.capacity() < len {
+        let mut bigger = Zeroizing::new(Vec::with_capacity(
+            len.max(data.capacity().saturating_mul(2)).min(cap),
+        ));
+        bigger.extend_from_slice(data);
+        *data = bigger;
+    }
+    data.extend_from_slice(bytes);
+    true
+}
+
+/// A backup file on its way from the UI for a restore (ADR-0021), in base64 parts like a file
+/// (see [`Upload`]). It is ciphertext under the backup code; wiped once used or replaced.
+#[derive(Default)]
+struct RestoreUpload(std::sync::Mutex<Zeroizing<Vec<u8>>>);
+
+/// The largest backup a restore takes.
+const MAX_BACKUP: usize = 1024 * 1024 * 1024;
+
+#[tauri::command]
+fn restore_part(up: State<'_, RestoreUpload>, first: bool, part: Zeroizing<String>) -> Res<()> {
+    use base64::Engine as _;
+    if part.len() > MAX_PART_CHARS {
+        return Err(err(ClientError::BadInput));
+    }
+    let bytes = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(part.as_bytes())
+            .map_err(|_| err(ClientError::BadInput))?,
+    );
+    let mut data = up.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if first {
+        *data = Zeroizing::new(Vec::new());
+    }
+    if append(&mut data, &bytes, MAX_BACKUP) {
+        Ok(())
+    } else {
+        *data = Zeroizing::new(Vec::new());
+        Err(err(ClientError::TooLarge))
+    }
+}
+
+/// The restore form; everything in it is wiped when dropped.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestoreForm {
+    code: Zeroizing<String>,
+    kind: SecretKind,
+    passphrase: Zeroizing<String>,
+}
+
+/// Sets Veil up from the backup sent with `restore_part`.
+#[tauri::command]
+async fn restore(
+    c: State<'_, Client>,
+    up: State<'_, RestoreUpload>,
+    form: RestoreForm,
+) -> Res<veil_client::service::RestoreView> {
+    let backup = core::mem::take(&mut *up.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    c.restore(veil_client::service::RestoreInput {
+        backup,
+        code: form.code,
+        kind: form.kind,
+        passphrase: form.passphrase,
+    })
+    .await
+    .map_err(err)
+}
+
+/// A backup just made, as the UI shows it: the code (first backup only) and where it went.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupSaved {
+    code: Option<String>,
+    /// The file name, on desktop saved in the Downloads folder; on Android where the user chose.
+    file: String,
+    bytes: u64,
+}
+
+/// "2026-11-04" from Unix seconds (for the file name; no date library).
+fn ymd(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Makes an encrypted backup and saves it: Android asks where; desktop puts it in Downloads.
+#[tauri::command]
+async fn create_backup(app: AppHandle, c: State<'_, Client>) -> Res<BackupSaved> {
+    let view = c.create_backup().await.map_err(err)?;
+    let data = c.take_backup().await.map_err(err)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let file = format!("veil-backup-{}.vbak", ymd(now));
+    match native::save_file(&app, &file, "application/octet-stream", &data).await {
+        Ok(()) => {}
+        Err(NativeError::Unavailable) => {
+            let dir = app.path().download_dir().map_err(|_| err(ClientError::Storage))?;
+            // Never over an existing file: veil-backup-<date> (2).vbak and so on.
+            let mut path = dir.join(&file);
+            let mut n = 2;
+            while path.exists() {
+                path = dir.join(format!("veil-backup-{} ({n}).vbak", ymd(now)));
+                n += 1;
+            }
+            std::fs::write(&path, &data[..]).map_err(|_| err(ClientError::Storage))?;
+            return Ok(BackupSaved {
+                code: view.code,
+                file: path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(&file)
+                    .to_owned(),
+                bytes: view.bytes,
+            });
+        }
+        Err(e) => return Err(native_err(e)),
+    }
+    Ok(BackupSaved {
+        code: view.code,
+        file,
+        bytes: view.bytes,
+    })
+}
+
+/// The backup code, after the PIN or password.
+#[tauri::command]
+async fn backup_code(c: State<'_, Client>, current: Zeroizing<String>) -> Res<Option<String>> {
+    c.backup_code(current).await.map_err(err)
 }
 
 /// Largest base64 part accepted; the UI sends 1 MiB of file per part.
@@ -781,6 +919,7 @@ pub fn run() {
     let result = tauri::Builder::default()
         .plugin(native::plugin())
         .manage(Uploads::default())
+        .manage(RestoreUpload::default())
         .setup(|app| {
             let dir = data_dir(&app.path().app_data_dir()?)?;
             let handle = app.handle().clone();
@@ -818,6 +957,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_state,
             setup,
+            restore_part,
+            restore,
+            create_backup,
+            backup_code,
             unlock,
             lock,
             unlock_info,
@@ -963,5 +1106,13 @@ mod tests {
             u.part(id, &"A".repeat(MAX_PART_CHARS + 4)),
             Err(ClientError::BadInput)
         );
+    }
+
+    #[test]
+    fn backup_file_dates() {
+        assert_eq!(ymd(0), "1970-01-01");
+        assert_eq!(ymd(951_782_400), "2000-02-29");
+        assert_eq!(ymd(1_793_750_400), "2026-11-04");
+        assert_eq!(ymd(4_102_444_799), "2099-12-31");
     }
 }

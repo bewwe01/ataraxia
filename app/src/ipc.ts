@@ -43,6 +43,8 @@ export interface ContactView {
   localPicture: boolean;
   /** The user's picture is hidden from this contact. */
   pictureHidden: boolean;
+  /** After a restore, this contact could not be reached: a new invite is needed. */
+  needsInvite: boolean;
   /** Arrived with the same name as an existing contact, under a different key. */
   keyWarning: boolean;
   /** Unblocked, but they have not received their new address yet. */
@@ -58,7 +60,9 @@ export interface MessageView {
   mine: boolean;
   /** "timer" is a notice that the disappearing-message timer changed; "call" a call line. */
   /** "renamed": the contact changed their name ("old\nnew" in `text`, a local line). */
-  kind: "text" | "timer" | "attachment" | "call" | "renamed";
+  /** "restored": Veil was restored from a backup (by them: `mine` false; by the user: true,
+   *  with text "needs-invite" when this contact could not be reached). */
+  kind: "text" | "timer" | "attachment" | "call" | "renamed" | "restored";
   text: string;
   atMs: number;
   status: MessageStatus;
@@ -277,6 +281,31 @@ function sendAttachment(contact: number, a: OutgoingAttachment): Promise<Message
   return run;
 }
 
+/** A backup just made (ADR-0021). `code` is set only for the first backup: write it down. */
+export interface BackupSaved {
+  code: string | null;
+  /** The file name (desktop: in the Downloads folder; Android: where the user chose). */
+  file: string;
+  bytes: number;
+}
+
+export interface RestoreView {
+  contacts: number;
+  /** Contacts the restore could not reach: they need a new invite. */
+  needInvite: number;
+}
+
+/** Sends a backup file to Rust in 1 MiB parts, then restores from it. */
+async function restore(file: File, code: string, kind: SecretKind, passphrase: string): Promise<RestoreView> {
+  let first = true;
+  for (let at = 0; at < file.size || first; at += PART_BYTES) {
+    const bytes = new Uint8Array(await file.slice(at, at + PART_BYTES).arrayBuffer());
+    await call<void>("restore_part", { first, part: base64(bytes) });
+    first = false;
+  }
+  return call<RestoreView>("restore", { form: { code, kind, passphrase } });
+}
+
 /** How every invite link starts (Rust's `veil_core::invite::LINK_PREFIX`). */
 export const INVITE_PREFIX = "veil://i/";
 
@@ -308,6 +337,11 @@ export const ipc = {
   cancelCallNotice: () => call<void>("cancel_call_notice"),
   state: () => call<AppState>("app_state"),
   setup: (input: SetupInput) => call<void>("setup", { input }),
+  restore,
+  /** Makes an encrypted backup and saves it (Android asks where; desktop: Downloads). */
+  createBackup: () => call<BackupSaved>("create_backup"),
+  /** The backup code, after the current PIN or password. */
+  backupCode: (current: string) => call<string | null>("backup_code", { current }),
   unlock: (passphrase: string) => call<void>("unlock", { passphrase }),
   lock: () => call<void>("lock"),
   unlockInfo: () => call<UnlockInfo>("unlock_info"),

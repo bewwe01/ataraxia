@@ -146,6 +146,14 @@ const MIGRATIONS: &[&str] = &[
      );
      CREATE TRIGGER contact_pictures_gone AFTER DELETE ON contacts
        BEGIN DELETE FROM pictures WHERE owner = OLD.id; END;",
+    // 7: backups and restore (ADR-0021). `rekey_link`/`rekey_sealed` are the standing re-key
+    // invite this contact gave us (redeemed only after a restore); `rekey_mine_*` the one we
+    // gave them; `needs_invite` marks a contact a restore could not reach.
+    "ALTER TABLE contacts ADD COLUMN rekey_link TEXT;
+     ALTER TABLE contacts ADD COLUMN rekey_sealed BLOB;
+     ALTER TABLE contacts ADD COLUMN rekey_mine_until INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE contacts ADD COLUMN rekey_mine_id BLOB;
+     ALTER TABLE contacts ADD COLUMN needs_invite INTEGER NOT NULL DEFAULT 0;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -175,7 +183,7 @@ impl core::fmt::Debug for Db {
     }
 }
 
-fn hex(b: &[u8]) -> Zeroizing<String> {
+pub(crate) fn hex(b: &[u8]) -> Zeroizing<String> {
     let mut s = Zeroizing::new(String::with_capacity(b.len().saturating_mul(2)));
     for byte in b {
         for nibble in [byte >> 4, byte & 0x0F] {

@@ -53,7 +53,9 @@ A **mailbox** is where others deposit envelopes for you.
   
   All ids are random 32-bit values. The inviter refuses to create an invite whose ids collide with existing keys.
 - There are no last-resort keys. A redemption consumes the invite's one-time keys (libsignal deletes the EC one-time key; Veil deletes the Kyber key on use), and the inviter then deletes the signed prekey and the invite record. Expired or revoked invites have all their prekeys deleted (`sweep_expired_invites`, `revoke_invite`).
-- **Re-keying** (after a restore from backup, §12) uses a **standing re-key invite** that each side hands the other inside its E2EE `ContactIntro.rekey`. It is consumed like any invite and replaced afterwards.
+- **Re-keying** (after a restore from backup, §12) uses a **standing re-key invite** (ADR-0021).
+  - Each side hands the other one in a `Rekey` message (§7) soon after pairing, and again before it runs out (400 days). A restore's `ContactIntro.rekey` carries a fresh one.
+  - It is consumed like any invite and then replaced. The invite record names the one contact (`only_from`) who may redeem it: it never creates a new contact, and another contact cannot consume it.
 - Clients MUST verify both prekey signatures (libsignal does; Spike A and the session tests show a forged Kyber signature is rejected). They MUST reject any session message below libsignal message version 4, and any `PreKeySignalMessage` without a Kyber prekey id. **No downgrade to non-PQ X3DH** (INV-CRY-3).
 
 ## 4. Invites and pairing
@@ -242,7 +244,8 @@ Defined in `crates/wire` (shared by client and relay).
 | `Call` | `call_id`, one of `Offer{sdp}`, `Answer{sdp}`, `Ice{candidates[]}`, `Hangup{reason}`, `Busy` | §8 |
 | `ContactIntro` | `mailbox_id`, `delivery_token`, `display_name?`, `invite_id?` + `invite_proof?` (both or neither), `rekey?` | §3, §4 |
 | `MailboxUpdate` | `new_mailbox_id`, `new_token`, `relay?` | §2 |
-| `SessionReset` | — | after restore (§12) |
+| `SessionReset` | — | reserved (a restore re-keys with §3's re-key invites instead) |
+| `Rekey` | `link (≤ 512)`, `sealed_package (≤ 8 KiB)` | a standing re-key invite for the recipient (§3, ADR-0021); kept only if its identity key is the sender's and it names our relay |
 | `Profile` | `rev`, `name (≤ 64 chars, may be empty)`, `status (≤ 140 chars)`, `picture? (JPEG or GIF, ≤ 1024 px a side; a GIF ≤ 100 frames)`, `pad (zeros; picture + pad ≤ 48 KiB)` | ADR-0020. Each replaces the last if its `rev` is higher. `picture` is present only for contacts the sender shows it to; absent means none. Senders pad every profile to the same size. A receiver drops a picture that is not a JPEG of at most 1024 px a side, checked by its start-of-frame header before anything decodes it, or a GIF within the same side limit, 100 frames and 4 Mpx of canvases in all. A receiver also rebuilds a GIF without its comments and extensions other than frame timing and the loop count (both in canonical form). Control and bidi characters are refused. Older apps drop it (unknown `oneof` tag). |
 
 Every message has a random 16-byte `id`, and `sent_at` is set by the sender but **never trusted for ordering security**. Duplicate `id`s are ignored (idempotent processing; libsignal already rejects ciphertext replays).
@@ -334,10 +337,18 @@ Every message has a random 16-byte `id`, and `sent_at` is set by the sender but 
 - **Biometric unlock** (optional) releases `dev` plus a passphrase-derived key cached in the keystore. The passphrase is required after every restart (design copy), so biometrics only guard warm unlocks.
 - **Auto-lock** zeroizes the DB key and session caches in memory.
 - **Panic wipe**: delete the keystore entry → overwrite and delete the vault header → delete the DB and attachment store. Destroying `dev` and the header crypto-shreds everything, even if file deletion is imperfect on flash storage (INV-REST-3).
-- **Backup**:
-  - `XChaCha20-Poly1305(Argon2id(backup_passphrase, m = 512 MiB / t = 4), archive)`, streamed with STREAM;
-  - contents: identity key, contacts, verification states, messages and attachments;
-  - **ratchet sessions are deliberately excluded**. Restoring old ratchet state would reuse message keys, so after a restore every contact gets a `SessionReset` and a fresh PQXDH, and the UI notes it.
+- **Backup** (ADR-0021, `crates/core/src/backup.rs`):
+  - **Key:** `Argon2id(backup_code, salt 16 B, m = 64 MiB / t = 4 / p = 1)`. The backup code is 32 Crockford base32 characters (160 random bits) that Veil generates and shows once; it is not a password the user picks. The phone-sized cost lets a desktop backup open on a phone, and the parameters are bounded before Argon2 runs.
+  - **File:** `"VEILBAK" | v=1 | m_kib, t, p (u32 BE) | salt (16) | nonce prefix (19)`, then XChaCha20-Poly1305 STREAM (`StreamBE32`) chunks, each with the whole header as AAD.
+    - Chunk 0 is a fixed 16-byte marker, which tells a wrong code from a damaged file.
+    - The data follows in 64 KiB chunks, the last one flagged as last, so truncation, reordering and extension all fail.
+  - **Contents:** a random 32-byte key, then a `sqlcipher_export` of the database under that key. It holds the identity key, mailbox and its key, contacts (with verification states and the re-key invites they gave us), messages and attachments.
+  - **Excluded:** ratchet sessions, our prekeys and invites, envelopes waiting to go out, and transfers in flight (`backup::NOT_BACKED_UP`). Restoring old ratchet state would reuse message keys.
+  - **Restore:**
+    - The relay must still accept the mailbox.
+    - The database is re-keyed into a new vault.
+    - Every contact who gave us a re-key invite is redeemed (§3). The `ContactIntro` carries a fresh re-key invite for them, and they take it as the same contact with the same safety number, with a notice in the chat.
+    - Contacts without one are marked as needing a new invite. Messages that arrived since the backup cannot be read, and are acknowledged and dropped.
 
 ## 13. Versioning and downgrade resistance
 
