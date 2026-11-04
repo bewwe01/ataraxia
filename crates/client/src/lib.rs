@@ -67,10 +67,14 @@ pub enum ClientError {
     TooLarge,
     #[error("Another contact already has that name")]
     NameTaken,
-    #[error("This backup code does not open this backup")]
+    #[error("This backup code does not open this backup, or the start of the file is damaged")]
     BackupCode,
     #[error("This is not a Veil backup, or it is damaged")]
     BackupInvalid,
+    #[error("The backup would be over 1 GB, too large to restore; remove some photos or files first")]
+    BackupTooLarge,
+    #[error("This was made by a newer version of Veil; update Veil first")]
+    NewerVersion,
     #[error("Message failed")]
     Protocol,
 }

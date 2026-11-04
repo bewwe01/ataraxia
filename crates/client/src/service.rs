@@ -47,7 +47,7 @@ pub use attachments::{
     AUTO_DOWNLOAD_PER_DAY, AUTO_DOWNLOAD_UNOPENED, AttachmentInput, AttachmentView, MAX_FILE,
     MAX_VOICE_BYTES, MAX_VOICE_MS,
 };
-pub use backup::{BackupView, RestoreInput, RestoreView};
+pub use backup::{BackupView, MAX_BACKUP, RestoreInput, RestoreView};
 pub use calls::{CallLogView, CallSetup, CallSignal, IceServerView};
 pub use look::{WallpaperInput, WallpaperView};
 pub use profile::{PictureVisibility, ProfileView};
@@ -364,6 +364,8 @@ enum Cmd {
     CreateBackup(Reply<BackupView>),
     TakeBackup(Reply<Zeroizing<Vec<u8>>>),
     BackupCode(Zeroizing<String>, Reply<Option<String>>),
+    BackupCodeSeen(Reply<()>),
+    NewBackupCode(Reply<()>),
     Unlock(Zeroizing<String>, Reply<UnlockOutcome>),
     UnlockInfo(Reply<UnlockInfo>),
     Security(Reply<SecurityView>),
@@ -405,6 +407,10 @@ enum Cmd {
     ProfileRows(Option<i64>, Reply<Vec<(i64, i64)>>),
     #[cfg(feature = "test-hooks")]
     HasRekey(i64, Reply<bool>),
+    #[cfg(feature = "test-hooks")]
+    TestQuery(String, Reply<i64>),
+    #[cfg(feature = "test-hooks")]
+    TestExec(String, Reply<()>),
     #[cfg(feature = "test-hooks")]
     RawUpload(Vec<u8>, Reply<Vec<u8>>),
     #[cfg(feature = "test-hooks")]
@@ -597,6 +603,15 @@ impl Client {
     pub async fn backup_code(&self, current: Zeroizing<String>) -> Result<Option<String>> {
         ask!(self, BackupCode, current)
     }
+    /// The user was shown the backup code with a backup that was saved: later backups stop
+    /// returning it (review BK-7).
+    pub async fn backup_code_seen(&self) -> Result<()> {
+        ask!(self, BackupCodeSeen)
+    }
+    /// Forgets the backup code; the next backup makes a new one (review BK-14).
+    pub async fn new_backup_code(&self) -> Result<()> {
+        ask!(self, NewBackupCode)
+    }
     /// Unlocks with the PIN or password. Entering the Purge PIN wipes Veil and returns
     /// [`UnlockOutcome::Purged`].
     pub async fn unlock(&self, passphrase: Zeroizing<String>) -> Result<UnlockOutcome> {
@@ -769,6 +784,16 @@ impl Client {
     #[cfg(feature = "test-hooks")]
     pub async fn profile_rows(&self, contact: Option<i64>) -> Result<Vec<(i64, i64)>> {
         ask!(self, ProfileRows, contact)
+    }
+    /// Tests only: one number from the database (`SELECT count(*) ...`).
+    #[cfg(feature = "test-hooks")]
+    pub async fn test_query(&self, sql: &str) -> Result<i64> {
+        ask!(self, TestQuery, sql.to_owned())
+    }
+    /// Tests only: runs SQL on the database (to move times back, say).
+    #[cfg(feature = "test-hooks")]
+    pub async fn test_exec(&self, sql: &str) -> Result<()> {
+        ask!(self, TestExec, sql.to_owned())
     }
     /// Tests only: this contact gave us a re-key invite.
     #[cfg(feature = "test-hooks")]
@@ -1284,7 +1309,7 @@ fn message_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MessageView> {
         id: r.get(0)?,
         mine: r.get(1)?,
         // A "renamed" line carries "<old name>\n<new name>" (local, never sent).
-        text: if (kind == "text" || kind == "renamed") && !deleted {
+        text: if matches!(kind.as_str(), "text" | "renamed" | "restored") && !deleted {
             body
         } else {
             String::new()
@@ -1436,6 +1461,7 @@ impl Actor {
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
+        backup::remove_leftovers(&self.dir);
         let mut tick = tokio::time::interval(
             TICK.min(self.auto_lock.checked_div(4).unwrap_or(TICK))
                 .max(Duration::from_millis(50)),
@@ -1626,6 +1652,12 @@ impl Actor {
                 let res = self.verify_current(&current).and_then(|_| self.backup_code());
                 let _ = r.send(res);
             }
+            Cmd::BackupCodeSeen(r) => {
+                let _ = r.send(self.backup_code_seen());
+            }
+            Cmd::NewBackupCode(r) => {
+                let _ = r.send(self.new_backup_code());
+            }
             Cmd::Unlock(p, r) => {
                 let res = self.unlock(&p).await;
                 let _ = r.send(res);
@@ -1792,6 +1824,18 @@ impl Actor {
                     )?;
                     Ok(i64::try_from(n).unwrap_or(i64::MAX))
                 });
+                let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::TestQuery(sql, r) => {
+                let res = self
+                    .s()
+                    .and_then(|s| Ok(s.db.conn().query_row(&sql, [], |row| row.get(0))?));
+                let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::TestExec(sql, r) => {
+                let res = self.s().and_then(|s| Ok(s.db.conn().execute_batch(&sql)?));
                 let _ = r.send(res);
             }
             #[cfg(feature = "test-hooks")]
@@ -2068,14 +2112,27 @@ impl Actor {
         let path = self.dir.join(backup::RESTORE_FILE);
         let r = self.restore_inner(&input, &path).await;
         backup::remove_db(&path);
-        if r.is_err() {
-            self.session = None;
-            let _ = self.wipe();
-        }
-        r
+        let key = match r {
+            Ok(key) => key,
+            Err(e) => {
+                self.session = None;
+                let _ = self.wipe();
+                return Err(e);
+            }
+        };
+        // From here the restore is done: the vault is written, and wiping it now would leave
+        // contacts we re-keyed talking to an erased device (review BK-6). If the session does
+        // not open, Veil is simply locked; re-keying is best effort, contact by contact.
+        self.open_session(&key).await?;
+        self.emit(ChangeKind::Connection, None);
+        Ok(self.rekey_all().await.unwrap_or(RestoreView {
+            contacts: 0,
+            need_invite: 0,
+        }))
     }
 
-    async fn restore_inner(&mut self, input: &RestoreInput, path: &std::path::Path) -> Result<RestoreView> {
+    /// Everything up to the vault header; returns the new database key.
+    async fn restore_inner(&mut self, input: &RestoreInput, path: &std::path::Path) -> Result<vault::DbKey> {
         let backup_key = self.unpack(input)?;
         // Opening runs the migrations, so an older backup is brought up to date here.
         let db = Db::open(path, &backup_key)?;
@@ -2088,6 +2145,10 @@ impl Actor {
         let (relay, _pushes) = Relay::connect(&relay_addr, pin).await?;
         authenticate(&relay, &pin, &mailbox, &mbox_key).await?;
         drop(relay);
+
+        // The Purge PIN's tag is per device (a random one is stored below): no backup, from
+        // whatever version, may say one is set (review BK-3).
+        db.set_setting("purge_set", &[0])?;
 
         let mut device = Zeroizing::new([0u8; 32]);
         rand::Rng::fill(&mut rng(), &mut device[..]);
@@ -2109,9 +2170,7 @@ impl Actor {
         )?;
         unlock::store_purge(&self.dir, &PurgeTag::random(&mut rng()))?;
         write_atomic(&self.dir, HEADER_FILE, &header.encode())?;
-        self.open_session(&key).await?;
-        self.emit(ChangeKind::Connection, None);
-        self.rekey_all().await
+        Ok(key)
     }
 
     fn address_of(&self, contact: i64) -> Result<veil_core::identity::Address> {
@@ -2819,7 +2878,9 @@ impl Actor {
                     &my_token,
                 )?;
                 s.db.conn().execute(
-                    "UPDATE contacts SET intro = ?2 WHERE id = ?1",
+                    // A known contact's new invite (after a restore that could not reach
+                    // them) is the new invite they needed.
+                    "UPDATE contacts SET intro = ?2, needs_invite = 0, rekey_pending_ms = 0 WHERE id = ?1",
                     params![id, red.envelope],
                 )?;
                 Ok(id)
@@ -3543,7 +3604,11 @@ impl Actor {
                 _ => ClientError::Protocol,
             })?;
         match opened {
-            Opened::Message { from, content } => {
+            Opened::Message {
+                from,
+                content,
+                rekeyed,
+            } => {
                 let row: Option<(i64, bool)> =
                     s.db.conn()
                         .query_row(
@@ -3560,7 +3625,16 @@ impl Actor {
                 if blocked && !matches!(body, Body::MailboxUpdate(_)) {
                     return Ok(());
                 }
-                self.receive(id, &msg_id, sent_at_ms, body)?;
+                // Anything from them means a session we re-keyed after our restore works
+                // (review BK-5).
+                s.db.conn()
+                    .execute("UPDATE contacts SET rekey_pending_ms = 0 WHERE id = ?1", [id])?;
+                match body {
+                    Body::ContactIntro(intro) if rekeyed => {
+                        self.receive_restore(id, &from, &intro).await?;
+                    }
+                    body => self.receive(id, &msg_id, sent_at_ms, body)?,
+                }
             }
             Opened::NewContact { from, intro, .. } => {
                 let invite_id = intro.invite_id.clone().unwrap_or_default();
@@ -3826,11 +3900,8 @@ impl Actor {
             Body::Call(c) => self.receive_call(contact, sent_at_ms, c)?,
             Body::Profile(p) => self.receive_profile(contact, &p)?,
             Body::Rekey(r) => self.receive_rekey(contact, &self.address_of(contact)?, &r)?,
-            // A known contact introducing themselves again redeemed our re-key invite: they
-            // restored from a backup (the core checked the invite and its proof).
-            Body::ContactIntro(intro) if intro.invite_id.is_some() => {
-                self.receive_restore(contact, &self.address_of(contact)?, &intro)?;
-            }
+            // A known contact's introduction is handled in `process` only when the core proved
+            // it redeemed one of our invites; any other one is ignored (review BK-1).
             // A new delivery token for this contact (they unblocked us). Moving to another
             // relay is not supported, so such an update is ignored.
             // Only a newer one (by their clock) counts, as for timers (review M1R2-1).

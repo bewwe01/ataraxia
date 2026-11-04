@@ -107,7 +107,7 @@ fn send(from: &Acc, to: &Acc, s: &str) -> Vec<u8> {
 
 fn recv(at: &Acc, env: &[u8]) -> Result<(Address, String), CoreError> {
     match block_on(at.open(&mut rng(), env, NOW))? {
-        Opened::Message { from, content } => Ok((from, body(&content).to_owned())),
+        Opened::Message { from, content, .. } => Ok((from, body(&content).to_owned())),
         other @ Opened::NewContact { .. } => panic!("unexpected {other:?}"),
     }
 }

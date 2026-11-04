@@ -61,7 +61,8 @@ export interface MessageView {
   /** "timer" is a notice that the disappearing-message timer changed; "call" a call line. */
   /** "renamed": the contact changed their name ("old\nnew" in `text`, a local line). */
   /** "restored": Veil was restored from a backup (by them: `mine` false; by the user: true,
-   *  with text "needs-invite" when this contact could not be reached). */
+   *  with text "needs-invite" when this contact could not be reached, or "no-reply" when they
+   *  sent nothing back for a week after it). */
   kind: "text" | "timer" | "attachment" | "call" | "renamed" | "restored";
   text: string;
   atMs: number;
@@ -342,6 +343,12 @@ export const ipc = {
   createBackup: () => call<BackupSaved>("create_backup"),
   /** The backup code, after the current PIN or password. */
   backupCode: (current: string) => call<string | null>("backup_code", { current }),
+  /** The user saw the code with a saved backup: later backups stop returning it. */
+  backupCodeSeen: () => call<void>("backup_code_seen"),
+  /** Forgets the backup code; the next backup makes and shows a new one. */
+  newBackupCode: () => call<void>("new_backup_code"),
+  /** A backup code is on screen or gone: Android blocks screenshots meanwhile. */
+  backupCodeOnScreen: (shown: boolean) => call<void>("backup_code_on_screen", { shown }),
   unlock: (passphrase: string) => call<void>("unlock", { passphrase }),
   lock: () => call<void>("lock"),
   unlockInfo: () => call<UnlockInfo>("unlock_info"),

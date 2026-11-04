@@ -402,8 +402,10 @@ fn append(data: &mut Zeroizing<Vec<u8>>, bytes: &[u8], cap: usize) -> bool {
 #[derive(Default)]
 struct RestoreUpload(std::sync::Mutex<Zeroizing<Vec<u8>>>);
 
-/// The largest backup a restore takes.
-const MAX_BACKUP: usize = 1024 * 1024 * 1024;
+/// The largest backup a restore takes; the client makes none larger (review BK-8).
+fn max_backup() -> usize {
+    usize::try_from(veil_client::service::MAX_BACKUP).unwrap_or(usize::MAX)
+}
 
 #[tauri::command]
 fn restore_part(up: State<'_, RestoreUpload>, first: bool, part: Zeroizing<String>) -> Res<()> {
@@ -420,7 +422,7 @@ fn restore_part(up: State<'_, RestoreUpload>, first: bool, part: Zeroizing<Strin
     if first {
         *data = Zeroizing::new(Vec::new());
     }
-    if append(&mut data, &bytes, MAX_BACKUP) {
+    if append(&mut data, &bytes, max_backup()) {
         Ok(())
     } else {
         *data = Zeroizing::new(Vec::new());
@@ -494,14 +496,32 @@ async fn create_backup(app: AppHandle, c: State<'_, Client>) -> Res<BackupSaved>
         Ok(()) => {}
         Err(NativeError::Unavailable) => {
             let dir = app.path().download_dir().map_err(|_| err(ClientError::Storage))?;
-            // Never over an existing file: veil-backup-<date> (2).vbak and so on.
+            // Never over an existing file or through a link: veil-backup-<date> (2).vbak and
+            // so on, each name created new in one step (review BK-13).
             let mut path = dir.join(&file);
-            let mut n = 2;
-            while path.exists() {
-                path = dir.join(format!("veil-backup-{} ({n}).vbak", ymd(now)));
-                n += 1;
+            let mut n = 2u32;
+            let mut out = loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(f) => break f,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => {
+                        path = dir.join(format!("veil-backup-{} ({n}).vbak", ymd(now)));
+                        n += 1;
+                    }
+                    Err(_) => return Err(err(ClientError::Storage)),
+                }
+            };
+            {
+                use std::io::Write as _;
+                if out.write_all(&data[..]).and_then(|()| out.sync_all()).is_err() {
+                    drop(out);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(err(ClientError::Storage));
+                }
             }
-            std::fs::write(&path, &data[..]).map_err(|_| err(ClientError::Storage))?;
             return Ok(BackupSaved {
                 code: view.code,
                 file: path
@@ -525,6 +545,50 @@ async fn create_backup(app: AppHandle, c: State<'_, Client>) -> Res<BackupSaved>
 #[tauri::command]
 async fn backup_code(c: State<'_, Client>, current: Zeroizing<String>) -> Res<Option<String>> {
     c.backup_code(current).await.map_err(err)
+}
+
+/// The user saw the backup code with a saved backup (review BK-7).
+#[tauri::command]
+async fn backup_code_seen(c: State<'_, Client>) -> Res<()> {
+    c.backup_code_seen().await.map_err(err)
+}
+
+/// Forgets the backup code; the next backup shows a new one (review BK-14).
+#[tauri::command]
+async fn new_backup_code(c: State<'_, Client>) -> Res<()> {
+    c.new_backup_code().await.map_err(err)
+}
+
+/// Whether screenshots were allowed before a backup code went on screen; `None` while none is.
+#[derive(Default)]
+struct CodeOnScreen(tauri::async_runtime::Mutex<Option<bool>>);
+
+/// A backup code is on screen (`true`) or gone (`false`). On Android, screenshots and the
+/// app switcher preview are blocked while it shows, whatever the setting, and the setting
+/// comes back after (review BK-14). Nothing to do on desktop.
+#[tauri::command]
+async fn backup_code_on_screen(app: AppHandle, guard: State<'_, CodeOnScreen>, shown: bool) -> Res<()> {
+    let mut was = guard.0.lock().await;
+    if shown {
+        if was.is_none() {
+            let allowed = native::screenshots_allowed(&app).await;
+            if allowed {
+                match native::set_screenshots_allowed(&app, false).await {
+                    Ok(()) | Err(NativeError::Unavailable) => {}
+                    Err(e) => return Err(native_err(e)),
+                }
+            }
+            *was = Some(allowed);
+        }
+    } else if let Some(allowed) = was.take()
+        && allowed
+    {
+        match native::set_screenshots_allowed(&app, true).await {
+            Ok(()) | Err(NativeError::Unavailable) => {}
+            Err(e) => return Err(native_err(e)),
+        }
+    }
+    Ok(())
 }
 
 /// Largest base64 part accepted; the UI sends 1 MiB of file per part.
@@ -920,6 +984,7 @@ pub fn run() {
         .plugin(native::plugin())
         .manage(Uploads::default())
         .manage(RestoreUpload::default())
+        .manage(CodeOnScreen::default())
         .setup(|app| {
             let dir = data_dir(&app.path().app_data_dir()?)?;
             let handle = app.handle().clone();
@@ -961,6 +1026,9 @@ pub fn run() {
             restore,
             create_backup,
             backup_code,
+            backup_code_seen,
+            new_backup_code,
+            backup_code_on_screen,
             unlock,
             lock,
             unlock_info,

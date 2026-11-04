@@ -153,11 +153,22 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE contacts ADD COLUMN rekey_sealed BLOB;
      ALTER TABLE contacts ADD COLUMN rekey_mine_until INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE contacts ADD COLUMN rekey_mine_id BLOB;
-     ALTER TABLE contacts ADD COLUMN needs_invite INTEGER NOT NULL DEFAULT 0;",
+     ALTER TABLE contacts ADD COLUMN needs_invite INTEGER NOT NULL DEFAULT 0;
+     -- The expiry of their re-key invite we hold: only a newer one replaces it (review BK-4).
+     ALTER TABLE contacts ADD COLUMN rekey_until INTEGER NOT NULL DEFAULT 0;
+     -- When a restore re-keyed this contact and nothing has come back from them yet (BK-5).
+     ALTER TABLE contacts ADD COLUMN rekey_pending_ms INTEGER NOT NULL DEFAULT 0;
+     -- No new re-key invite for them before this (after one could not be sealed; BK-2).
+     ALTER TABLE contacts ADD COLUMN rekey_retry_ms INTEGER NOT NULL DEFAULT 0;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
     let have: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // A database from a newer Veil: its schema is unknown here, so nothing is touched
+    // (review BK-12).
+    if have > i64::try_from(MIGRATIONS.len()).unwrap_or(i64::MAX) {
+        return Err(ClientError::NewerVersion);
+    }
     for (n, sql) in MIGRATIONS.iter().enumerate() {
         let version = i64::try_from(n)
             .map_err(|_| ClientError::Storage)?

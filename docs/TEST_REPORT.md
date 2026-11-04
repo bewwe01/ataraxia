@@ -2,6 +2,34 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Milestone 7: backup review round 1 fixes (2026-11-04)
+
+Fixes for BK-1 to BK-16 (docs/REVIEW_REPORT.md), each covered by a regression test. Each of the BK-1, BK-4 and BK-9 tests was confirmed to fail with its fix reverted (`test result: FAILED. 0 passed; 1 failed` for each), then to pass again.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings
+# exit 0, no warnings
+$ cargo test --workspace --all-features
+# 254 passed, 0 failed (1 ignored)
+$ cargo test -p veil-client --features test-hooks --test backup
+test a_contact_cannot_fake_a_restore ... ok
+test a_new_invite_after_a_restore_outlives_its_ttl ... ok
+test a_stale_rekey_invite_ends_as_needs_invite ... ok
+test a_restored_backup_keeps_identity_contacts_and_history ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 48.07s
+$ cargo test -p veil-core --lib
+test result: ok. 83 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.60s
+$ (cd app/src-tauri && cargo clippy --all-targets -- -D warnings && cargo fmt --check)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.55s
+$ pnpm -C app typecheck   # tsc: 0 errors
+$ pnpm -C app lint
+lint: 23 files clean
+contrast: 25 panels; worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001
+$ cd design/tools && node check.mjs
+PASS
+```
+
 ## Milestone 7: encrypted backup and restore (2026-11-04)
 
 Owner request: encrypted backup and restore (ADR-0021). Before the review gate.

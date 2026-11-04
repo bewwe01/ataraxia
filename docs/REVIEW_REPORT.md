@@ -6409,3 +6409,349 @@ Files referenced:
 - /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/fp.rs
 - /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/fix.rs
 - /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/r5/head.rs
+
+## Backup and restore (milestone 7) review, round 1 (2026-11-04)
+
+**Scope:** commit 33d2160, 24 files, +1917/−27. I read the core, client and app code, the docs (ADR-0021, PROTOCOL §3/§7/§12, INV-BAK-1/2) and the surrounding callers: `Account::open`, `consume_invite_if_proven`, `revoke_invite`, `SqlBackend::apply`, `atomically`, `on_tick`, `queue_control_as`, `cleanup_invites`, `redeem` and `upsert_contact`, `Db::open` and `migrate`, `set_purge`/`clear_purge`, `verify_current`, `wipe`.
+
+**Commands run (all pass):**
+- `cargo test -p veil-core --lib backup`: 3 passed
+- `cargo test -p veil-core --lib rekey`: 3 passed
+- `cargo test -p veil-client --test backup`: 1 passed
+- `pnpm -C app typecheck`: 0 errors
+- `pnpm -C app lint`: clean
+
+**Verdict: FAIL.** 3 High, 7 Medium, 6 Low.
+
+---
+
+## Findings
+
+### BK-1 (High, HIGH confidence): any known contact can trigger `receive_restore` without the core verifying anything
+
+**Where:** `crates/client/src/service.rs:3831`, `crates/core/src/account.rs:836-852` (`consume_invite_if_proven`), `crates/client/src/service/backup.rs:259-295`.
+
+**Problem:**
+- The client branch `Body::ContactIntro(intro) if intro.invite_id.is_some()` carries the comment "the core checked the invite and its proof". That is not true.
+- `consume_invite_if_proven` returns `Ok(())` in three cases where nothing was checked:
+  - `invite_proof` is `None`;
+  - no invite record has that id (a made-up id, or one already used);
+  - and in every case it never requires the message to be a `PreKey` message that uses that invite's prekeys.
+- So a contact can send, over the existing Whisper session, `ContactIntro { invite_id: Some(random) }`. `receive_restore` then:
+  - overwrites `mailbox` and `token` with values the sender picks, which skips the "only a newer one" ordering that `MailboxUpdate` has (M1R2-1);
+  - deletes our queued control and mailbox rows;
+  - marks every queued outgoing message `failed` and drops its envelope, even though the session is still fine;
+  - shows a fake "X restored Veil from a backup" line;
+  - sets `rekey_mine_id = NULL` without revoking our current re-key invite (see BK-11), then issues a new one.
+- Repeating it piles up unrevoked invites in our store: a signed, a one-time and a Kyber prekey each, kept for 400 days.
+
+**Fix:** let the core report a verified re-key instead of the client guessing from the message body.
+- In `Account::open`, compute `rekeyed` only when all of these hold: the ciphertext is `CiphertextMessage::PreKeySignalMessage`, its signed, Kyber and one-time prekey ids equal the record's, the proof checks out, and the record was deleted.
+- Return it in the result: `Opened::Message { from, content, rekeyed: bool }`.
+- In `consume_invite_if_proven`, if `invite_id` is `Some` but the record is missing or the proof is missing, return `Err(CoreError::InviteInvalid)`, or at least `Ok(false)`.
+- In the client:
+  ```rust
+  Opened::Message { content, rekeyed: true, .. } => /* receive_restore */
+  ```
+  and ignore a `ContactIntro` from a known contact otherwise.
+- Add a core test (Whisper `ContactIntro` with a bogus id: no state change) and a client test (no "restored" row, outbox untouched).
+
+### BK-2 (High, HIGH confidence): contacts without a session make a new, orphaned re-key invite every 5 s tick, without limit
+
+**Where:** `crates/client/src/service/backup.rs:153-211` (`sync_rekeys` / `give_rekey`), `service.rs:1506` (called on every tick, `TICK` = 5 s).
+
+**Problem:**
+- `give_rekey` calls `new_rekey`, and so `issue_invite`, **before** `atomically`. `SqlBackend::apply` uses its own `SAVEPOINT kv_apply`, which commits when no transaction is open, so the invite and its three prekeys are committed at once.
+- Next, `queue_control_as` calls `account.seal`. For a contact with no session this fails with `NoSession`, and the savepoint rolls back. The invite is not rolled back, and `rekey_mine_until` stays 0.
+- After every restore, each `needs_invite` contact (Carol in the integration test) is in exactly this state, so the loop runs forever:
+  - up to `PER_ROUND` = 4 contacts every 5 s, which is about 69k invite records a day;
+  - each one costs a Kyber1024 key generation plus signatures and several KB of storage, kept for 400 days (`cleanup_invites` sweeps only expired ones);
+  - `find_invite_for` scans all of them linearly for every `PreKey` message from a stranger.
+- The result is database growth and CPU and battery drain on the restored device.
+
+**Fix:**
+- Create the invite inside the savepoint, and seal before committing:
+  ```rust
+  let id = self.atomically(async {
+      let created = self.new_rekey(&addr, &my_token).await?;
+      // revoke old, queue_control_as(...)?, UPDATE contacts ...
+  }).await?;
+  ```
+- Skip contacts that cannot be sealed to: add `AND needs_invite = 0` to the `sync_rekeys` query, or check that a session exists first.
+- Add a backoff column (`rekey_retry_at`) so a failure is not retried every tick.
+- Add a test: after the restore in `tests/backup.rs`, wait a few ticks and assert the count of `inv/` keys stays the same.
+
+### BK-3 (High, HIGH confidence): after a restore the Purge PIN shows as set but does nothing
+
+**Where:** `crates/client/src/service/backup.rs:97-115` (`strip`), `service.rs:2078-2114` (`restore_inner`).
+
+**Problem:**
+- `purge_set` lives in the `settings` table, so it travels in the backup.
+- `restore_inner` writes a **random** `PurgeTag` (`unlock::store_purge(.., PurgeTag::random(..))`), but the restored database can still say `purge_set = [1]`.
+- The Security screen (`service.rs:2268`) then tells the user a Purge PIN is set. Under coercion, entering it is just a wrong PIN; nothing is wiped.
+- The code already guards against this exact mismatch elsewhere ("Flag first, then the tag", review U-6, `service.rs:2302-2306`).
+
+**Fix:**
+- In `strip`, add:
+  ```sql
+  INSERT OR REPLACE INTO {schema}.settings (k, v) VALUES ('purge_set', x'00');
+  ```
+- Also call `db.set_setting("purge_set", &[0])` in `restore_inner` before the `PRAGMA rekey`, for backups made by other versions.
+- Show a hint after the restore that the Purge PIN must be set again.
+- Add an assertion to `tests/backup.rs` that `security().purge_set` is false after a restore of a backup made with a Purge PIN set.
+
+### BK-4 (Medium, HIGH confidence): an older `Rekey` can replace a newer one; the relay can force this by reordering
+
+**Where:** `crates/client/src/service/backup.rs:241-253` (`receive_rekey`).
+
+**Problem:**
+- `give_rekey` revokes the old invite whenever it issues a new one.
+- `receive_rekey` stores whatever `Rekey` arrives last. It has no ordering check, unlike `Profile` and `MailboxUpdate`.
+- The relay decides delivery order, and libsignal accepts out-of-order messages. So the relay can hand over Rekey#2, then Rekey#1. We then keep a revoked invite, and the next restore silently fails for that contact (see BK-5).
+
+**Fix:** store the invite's `expires_at`, which is authenticated inside the E2EE link, and accept only a newer one:
+```sql
+UPDATE contacts SET rekey_link=?2, rekey_sealed=?3, rekey_until=?4, needs_invite=0
+WHERE id=?1 AND COALESCE(rekey_until,0) < ?4
+```
+This needs a `rekey_until` column in migration 7.
+
+### BK-5 (Medium, HIGH confidence): redeeming a stale re-key invite fails silently on the contact's side and is reported as success
+
+**Where:** `crates/client/src/service/backup.rs:401-488` (`rekey_all` / `rekey_one`).
+
+**Problem:**
+- `rekey_one` counts as a success as soon as the redemption is built and queued. Whether it actually arrives is never checked.
+- The invite in the backup is dead in several cases, all of them normal:
+  - the contact renewed it after the backup (renewal is about yearly);
+  - the contact restored from their own backup (`strip` sets `rekey_mine_until = 0`, so they issue new invites to everyone);
+  - the BK-4 reordering.
+- In each case the contact's prekeys are gone, `decrypt_in_tx` fails, and the envelope is dropped.
+- The restored user sees "reached". The contact is never marked `needs_invite`, and every later message is sealed for a session the contact does not have, so all of them are lost silently.
+
+**Fix:**
+- Mark re-keyed contacts `rekey_pending = 1` and clear it on the first message decrypted from them. Their `receive_restore` already sends a `Rekey` and a profile back, so a reply is expected.
+- If nothing arrives within, say, 7 days, set `needs_invite = 1` and show the warning line.
+- Add a test: Bob renews his invite after the backup, the restore follows, and Bob's chat ends up `needs_invite`.
+
+### BK-6 (Medium, HIGH confidence): a restore that fails after re-keying started wipes everything and burns contacts' invites
+
+**Where:** `crates/client/src/service.rs:2061-2076` and `2114`.
+
+**Problem:**
+- `restore()` wipes on any error from `restore_inner`, and that includes an error from `rekey_all()`. `rekey_all` runs after the header is written, and any `conn.execute(...)?` inside it can fail.
+- By then `rekey_one` may already have committed and delivered `ContactIntro`s:
+  - those contacts now hold a session with a device that has been erased;
+  - their invites in the backup are used up, so a retry hits BK-5 for them.
+
+**Fix:**
+- Treat the restore as committed once `write_atomic(HEADER_FILE)` succeeds.
+- Make `rekey_all` best-effort: log the failure count, mark the failed contacts `needs_invite`, and return the view. For example:
+  ```rust
+  let view = self.rekey_all().await.unwrap_or(RestoreView { contacts: 0, need_invite: 0 });
+  ```
+  or keep a per-contact result.
+- Only errors before the header write should trigger `wipe()`.
+
+### BK-7 (Medium, HIGH confidence): the backup code can be lost the one time it is "shown once"
+
+**Where:** `crates/client/src/service/backup.rs:303-310`, `app/src-tauri/src/lib.rs:485-520`, `app/src/components/Backup.tsx` (`make()`).
+
+**Problem:**
+- `create_backup` saves `backup.code` to settings **before** the backup is written and saved anywhere.
+- If any of these fail, the code in `view.code` is thrown away:
+  - the export or the seal;
+  - `native::save_file` (including the user pressing Cancel, which `Backup.tsx` hides quietly);
+  - the desktop `fs::write`.
+- Every later backup then returns `code: None`. The banner "This is the only time it is shown" never appears, and the user has a backup with a code they never saw unless they find "Show my backup code".
+
+**Fix:**
+- Keep a `backup.code_ack` flag.
+- Return `code` whenever `code_ack` is unset.
+- Set the flag only through a new IPC `backup_code_seen()`, called after the shell has saved the file and the UI has shown the code.
+
+### BK-8 (Medium, HIGH confidence): backups larger than `MAX_BACKUP` can be made but never restored
+
+**Where:** `app/src-tauri/src/lib.rs:406` (`MAX_BACKUP` = 1 GiB), `crates/client/src/service/backup.rs:301-340`.
+
+**Problem:**
+- The database holds attachment data, so a user with many photos goes past 1 GiB easily.
+- `create_backup` has no size limit. The file is made and saved, then `restore_part` refuses it with `TooLarge`. The user finds out only on the new phone.
+- On Android the whole file also passes through memory: `take_backup` reads all of it, then base64 goes over the bridge.
+
+**Fix:**
+- Share the limit: `pub const MAX_BACKUP` in `veil_client::service`.
+- In `create_backup`, after sealing, refuse with `ClientError::TooLarge` and remove the file when `bytes > MAX_BACKUP`, and show "too large to back up: remove some media".
+- Alternatively make restore streaming, so the cap can go.
+
+### BK-9 (Medium, MEDIUM confidence): the `needs_invite` recovery path (re-pairing with a known contact through an ordinary invite) breaks after the invite's TTL
+
+**Where:** `crates/client/src/service.rs:3831` and `service/backup.rs:259-295`, compared with the `NewContact` path at `service.rs:3565-3630`.
+
+**Problem:**
+- Following "ask them for a new invite", Alice redeems Carol's ordinary invite.
+- Alice's `upsert_contact` sets `token` to Carol's **invite** token (`red.contact_delivery_token`).
+- On Carol's side the known-contact path calls `receive_restore`. That path:
+  - does not delete Carol's `invites` row (the `NewContact` path does `DELETE FROM invites WHERE id = ?1`);
+  - does not move that row's token into `my_token`.
+- When the invite expires (7 days at most), `cleanup_invites` calls `queue_token_removal` for the very token Alice now delivers with, and the relay starts refusing Alice's messages to Carol.
+- No test covers this path.
+
+**Fix:**
+- In the known-contact re-key branch: look up `invites` by `intro.invite_id`.
+- If a row is found, set `contacts.my_token` to its token and delete the row, the same as the `NewContact` path.
+- If no row is found, it was a re-key invite and `my_token` stays as it is.
+- Add an integration test: restore → Carol `needs_invite` → Carol invites Alice → messages still flow after the invite TTL (use the test clock hook).
+
+### BK-10 (Medium, HIGH confidence): INV-BAK-1's main claim is not tested
+
+**Where:** `crates/client/tests/backup.rs:62-65`, `docs/INVARIANTS.md` (INV-BAK-1).
+
+**Problem:**
+- "The backup file holds no message text" is checked by searching the **sealed ciphertext** for the marker, which can never fail.
+- Nothing checks what the backup actually contains. No test confirms that the restored or exported database has no `sess/`, `pk/`, `spk/`, `kpk/` or `inv/` keys, no `invites` rows and no envelopes.
+- Nothing confirms that the rows `strip` deleted are overwritten. This depends on `secure_delete` being passed on implicitly to the attached `bak` schema (SQLite copies the main database's setting at `ATTACH`). It is correct today but not written down, and it breaks if someone reorders the pragmas.
+- CLAUDE.md rule 9 applies: a security claim needs a test.
+
+**Fix:**
+- In `export_to`:
+  - after `ATTACH`, run `PRAGMA bak.secure_delete = ON;`;
+  - after `strip`, run `VACUUM bak;`, which rebuilds the file with no free pages.
+- Add a test-hook test that opens the backup, takes the 32-byte key, opens the export with it, and asserts:
+  ```sql
+  SELECT count(*) FROM kv WHERE substr(k,1,5) IN ('sess/','inv/') OR substr(k,1,3)='pk/' ...  -- = 0
+  SELECT count(*) FROM invites  -- = 0
+  SELECT count(*) FROM messages WHERE envelope IS NOT NULL  -- = 0
+  ```
+- In the same test, run `PRAGMA freelist_count` on the export and expect 0.
+
+### BK-11 (Low, HIGH confidence): `receive_restore` drops `rekey_mine_id` without revoking that invite
+
+**Where:** `crates/client/src/service/backup.rs:273-276`.
+
+**Problem:** if the restoring contact used an older invite (BK-4/BK-5) or none (BK-1), our current invite record is orphaned for 400 days.
+
+**Fix:** read `rekey_mine_id` first, then:
+```rust
+let _ = s.account.revoke_invite(&old).await;
+```
+inside `process`, or queue the revocation. Also treat a missing record (`InviteInvalid`) as already gone in `give_rekey`. Today `revoke_invite` fails on a missing record and so aborts every later renewal for that contact.
+
+### BK-12 (Low, HIGH confidence): a backup from a newer Veil is accepted
+
+**Where:** `crates/client/src/db.rs:159-174`.
+
+**Problem:** when `user_version > MIGRATIONS.len()`, every migration is skipped and the restore goes ahead on a schema this version does not know.
+
+**Fix:** in `migrate`, add
+```rust
+if have > MIGRATIONS.len() as i64 { return Err(ClientError::UnsupportedVersion) }
+```
+and map it in `restore_inner` to an error saying "made by a newer Veil".
+
+### BK-13 (Low, HIGH confidence): the desktop Downloads write checks and writes in two steps and follows links
+
+**Where:** `app/src-tauri/src/lib.rs:500-504`.
+
+**Problem:** `path.exists()` followed by `std::fs::write` can still overwrite a file, or follow a symlink, that appears in between.
+
+**Fix:** use `OpenOptions::new().write(true).create_new(true).open(&path)` in the loop, retry on `AlreadyExists`, then `write_all` and `sync_all`.
+
+### BK-14 (Low): handling of the backup code
+
+**Problem:**
+- The code can never be changed. If it leaks once, every future backup is open to whoever has it.
+- On Android, if the user has allowed screenshots, `CodeCard` can be screenshotted, and photo sync may then put it next to a backup kept in the cloud.
+- ADR-0021 gives no written rule-2 / rule-9 argument for letting the webview hold this secret (a JS string that cannot be wiped).
+
+**Fix:**
+- Add a "New backup code" action that deletes `backup.code`; the next backup then shows a new one.
+- Force `set_screenshots_allowed(false)` while a code is on screen.
+- Add a sentence to ADR-0021 and an INVARIANTS note saying why showing the code in the webview is acceptable.
+- In `BackupCard`, clear `saved.code` and `shown` when the component unmounts or the app locks.
+
+### BK-15 (Low, MEDIUM confidence): re-keying does not exclude contacts under a key warning
+
+**Where:** `service/backup.rs:241-253` (`receive_rekey`) and `403-407` (`rekey_all`).
+
+**Problem:** `sync_rekeys` skips `key_warning = 1`, but neither of these does. A contact flagged under INV-ID-2 can therefore give us a re-key invite, and after a restore they get our `ContactIntro` with a fresh invite and our mailbox token.
+
+**Fix:**
+- Add `AND key_warning = 0` to the `rekey_all` query, and count those contacts as `need_invite`.
+- In `receive_rekey`, ignore the invite when `key_warning = 1`.
+
+### BK-16 (Low): leftover files and transaction scope
+
+**Problem:**
+- `backup.vbak`, `backup-export.db` and `restore.db` (all encrypted) are removed only by the next backup or restore, or by Erase. A crash leaves them on disk until then.
+- In `rekey_one`, `new_rekey` is inside the savepoint (correct), but `give_rekey` has the BK-2 ordering.
+- A damaged marker chunk is reported as "wrong code". This is only a UX inaccuracy; nothing leaks.
+
+**Fix:**
+- At `Actor` start, call `remove_db` on `EXPORT_FILE` and `RESTORE_FILE`, and remove `BACKUP_FILE` and its `.tmp`.
+- Optionally reword the `BackupCode` error to "wrong code, or the start of the file is damaged".
+
+---
+
+## Checked and found correct
+
+**Core file format (`crates/core/src/backup.rs`):**
+- `StreamBE32<XChaCha20Poly1305>` gets a random 19-byte nonce prefix and a key per file (random salt).
+- Chunk 0 is the marker with `last = false`. Data runs from index 1, and only the final chunk is sealed with `last = true`.
+- The 55-byte header is AAD on every chunk.
+- Rejected cases, each checked against the code:
+  - header plus marker with no data (`len <= TAG`);
+  - a file cut at a chunk boundary (the last-flag mismatch);
+  - extension and reordering;
+  - index overflow (`checked_add`).
+- No `unwrap`, panic or indexing on untrusted input.
+
+**KDF and code:**
+- m, t and p are checked against `FLOOR`/`CEILING` before Argon2 runs. A crafted file can still ask for at most 512 MiB on the phone, but only a file the user picks.
+- The version byte is checked before the KDF.
+- The code is 32 characters drawn uniformly by `random_range` from a 32-character alphabet, so 160 bits.
+- Parsing is strict: non-ASCII, `U` and the wrong length are refused, and the Crockford lookalikes O, I and L are mapped to 0 and 1.
+- `BackupCode` derives no `Debug`, `Clone` or `Serialize` and is zeroized.
+- Telling a wrong code from damage gives an attacker nothing they can use.
+
+**Keys and plaintext on disk:**
+- The export is SQLCipher under a random raw key that lives only in memory.
+- The sealed stream is that key followed by already-encrypted pages, so no plaintext page touches disk during backup or restore.
+- Journals are encrypted, and all side files are cleaned on the error paths of `create_backup`, `unpack` and `restore`.
+- All six temp file names are in `DATA_FILES`, so Erase removes them. The journal mode is DELETE, so there are no `-wal`/`-shm` files.
+- `PRAGMA user_version` is copied into the export, and the migrations run when it is opened.
+
+**What `strip` keeps out:**
+- Removed: sessions, our prekeys of all three kinds, invites, envelopes, transfers in flight (upload tokens are nulled), and our `rekey_mine_*`.
+- Kept, as they must be for a restore: mailbox key, delivery tokens, relay pin, and the re-key invites contacts gave us. The ADR's "backup plus code is the account" covers this.
+- `backup.code` sits inside the backup it opens. That is circular, not a weakness.
+- Wrong: `purge_set` must be reset (BK-3).
+
+**Re-key invites:**
+- `only_from` is enforced in both core paths.
+- A stranger holding the link gets `UnknownSender`, and another contact gets `InviteInvalid` (tested).
+- `check_rekey` requires the sender's identity key and our relay pin.
+- `sync_rekeys` skips blocked contacts and contacts under a key warning, so INV-ID-2 is preserved: the same key gives the same address and no key warning.
+- A replayed `PreKey` or Whisper envelope is rejected by libsignal (the one-time prekey is deleted, and duplicate messages are detected).
+- Forward secrecy cost of the 400-day signed and Kyber prekeys: small. They are one-time per contact, deleted when used, kept out of backups, and an attacker who steals them already has the device's identity key.
+
+**Restore flow:**
+- It runs only from the `New` state.
+- The relay check authenticates the backed-up mailbox before anything is written.
+- `PRAGMA rekey` moves the database into a new vault with a new device secret.
+- The header is written last, so a crash before that leaves the state `New`.
+
+**App:**
+- No clipboard use.
+- `restore_part` caps part size and the total, grows its buffer without leaving unwiped copies, and wipes it on use, on the first part and on overflow.
+- `RestoreForm` uses `deny_unknown_fields`.
+- The webview gets only the file name, and the ciphertext it sends is from a file the user picked. That is within rule 2 as ADR-0021 argues, apart from BK-14 for the code itself.
+- The `backup_code` gate goes through `verify_current`, which uses the unlock delays and attempt counters (tested with a wrong password).
+- All IPC goes through `ipc.ts`.
+- Labels are present, the Banner and `role="alert"` and `role="status"` are used, and only design tokens appear in the CSS.
+
+**Tests:** the INV-BAK-2 tests are meaningful (stranger, another contact, the right contact, both directions, same safety number). The INV-BAK-1 test is weaker than the claim (BK-10).
+
+---
+
+**Recommended next step:** fix BK-1, BK-2 and BK-3, each with a regression test, then BK-4 to BK-10, and re-run the review gate. No files were edited.

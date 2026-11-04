@@ -67,8 +67,14 @@ pub struct Redeemed {
 /// A successfully opened envelope. `Debug` names only the variant: neither content, nor
 /// keys, nor addresses belong in logs (review round 2, N5).
 pub enum Opened {
-    /// A message from an existing contact.
-    Message { from: Address, content: Content },
+    /// A message from an existing contact. `rekeyed`: it redeemed one of our invites (a
+    /// re-key invite after their restore, or an ordinary one), proven by its `PreKey` message
+    /// using exactly that invite's prekeys and by the invite proof (ADR-0021, review BK-1).
+    Message {
+        from: Address,
+        content: Content,
+        rekeyed: bool,
+    },
     /// Someone redeemed one of our invites. The caller creates the contact
     /// (initially unverified unless a mutual in-person scan confirms the key).
     NewContact {
@@ -723,13 +729,17 @@ impl<B: KvBackend> Account<B> {
             Some(known) if known == sender_ik => {
                 self.transact(async {
                     let content = self.decrypt_in_tx(rng, &remote, &ciphertext).await?;
-                    // A known contact redeeming one of our re-key invites consumes it.
-                    if let Some(Body::ContactIntro(intro)) = &content.body {
-                        self.consume_invite_if_proven(intro, &sender_ik, now)?;
-                    }
+                    // A known contact redeeming one of our invites consumes it.
+                    let rekeyed = match &content.body {
+                        Some(Body::ContactIntro(intro)) => {
+                            self.consume_invite_if_proven(intro, &sender_ik, &ciphertext, now)?
+                        }
+                        _ => false,
+                    };
                     Ok(Opened::Message {
                         from: from.clone(),
                         content,
+                        rekeyed,
                     })
                 })
                 .await
@@ -833,13 +843,35 @@ impl<B: KvBackend> Account<B> {
         })
     }
 
-    fn consume_invite_if_proven(&self, intro: &ContactIntro, sender: &IdentityKey, now: u64) -> Result<()> {
-        let (Some(id), Some(proof)) = (intro.invite_id.as_deref(), intro.invite_proof.as_deref()) else {
-            return Ok(());
+    /// A known contact's introduction that names one of our invites: `true` once proven and
+    /// consumed. Anything that names an invite but does not prove it is refused, so a contact
+    /// cannot claim a re-key over the existing session (review BK-1): the message must be a
+    /// `PreKey` message using exactly that invite's prekeys, and the proof must hold.
+    fn consume_invite_if_proven(
+        &self,
+        intro: &ContactIntro,
+        sender: &IdentityKey,
+        ciphertext: &CiphertextMessage,
+        now: u64,
+    ) -> Result<bool> {
+        let (id, proof) = match (intro.invite_id.as_deref(), intro.invite_proof.as_deref()) {
+            (None, None) => return Ok(false),
+            (Some(id), Some(proof)) => (id, proof),
+            _ => return Err(CoreError::InviteInvalid),
         };
-        let rec = self.with_store(|s| s.get(&keys::with(keys::INVITE, id)))?;
-        let Some(raw) = rec else { return Ok(()) };
+        let raw = self
+            .with_store(|s| s.get(&keys::with(keys::INVITE, id)))?
+            .ok_or(CoreError::InviteInvalid)?;
         let rec = InviteRecordPb::decode(raw.as_slice()).map_err(|_| CoreError::Storage)?;
+        let CiphertextMessage::PreKeySignalMessage(pre) = ciphertext else {
+            return Err(CoreError::InviteInvalid);
+        };
+        if u32::from(pre.signed_pre_key_id()) != rec.signed_prekey_id
+            || pre.kyber_pre_key_id().map(u32::from) != Some(rec.kyber_prekey_id)
+            || pre.pre_key_id().map(u32::from) != Some(rec.prekey_id)
+        {
+            return Err(CoreError::InviteInvalid);
+        }
         if now >= rec.expires_at {
             return Err(CoreError::InviteInvalid);
         }
@@ -848,7 +880,8 @@ impl<B: KvBackend> Account<B> {
             return Err(CoreError::InviteInvalid);
         }
         verify_proof(&rec.proof_key, id, sender, proof)?;
-        self.delete_invite(id, &rec)
+        self.delete_invite(id, &rec)?;
+        Ok(true)
     }
 
     /// Fails (and so aborts the transaction) if the store is unavailable, never skips (review L6).
@@ -1578,7 +1611,12 @@ mod pairing_tests {
                 .unwrap();
         assert_eq!(red.contact, to_bob);
         match block_on(bob.open(&mut rng(), &red.envelope, NOW)).unwrap() {
-            Opened::Message { from, content } => {
+            Opened::Message {
+                from,
+                content,
+                rekeyed,
+            } => {
+                assert!(rekeyed, "a proven re-key says so");
                 assert_eq!(from, to_alice);
                 assert!(matches!(content.body, Some(Body::ContactIntro(_))));
             }
@@ -1600,10 +1638,12 @@ mod pairing_tests {
         assert!(rekey.invite.expires_at >= NOW + 365 * 24 * 3600);
     }
 
-    /// Review round 2, N3: a *known* contact redeeming one of our re-key invites
-    /// (`consume_invite_if_proven`). A valid proof consumes the invite and all its prekeys;
-    /// a bad proof or an expired invite is refused without any state change and leaves the
-    /// invite usable; an unknown invite id is ignored.
+    /// Review round 2, N3, tightened by BK-1: a *known* contact's introduction that names one
+    /// of our invites is accepted only as a `PreKey` message using that invite's prekeys with a
+    /// valid proof. Over the existing session, every such claim (bad proof, another identity's
+    /// proof, expired, an unknown id, even a valid proof) is refused and
+    /// changes nothing, so nobody can fake a restore. The real path is tested in
+    /// `rekey_invites_serve_only_their_contact`.
     #[test]
     fn known_contact_rekey_invite_paths() {
         let (alice, bob) = pair();
@@ -1611,38 +1651,29 @@ mod pairing_tests {
         let rekey = invite(&bob, 600);
         let id = rekey.invite.id;
         let good = rekey.invite.proof(alice.identity.public()).unwrap().to_vec();
-
-        // Bad proof: refused, nothing changes.
-        let env = block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&id, vec![9; 32]), NOW)).unwrap();
-        let (bob, r) = open_checked(bob, &env, NOW);
-        assert_eq!(r.err(), Some(CoreError::AuthFailed));
-        assert_eq!(prekeys_present(&bob, &rekey), [true; 4]);
-
-        // Proof bound to another identity (Mallory's), presented by Alice: refused.
         let mallory = acc();
         let foreign = rekey.invite.proof(mallory.identity.public()).unwrap().to_vec();
-        let env = block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&id, foreign), NOW)).unwrap();
-        let (bob, r) = open_checked(bob, &env, NOW);
-        assert_eq!(r.err(), Some(CoreError::AuthFailed));
-
-        // Expired: refused, nothing changes.
-        let env = block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&id, good.clone()), NOW)).unwrap();
-        let (bob, r) = open_checked(bob, &env, NOW + 600);
-        assert_eq!(r.err(), Some(CoreError::InviteInvalid));
-        assert_eq!(prekeys_present(&bob, &rekey), [true; 4]);
-
-        // Unknown invite id: the message is delivered and nothing is consumed.
-        let env =
-            block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&[0xEE; 16], good.clone()), NOW)).unwrap();
-        let (bob, r) = open_checked(bob, &env, NOW);
-        assert!(matches!(r, Ok(Opened::Message { .. })));
-        assert_eq!(prekeys_present(&bob, &rekey), [true; 4]);
-
-        // Valid proof: delivered, and the invite plus all three prekeys are gone.
-        let env = block_on(alice.seal(&mut rng(), &to_bob, &rekey_intro(&id, good), NOW)).unwrap();
-        let (bob, r) = open_checked(bob, &env, NOW);
-        assert!(matches!(r, Ok(Opened::Message { .. })));
-        assert_eq!(prekeys_present(&bob, &rekey), [false; 4]);
+        // An id without a proof is malformed content, refused before any invite lookup.
+        let mut bob = bob;
+        for (what, content, now) in [
+            ("bad proof", rekey_intro(&id, vec![9; 32]), NOW),
+            ("another identity's proof", rekey_intro(&id, foreign), NOW),
+            ("expired", rekey_intro(&id, good.clone()), NOW + 600),
+            ("unknown invite id", rekey_intro(&[0xEE; 16], good.clone()), NOW),
+            ("valid proof, but over the session", rekey_intro(&id, good), NOW),
+        ] {
+            let env = block_on(alice.seal(&mut rng(), &to_bob, &content, NOW)).unwrap();
+            let (b, r) = open_checked(bob, &env, now);
+            assert_eq!(r.err(), Some(CoreError::InviteInvalid), "{what}");
+            assert_eq!(prekeys_present(&b, &rekey), [true; 4], "{what}");
+            bob = b;
+        }
+        // An ordinary message is not a re-key.
+        let env = block_on(alice.seal(&mut rng(), &to_bob, &text("hi"), NOW)).unwrap();
+        assert!(matches!(
+            block_on(bob.open(&mut rng(), &env, NOW)),
+            Ok(Opened::Message { rekeyed: false, .. })
+        ));
     }
 
     /// Review round 5, R5-3: every secret of an invite, the ML-KEM prekey included, comes from

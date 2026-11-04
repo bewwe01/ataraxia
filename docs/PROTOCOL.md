@@ -56,6 +56,8 @@ A **mailbox** is where others deposit envelopes for you.
 - **Re-keying** (after a restore from backup, §12) uses a **standing re-key invite** (ADR-0021).
   - Each side hands the other one in a `Rekey` message (§7) soon after pairing, and again before it runs out (400 days). A restore's `ContactIntro.rekey` carries a fresh one.
   - It is consumed like any invite and then replaced. The invite record names the one contact (`only_from`) who may redeem it: it never creates a new contact, and another contact cannot consume it.
+  - From a known contact, an introduction naming one of our invites counts as a re-key **only** when it is a `PreKey` message whose signed, Kyber and one-time prekey ids are exactly that invite's, with a valid proof (the checks of §4.3 step 5). One sent over the existing session is refused and changes nothing (review BK-1). An ordinary invite redeemed by a known contact is re-keying too; its delivery token becomes ours for them and the invite is used up (BK-9).
+  - A receiver keeps a re-key invite only if it expires later than the one it holds, since the relay chooses the order (BK-4).
 - Clients MUST verify both prekey signatures (libsignal does; Spike A and the session tests show a forged Kyber signature is rejected). They MUST reject any session message below libsignal message version 4, and any `PreKeySignalMessage` without a Kyber prekey id. **No downgrade to non-PQ X3DH** (INV-CRY-3).
 
 ## 4. Invites and pairing

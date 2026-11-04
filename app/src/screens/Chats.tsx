@@ -205,9 +205,11 @@ function RestoreNotice({ m, name }: { m: MessageView; name: string }) {
     ? `${name} restored Veil from a backup on a new device. Same safety number; messages you sent before this could not be read there.`
     : m.text === "needs-invite"
       ? `You restored Veil from a backup, but ${name} could not be reached. Ask them for a new invite.`
+      : m.text === "no-reply"
+        ? `${name} has not answered since you restored Veil; they may not be getting your messages. Ask them for a new invite.`
       : "You restored Veil from a backup. Messages sent to you since the backup could not be read.";
   return (
-    <div className={`sys-msg${m.mine && m.text === "needs-invite" ? " warning" : ""}`}>
+    <div className={`sys-msg${m.mine && (m.text === "needs-invite" || m.text === "no-reply") ? " warning" : ""}`}>
       <Icon name="refresh" />
       {text}
     </div>

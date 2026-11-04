@@ -311,6 +311,8 @@ export function Restore({ onDone, onBack }: { onDone: () => void; onBack: () => 
             <h1 className="onb-title">Welcome back</h1>
             <p className="muted">Your contacts and messages are back. Each contact you can reach is told you restored Veil; your safety numbers stay the same.</p>
           </div>
+          {/* The Purge PIN belongs to a device and is not in backups (review BK-3). */}
+          <p className="hint">A Purge PIN is not part of a backup: if you used one, set it again in Settings → Security.</p>
           {done.needInvite > 0 ? (
             <Banner tone="warning" icon="alert-triangle">
               <p>{done.needInvite === 1 ? "1 contact" : `${done.needInvite} contacts`} could not be reached from the backup. Ask them for a new invite; their chats say so.</p>

@@ -441,13 +441,19 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
   - That key and the exported file are sealed with XChaCha20-Poly1305 STREAM (as attachments), under `Argon2id(backup code)`. The header is AAD on every chunk.
   - Chunk 0 is a fixed marker, which tells a wrong code from a damaged file.
   - The backup code is generated (160 bits, Crockford base32) rather than chosen, so a stolen file cannot be guessed offline. The phone-sized Argon2 cost is then enough, and a desktop backup opens on a phone.
-  - The code is shown once, kept in the encrypted database, and shown again only after the PIN or password. It never goes to the clipboard (rule 6).
+  - The code is kept in the encrypted database. It is shown with each backup until the user confirms they wrote it down, and afterwards only after the PIN or password. It never goes to the clipboard (rule 6). "Make a new backup code" forgets it, so the next backup gets a new code; older backups keep opening with the old one only.
+  - *Why the webview may show it (rules 2 and 9):* the code is the one secret the user must carry in their head or on paper, so it has to be displayed, and the webview is what displays things. It reaches the webview only as display text in answer to an explicit action (a new backup, or "Show my backup code" after the PIN or password). It is held only in that component's state, which goes when Settings closes or Veil locks. On Android, screenshots and the app-switcher preview are blocked while it is on screen, whatever the screenshot setting. It cannot be wiped from JS memory. That is accepted, because anyone able to read the webview's memory already reads every message on screen. Session keys, the database key and the identity key never go there.
 - *Restore:*
   - Done on a new install, before setup.
   - The relay must still accept the backed-up mailbox. The database is re-keyed into a new vault (new device secret, new PIN or password) and migrated.
   - Each contact's re-key invite is redeemed. Our `ContactIntro` carries a fresh re-key invite for them.
   - The contact's app sees a known contact (same identity key, so the same safety number and no key warning). It updates their mailbox details, marks what it had queued under the old session as failed, writes a "restored" line, and sends us a new re-key invite.
   - Contacts without a re-key invite (paired before this, or never online since) are marked "needs a new invite" in their chat.
+  - Only an introduction that is a `PreKey` message using exactly the prekeys of an invite we hold, with a valid proof, counts as a restore. One sent over the existing session is refused, so a contact cannot fake one (review BK-1).
+  - An invite in the backup may be stale: the contact renewed it, or restored from their own backup. A re-keyed contact who sends nothing back within 7 days is then marked "needs a new invite" too (BK-5). A newer re-key invite replaces an older one, never the reverse, whatever order the relay delivers them in (BK-4).
+  - The restore counts as done once the new vault is written. Re-keying after that is best effort, contact by contact (BK-6).
+  - The Purge PIN belongs to a device and is not restored; the UI says to set it again (BK-3).
+  - A backup made by a newer Veil is refused (BK-12). None is made over 1 GiB, the most a restore takes (BK-8).
 - *Getting the file out:*
   - Android saves through the system "Save as" screen; desktop writes to the Downloads folder. The webview gets only the file name.
   - A restore's file goes from the webview to Rust in base64 parts, like an attachment. It is ciphertext under the code, at most 1 GiB, and wiped once used.

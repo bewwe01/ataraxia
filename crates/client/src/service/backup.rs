@@ -11,7 +11,7 @@ use std::io::Read as _;
 use std::path::Path;
 
 use rand::seq::SliceRandom as _;
-use rusqlite::params;
+use rusqlite::{OptionalExtension as _, params};
 use veil_core::backup::{self as bak, BackupCode};
 use veil_core::content::{Body, ContactIntro, RekeyInvite};
 use veil_core::identity::Address;
@@ -29,6 +29,10 @@ pub const BACKUP_FILE: &str = "backup.vbak";
 pub const EXPORT_FILE: &str = "backup-export.db";
 pub const RESTORE_FILE: &str = "restore.db";
 const CODE_KEY: &str = "backup.code";
+/// Set once the user was shown the backup code after a backup that was saved (review BK-7).
+const CODE_SEEN_KEY: &str = "backup.code_seen";
+/// The largest backup a restore takes, and so the largest one made (review BK-8).
+pub const MAX_BACKUP: u64 = 1024 * 1024 * 1024;
 /// The tag on a queued re-key invite, so a newer one replaces it.
 const TAG: &str = "rekey";
 /// The tag on the introduction a restore sends each contact.
@@ -37,6 +41,12 @@ const RESTORE_TAG: &str = "restore";
 const RENEW_BEFORE_SECS: u64 = 30 * 24 * 3600;
 /// Contacts given a new re-key invite per round (as for profiles).
 const PER_ROUND: usize = 4;
+/// After a re-key invite could not be made or sealed for a contact, the next try waits this
+/// long (review BK-2).
+const RETRY_AFTER_MS: i64 = 60 * 60 * 1000;
+/// A contact re-keyed by our restore who sent nothing back for this long probably cannot read
+/// the new session (their invite was stale): they are marked as needing an invite (BK-5).
+pub const REKEY_ANSWER_MS: i64 = 7 * 24 * 3600 * 1000;
 
 /// A contact as a restore re-keys it: id, address, our token for them, their re-key invite.
 type RekeyRow = (i64, String, Vec<u8>, Option<String>, Option<Vec<u8>>);
@@ -83,6 +93,15 @@ fn sql_path(p: &Path) -> Result<String> {
     Ok(p.to_str().ok_or(ClientError::Storage)?.replace('\'', "''"))
 }
 
+/// Removes what a backup or restore that did not finish (a crash, say) left in the data
+/// directory; all of it is encrypted, but none of it is needed (review BK-16).
+pub(super) fn remove_leftovers(dir: &Path) {
+    remove_db(&dir.join(EXPORT_FILE));
+    remove_db(&dir.join(RESTORE_FILE));
+    let _ = std::fs::remove_file(dir.join(BACKUP_FILE));
+    let _ = std::fs::remove_file(dir.join(format!("{BACKUP_FILE}.tmp")));
+}
+
 /// Removes a file and its `SQLite` side files, if any.
 pub(super) fn remove_db(path: &Path) {
     for ext in ["", "-journal", "-wal", "-shm"] {
@@ -109,7 +128,11 @@ fn strip(conn: &rusqlite::Connection, schema: &str) -> Result<()> {
          UPDATE {schema}.attachments SET state = 'failed', upload_token = NULL WHERE state IN ('upload', 'download');
          DELETE FROM {schema}.attachment_chunks WHERE message IN
            (SELECT message FROM {schema}.attachments WHERE state = 'failed' AND data IS NULL);
-         UPDATE {schema}.contacts SET rekey_mine_until = 0, rekey_mine_id = NULL, profile_sent = NULL, intro = NULL;"
+         UPDATE {schema}.contacts SET rekey_mine_until = 0, rekey_mine_id = NULL, profile_sent = NULL, intro = NULL,
+           rekey_pending_ms = 0, rekey_retry_ms = 0;
+         -- The Purge PIN's tag is per device and not in the backup: the restore makes a random
+         -- one, so the flag must not say a Purge PIN is set (review BK-3).
+         INSERT OR REPLACE INTO {schema}.settings (k, v) VALUES ('purge_set', x'00');"
     ))?;
     Ok(())
 }
@@ -131,16 +154,24 @@ fn export_to(db: &Db, path: &Path, key: &[u8; 32]) -> Result<()> {
         crate::db::hex(&key[..]).as_str()
     ));
     conn.execute_batch(&attach)?;
+    // Deleted rows are overwritten, not left in free pages (SQLite copies the main database's
+    // setting at ATTACH; this does not rely on it), and the VACUUM below leaves no free pages
+    // at all (review BK-10, INV-BAK-1).
     let r = conn
-        .query_row("SELECT sqlcipher_export('bak')", [], |_| Ok(()))
+        .execute_batch("PRAGMA bak.secure_delete = ON;")
         .map_err(ClientError::from)
+        .and_then(|()| {
+            conn.query_row("SELECT sqlcipher_export('bak')", [], |_| Ok(()))
+                .map_err(ClientError::from)
+        })
         // The export copies tables, not the schema version, which the migrations go by.
         .and_then(|()| {
             let v: i64 = conn.query_row("PRAGMA main.user_version", [], |r| r.get(0))?;
             conn.execute_batch(&format!("PRAGMA bak.user_version = {v};"))?;
             Ok(())
         })
-        .and_then(|()| strip(conn, "bak"));
+        .and_then(|()| strip(conn, "bak"))
+        .and_then(|()| Ok(conn.execute_batch("VACUUM bak;")?));
     let _ = conn.execute_batch("DETACH DATABASE bak;");
     r
 }
@@ -152,15 +183,18 @@ impl Actor {
     /// on every retry tick; at most [`PER_ROUND`] contacts a round, in random order.
     pub(super) async fn sync_rekeys(&self) {
         let Ok(s) = self.s() else { return };
+        let _ = self.expire_rekeys();
         let horizon = i64::try_from(now_secs().saturating_add(RENEW_BEFORE_SECS)).unwrap_or(i64::MAX);
+        // Not to contacts we have no session with (they need an invite from us first), nor
+        // again soon after a try failed: each try makes an invite with fresh prekeys (BK-2).
         let Ok(mut due) =
             s.db.conn()
                 .prepare(
                     "SELECT id FROM contacts WHERE blocked = 0 AND key_warning = 0 AND intro IS NULL
-                 AND rekey_mine_until < ?1",
+                 AND needs_invite = 0 AND rekey_mine_until < ?1 AND rekey_retry_ms <= ?2",
                 )
                 .and_then(|mut st| {
-                    st.query_map([horizon], |r| r.get::<_, i64>(0))?
+                    st.query_map(params![horizon, now_ms()], |r| r.get::<_, i64>(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()
                 })
         else {
@@ -169,8 +203,51 @@ impl Actor {
         due.shuffle(&mut rng());
         due.truncate(PER_ROUND);
         for contact in due {
-            let _ = self.give_rekey(contact).await;
+            if self.give_rekey(contact).await.is_err() {
+                let _ = s.db.conn().execute(
+                    "UPDATE contacts SET rekey_retry_ms = ?2 WHERE id = ?1",
+                    params![contact, now_ms().saturating_add(RETRY_AFTER_MS)],
+                );
+            }
         }
+    }
+
+    /// Contacts our restore re-keyed who sent nothing back in [`REKEY_ANSWER_MS`]: their
+    /// re-key invite was probably stale, so they never got the new session. They are marked
+    /// as needing an invite, with a line in the chat (review BK-5).
+    fn expire_rekeys(&self) -> Result<()> {
+        let s = self.s()?;
+        let before = now_ms().saturating_sub(REKEY_ANSWER_MS);
+        let due: Vec<i64> =
+            s.db.conn()
+                .prepare("SELECT id FROM contacts WHERE rekey_pending_ms > 0 AND rekey_pending_ms <= ?1")?
+                .query_map([before], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+        for contact in due {
+            let conn = s.db.conn();
+            conn.execute_batch("SAVEPOINT rekey_expire;")?;
+            let r = conn
+                .execute(
+                    "UPDATE contacts SET rekey_pending_ms = 0, needs_invite = 1 WHERE id = ?1",
+                    [contact],
+                )
+                .and_then(|_| {
+                    conn.execute(
+                        "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', 'no-reply', ?2, 'sent')",
+                        params![contact, now_ms()],
+                    )
+                });
+            match r {
+                Ok(_) => conn.execute_batch("RELEASE rekey_expire;")?,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK TO rekey_expire; RELEASE rekey_expire;");
+                    return Err(e.into());
+                }
+            }
+            self.emit(ChangeKind::Messages, Some(contact));
+            self.emit(ChangeKind::Contacts, Some(contact));
+        }
+        Ok(())
     }
 
     /// A new re-key invite for one contact, queued to them; the one before is revoked.
@@ -182,11 +259,13 @@ impl Actor {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
         let addr = Address::parse(&address).map_err(|_| ClientError::Storage)?;
-        let created = self.new_rekey(&addr, &my_token).await?;
+        // All in one savepoint: an invite that cannot be sealed to the contact is not kept
+        // (review BK-2).
         let id = self
             .atomically(async {
+                let created = self.new_rekey(&addr, &my_token).await?;
                 if let Some(old) = old.as_deref().and_then(|o| <[u8; 16]>::try_from(o).ok()) {
-                    s.account.revoke_invite(&old).await?;
+                    revoke_quietly(&s.account, &old).await?;
                 }
                 s.db.conn().execute(
                     "DELETE FROM messages WHERE contact = ?1 AND mine = 1 AND kind = 'control' AND body = ?2",
@@ -196,7 +275,7 @@ impl Actor {
                     .queue_control_as(contact, Body::Rekey(created.0), None, TAG)
                     .await?;
                 s.db.conn().execute(
-                    "UPDATE contacts SET rekey_mine_until = ?2, rekey_mine_id = ?3 WHERE id = ?1",
+                    "UPDATE contacts SET rekey_mine_until = ?2, rekey_mine_id = ?3, rekey_retry_ms = 0 WHERE id = ?1",
                     params![
                         contact,
                         i64::try_from(created.1).unwrap_or(i64::MAX),
@@ -243,10 +322,19 @@ impl Actor {
         let Some(theirs) = s.account.contact_identity(address)? else {
             return Ok(());
         };
-        if check_rekey(r, &theirs.serialize(), &s.pin, now_secs()).is_some() {
+        if let Some(inv) = check_rekey(r, &theirs.serialize(), &s.pin, now_secs()) {
+            // Only a newer invite replaces the one we hold: the relay chooses the order, and
+            // an older one is already revoked (review BK-4). Never from a contact under a key
+            // warning (BK-15, INV-ID-2).
             s.db.conn().execute(
-                "UPDATE contacts SET rekey_link = ?2, rekey_sealed = ?3, needs_invite = 0 WHERE id = ?1",
-                params![contact, r.link, r.sealed_package],
+                "UPDATE contacts SET rekey_link = ?2, rekey_sealed = ?3, rekey_until = ?4, needs_invite = 0
+                 WHERE id = ?1 AND key_warning = 0 AND rekey_until < ?4",
+                params![
+                    contact,
+                    r.link,
+                    r.sealed_package,
+                    i64::try_from(inv.expires_at).unwrap_or(i64::MAX)
+                ],
             )?;
         }
         Ok(())
@@ -256,7 +344,7 @@ impl Actor {
     /// `process`'s transaction). Same identity key, so the same contact and safety number;
     /// what we queued for them under the old session can no longer be read, so it is marked
     /// failed, and they get a new re-key invite and our profile again.
-    pub(super) fn receive_restore(
+    pub(super) async fn receive_restore(
         &self,
         contact: i64,
         address: &Address,
@@ -264,6 +352,32 @@ impl Actor {
     ) -> Result<()> {
         let s = self.s()?;
         let conn = s.db.conn();
+        // They may have used an older invite of ours, or an ordinary one: the re-key invite we
+        // gave them last is not kept for 400 days for nothing (review BK-11).
+        let old: Option<Vec<u8>> = conn.query_row(
+            "SELECT rekey_mine_id FROM contacts WHERE id = ?1",
+            [contact],
+            |r| r.get(0),
+        )?;
+        if let Some(old) = old.as_deref().and_then(|o| <[u8; 16]>::try_from(o).ok()) {
+            revoke_quietly(&s.account, &old).await?;
+        }
+        // An ordinary invite (asked for after a restore that could not reach us): its token
+        // is the one they deliver with now, so it becomes ours for them, and the invite is
+        // used up, as for a new contact. A re-key invite has no row here (review BK-9).
+        let invite_id = intro.invite_id.clone().unwrap_or_default();
+        let token: Option<Vec<u8>> = conn
+            .query_row("SELECT token FROM invites WHERE id = ?1", [&invite_id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if let Some(token) = token {
+            conn.execute(
+                "UPDATE contacts SET my_token = ?2 WHERE id = ?1",
+                params![contact, arr32(&token)?.to_vec()],
+            )?;
+            conn.execute("DELETE FROM invites WHERE id = ?1", [&invite_id])?;
+        }
         if let (Ok(mailbox), Ok(token)) = (arr32(&intro.mailbox_id), arr32(&intro.delivery_token)) {
             conn.execute(
                 "UPDATE contacts SET mailbox = ?2, token = ?3 WHERE id = ?1",
@@ -300,14 +414,18 @@ impl Actor {
     /// user. The first backup makes the backup code and returns it to be written down.
     pub(super) fn create_backup(&self) -> Result<BackupView> {
         let s = self.s()?;
-        let (code, new) = if let Some(c) = s.db.setting(CODE_KEY)? {
+        let code = if let Some(c) = s.db.setting(CODE_KEY)? {
             let c = core::str::from_utf8(&c).map_err(|_| ClientError::Storage)?;
-            (BackupCode::parse(c).map_err(|_| ClientError::Storage)?, false)
+            BackupCode::parse(c).map_err(|_| ClientError::Storage)?
         } else {
             let c = BackupCode::generate(&mut rng());
             s.db.set_setting(CODE_KEY, c.expose().as_bytes())?;
-            (c, true)
+            s.db.set_setting(CODE_SEEN_KEY, &[0])?;
+            c
         };
+        // Shown until the UI says the user saw it with a saved backup, not just once: a
+        // backup that failed or was not saved must not swallow the code (review BK-7).
+        let new = s.db.setting(CODE_SEEN_KEY)?.is_none_or(|v| v.as_slice() != [1]);
         let export = self.dir.join(EXPORT_FILE);
         remove_db(&export);
         let mut key = Zeroizing::new([0u8; 32]);
@@ -325,18 +443,48 @@ impl Actor {
             )?;
             let out = w.into_inner().map_err(|_| ClientError::Storage)?;
             out.sync_all().map_err(|_| ClientError::Storage)?;
-            drop(out);
-            std::fs::rename(&tmp, self.dir.join(BACKUP_FILE)).map_err(|_| ClientError::Storage)?;
-            std::fs::metadata(self.dir.join(BACKUP_FILE))
+            let bytes = out
+                .metadata()
                 .map(|m| m.len())
-                .map_err(|_| ClientError::Storage)
+                .map_err(|_| ClientError::Storage)?;
+            drop(out);
+            // One a restore would refuse is not made at all (review BK-8).
+            if bytes > MAX_BACKUP {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(ClientError::BackupTooLarge);
+            }
+            std::fs::rename(&tmp, self.dir.join(BACKUP_FILE)).map_err(|_| ClientError::Storage)?;
+            Ok(bytes)
         });
         remove_db(&export);
+        if r.is_err() {
+            let _ = std::fs::remove_file(self.dir.join(format!("{BACKUP_FILE}.tmp")));
+        }
         let bytes = r?;
         Ok(BackupView {
             code: new.then(|| code.display().to_string()),
             bytes,
         })
+    }
+
+    /// The user saw the backup code with a saved backup: later backups no longer show it.
+    pub(super) fn backup_code_seen(&self) -> Result<()> {
+        let s = self.s()?;
+        if s.db.setting(CODE_KEY)?.is_some() {
+            s.db.set_setting(CODE_SEEN_KEY, &[1])?;
+        }
+        Ok(())
+    }
+
+    /// Forgets the backup code: the next backup makes and shows a new one. Backups made
+    /// before still open with the old code only (review BK-14).
+    pub(super) fn new_backup_code(&self) -> Result<()> {
+        let s = self.s()?;
+        s.db.conn().execute(
+            "DELETE FROM settings WHERE k IN (?1, ?2)",
+            params![CODE_KEY, CODE_SEEN_KEY],
+        )?;
+        Ok(())
     }
 
     /// The backup code, for "Show my backup code" (after the user's PIN or password).
@@ -403,7 +551,12 @@ impl Actor {
         let rows: Vec<RekeyRow> =
             s.db.conn()
                 .prepare(
-                    "SELECT id, address, my_token, rekey_link, rekey_sealed FROM contacts WHERE blocked = 0",
+                    // A contact under a key warning is not re-keyed (review BK-15, INV-ID-2):
+                    // their invite is dropped below, and they need a new one.
+                    "SELECT id, address, my_token,
+                       CASE WHEN key_warning = 0 THEN rekey_link END,
+                       CASE WHEN key_warning = 0 THEN rekey_sealed END
+                     FROM contacts WHERE blocked = 0",
                 )?
                 .query_map([], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
@@ -422,15 +575,12 @@ impl Actor {
                     .is_ok(),
                 _ => false,
             };
-            let conn = s.db.conn();
             if !ok {
                 view.need_invite = view.need_invite.saturating_add(1);
-                conn.execute("UPDATE contacts SET needs_invite = 1 WHERE id = ?1", [contact])?;
             }
-            conn.execute(
-                "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', ?2, ?3, 'sent')",
-                params![contact, if ok { "" } else { "needs-invite" }, now_ms()],
-            )?;
+            // Best effort: the restore is done, and one contact's row is no reason to stop
+            // (review BK-6).
+            let _ = mark_restored(s.db.conn(), contact, ok);
         }
         self.emit(ChangeKind::Contacts, None);
         Ok(view)
@@ -471,9 +621,9 @@ impl Actor {
                     return Err(ClientError::InviteInvalid);
                 }
                 s.db.conn().execute(
-                    "UPDATE contacts SET rekey_link = NULL, rekey_sealed = NULL, needs_invite = 0,
-                       rekey_mine_until = ?2, rekey_mine_id = ?3 WHERE id = ?1",
-                    params![contact, i64::try_from(until).unwrap_or(i64::MAX), id.to_vec()],
+                    "UPDATE contacts SET rekey_link = NULL, rekey_sealed = NULL, rekey_until = 0, needs_invite = 0,
+                       rekey_mine_until = ?2, rekey_mine_id = ?3, rekey_pending_ms = ?4 WHERE id = ?1",
+                    params![contact, i64::try_from(until).unwrap_or(i64::MAX), id.to_vec(), now_ms()],
                 )?;
                 s.db.conn().execute(
                     "INSERT INTO messages (contact, mine, kind, body, at_ms, status, envelope)
@@ -485,5 +635,29 @@ impl Actor {
             .await?;
         self.deliver(row).await;
         Ok(())
+    }
+}
+
+/// The chat line after our restore, and the contact marked when they could not be reached.
+fn mark_restored(conn: &rusqlite::Connection, contact: i64, reached: bool) -> Result<()> {
+    if !reached {
+        conn.execute("UPDATE contacts SET needs_invite = 1 WHERE id = ?1", [contact])?;
+    }
+    conn.execute(
+        "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', ?2, ?3, 'sent')",
+        params![contact, if reached { "" } else { "needs-invite" }, now_ms()],
+    )?;
+    Ok(())
+}
+
+/// Revokes one of our invites; one already gone (used, expired and swept) is not an error
+/// (review BK-11), or a single missing record would block every later renewal.
+async fn revoke_quietly(
+    account: &veil_core::account::Account<crate::db::SqlBackend>,
+    id: &[u8; 16],
+) -> Result<()> {
+    match account.revoke_invite(id).await {
+        Ok(()) | Err(veil_core::CoreError::InviteInvalid) => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
