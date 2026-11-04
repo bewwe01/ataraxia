@@ -6755,3 +6755,299 @@ and map it in `restore_inner` to an error saying "made by a newer Veil".
 ---
 
 **Recommended next step:** fix BK-1, BK-2 and BK-3, each with a regression test, then BK-4 to BK-10, and re-run the review gate. No files were edited.
+
+---
+
+## Backup and restore (milestone 7) review, round 2 (2026-11-04)
+
+**Scope:** I reviewed the fixes in `git diff 33d2160 f49e8e5`, 17 files, +1224/−116, and read the full current versions of the changed files. Around the changed code I read:
+- `crates/core/src/backup.rs`
+- `crates/core/src/account.rs`: `open`, `transact`, `consume_invite_if_proven`, `revoke_invite`, `delete_invite`
+- `crates/core/src/store.rs`: the overlay, `commit` and `rollback`
+- `crates/client/src/db.rs`: `migrate`, `Db::open`, `SqlBackend::apply`
+- `crates/client/src/service.rs`: `restore`, `restore_inner`, `open_session`, `process_inner`, `receive`, `accept_invite`, `atomically`, `on_tick`, `sync`, `message_row`, the test hooks
+- `crates/client/src/service/backup.rs`, all of it
+- `crates/client/tests/backup.rs`
+- `app/src-tauri/src/lib.rs`: `restore_part`, `create_backup`, `backup_code_on_screen`, `set_screenshots_allowed`
+- `app/src-tauri/src/native.rs` and `app/android/VeilNativePlugin.kt`: `setScreenshotsAllowed`, `screenshotsAllowed`
+- `app/src/components/Backup.tsx`, `app/src/screens/Settings.tsx`, `app/src/screens/Chats.tsx`, `app/src/screens/Onboarding.tsx`, `app/src/ipc.ts`
+- docs: ADR-0021, PROTOCOL §3, INV-BAK-1 and INV-BAK-2
+
+I did not edit any files.
+
+**Commands run (all pass):**
+- `CARGO_INCREMENTAL=0 cargo test -p veil-core --lib pairing_tests`: 5 passed, including `known_contact_rekey_invite_paths` and `rekey_invites_serve_only_their_contact`.
+- `CARGO_INCREMENTAL=0 cargo test -p veil-client --test backup`: 4 passed (`a_restored_backup_keeps_identity_contacts_and_history`, `a_contact_cannot_fake_a_restore`, `a_stale_rekey_invite_ends_as_needs_invite`, `a_new_invite_after_a_restore_outlives_its_ttl`), in 47.6 s.
+
+**Verdict: FAIL.** 1 High, 3 Medium, 6 Low are open. All 16 round 1 findings were addressed: 14 are Fixed and 2 are Partially fixed (BK-6, BK-14).
+
+---
+
+## Status of the round 1 findings
+
+| ID | Status | Notes and regression test |
+|---|---|---|
+| BK-1 | **Fixed** | `consume_invite_if_proven` now returns `Result<bool>`. An introduction that names an invite is refused (`InviteInvalid`, which rolls back the whole `transact`, so the ratchet does not advance either) in these cases: a missing proof, a missing record, a ciphertext that is not a `PreKeySignalMessage`, or prekey ids (signed, Kyber, one-time) that differ from the record's. On top of that come the existing checks: expiry, `only_from` and the proof. `rekeyed` reaches the client through `Opened::Message`, and the client acts only on `ContactIntro if rekeyed`. `receive()` no longer has a `ContactIntro` arm, so other introductions fall into `_ => {}`. **The tests would fail without the fix:** the core loop's case "valid proof, but over the session" passed under the old code, and in `a_contact_cannot_fake_a_restore` the old code would have written a "restored" row and moved Bob's mailbox to `[7;32]`, so "still here" would never arrive. |
+| BK-2 | **Fixed** | `new_rekey` is now inside `atomically`. I checked that the core keeps no state outside SQL that a rollback could miss: `VeilStore` only has an overlay that is cleared on commit, and `SqlBackend::apply` nests `SAVEPOINT kv_apply`. `sync_rekeys` skips `needs_invite = 1` contacts and sets a one-hour back-off (`rekey_retry_ms`) after a failure. **The test would fail without the fix:** the count of `inv/` keys over 12 s would grow for Carol. The back-off itself has no test of its own. |
+| BK-3 | **Fixed** | Both places now clear the flag: `strip` writes `purge_set = 0`, and `restore_inner` calls `set_setting("purge_set", [0])` before the re-key. The Onboarding screen shows a hint to set the Purge PIN again. **Tested both ways:** the backup holds no `purge_set = 1`, and `security().purge_set` is false after the restore. |
+| BK-4 | **Fixed** | `rekey_until` is the authenticated `expires_at`, and the update has the guard `WHERE ... rekey_until < ?4`. **The test would fail without the guard:** the far-future value would be overwritten. A residual clock-skew issue is BK2-9. |
+| BK-5 | **Fixed** | Contacts re-keyed by a restore get `rekey_pending_ms`. Any message we decrypt from them clears it. After 7 days `expire_rekeys` sets `needs_invite` and writes a "no-reply" line. **The test would fail without the fix.** A false-positive case is BK2-7. |
+| BK-6 | **Partially** | Errors after the header write no longer wipe the device, and each contact's re-keying is best effort. But a crash, or an `open_session` error, between the header write and the end of `rekey_all` leaves a restore that never finishes and gives no sign of it (BK2-2). No test. |
+| BK-7 | **Fixed** | A `backup.code_seen` flag is set only by `backup_code_seen()`, which runs when the user taps "I wrote it down". Until then every backup returns the code. **Tested.** |
+| BK-8 | **Fixed** | `MAX_BACKUP` is now shared between the client and the shell, and `create_backup` refuses an oversized file with `BackupTooLarge` and removes the temp file. No test (Low, BK2-10). |
+| BK-9 | **Fixed** | In the known-contact re-key branch, a matching `invites` row moves its token into `my_token` and the row is deleted. **The test would fail without the fix:** the invite count would be 1, and after the TTL the token would be removed, so "a week later" would never arrive. A leftover token is BK2-8. |
+| BK-10 | **Fixed** | The export now runs `PRAGMA bak.secure_delete = ON`, then `strip`, then `VACUUM bak`. The test opens the decrypted backup and checks every `NOT_BACKED_UP` prefix, `invites`, envelopes, `intro`, `freelist_count = 0` and `purge_set`. The VACUUM's cost is BK2-6. |
+| BK-11 | **Fixed** | `receive_restore` revokes the old `rekey_mine_id`. `revoke_quietly` treats a record that is already gone (`InviteInvalid`) as success, in both places that revoke. No test of its own. |
+| BK-12 | **Fixed** | `migrate` returns `NewerVersion` before touching anything, but see BK2-10 on ordering and the missing test. |
+| BK-13 | **Fixed** | Each file name is created with `create_new(true)` (O_EXCL, so a symlink in the final component is not followed). It retries on `AlreadyExists` up to 1000 names, runs `write_all` and `sync_all`, and removes the file on failure. |
+| BK-14 | **Partially** | Added: "Make a new backup code", the ADR argument for showing the code in the webview, and the Android screenshot guard. Two new defects come with it: the new action skips the PIN gate (BK2-1), and the guard can restore an out-of-date screenshot setting (BK2-3). |
+| BK-15 | **Fixed** | `rekey_all` uses `CASE WHEN key_warning = 0` and so counts such contacts as needing an invite. `receive_rekey` has the guard `key_warning = 0`. |
+| BK-16 | **Fixed** | `remove_leftovers` runs at `Actor::run`, and the `.tmp` file is removed on error. The error text now reads "or the start of the file is damaged". |
+
+---
+
+## Findings
+
+### BK2-1 (High, HIGH confidence): "Make a new backup code" skips the PIN or password gate, so anyone holding the unlocked phone gets a working code plus backup, which together are the whole account
+
+**Where:**
+- `crates/client/src/service.rs:1658` (`Cmd::NewBackupCode(r) => r.send(self.new_backup_code())`)
+- `crates/client/src/service/backup.rs:481-488` (`new_backup_code`)
+- `crates/client/src/service/backup.rs:430-437` (`create_backup` returns the code whenever `code_seen` is unset)
+- `app/src/components/Backup.tsx` (`renew()`)
+
+**Problem:**
+- ADR-0021 lets the code be shown again only after the PIN or password: `Cmd::BackupCode` goes through `verify_current`, with its delays and attempt counters. That gate exists for someone who has the unlocked phone for a short time.
+- `new_backup_code` deletes `backup.code` and `backup.code_seen` with no check at all. The next `create_backup`, which has no gate either, then makes a new code and returns it in `BackupView.code`. On desktop the file goes to Downloads; on Android it goes wherever the person picks.
+- So with an unlocked phone and no PIN, someone can tap "Make a new backup code", then "Back up now", and leave with:
+  - a backup file that holds the identity key, the mailbox key, every contact's re-key invite and the full history;
+  - the code that opens it.
+- Restoring it elsewhere redeems every contact's re-key invite. The contacts then move their sessions to the attacker's device, which they see as "X restored Veil", with the same safety number and no key warning.
+- The same bypass also wipes out, without asking, the code the legitimate user wrote down for future backups.
+
+**Fix:**
+- Gate it like `BackupCode`:
+  ```rust
+  Cmd::NewBackupCode(current, r) => {
+      let res = self.verify_current(&current).and_then(|()| self.new_backup_code());
+      let _ = r.send(res);
+  }
+  ```
+  Use `new_backup_code(current: Zeroizing<String>)` in `Client`, the Tauri command and `ipc.ts`, and add a `SecretField` to the "New code" panel.
+- Add a test to `tests/backup.rs`: `new_backup_code` with a wrong password fails, and the next backup's `code` is `None`.
+- Write the reasoning into ADR-0021 / INV-BAK-1: the code is shown without the PIN only for the very first backup, and only until it is acknowledged.
+
+### BK2-2 (Medium, HIGH confidence): a restore that stops after the header write never re-keys anyone and never tells the user
+
+**Where:** `crates/client/src/service.rs:2120-2130` (`restore` after `restore_inner`), `crates/client/src/service/backup.rs:549-588` (`rekey_all`).
+
+**Problem:**
+- Once `write_atomic(HEADER_FILE)` has run, the state is no longer `New`. Re-keying then runs only once, inside this one call:
+  - `open_session(&key).await?` returns early on an error;
+  - `rekey_all` runs one contact at a time and does a network `deliver` for each, so with many contacts it takes a while;
+  - the app can be killed, or the user can leave, during that time.
+- In any of these cases the contacts that were not reached stay in a broken state:
+  - `rekey_link` is still set and `needs_invite = 0`;
+  - there is no "restored" line, and no session exists.
+- `rekey_all` is never called again: `open_session` and unlock do not call it.
+- `sync_rekeys` then tries `give_rekey` for them every hour. It fails each time with `NoSession`, which is harmless but useless.
+- The user sees "The restore failed" when it was `open_session` that failed. Retrying gives `AlreadySetUp`; unlocking works, but those contacts are silently unreachable and nothing says so. This is the outcome BK-5/BK-6 meant to prevent.
+
+**Fix:**
+- In `restore_inner`, before the `PRAGMA rekey`, set a durable flag: `db.set_setting("restore.rekey_due", &[1])`.
+- At the end of `open_session`, run `rekey_all` while the flag is set, and clear it when `rekey_all` returns. `rekey_one` already sets `rekey_link = NULL` when it succeeds, so a second run must only skip contacts whose `rekey_pending_ms > 0` or who already have a restored line.
+- On an `open_session` error after the header, return `Ok(RestoreView { .. })` together with a "locked, unlock to finish" state, not `Err`.
+- Add a test: use a test hook to make `rekey_all` fail after the first contact (or skip it), lock, unlock, and assert that the remaining contacts are re-keyed or marked `needs_invite`.
+
+### BK2-3 (Medium, HIGH confidence): the Android screenshot guard can bring back a stale "allowed" over the user's newer choice to block
+
+**Where:**
+- `app/src-tauri/src/lib.rs:565-592` (`backup_code_on_screen`, `CodeOnScreen`)
+- `app/src-tauri/src/lib.rs:202-209` (`set_screenshots_allowed`)
+- `app/src/screens/Settings.tsx:342` and `:417`: the "Block screenshots" toggle and `BackupCard` are on the same screen
+
+**Problem:**
+- `setScreenshotsAllowed` in `VeilNativePlugin.kt:571` both saves the user's choice (`ALLOW_SCREENSHOTS`) and sets `FLAG_SECURE`.
+- Step by step:
+  1. Screenshots are allowed when the code appears. The guard stores `Some(true)` and saves `false`.
+  2. The Settings toggle still shows "allowed", because `native_info` was read before the code appeared.
+  3. The user taps "Block screenshots". `set_screenshots_allowed(false)` saves `false`.
+  4. The code is dismissed ("I wrote it down", or leaving Settings). The guard calls `set_screenshots_allowed(true)`.
+- The user's explicit "block" is undone without a word. Screenshots and the recent-apps preview are on again while the toggle shows "Block screenshots" as on. That is a security setting the UI misreports, the same kind of mismatch as BK-3.
+- Two smaller effects:
+  - The toggle misreports the state the whole time the code is shown.
+  - If the app is killed while the code is shown, the saved preference stays at `false`. That errs on the safe side, but it is not what the comment says.
+
+**Fix:**
+- Make the user's toggle the one that wins. In `set_screenshots_allowed`, take `CodeOnScreen`:
+  ```rust
+  let mut was = guard.0.lock().await;
+  if was.is_some() {
+      *was = Some(allow);                       // applied when the code goes
+      if allow { return Ok(()); }               // keep FLAG_SECURE while it shows
+  }
+  native::set_screenshots_allowed(&app, allow).await.map_err(native_err)
+  ```
+- Better still, give the plugin a non-persisting `setSecureOverride(bool)` that only changes `FLAG_SECURE`, so the saved preference is never written by the guard.
+- Call `refresh()` in Settings when the code is dismissed.
+
+### BK2-4 (Medium, MEDIUM confidence): `expire_rekeys` opens a savepoint per contact but does not roll back when RELEASE fails, so a transaction can stay open across the tick
+
+**Where:** `crates/client/src/service/backup.rs:216-242`.
+
+**Problem:**
+- When no transaction is open, `SAVEPOINT rekey_expire` starts one, and `RELEASE` commits it.
+- If that commit fails (`SQLITE_FULL` with disk tight, or `SQLITE_BUSY`), `conn.execute_batch("RELEASE rekey_expire;")?` returns early with the transaction still open, as SQLite keeps it open when the COMMIT fails.
+- Every write after that in the tick sits in a transaction that never commits: `cleanup_invites` on the next tick, `set_setting("last_seq")` in `sync`, and the `rekey_retry_ms` update.
+- The next `atomically` notices that the connection is not in autocommit mode and rolls back all of it (P4R2-2). The rollback includes a `last_seq` that `sync` has already acknowledged to the relay, so envelopes the relay has dropped are fetched again. Usually that is harmless, because libsignal rejects the duplicates.
+- `atomically` and `kv_apply` both handle this case correctly; this new savepoint does not, so it is inconsistent with them.
+
+**Fix:**
+- Mirror `atomically`:
+  ```rust
+  let end = if r.is_ok() { "RELEASE rekey_expire" } else { "ROLLBACK TO rekey_expire; RELEASE rekey_expire" };
+  if conn.execute_batch(end).is_err() || !conn.is_autocommit() {
+      if !conn.is_autocommit() { let _ = conn.execute_batch("ROLLBACK"); }
+      return Err(ClientError::Storage);
+  }
+  ```
+- Or simpler: make `expire_rekeys` async and wrap its body in `self.atomically(...)`.
+
+### BK2-5 (Low, HIGH confidence): migration 7 was edited in place
+
+**Where:** `crates/client/src/db.rs:148-162`.
+
+**Problem:**
+- Any database at `user_version = 7` made by 33d2160 lacks `rekey_until`, `rekey_pending_ms` and `rekey_retry_ms`. On such a database:
+  - `receive_rekey` fails with `Storage`. `sync` treats `Storage` as transient and never acknowledges it, so a single `Rekey` blocks the inbox for good;
+  - `sync_rekeys` fails silently.
+- 33d2160 is in no tag (`git tag --contains` is empty; the newest tag is v0.1.0-preview.4), so only development databases are affected.
+- There is no `migrates_a_version_6_database` test.
+
+**Fix:**
+- Keep it as is only if no build of 33d2160 went out, and say so in TEST_REPORT. Otherwise add the three columns as migration 8.
+- Either way, add `db::tests::migrates_a_version_6_database`.
+
+### BK2-6 (Low, MEDIUM confidence): `VACUUM bak` builds a full copy in memory
+
+**Where:** `crates/client/src/service/backup.rs:165`, `db.rs:219` (`temp_store = MEMORY`).
+
+**Problem:**
+- VACUUM builds its transient database as a temp database, so with `temp_store = MEMORY` its pages live in RAM. Backing up a database close to `MAX_BACKUP` therefore needs up to about 1 GiB more RAM on the phone, on top of the full-file buffer in `take_backup`. Low-end Android phones can kill the app for this, and then no backup can be made.
+- For confidentiality the VACUUM adds little. `secure_delete` already zeroes freed pages, and they sit under the export's key, inside a file sealed under the code.
+
+**Fix:** pick one of these:
+- run `PRAGMA bak.auto_vacuum = FULL` on the empty attached database before `sqlcipher_export`, so deletes shrink the file without a full copy, and drop the `VACUUM`;
+- keep `VACUUM`, and change the test assertion from `freelist_count = 0` to "free pages are all zero".
+
+### BK2-7 (Low, HIGH confidence): the "no-reply" mark is a false positive when the contact is simply offline for a week, and its warning line stays
+
+**Where:** `crates/client/src/service/backup.rs:216-242`, `service.rs:3629-3631`.
+
+**Problem:**
+- A contact who keeps their phone off for 7 days (a holiday, say) gets `needs_invite = 1` and the warning "they may not be getting your messages".
+- When they come back, their `Rekey` (sent by `receive_restore`) clears `needs_invite`. A message from them clears only `rekey_pending_ms`.
+- The warning line stays in the chat for good, and may send the user off to swap invites for no reason.
+
+**Fix:**
+- A message we decrypt proves the new session works, so clear both flags in `process_inner`:
+  ```sql
+  UPDATE contacts SET rekey_pending_ms = 0, needs_invite = 0 WHERE id = ?1
+  ```
+- Optionally delete or replace the "no-reply" line at that point.
+
+### BK2-8 (Low, HIGH confidence): BK-9 leaves the contact's old delivery token registered at the relay
+
+**Where:** `crates/client/src/service/backup.rs:383-390`.
+
+**Problem:** when an ordinary invite's token replaces `my_token`, the old `my_token` is never removed at the relay. It is still a valid way to deposit into our mailbox: it was held by the lost device and it is in the backup.
+
+**Fix:** read the old `my_token` first and call `queue_token_removal(&old)` inside the same transaction, as `cleanup_invites` does.
+
+### BK2-9 (Low, MEDIUM confidence): after a contact's restore, the guard "only a newer re-key invite" can turn down their fresh one
+
+**Where:** `crates/client/src/service/backup.rs:322-336`, called from `receive_restore:403`.
+
+**Problem:**
+- After a contact restores, any re-key invite we hold from them is certainly dead: their prekeys were stripped from the backup.
+- Their fresh `intro.rekey` is still compared with the old `rekey_until`. The two expiries come from different devices' clocks. If the restored device's clock runs behind by more than the time since the old invite was issued (for example, they paired the day before), the fresh invite is refused and the dead one is kept.
+- The next restore then fails for that contact, and only BK-5's 7-day rule catches it.
+
+**Fix:** in `receive_restore`, before calling `receive_rekey`, run:
+```sql
+UPDATE contacts SET rekey_link = NULL, rekey_sealed = NULL, rekey_until = 0 WHERE id = ?1
+```
+
+### BK2-10 (Low): several fixes have no test, and one claim is out of order
+
+**Problem:**
+- BK-12: `Db::open` runs `execute_batch(SCHEMA)` (`CREATE ... IF NOT EXISTS`) before `migrate`'s newer-version check. A newer database can therefore be changed before it is refused, so the comment "nothing is touched" is not true.
+- No test covers:
+  - `NewerVersion` (BK-12);
+  - `BackupTooLarge` (BK-8);
+  - the BK-2 back-off;
+  - `revoke_quietly` (BK-11).
+  CLAUDE.md rule 9 asks for a test, or a written argument, for each.
+
+**Fix:**
+- Move the version check into `Db::open`, before `SCHEMA`.
+- Add `db::tests::refuses_a_newer_database`, with `user_version = MIGRATIONS.len() + 1`, and a restore of such a backup that expects `NewerVersion` and leaves Veil new.
+- Add a client test where `give_rekey` fails and the contact's `rekey_retry_ms` is set into the future.
+
+---
+
+## Checked and found correct
+
+**BK-1 path (hostile contact or relay):**
+- The relay cannot trigger `rekeyed`. It needs a `PreKeySignalMessage` that decrypts under a known contact's identity key, plus a proof bound to that key.
+- A contact can trigger it only by actually redeeming an invite we gave them, which is the same power the design already gives them.
+- A Whisper message, a made-up id, an id without a proof (or a proof without an id), the wrong prekey ids, an expired invite, the wrong `only_from` and a bad proof are all refused. The refusal rolls back the decrypt, then the message is acknowledged and dropped (`Protocol`), so it cannot stall the inbox.
+- `ContactIntro` with `(None, None)` from a known contact is ignored by `receive()`.
+- A blocked contact's restore is ignored. The core still consumes the invite, and `revoke_quietly` copes with that later.
+
+**Transactions:**
+- `atomically` stays the outermost savepoint everywhere:
+  - `give_rekey` and `rekey_one` are called from the tick or from `restore`, never inside another `atomically`;
+  - `receive_restore` runs inside `process`'s savepoint, and its `revoke_invite` runs as a nested `kv_apply`.
+- The core's `transact` refuses to start with pending overlay writes, and leaves the overlay empty after `open`, so the nested revoke is safe.
+- No core state lives outside SQL, so rolling back SQL rolls back everything.
+
+**Panics:**
+- The new code has no `unwrap`, `expect` or indexing on untrusted data: `arr32(..)?`, `unwrap_or_default` on `invite_id`, `try_from(..).unwrap_or`, `checked`/`saturating` arithmetic.
+- `restore_part` caps part and total sizes and wipes the buffer.
+
+**Secrets:**
+- No new logging.
+- `TestQuery`/`TestExec` are `#[cfg(feature = "test-hooks")]`, and the app's Cargo.toml does not enable that feature (only the client's dev-dependency does).
+- The webview receives only fixed tokens in "restored" lines (`""`, `"needs-invite"`, `"no-reply"`), never content from a contact.
+- The backup code goes to the webview only on an explicit action (but see BK2-1 for the missing gate).
+
+**Restored-line text:**
+- `message_row` now passes on the body for `restored`.
+- The chat-list preview and search filter on `text`/`attachment`/`call`, so the tokens never show up as previews or search hits.
+- `RestoreNotice` handles all three tokens with the `warning` class and no colour-only state.
+- Tested: `m.text == "needs-invite"`, `"no-reply"`.
+
+**Migration 7:**
+- The new columns are `NOT NULL DEFAULT 0`, which is safe for existing rows.
+- `strip` resets `rekey_pending_ms`/`rekey_retry_ms`, and `rekey_one` resets `rekey_until`.
+- `migrate` runs each step in BEGIN/COMMIT with ROLLBACK on error.
+
+**Backup code flow (BK-7):**
+- A cancelled or failed save never marks the code as seen.
+- "I wrote it down" appears only after a save that worked.
+- `show()` clears `saved.code`, so only one `CodeCard`, and one guard owner, is mounted at a time.
+
+**Screenshot guard otherwise:**
+- It serialises through a tokio mutex.
+- `true` when screenshots were already blocked stores `Some(false)` and restores nothing.
+- It cannot be used to allow screenshots beyond the saved preference, so the missing check for the Unlocked state is acceptable.
+- On desktop it does nothing.
+
+**Desktop save (BK-13):** O_EXCL creation, a bounded loop, `sync_all`, and cleanup on failure.
+
+**Docs:** PROTOCOL §3, ADR-0021 and INV-BAK-1/2 describe the fixed behaviour accurately, and the tests they name exist and pass.
+
+---
+
+**Verdict: FAIL.** BK2-1 (High) and BK2-2, BK2-3, BK2-4 (Medium) are open. Fix BK2-1 with a regression test, then BK2-2 to BK2-4, and re-run the gate.

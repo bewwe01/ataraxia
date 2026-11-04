@@ -255,6 +255,27 @@ async fn a_restored_backup_keeps_identity_contacts_and_history() {
     let invites = alice2.test_query(INVITES).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(12)).await;
     assert_eq!(alice2.test_query(INVITES).await.unwrap(), invites);
+    // And if one is tried for her anyway (as if she were not marked), the failure backs off
+    // for an hour rather than repeating each tick, and leaves no invite behind (BK-2).
+    alice2
+        .test_exec(&format!(
+            "UPDATE contacts SET needs_invite = 0 WHERE id = {}",
+            a_carol.id
+        ))
+        .await
+        .unwrap();
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    within(std::time::Duration::from_secs(30), || async {
+        (of(&alice2, a_carol.id, "rekey_retry_ms").await > now + 30 * 60 * 1000).then_some(())
+    })
+    .await;
+    assert_eq!(alice2.test_query(INVITES).await.unwrap(), invites);
 
     // Nothing of the backup is left in the clear on the new device.
     alice2.lock().await.unwrap();
@@ -461,4 +482,94 @@ async fn a_new_invite_after_a_restore_outlives_its_ttl() {
     );
     alice2.send(a_carol.id, "a week later".into()).await.unwrap();
     arrives(c, c_alice.id, "a week later").await;
+}
+
+/// Review BK2-1: a new backup code takes the PIN or password, as showing it does: someone
+/// holding the unlocked phone cannot get a fresh code shown with a new backup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_backup_code_takes_the_password() {
+    let r = relay().await;
+    let alice = user(&r, "Alice").await;
+    let a = &alice.client;
+    let (_, code) = backup(a).await;
+    assert_eq!(
+        a.new_backup_code(Zeroizing::new("wrong password here".into()))
+            .await
+            .unwrap_err(),
+        ClientError::WrongPassphrase
+    );
+    assert!(
+        a.create_backup().await.unwrap().code.is_none(),
+        "the code is unchanged and hidden"
+    );
+    let _ = a.take_backup().await.unwrap();
+    a.new_backup_code(Zeroizing::new("correct horse battery".into()))
+        .await
+        .unwrap();
+    let fresh = a.create_backup().await.unwrap().code.unwrap();
+    assert_ne!(fresh, code);
+}
+
+/// Review BK2-2: a restore stopped after the vault was written (Veil killed, say) finishes
+/// at the next unlock: the contact is re-keyed then, exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_stopped_before_rekeying_finishes_at_unlock() {
+    let r = relay().await;
+    let (alice, bob) = (user(&r, "Alice").await, user(&r, "Bob").await);
+    let (a_bob, b_alice) = pair(&alice.client, &bob.client).await;
+    let (a, b) = (&alice.client, &bob.client);
+    within(std::time::Duration::from_secs(30), || async {
+        a.has_rekey(a_bob.id).await.unwrap().then_some(())
+    })
+    .await;
+    let (file, code) = backup(a).await;
+    drop(alice);
+    let dir = tempfile::tempdir().unwrap();
+    let alice2 = start(dir.path(), std::sync::Arc::default());
+    alice2.stop_restore_before_rekey().await.unwrap();
+    let view = alice2.restore(input(&file, &code)).await.unwrap();
+    assert!(!view.finished);
+    assert_eq!(alice2.state().await.unwrap(), AppState::Locked);
+    alice2
+        .unlock(Zeroizing::new("a new phone, a new password".into()))
+        .await
+        .unwrap();
+    eventually(|| async {
+        b.messages(b_alice.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.kind == "restored")
+            .then_some(())
+    })
+    .await;
+    alice2.send(a_bob.id, "finished".into()).await.unwrap();
+    arrives(b, b_alice.id, "finished").await;
+    // Done once: another lock and unlock re-keys nobody again.
+    alice2.lock().await.unwrap();
+    alice2
+        .unlock(Zeroizing::new("a new phone, a new password".into()))
+        .await
+        .unwrap();
+    let lines = |c: &veil_client::service::Client, id: i64| {
+        let c = c.clone();
+        async move {
+            c.messages(id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|m| m.kind == "restored")
+                .count()
+        }
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(lines(&alice2, a_bob.id).await, 1);
+    assert_eq!(lines(b, b_alice.id).await, 1);
+    assert_eq!(
+        alice2
+            .test_query("SELECT count(*) FROM settings WHERE k = 'restore.rekey_due'")
+            .await
+            .unwrap(),
+        0
+    );
 }

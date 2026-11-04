@@ -294,6 +294,8 @@ export interface RestoreView {
   contacts: number;
   /** Contacts the restore could not reach: they need a new invite. */
   needInvite: number;
+  /** False when the restored data could not be opened yet: unlocking finishes the restore. */
+  finished: boolean;
 }
 
 /** Sends a backup file to Rust in 1 MiB parts, then restores from it. */
@@ -346,7 +348,7 @@ export const ipc = {
   /** The user saw the code with a saved backup: later backups stop returning it. */
   backupCodeSeen: () => call<void>("backup_code_seen"),
   /** Forgets the backup code; the next backup makes and shows a new one. */
-  newBackupCode: () => call<void>("new_backup_code"),
+  newBackupCode: (current: string) => call<void>("new_backup_code", { current }),
   /** A backup code is on screen or gone: Android blocks screenshots meanwhile. */
   backupCodeOnScreen: (shown: boolean) => call<void>("backup_code_on_screen", { shown }),
   unlock: (passphrase: string) => call<void>("unlock", { passphrase }),

@@ -93,6 +93,8 @@ const RECEIPTS: &str = "receipts";
 const NOTIFY: &str = "notify";
 const TYPING: &str = "typing";
 const HEADER_FILE: &str = "vault.hdr";
+/// A message decrypted from a contact: whatever a restore re-keyed with them works.
+const SESSION_WORKS: &str = "UPDATE contacts SET rekey_pending_ms = 0, needs_invite = 0 WHERE id = ?1";
 const DB_FILE: &str = "veil.db";
 
 fn rng() -> rand::rand_core::UnwrapErr<OsRng> {
@@ -365,7 +367,9 @@ enum Cmd {
     TakeBackup(Reply<Zeroizing<Vec<u8>>>),
     BackupCode(Zeroizing<String>, Reply<Option<String>>),
     BackupCodeSeen(Reply<()>),
-    NewBackupCode(Reply<()>),
+    NewBackupCode(Zeroizing<String>, Reply<()>),
+    #[cfg(feature = "test-hooks")]
+    StopRestoreBeforeRekey(Reply<()>),
     Unlock(Zeroizing<String>, Reply<UnlockOutcome>),
     UnlockInfo(Reply<UnlockInfo>),
     Security(Reply<SecurityView>),
@@ -608,9 +612,15 @@ impl Client {
     pub async fn backup_code_seen(&self) -> Result<()> {
         ask!(self, BackupCodeSeen)
     }
-    /// Forgets the backup code; the next backup makes a new one (review BK-14).
-    pub async fn new_backup_code(&self) -> Result<()> {
-        ask!(self, NewBackupCode)
+    /// Forgets the backup code; the next backup makes a new one and shows it (review BK-14).
+    /// Asks for the PIN or password first, as showing the code does (review BK2-1).
+    pub async fn new_backup_code(&self, current: Zeroizing<String>) -> Result<()> {
+        ask!(self, NewBackupCode, current)
+    }
+    /// Tests only: the next restore stops after writing the vault, before re-keying.
+    #[cfg(feature = "test-hooks")]
+    pub async fn stop_restore_before_rekey(&self) -> Result<()> {
+        ask!(self, StopRestoreBeforeRekey)
     }
     /// Unlocks with the PIN or password. Entering the Purge PIN wipes Veil and returns
     /// [`UnlockOutcome::Purged`].
@@ -996,6 +1006,9 @@ struct Actor {
     invite_ttl_secs: u64,
     /// While locked with notifications on: hears that something arrived (ADR-0016).
     watcher: Option<watcher::Watcher>,
+    /// Tests only: the next restore stops before re-keying, as if Veil were killed there.
+    #[cfg(feature = "test-hooks")]
+    stop_restore_before_rekey: bool,
 }
 
 struct Decoy {
@@ -1402,6 +1415,8 @@ impl Actor {
             decoy: None,
             invite_ttl_secs,
             watcher: None,
+            #[cfg(feature = "test-hooks")]
+            stop_restore_before_rekey: false,
         }
     }
 
@@ -1655,8 +1670,14 @@ impl Actor {
             Cmd::BackupCodeSeen(r) => {
                 let _ = r.send(self.backup_code_seen());
             }
-            Cmd::NewBackupCode(r) => {
-                let _ = r.send(self.new_backup_code());
+            Cmd::NewBackupCode(current, r) => {
+                let res = self.verify_current(&current).and_then(|_| self.new_backup_code());
+                let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::StopRestoreBeforeRekey(r) => {
+                self.stop_restore_before_rekey = true;
+                let _ = r.send(Ok(()));
             }
             Cmd::Unlock(p, r) => {
                 let res = self.unlock(&p).await;
@@ -2121,14 +2142,28 @@ impl Actor {
             }
         };
         // From here the restore is done: the vault is written, and wiping it now would leave
-        // contacts we re-keyed talking to an erased device (review BK-6). If the session does
-        // not open, Veil is simply locked; re-keying is best effort, contact by contact.
-        self.open_session(&key).await?;
+        // contacts we re-keyed talking to an erased device (review BK-6). Re-keying is due
+        // until it has run to the end (a flag in the database): if the session does not open
+        // now, or Veil is stopped part way, it runs when Veil is next unlocked (BK2-2).
+        #[cfg(feature = "test-hooks")]
+        if self.stop_restore_before_rekey {
+            self.stop_restore_before_rekey = false;
+            return Ok(RestoreView {
+                contacts: 0,
+                need_invite: 0,
+                finished: false,
+            });
+        }
+        if self.open_session(&key).await.is_err() {
+            self.session = None;
+            return Ok(RestoreView {
+                contacts: 0,
+                need_invite: 0,
+                finished: false,
+            });
+        }
         self.emit(ChangeKind::Connection, None);
-        Ok(self.rekey_all().await.unwrap_or(RestoreView {
-            contacts: 0,
-            need_invite: 0,
-        }))
+        self.restore_view()
     }
 
     /// Everything up to the vault header; returns the new database key.
@@ -2149,6 +2184,8 @@ impl Actor {
         // The Purge PIN's tag is per device (a random one is stored below): no backup, from
         // whatever version, may say one is set (review BK-3).
         db.set_setting("purge_set", &[0])?;
+        // Re-keying is due from now until it has run to the end (review BK2-2).
+        backup::mark_rekey_due(&db)?;
 
         let mut device = Zeroizing::new([0u8; 32]);
         rand::Rng::fill(&mut rng(), &mut device[..]);
@@ -2297,6 +2334,14 @@ impl Actor {
         self.expire_messages();
         let _ = self.cleanup_invites().await;
         self.connect().await;
+        // A restore that did not get to re-key everyone finishes here (review BK2-2).
+        #[cfg(feature = "test-hooks")]
+        let stop = self.stop_restore_before_rekey;
+        #[cfg(not(feature = "test-hooks"))]
+        let stop = false;
+        if !stop {
+            self.finish_restore().await;
+        }
         Ok(())
     }
 
@@ -3625,10 +3670,8 @@ impl Actor {
                 if blocked && !matches!(body, Body::MailboxUpdate(_)) {
                     return Ok(());
                 }
-                // Anything from them means a session we re-keyed after our restore works
-                // (review BK-5).
-                s.db.conn()
-                    .execute("UPDATE contacts SET rekey_pending_ms = 0 WHERE id = ?1", [id])?;
+                // Anything from them proves the session works: no invite needed (BK-5, BK2-7).
+                s.db.conn().execute(SESSION_WORKS, [id])?;
                 match body {
                     Body::ContactIntro(intro) if rekeyed => {
                         self.receive_restore(id, &from, &intro).await?;
@@ -4161,7 +4204,7 @@ impl Actor {
         Ok(())
     }
 
-    fn queue_token_removal(db: &Db, token: &[u8]) -> Result<()> {
+    pub(super) fn queue_token_removal(db: &Db, token: &[u8]) -> Result<()> {
         db.conn().execute(
             "INSERT OR IGNORE INTO token_removals (hash) VALUES (?1)",
             [token_hash(&arr32(token)?)],

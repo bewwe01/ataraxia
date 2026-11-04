@@ -34,6 +34,7 @@ export function BackupCard({ kind }: { kind: SecretKind }) {
   const [current, setCurrent] = useState("");
   const [shown, setShown] = useState<string | null>(null);
   const [renewing, setRenewing] = useState(false);
+  const [renewSecret, setRenewSecret] = useState("");
   const [note, setNote] = useState<string | null>(null);
 
   async function make() {
@@ -61,16 +62,19 @@ export function BackupCard({ kind }: { kind: SecretKind }) {
     }
   }
 
-  async function renew() {
+  async function renew(e: FormEvent) {
+    e.preventDefault();
     setError(null);
     try {
-      await ipc.newBackupCode();
+      await ipc.newBackupCode(renewSecret);
       setRenewing(false);
       setShown(null);
       setSaved(null);
       setNote("The next backup gets a new code. Backups made before open with the old code only.");
     } catch (err) {
       setError(err instanceof IpcError ? err.message : "Could not do that");
+    } finally {
+      setRenewSecret("");
     }
   }
 
@@ -123,13 +127,14 @@ export function BackupCard({ kind }: { kind: SecretKind }) {
         <button className="btn btn-ghost btn-block" type="button" onClick={() => { setAsking(true); setShown(null); }}>Show my backup code</button>
       )}
       {renewing ? (
-        <div className="stack-sm" role="group" aria-label="New backup code">
+        <form className="stack-sm" aria-label="New backup code" onSubmit={(e) => void renew(e)}>
           <p className="hint">Use this if someone may have seen your code. Your next backup gets a new code; backups you made before still open with the old one, so delete them.</p>
+          <SecretField id="bk-renew" label={kind === "pin" ? "Your PIN" : "Your password"} kind={kind} value={renewSecret} onChange={setRenewSecret} autoComplete="current-password" />
           <div className="banner-actions">
-            <button className="btn btn-secondary" type="button" onClick={() => setRenewing(false)}>Cancel</button>
-            <button className="btn btn-primary" type="button" onClick={() => void renew()}>New code</button>
+            <button className="btn btn-secondary" type="button" onClick={() => { setRenewing(false); setRenewSecret(""); }}>Cancel</button>
+            <button className="btn btn-primary" type="submit">New code</button>
           </div>
-        </div>
+        </form>
       ) : (
         <button className="btn btn-ghost btn-block" type="button" onClick={() => { setRenewing(true); setNote(null); }}>Make a new backup code</button>
       )}

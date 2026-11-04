@@ -199,10 +199,24 @@ async fn unlock_biometric(app: AppHandle, c: State<'_, Client>) -> Res<()> {
 }
 
 #[tauri::command]
-async fn set_screenshots_allowed(app: AppHandle, c: State<'_, Client>, allow: bool) -> Res<()> {
+async fn set_screenshots_allowed(
+    app: AppHandle,
+    c: State<'_, Client>,
+    guard: State<'_, CodeOnScreen>,
+    allow: bool,
+) -> Res<()> {
     // Only from Settings, while unlocked (review U-11).
     if c.state().await.map_err(err)? != AppState::Unlocked {
         return Err(err(ClientError::Locked));
+    }
+    // While a backup code is on screen, the user's choice is what comes back when it goes;
+    // screenshots stay blocked until then (review BK2-3).
+    let mut was = guard.0.lock().await;
+    if was.is_some() {
+        *was = Some(allow);
+        if allow {
+            return Ok(());
+        }
     }
     native::set_screenshots_allowed(&app, allow)
         .await
@@ -553,10 +567,11 @@ async fn backup_code_seen(c: State<'_, Client>) -> Res<()> {
     c.backup_code_seen().await.map_err(err)
 }
 
-/// Forgets the backup code; the next backup shows a new one (review BK-14).
+/// Forgets the backup code after the PIN or password; the next backup shows a new one
+/// (reviews BK-14, BK2-1).
 #[tauri::command]
-async fn new_backup_code(c: State<'_, Client>) -> Res<()> {
-    c.new_backup_code().await.map_err(err)
+async fn new_backup_code(c: State<'_, Client>, current: Zeroizing<String>) -> Res<()> {
+    c.new_backup_code(current).await.map_err(err)
 }
 
 /// Whether screenshots were allowed before a backup code went on screen; `None` while none is.

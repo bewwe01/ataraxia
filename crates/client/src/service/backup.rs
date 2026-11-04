@@ -29,6 +29,8 @@ pub const BACKUP_FILE: &str = "backup.vbak";
 pub const EXPORT_FILE: &str = "backup-export.db";
 pub const RESTORE_FILE: &str = "restore.db";
 const CODE_KEY: &str = "backup.code";
+/// Set by a restore until every contact was re-keyed or marked: the time it started (ms, LE).
+const REKEY_DUE_KEY: &str = "restore.rekey_due";
 /// Set once the user was shown the backup code after a backup that was saved (review BK-7).
 const CODE_SEEN_KEY: &str = "backup.code_seen";
 /// The largest backup a restore takes, and so the largest one made (review BK-8).
@@ -86,11 +88,18 @@ pub struct RestoreView {
     /// Contacts that gave no re-key invite (paired before backups existed, or never online
     /// since): they need a new invite.
     pub need_invite: u32,
+    /// False when Veil could not open the restored data yet: unlocking finishes the restore.
+    pub finished: bool,
 }
 
 /// A path inside an SQL string literal.
 fn sql_path(p: &Path) -> Result<String> {
     Ok(p.to_str().ok_or(ClientError::Storage)?.replace('\'', "''"))
+}
+
+/// Marks re-keying as due in a restored database (review BK2-2).
+pub(super) fn mark_rekey_due(db: &Db) -> Result<()> {
+    db.set_setting(REKEY_DUE_KEY, &now_ms().to_le_bytes())
 }
 
 /// Removes what a backup or restore that did not finish (a crash, say) left in the data
@@ -155,10 +164,11 @@ fn export_to(db: &Db, path: &Path, key: &[u8; 32]) -> Result<()> {
     ));
     conn.execute_batch(&attach)?;
     // Deleted rows are overwritten, not left in free pages (SQLite copies the main database's
-    // setting at ATTACH; this does not rely on it), and the VACUUM below leaves no free pages
-    // at all (review BK-10, INV-BAK-1).
+    // setting at ATTACH; this does not rely on it), and full auto-vacuum (set while the file
+    // is still empty) gives freed pages back, so none are left at all (review BK-10). Unlike
+    // a VACUUM, it needs no second copy of the database in memory (BK2-6).
     let r = conn
-        .execute_batch("PRAGMA bak.secure_delete = ON;")
+        .execute_batch("PRAGMA bak.secure_delete = ON; PRAGMA bak.auto_vacuum = FULL;")
         .map_err(ClientError::from)
         .and_then(|()| {
             conn.query_row("SELECT sqlcipher_export('bak')", [], |_| Ok(()))
@@ -170,8 +180,7 @@ fn export_to(db: &Db, path: &Path, key: &[u8; 32]) -> Result<()> {
             conn.execute_batch(&format!("PRAGMA bak.user_version = {v};"))?;
             Ok(())
         })
-        .and_then(|()| strip(conn, "bak"))
-        .and_then(|()| Ok(conn.execute_batch("VACUUM bak;")?));
+        .and_then(|()| strip(conn, "bak"));
     let _ = conn.execute_batch("DETACH DATABASE bak;");
     r
 }
@@ -183,7 +192,7 @@ impl Actor {
     /// on every retry tick; at most [`PER_ROUND`] contacts a round, in random order.
     pub(super) async fn sync_rekeys(&self) {
         let Ok(s) = self.s() else { return };
-        let _ = self.expire_rekeys();
+        let _ = self.expire_rekeys().await;
         let horizon = i64::try_from(now_secs().saturating_add(RENEW_BEFORE_SECS)).unwrap_or(i64::MAX);
         // Not to contacts we have no session with (they need an invite from us first), nor
         // again soon after a try failed: each try makes an invite with fresh prekeys (BK-2).
@@ -215,7 +224,7 @@ impl Actor {
     /// Contacts our restore re-keyed who sent nothing back in [`REKEY_ANSWER_MS`]: their
     /// re-key invite was probably stale, so they never got the new session. They are marked
     /// as needing an invite, with a line in the chat (review BK-5).
-    fn expire_rekeys(&self) -> Result<()> {
+    async fn expire_rekeys(&self) -> Result<()> {
         let s = self.s()?;
         let before = now_ms().saturating_sub(REKEY_ANSWER_MS);
         let due: Vec<i64> =
@@ -224,26 +233,20 @@ impl Actor {
                 .query_map([before], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
         for contact in due {
-            let conn = s.db.conn();
-            conn.execute_batch("SAVEPOINT rekey_expire;")?;
-            let r = conn
-                .execute(
+            // One transaction per contact, closed the same way as every other (BK2-4).
+            self.atomically(async {
+                let conn = s.db.conn();
+                conn.execute(
                     "UPDATE contacts SET rekey_pending_ms = 0, needs_invite = 1 WHERE id = ?1",
                     [contact],
-                )
-                .and_then(|_| {
-                    conn.execute(
-                        "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', 'no-reply', ?2, 'sent')",
-                        params![contact, now_ms()],
-                    )
-                });
-            match r {
-                Ok(_) => conn.execute_batch("RELEASE rekey_expire;")?,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK TO rekey_expire; RELEASE rekey_expire;");
-                    return Err(e.into());
-                }
-            }
+                )?;
+                conn.execute(
+                    "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', 'no-reply', ?2, 'sent')",
+                    params![contact, now_ms()],
+                )?;
+                Ok(())
+            })
+            .await?;
             self.emit(ChangeKind::Messages, Some(contact));
             self.emit(ChangeKind::Contacts, Some(contact));
         }
@@ -372,6 +375,15 @@ impl Actor {
             })
             .optional()?;
         if let Some(token) = token {
+            // The token they had before (on the lost device, and in the backup) is withdrawn
+            // from the relay (review BK2-8).
+            let old: Vec<u8> =
+                conn.query_row("SELECT my_token FROM contacts WHERE id = ?1", [contact], |r| {
+                    r.get(0)
+                })?;
+            if old != token {
+                Self::queue_token_removal(&s.db, &old)?;
+            }
             conn.execute(
                 "UPDATE contacts SET my_token = ?2 WHERE id = ?1",
                 params![contact, arr32(&token)?.to_vec()],
@@ -394,6 +406,12 @@ impl Actor {
         )?;
         conn.execute(
             "UPDATE messages SET envelope = NULL, status = 'failed' WHERE contact = ?1 AND mine = 1 AND envelope IS NOT NULL",
+            [contact],
+        )?;
+        // Any re-key invite we hold from them died with their old device: their fresh one
+        // replaces it whatever the two devices' clocks say (review BK2-9).
+        conn.execute(
+            "UPDATE contacts SET rekey_link = NULL, rekey_sealed = NULL, rekey_until = 0 WHERE id = ?1",
             [contact],
         )?;
         if let Some(r) = &intro.rekey {
@@ -543,10 +561,40 @@ impl Actor {
         }
     }
 
+    /// Finishes a restore if re-keying is still due (right after it, or at the next unlock if
+    /// Veil stopped part way; review BK2-2). The flag goes once every contact was handled.
+    pub(super) async fn finish_restore(&self) {
+        let Ok(s) = self.s() else { return };
+        let Ok(Some(due)) = s.db.setting(REKEY_DUE_KEY) else {
+            return;
+        };
+        let since = <[u8; 8]>::try_from(due.as_slice()).map_or(0, i64::from_le_bytes);
+        if self.rekey_all(since).await.is_ok() {
+            let _ =
+                s.db.conn()
+                    .execute("DELETE FROM settings WHERE k = ?1", [REKEY_DUE_KEY]);
+        }
+    }
+
+    /// How the restore went, from the database.
+    pub(super) fn restore_view(&self) -> Result<RestoreView> {
+        let s = self.s()?;
+        let count = |q: &str| -> Result<u32> {
+            let n: i64 = s.db.conn().query_row(q, [], |r| r.get(0))?;
+            Ok(u32::try_from(n).unwrap_or(u32::MAX))
+        };
+        Ok(RestoreView {
+            contacts: count("SELECT count(*) FROM contacts WHERE blocked = 0")?,
+            need_invite: count("SELECT count(*) FROM contacts WHERE blocked = 0 AND needs_invite = 1")?,
+            finished: s.db.setting(REKEY_DUE_KEY)?.is_none(),
+        })
+    }
+
     /// After a restore: a new session with every contact who gave us a re-key invite (the
     /// introduction carries a fresh re-key invite for them); the others are marked as needing
-    /// a new invite. Every chat says what happened.
-    pub(super) async fn rekey_all(&self) -> Result<RestoreView> {
+    /// a new invite. Every chat says what happened. Contacts already handled by this restore
+    /// (a restored line since `since`) are skipped, so running it again is safe.
+    async fn rekey_all(&self, since: i64) -> Result<()> {
         let s = self.s()?;
         let rows: Vec<RekeyRow> =
             s.db.conn()
@@ -556,18 +604,14 @@ impl Actor {
                     "SELECT id, address, my_token,
                        CASE WHEN key_warning = 0 THEN rekey_link END,
                        CASE WHEN key_warning = 0 THEN rekey_sealed END
-                     FROM contacts WHERE blocked = 0",
+                     FROM contacts c WHERE blocked = 0 AND NOT EXISTS (SELECT 1 FROM messages m
+                       WHERE m.contact = c.id AND m.kind = 'restored' AND m.mine = 1 AND m.at_ms >= ?1)",
                 )?
-                .query_map([], |r| {
+                .query_map([since], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
-        let mut view = RestoreView {
-            contacts: 0,
-            need_invite: 0,
-        };
         for (contact, address, my_token, link, sealed) in rows {
-            view.contacts = view.contacts.saturating_add(1);
             let ok = match (link, sealed) {
                 (Some(link), Some(sealed)) => self
                     .rekey_one(contact, &address, &my_token, &link, &sealed)
@@ -575,15 +619,14 @@ impl Actor {
                     .is_ok(),
                 _ => false,
             };
-            if !ok {
-                view.need_invite = view.need_invite.saturating_add(1);
-            }
             // Best effort: the restore is done, and one contact's row is no reason to stop
-            // (review BK-6).
-            let _ = mark_restored(s.db.conn(), contact, ok);
+            // (review BK-6). A contact reached got the line with the re-key itself.
+            if !ok {
+                let _ = mark_unreached(s.db.conn(), contact);
+            }
         }
         self.emit(ChangeKind::Contacts, None);
-        Ok(view)
+        Ok(())
     }
 
     async fn rekey_one(
@@ -630,7 +673,14 @@ impl Actor {
                      VALUES (?1, 1, 'control', ?2, ?3, 'sending', ?4)",
                     params![contact, RESTORE_TAG, now_ms(), red.envelope],
                 )?;
-                Ok(s.db.conn().last_insert_rowid())
+                let row = s.db.conn().last_insert_rowid();
+                // The chat line in the same transaction, which also marks this contact as
+                // handled if the restore has to run again (BK2-2).
+                s.db.conn().execute(
+                    "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', '', ?2, 'sent')",
+                    params![contact, now_ms()],
+                )?;
+                Ok(row)
             })
             .await?;
         self.deliver(row).await;
@@ -638,14 +688,12 @@ impl Actor {
     }
 }
 
-/// The chat line after our restore, and the contact marked when they could not be reached.
-fn mark_restored(conn: &rusqlite::Connection, contact: i64, reached: bool) -> Result<()> {
-    if !reached {
-        conn.execute("UPDATE contacts SET needs_invite = 1 WHERE id = ?1", [contact])?;
-    }
+/// A contact our restore could not reach: marked, with a line in their chat.
+fn mark_unreached(conn: &rusqlite::Connection, contact: i64) -> Result<()> {
+    conn.execute("UPDATE contacts SET needs_invite = 1 WHERE id = ?1", [contact])?;
     conn.execute(
-        "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', ?2, ?3, 'sent')",
-        params![contact, if reached { "" } else { "needs-invite" }, now_ms()],
+        "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', 'needs-invite', ?2, 'sent')",
+        params![contact, now_ms()],
     )?;
     Ok(())
 }

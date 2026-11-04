@@ -221,6 +221,12 @@ impl Db {
         )?;
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
             .map_err(|_| ClientError::WrongPassphrase)?;
+        // A database from a newer Veil is refused before anything is written to it (review
+        // BK-12, BK2-10).
+        let have: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if have > i64::try_from(MIGRATIONS.len()).unwrap_or(i64::MAX) {
+            return Err(ClientError::NewerVersion);
+        }
         conn.execute_batch(SCHEMA)?;
         migrate(&conn)?;
         Ok(Self(Rc::new(conn)))
@@ -310,6 +316,38 @@ impl KvBackend for SqlBackend {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Review BK-12 / BK2-10: a database with a schema newer than this Veil knows is refused,
+    /// and left as it was.
+    #[test]
+    fn refuses_a_newer_database() {
+        let dir = std::env::temp_dir().join(format!("veil-db-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("veil.db");
+        let key = [9u8; 32];
+        let newer = i64::try_from(MIGRATIONS.len()).unwrap() + 1;
+        {
+            let db = Db::open(&path, &key).unwrap();
+            db.conn()
+                .execute_batch(&format!("PRAGMA user_version = {newer};"))
+                .unwrap();
+            db.conn().execute_batch("DROP TABLE token_removals;").unwrap();
+        }
+        assert_eq!(Db::open(&path, &key).unwrap_err(), ClientError::NewerVersion);
+        // Nothing was created or changed by the refused open.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex(&key).as_str()))
+            .unwrap();
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'token_removals'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn encrypted_at_rest_and_wrong_key_refused() {

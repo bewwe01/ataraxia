@@ -313,6 +313,11 @@ export function Restore({ onDone, onBack }: { onDone: () => void; onBack: () => 
           </div>
           {/* The Purge PIN belongs to a device and is not in backups (review BK-3). */}
           <p className="hint">A Purge PIN is not part of a backup: if you used one, set it again in Settings → Security.</p>
+          {!done.finished ? (
+            <Banner tone="warning" icon="alert-triangle">
+              <p>Your data is back, but Veil could not open it yet. Unlock Veil with your new PIN or password to finish; your contacts are told then.</p>
+            </Banner>
+          ) : null}
           {done.needInvite > 0 ? (
             <Banner tone="warning" icon="alert-triangle">
               <p>{done.needInvite === 1 ? "1 contact" : `${done.needInvite} contacts`} could not be reached from the backup. Ask them for a new invite; their chats say so.</p>
