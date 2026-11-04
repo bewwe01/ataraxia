@@ -109,8 +109,11 @@ object VeilNotify {
     )
   }
 
+  /** Opens the activity itself, not a launcher alias: an alias may be disabled later, when the
+   *  user picks another app icon, and a notice pointing at it would then open nothing (IC-2). */
   fun openApp(ctx: Context): PendingIntent? {
-    val launch = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: return null
+    val launch = Intent(Intent.ACTION_MAIN).setClassName(ctx, "__PACKAGE__.MainActivity")
+      .addCategory(Intent.CATEGORY_LAUNCHER)
     launch.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
     return PendingIntent.getActivity(ctx, 0, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
   }
@@ -139,22 +142,34 @@ object VeilIcons {
   private fun component(ctx: Context, name: String) =
     ComponentName(ctx.packageName, "__PACKAGE__.Launch" + name.replaceFirstChar { it.uppercase() })
 
-  /** The enabled one; the manifest enables only "veil" until the user picks another. */
-  fun current(ctx: Context): String {
-    val pm = ctx.packageManager
-    for (name in ALL) {
-      val state = try {
-        pm.getComponentEnabledSetting(component(ctx, name))
-      } catch (e: IllegalArgumentException) {
-        continue
-      }
-      if (state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED ||
-        (state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && name == "veil")
-      ) {
-        return name
-      }
+  /** The launcher icon of each, for the recent-apps entry. */
+  fun iconRes(ctx: Context, name: String): Int = when (name) {
+    "calculator" -> R.mipmap.veil_disguise_calculator
+    "notes" -> R.mipmap.veil_disguise_notes
+    "weather" -> R.mipmap.veil_disguise_weather
+    "clock" -> R.mipmap.veil_disguise_clock
+    else -> ctx.applicationInfo.icon
+  }
+
+  /** The manifest enables only "veil" until the user picks another. */
+  fun isEnabled(ctx: Context, name: String): Boolean {
+    val state = try {
+      ctx.packageManager.getComponentEnabledSetting(component(ctx, name))
+    } catch (e: IllegalArgumentException) {
+      return false
     }
-    return "veil"
+    return state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED ||
+      (state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && name == "veil")
+  }
+
+  /** The enabled one (the last disguise if a switch was cut short; see `reconcile`). */
+  fun current(ctx: Context): String = ALL.filter { isEnabled(ctx, it) }.lastOrNull() ?: "veil"
+
+  /** After a switch cut short (two enabled), keeps exactly the one `current` names (IC-4).
+   *  The alias names (.LaunchVeil, …) are a compatibility contract: renaming one a user has
+   *  enabled would leave no launcher entry after an update. */
+  fun reconcile(ctx: Context) {
+    if (ALL.count { isEnabled(ctx, it) } != 1) set(ctx, current(ctx))
   }
 
   /** Enables `name` first, then disables the others, so there is never no launcher icon. */
@@ -405,6 +420,11 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
   override fun load(webView: WebView) {
     VeilNotify.channels(activity)
     if (prefs().getBoolean(BACKGROUND, false)) startService(true)
+    try {
+      VeilIcons.reconcile(activity)
+    } catch (e: Exception) {
+      // Left as it is; the next switch sets it straight.
+    }
     if (VeilIcons.disguised(activity)) applyTaskLabel()
     // MainActivity sets FLAG_SECURE before anything is drawn; lift it only if the user chose so.
     if (prefs().getBoolean(ALLOW_SCREENSHOTS, false)) {
@@ -658,12 +678,21 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
     invoke.resolve()
   }
 
-  /** The recent-apps screen shows the disguise's name too. */
+  /** The recent-apps screen shows the disguise's name and icon too (IC-3). */
   private fun applyTaskLabel() {
-    val label = VeilIcons.label(VeilIcons.current(activity))
+    val name = VeilIcons.current(activity)
+    val label = VeilIcons.label(name)
     activity.runOnUiThread {
-      @Suppress("DEPRECATION")
-      activity.setTaskDescription(ActivityManager.TaskDescription(label))
+      val desc = if (Build.VERSION.SDK_INT >= 33) {
+        ActivityManager.TaskDescription.Builder().setLabel(label).setIcon(VeilIcons.iconRes(activity, name)).build()
+      } else if (Build.VERSION.SDK_INT >= 28) {
+        @Suppress("DEPRECATION")
+        ActivityManager.TaskDescription(label, VeilIcons.iconRes(activity, name))
+      } else {
+        @Suppress("DEPRECATION")
+        ActivityManager.TaskDescription(label)
+      }
+      activity.setTaskDescription(desc)
     }
   }
 
@@ -685,6 +714,8 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
       return
     }
     applyTaskLabel()
+    // The background notice is posted again with the new name (IC-2).
+    if (prefs().getBoolean(BACKGROUND, false)) startService(true)
     invoke.resolve()
   }
 

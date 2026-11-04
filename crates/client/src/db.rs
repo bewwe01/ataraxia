@@ -159,7 +159,9 @@ const MIGRATIONS: &[&str] = &[
      -- When a restore re-keyed this contact and nothing has come back from them yet (BK-5).
      ALTER TABLE contacts ADD COLUMN rekey_pending_ms INTEGER NOT NULL DEFAULT 0;
      -- No new re-key invite for them before this (after one could not be sealed; BK-2).
-     ALTER TABLE contacts ADD COLUMN rekey_retry_ms INTEGER NOT NULL DEFAULT 0;",
+     ALTER TABLE contacts ADD COLUMN rekey_retry_ms INTEGER NOT NULL DEFAULT 0;
+     -- A restore has yet to re-key or mark this contact (review BK4-1).
+     ALTER TABLE contacts ADD COLUMN restore_due INTEGER NOT NULL DEFAULT 0;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {
@@ -325,7 +327,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("veil.db");
         let key = [6u8; 32];
-        let m7: [&str; 8] = [
+        let m7: [&str; 9] = [
             "rekey_link",
             "rekey_sealed",
             "rekey_mine_until",
@@ -334,6 +336,7 @@ mod tests {
             "rekey_until",
             "rekey_pending_ms",
             "rekey_retry_ms",
+            "restore_due",
         ];
         {
             let db = Db::open(&path, &key).unwrap();

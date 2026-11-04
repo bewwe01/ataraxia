@@ -29,9 +29,8 @@ pub const BACKUP_FILE: &str = "backup.vbak";
 pub const EXPORT_FILE: &str = "backup-export.db";
 pub const RESTORE_FILE: &str = "restore.db";
 const CODE_KEY: &str = "backup.code";
-/// Set by a restore until every contact was re-keyed or marked: the highest message row id
-/// before it started (LE). Row ids only grow, so a line written by this restore is above it
-/// whatever any clock says (review BK3-1).
+/// Set by a restore until every contact was re-keyed or marked. Which contacts are still due is
+/// `contacts.restore_due`, never a time or a message row (reviews BK3-1, BK4-1).
 const REKEY_DUE_KEY: &str = "restore.rekey_due";
 /// Set once the user was shown the backup code after a backup that was saved (review BK-7).
 const CODE_SEEN_KEY: &str = "backup.code_seen";
@@ -104,10 +103,9 @@ fn sql_path(p: &Path) -> Result<String> {
 
 /// Marks re-keying as due in a restored database (review BK2-2).
 pub(super) fn mark_rekey_due(db: &Db) -> Result<()> {
-    let top: i64 = db
-        .conn()
-        .query_row("SELECT coalesce(max(id), 0) FROM messages", [], |r| r.get(0))?;
-    db.set_setting(REKEY_DUE_KEY, &top.to_le_bytes())
+    db.conn()
+        .execute("UPDATE contacts SET restore_due = 1 WHERE blocked = 0", [])?;
+    db.set_setting(REKEY_DUE_KEY, &[1])
 }
 
 /// Removes what a backup or restore that did not finish (a crash, say) left in the data
@@ -146,7 +144,7 @@ fn strip(conn: &rusqlite::Connection, schema: &str) -> Result<()> {
          DELETE FROM {schema}.attachment_chunks WHERE message IN
            (SELECT message FROM {schema}.attachments WHERE state = 'failed' AND data IS NULL);
          UPDATE {schema}.contacts SET rekey_mine_until = 0, rekey_mine_id = NULL, profile_sent = NULL, intro = NULL,
-           rekey_pending_ms = 0, rekey_retry_ms = 0;
+           rekey_pending_ms = 0, rekey_retry_ms = 0, restore_due = 0;
          -- The Purge PIN's tag is per device and not in the backup: the restore makes a random
          -- one, so the flag must not say a Purge PIN is set (review BK-3).
          INSERT OR REPLACE INTO {schema}.settings (k, v) VALUES ('purge_set', x'00');"
@@ -573,12 +571,10 @@ impl Actor {
     /// Veil stopped part way; review BK2-2). The flag goes once every contact was handled.
     pub(super) async fn finish_restore(&self) {
         let Ok(s) = self.s() else { return };
-        let Ok(Some(due)) = s.db.setting(REKEY_DUE_KEY) else {
+        let Ok(Some(_)) = s.db.setting(REKEY_DUE_KEY) else {
             return;
         };
-        // A malformed flag handles everyone again rather than no one.
-        let since = <[u8; 8]>::try_from(due.as_slice()).map_or(-1, i64::from_le_bytes);
-        if self.rekey_all(since).await.is_ok() {
+        if self.rekey_all().await.is_ok() {
             let _ =
                 s.db.conn()
                     .execute("DELETE FROM settings WHERE k = ?1", [REKEY_DUE_KEY]);
@@ -602,9 +598,9 @@ impl Actor {
 
     /// After a restore: a new session with every contact who gave us a re-key invite (the
     /// introduction carries a fresh re-key invite for them); the others are marked as needing
-    /// a new invite. Every chat says what happened. Contacts already handled by this restore
-    /// (a restored line with a row id above `since`) are skipped, so running it again is safe.
-    async fn rekey_all(&self, since: i64) -> Result<()> {
+    /// a new invite. Every chat says what happened. Only contacts still `restore_due` are
+    /// handled, each in one transaction with its line, so running it again is safe.
+    async fn rekey_all(&self) -> Result<()> {
         let s = self.s()?;
         let rows: Vec<RekeyRow> =
             s.db.conn()
@@ -614,10 +610,9 @@ impl Actor {
                     "SELECT id, address, my_token,
                        CASE WHEN key_warning = 0 THEN rekey_link END,
                        CASE WHEN key_warning = 0 THEN rekey_sealed END
-                     FROM contacts c WHERE blocked = 0 AND NOT EXISTS (SELECT 1 FROM messages m
-                       WHERE m.contact = c.id AND m.kind = 'restored' AND m.mine = 1 AND m.id > ?1)",
+                     FROM contacts WHERE blocked = 0 AND restore_due = 1",
                 )?
-                .query_map([since], |r| {
+                .query_map([], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
@@ -636,7 +631,9 @@ impl Actor {
             // Best effort: the restore is done, and one contact's row is no reason to stop
             // (review BK-6). A contact reached got the line with the re-key itself.
             if !ok {
-                let _ = mark_unreached(s.db.conn(), contact);
+                let _ = self
+                    .atomically(async { mark_unreached(s.db.conn(), contact) })
+                    .await;
             }
         }
         self.emit(ChangeKind::Contacts, None);
@@ -679,7 +676,7 @@ impl Actor {
                 }
                 s.db.conn().execute(
                     "UPDATE contacts SET rekey_link = NULL, rekey_sealed = NULL, rekey_until = 0, needs_invite = 0,
-                       rekey_mine_until = ?2, rekey_mine_id = ?3, rekey_pending_ms = ?4 WHERE id = ?1",
+                       rekey_mine_until = ?2, rekey_mine_id = ?3, rekey_pending_ms = ?4, restore_due = 0 WHERE id = ?1",
                     params![contact, i64::try_from(until).unwrap_or(i64::MAX), id.to_vec(), now_ms()],
                 )?;
                 s.db.conn().execute(
@@ -704,7 +701,10 @@ impl Actor {
 
 /// A contact our restore could not reach: marked, with a line in their chat.
 fn mark_unreached(conn: &rusqlite::Connection, contact: i64) -> Result<()> {
-    conn.execute("UPDATE contacts SET needs_invite = 1 WHERE id = ?1", [contact])?;
+    conn.execute(
+        "UPDATE contacts SET needs_invite = 1, restore_due = 0 WHERE id = ?1",
+        [contact],
+    )?;
     conn.execute(
         "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES (?1, 1, 'restored', 'needs-invite', ?2, 'sent')",
         params![contact, now_ms()],

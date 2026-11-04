@@ -284,13 +284,18 @@ async fn set_dark_bars(app: AppHandle, dark: bool) {
 
 #[tauri::command]
 async fn lock(app: AppHandle, c: State<'_, Client>, guard: State<'_, CodeOnScreen>) -> Res<()> {
-    // Locking takes any backup code off screen: the screenshot setting comes back (BK3-4).
-    if let Some(allowed) = guard.0.lock().await.take()
-        && allowed
-    {
-        let _ = native::set_screenshots_allowed(&app, true).await;
+    // Locking takes any backup code off screen: the screenshot setting comes back (BK3-4),
+    // only after the lock, so the code is never on screen without the block (BK4-3).
+    let r = c.lock().await.map_err(err);
+    release_code_guard(&app, &guard).await;
+    r
+}
+
+/// The backup code is gone from the screen: the screenshot setting the user chose comes back.
+async fn release_code_guard(app: &AppHandle, guard: &CodeOnScreen) {
+    if let Some(true) = guard.0.lock().await.take() {
+        let _ = native::set_screenshots_allowed(app, true).await;
     }
-    c.lock().await.map_err(err)
 }
 
 #[tauri::command]
@@ -1056,6 +1061,17 @@ async fn set_background(app: AppHandle, c: State<'_, Client>, on: bool) -> Res<(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let result = tauri::Builder::default()
+        // A reloaded page shows no backup code, so the guard for one is released (BK4-3).
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                let app = webview.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(guard) = app.try_state::<CodeOnScreen>() {
+                        release_code_guard(&app, &guard).await;
+                    }
+                });
+            }
+        })
         .plugin(native::plugin())
         .manage(Uploads::default())
         .manage(RestoreUpload::default())

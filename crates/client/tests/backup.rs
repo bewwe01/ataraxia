@@ -662,3 +662,22 @@ async fn a_partial_restore_resumes_whatever_the_clocks_say() {
         .await;
     }
 }
+
+/// Reviews BK-12, BK4-4: a backup made by a newer Veil (a schema this one does not know) is
+/// refused, and Veil is left new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_backup_is_refused() {
+    let r = relay().await;
+    let alice = user(&r, "Alice").await;
+    let a = &alice.client;
+    a.test_exec("PRAGMA user_version = 999;").await.unwrap();
+    let (file, code) = backup(a).await;
+    drop(alice);
+    let dir = tempfile::tempdir().unwrap();
+    let alice2 = start(dir.path(), std::sync::Arc::default());
+    assert_eq!(
+        alice2.restore(input(&file, &code)).await.unwrap_err(),
+        ClientError::NewerVersion
+    );
+    assert_eq!(alice2.state().await.unwrap(), AppState::New);
+}

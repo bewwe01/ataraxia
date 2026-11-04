@@ -2,9 +2,30 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Backup round 4 and icon round 1 fixes (2026-11-04)
+
+Backup gate: round 4 **PASS**. Its Low findings are fixed too:
+- BK4-1: a per-contact `restore_due` flag.
+- BK4-3: lock first, then release the code guard; the guard is also released on page load.
+- BK4-4: `a_newer_backup_is_refused`, plus written arguments for `revoke_quietly` and `BackupTooLarge`.
+
+Icon round 1 findings IC-1 to IC-6 are fixed: the hint is honest about the notification header, notification taps open `MainActivity`, the recents entry shows the icon, a cut-short switch is reconciled, the badging check in the release workflow is exact, and the picker uses `aria-disabled`.
+
+```text
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
+$ cargo clippy --workspace --all-targets -- -D warnings                  # exit 0
+$ cargo test --workspace --all-features
+# 260 passed, 0 failed
+$ cargo test -p veil-client --features test-hooks --test backup
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 59.06s
+$ (cd app/src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings)   # exit 0
+$ pnpm -C app typecheck   # 0 errors
+$ pnpm -C app lint        # 24 files clean
+```
+
 ## Backup review round 3 fixes, and the disguised app icon (2026-11-04)
 
-Fixes for BK3-1 to BK3-6, plus the gaps that remained from BK2-5 and BK2-10. `a_partial_restore_resumes_whatever_the_clocks_say` was confirmed to fail on the old clock-based check (`test result: FAILED. 0 passed; 1 failed`). The disguised app icon (ADR-0022) is Android-only Kotlin, manifest and resources. `harden.py` was run on a mock of the generated project, and all of its XML parses. The APK itself is built by the release workflow, which now also checks that the launcher aliases are in the APK.
+Fixes for BK3-1 to BK3-6, plus the gap that remained from BK2-5. (BK2-10's leftovers were closed in round 4, BK4-4.) `a_partial_restore_resumes_whatever_the_clocks_say` was confirmed to fail on the old clock-based check (`test result: FAILED. 0 passed; 1 failed`). The disguised app icon (ADR-0022) is Android-only Kotlin, manifest and resources. `harden.py` was run on a mock of the generated project, and all of its XML parses. The APK itself is built by the release workflow, which now also checks that the launcher aliases are in the APK.
 
 ```text
 $ cargo fmt --all --check   # ok

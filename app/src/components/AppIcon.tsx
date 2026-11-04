@@ -76,13 +76,13 @@ export function AppIconPicker() {
       <div className="appicon-tiles" role="radiogroup" aria-label="App icon" aria-busy={busy}>
         {ORDER.map((i) => (
           <label key={i} className="appicon-tile">
-            <input type="radio" name="app-icon" value={i} checked={icon === i} disabled={busy} onChange={() => void choose(i)} />
+            <input type="radio" name="app-icon" value={i} checked={icon === i} aria-disabled={busy} onChange={() => void choose(i)} />
             <span className="appicon-thumb" aria-hidden="true">{i === "veil" ? <Logo /> : <Glyph icon={i} />}</span>
             <span className="appicon-name">{NAMES[i]}{icon === i ? <span className="sr-only"> (in use)</span> : null}</span>
           </label>
         ))}
       </div>
-      <p className="hint">A disguise changes Veil's name and icon on the home screen, in the app list and in recent apps. Notifications then show only that name and “Tap to open”; calls still say “Incoming call”. Android's own Settings → Apps still lists Veil, so this hides Veil from a glance, not from a search of the phone.</p>
+      <p className="hint">A disguise changes Veil's name and icon on the home screen, in the app list and in recent apps. Notifications then say only “Tap to open” (calls still say “Incoming call”), but Android itself puts “Veil” at the top of every notification, also on the lock screen: to hide that too, turn Veil's notifications off. Android's own Settings → Apps also still lists Veil, so this hides Veil from a glance, not from a search of the phone.</p>
       {note ? <p className="hint" role="status">{note}</p> : null}
       {error ? <p className="field-error" role="alert">{error}</p> : null}
     </section>

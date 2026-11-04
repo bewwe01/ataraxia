@@ -7262,3 +7262,297 @@ In the first case, `contacts: 0, need_invite: 0` is also reported, which is acce
 ---
 
 **Verdict: FAIL.** BK3-1 (Medium) is open. Fix BK3-1 with a regression test that covers both a partial run and a historical line dated in the future. Fix BK3-2 so the newer-version test checks the reordering, then re-run the gate. BK3-3 to BK3-6 and the residual gaps in BK2-5 and BK2-10 are Low and can follow.
+
+---
+
+## Backup (round 4) and disguised app icon (round 1) review (2026-11-04)
+
+**Scope:** I reviewed `git diff 7190660 44b2091` (21 files, +960/−40), plus the full current versions of these:
+- `crates/client/src/service/backup.rs`: `mark_rekey_due`, `strip`, `export_to`, `sync_rekeys`, `expire_rekeys`, `give_rekey`, `finish_restore`, `restore_view`, `rekey_all`, `rekey_one`, `mark_unreached`
+- `crates/client/src/service.rs`: `restore`, `restore_inner`, `open_session`, `on_tick`, `expire_messages`, `delete_for_me`, `deliver`, `interruptible`
+- `crates/client/src/db.rs`: `SCHEMA`, migration 7, `migrate`, and the tests
+- `crates/client/tests/backup.rs`
+- `app/src-tauri/src/lib.rs` and `native.rs`, both platforms
+- `app/android/harden.py` and `VeilNativePlugin.kt`, all of both
+- `app/src/components/AppIcon.tsx`, `Backup.tsx`, `screens/Settings.tsx`, `screens/Onboarding.tsx`, `ipc.ts`, `styles/app.css`
+- `.github/workflows/release.yml`
+- ADR-0021/0022, INV-BAK-1/2, THREAT_MODEL §4, the new DESIGN.md row
+- Tauri's current Android manifest template (`crates/tauri-cli/templates/mobile/android/app/src/main/AndroidManifest.xml` on `dev`)
+- `tauri-utils` `update_android_manifest` (the only thing that rewrites the manifest after `harden.py`)
+
+I did not edit any repository files.
+
+**Commands run (all pass):**
+- `CARGO_INCREMENTAL=0 cargo test -p veil-client --features test-hooks --test backup`: 7 passed in 55.86 s, including `a_partial_restore_resumes_whatever_the_clocks_say`.
+- `CARGO_INCREMENTAL=0 cargo test -p veil-client --features test-hooks --lib db::tests`: 8 passed, including `migrates_a_version_6_database` and `refuses_a_newer_database`.
+- A Python `sqlite3` probe of row-id reuse. In a table with `id INTEGER PRIMARY KEY` and rows 1..5, I deleted row 5 and inserted a new row. The new row got id 5 again, which matters for BK4-1.
+- There is no Android SDK here, so I checked the Kotlin and the manifest by reading them.
+
+**Verdicts:**
+- **Part A, backup round 4: PASS.**
+  - BK3-1 (Medium) is Fixed, and its test fails without the fix.
+  - Of BK3-2 to BK3-6, four are Fixed and BK3-4 is Partially fixed.
+  - BK2-5 is Fixed. BK2-10 is still Partially fixed.
+  - 4 Low findings are open (BK4-1 to BK4-4).
+- **Part B, disguised icon round 1: FAIL.** 1 Medium (IC-1) and 5 Low are open.
+
+---
+
+## Status of the round 3 findings and the residual gaps
+
+| ID | Status | Notes and regression test |
+|---|---|---|
+| BK3-1 | **Fixed** | `mark_rekey_due` stores `coalesce(max(id), 0)` from the restored database. Because it is called after `Db::open`, that is the post-strip, post-migration maximum. `rekey_all` uses `m.id > ?1`, and a malformed flag falls back to `-1`. Forward skew can no longer skip a contact: the only `restored`/`mine = 1` writers are `rekey_one`, `mark_unreached` and `expire_rekeys`. `expire_rekeys` needs `rekey_pending_ms > 0`, which `strip` zeroes, so no such line can sit above `top` before this restore writes one. **The test would fail without the fix:** with the old `m.at_ms >= now` check, the lines dated 2100 make both contacts count as handled, so the first run is a no-op, the flag is cleared, and `assert!(!view.finished)` fails. TEST_REPORT records that failure. Deleting the `NOT EXISTS` clause would also fail the test (Bob would get a `needs-invite` line on resume), so the BK2-2 "skip" now has teeth. There is one residual repeat case, from row-id reuse (BK4-1, Low). |
+| BK3-2 | **Fixed** | The test now drops `invites`, which `SCHEMA` creates (`db.rs:40`). With the version check back after `execute_batch(SCHEMA)`, `invites` would be recreated and the `sqlite_master` count would be 1, so the test fails without the fix. |
+| BK3-3 | **Fixed** (residual noted in BK4-2) | `open_session` only sets `finish_restore_due`. `on_tick` takes it after `expire_messages`/`cleanup_invites`, so `Unlock`/`UnlockBio` reply first. `restore()` clears the flag and runs `finish_restore` inline, which is acceptable because the user is waiting on the restore screen. A tick while locked consumes the flag harmlessly, because `s()` fails and the next `open_session` sets it again. Both resume tests depend on the tick path. They would time out if `on_tick` did not run `finish_restore`. |
+| BK3-4 | **Partially** | Fixed: `native_info` reports the pending choice while a code is shown, and `CodeCard` calls `onGone` → Settings' `refresh()` after the guard is released. The ref avoids re-running the effect. Not quite: the reset happens only in the explicit `lock` command, not on auto-lock or page load, and it lifts `FLAG_SECURE` before the code leaves the screen (BK4-3). The shell has no test, which is accepted as argued in ADR-0021. |
+| BK3-5 | **Fixed** | `RestoreView.unlocked` is true from `restore_view` and false on both early returns, and Onboarding words each case correctly: "the next time you unlock it" is true, because the flag is re-armed only by `open_session`. The test asserts `view.unlocked` in the partial case. |
+| BK3-6 | **Fixed** | `PRAGMA auto_vacuum = 1` is asserted. That would fail without the pragma (SQLite's default is 0, as my round 3 probe showed). INV-BAK-1 and ADR-0021 now describe auto-vacuum, and that the restored database keeps it on. |
+| BK2-5 | **Fixed** | `migrates_a_version_6_database` drops exactly the 8 migration-7 columns, sets `user_version = 6`, reopens, and asserts each column, the version and the row. It would fail if migration 7 lost any of the three late columns. |
+| BK2-10 | **Partially** | `refuses_a_newer_database` now tests the ordering (BK3-2). Still missing: neither `BackupTooLarge` (BK-8) nor `revoke_quietly` (BK-11) has a test or a written argument in INVARIANTS, and there is no "restore of a newer backup leaves Veil new" test. TEST_REPORT says the BK2-10 gaps were closed (BK4-4). |
+
+---
+
+## Findings: backup
+
+### BK4-1 (Low, HIGH confidence): the row-id marker can be reused, so an interrupted restore can still handle a contact twice
+
+**Where:** `crates/client/src/service/backup.rs:106-111` (`mark_rekey_due`), `:618` (`m.id > ?1`); `service.rs` `open_session` → `expire_messages()` (`DELETE FROM messages WHERE expires_at_ms <= ?1`); `delete_for_me` (`service.rs:3440-3450`, which allows `kind = 'restored'`).
+
+**Problem:**
+- `messages.id` is `INTEGER PRIMARY KEY` without `AUTOINCREMENT`. A new row gets `max(id) + 1`, so if the highest rows are deleted, their ids are handed out again. My probe confirms this.
+- Between `mark_rekey_due` (which stores `top`) and the first `rekey_one` insert, `open_session` runs `expire_messages`. It is realistic for the newest message in a backup to be a disappearing message that has expired by restore time. Contact 1's new `restored` line can then get an id ≤ `top`.
+- If that run is cut short, by a kill or a `rekey_all` error, the resume does not count contact 1 as handled. Its `rekey_link` is already NULL, so `mark_unreached` writes a false `needs-invite` line and sets `needs_invite = 1`. That is the BK3-1 "handled twice" outcome. `SESSION_WORKS` clears the flag when the contact answers, but the line stays.
+- The same happens if the user deletes the new "restored" line ("delete for me") before the next unlock.
+- It can only repeat, never skip, so it is Low.
+
+**Fix:** track the pending contacts explicitly, not through message rows. Add migration 8:
+```sql
+ALTER TABLE contacts ADD COLUMN restore_due INTEGER NOT NULL DEFAULT 0;
+```
+Then:
+- `mark_rekey_due`: `UPDATE contacts SET restore_due = 1 WHERE blocked = 0`.
+- `rekey_one`, inside its savepoint, and `mark_unreached`: `... SET restore_due = 0 ...`, in the same transaction as the line. Make `mark_unreached` a single `atomically` block.
+- `rekey_all`: `... FROM contacts c WHERE blocked = 0 AND restore_due = 1`.
+- The setting can stay as the "due at all" flag.
+
+A minimal alternative is to compute `top` after `expire_messages`, but that does not cover `delete_for_me` or a contact's delete during `sync`. Add to the new test a disappearing message with the highest id that expires before the restore, and assert the same "exactly one new line" result.
+
+### BK4-2 (Low, MEDIUM confidence): the tick still holds the actor while it delivers every re-key
+
+**Where:** `service.rs` `on_tick` (`if std::mem::take(&mut self.finish_restore_due) { self.finish_restore().await; }`) → `rekey_one` → `self.deliver(row).await` (`backup.rs:700`).
+
+**Problem:**
+- The unlock reply is no longer delayed, but the actor is sequential. The commands the UI sends right after unlock (contacts, chats, `touch`) queue behind a re-keying run that makes one relay call per contact, each up to `CALL_TIMEOUT`.
+- A slow or hostile relay therefore moves the spinner from the unlock screen to the chat list.
+- Safety is unchanged: a Lock interrupts it, and undelivered rows are retried.
+
+**Fix:** keep the redemption local and leave delivery to the outbox:
+```rust
+// rekey_one: drop the inline `self.deliver(row).await;` when called from finish_restore,
+// e.g. add `deliver_now: bool` and pass `false` from rekey_all on the tick path;
+// retry_failed already picks up the 'sending' control row.
+```
+Alternatively, accept it as it is and say so in ADR-0021.
+
+### BK4-3 (Low, HIGH confidence): `lock` lifts `FLAG_SECURE` while the code is still rendered, and only the explicit Lock resets the guard
+
+**Where:** `app/src-tauri/src/lib.rs:286-294`.
+
+**Problem:**
+- In the "Lock now" handler, `set_screenshots_allowed(true)` runs before `c.lock()`, and the webview re-renders only after `onLocked`. For that window the backup code is on screen without `FLAG_SECURE`. The window is short and user-initiated, but it is the wrong order.
+- The case BK3-4 actually named, a webview reload with a code shown, is still not reset. Auto-lock (`lock_now` in the client) never goes through this command either. A guard stuck at `Some` swallows every later "allow" until the next manual Lock. That fails safe.
+
+**Fix:**
+- Lock first, then restore:
+  ```rust
+  let r = c.lock().await.map_err(err);
+  if let Some(true) = guard.0.lock().await.take() {
+      let _ = native::set_screenshots_allowed(&app, true).await;
+  }
+  r
+  ```
+- Also clear the guard on the shell's page-load event (`on_page_load` with `PageLoadEvent::Started`), so a reload cannot leave it stuck.
+
+### BK4-4 (Low, HIGH confidence): the BK2-10 leftovers are still open, but TEST_REPORT says they are done
+
+**Where:** `docs/TEST_REPORT.md` (the new section: "plus the gaps that remained from BK2-5 and BK2-10"), `docs/INVARIANTS.md` INV-BAK-1/2.
+
+**Problem:**
+- `BackupTooLarge` (`backup.rs:477-480`) has no test or argument.
+- `revoke_quietly` (`backup.rs:716-727`) has no test or argument.
+- No test restores a backup made by a newer Veil and expects `NewerVersion` with Veil left new.
+- This goes against CLAUDE.md rule 9.
+
+**Fix:**
+- Add a written argument to INV-BAK-2 for `revoke_quietly`: it maps only `InviteInvalid` to `Ok`, and every other error propagates.
+- Add a `#[cfg(feature = "test-hooks")]` size override, so a client test can expect `BackupTooLarge` from a small limit.
+- Add `backup::a_newer_backup_is_refused`: bump `user_version` through `test_exec` before backing up, restore, and assert `NewerVersion` and `AppState::New`.
+- Or reword TEST_REPORT to say what is still open.
+
+---
+
+## Findings: disguised app icon
+
+### IC-1 (Medium, HIGH confidence): the Settings hint says notifications show only the disguise's name, but Android puts "Veil" in every notification's header
+
+**Where:** `app/src/components/AppIcon.tsx:85`. The UI text contradicts ADR-0022's own Consequences and THREAT_MODEL §4 item 14.
+
+**Problem:**
+- Since Android 7, the notification header shows the application label (`<application android:label="@string/app_name">`, "Veil"). An ordinary app cannot override it. `EXTRA_SUBSTITUTE_APP_NAME` needs the privileged `SUBSTITUTE_NOTIFICATION_APP_NAME` permission.
+- Both channels are `VISIBILITY_PUBLIC`, so the lock screen and the shade show "Veil · now / Calculator / Tap to open". That is a stronger tell than no disguise at all, in exactly the "someone glances at the phone" case the feature is for.
+- The ADR documents the limit, but the only place the user reads about it says "Notifications then show only that name". That is a false security claim in the UI.
+
+**Fix:** correct the hint, and give the user the real choice:
+```tsx
+<p className="hint">A disguise changes Veil's name and icon on the home screen, in the app list and in recent apps. Android still puts “Veil” at the top of every notification, including on the lock screen: to hide that too, turn Veil's notifications off. Android's own Settings → Apps also still lists Veil, so this hides Veil from a glance, not from a search of the phone.</p>
+```
+Optionally, have `notifyMessage` post nothing for messages while disguised, behind a setting, and say so in ADR-0022.
+
+### IC-2 (Low, HIGH confidence): the ongoing background notification is not rebuilt when the icon changes, so it keeps "Veil" and a tap that fails
+
+**Where:** `VeilNativePlugin.kt:676-689` (`setAppIcon`), `:188-210` (`VeilService.onStartCommand`), `:112-116` (`openApp` → `getLaunchIntentForPackage`).
+
+**Problem:**
+- The foreground-service notice is built once, in `onStartCommand`. After switching to a disguise, it still reads "Veil / Keeping Veil connected in the background" until the process restarts.
+- Its `PendingIntent` is bound to the alias that `getLaunchIntentForPackage` returned at the time, which is now disabled. A tap on it then resolves to nothing and silently does not open the app.
+- `PendingIntent` identity includes the component, so `FLAG_UPDATE_CURRENT` does not fix older ones.
+- Message notifications are rebuilt per post and cancelled on resume, so only the service notice is affected.
+
+**Fix:**
+- Point notifications at the real activity, not an alias, so they survive any switch:
+  ```kotlin
+  fun openApp(ctx: Context): PendingIntent? {
+    val launch = Intent(Intent.ACTION_MAIN).setClassName(ctx, ctx.packageName + ".MainActivity")
+      .addCategory(Intent.CATEGORY_LAUNCHER)
+    launch.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+    return PendingIntent.getActivity(ctx, 0, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+  }
+  ```
+  `MainActivity` stays `exported="true"`. Within the app, export is not needed anyway.
+- In `setAppIcon`, after `VeilIcons.set` succeeds: `if (prefs().getBoolean(BACKGROUND, false)) startService(true)`, so `onStartCommand` posts the notice again with the new title and text.
+
+### IC-3 (Low, MEDIUM confidence): the recent-apps entry changes only its label, not its icon, after an in-session switch
+
+**Where:** `VeilNativePlugin.kt:662-669` (`applyTaskLabel` uses `TaskDescription(label)`).
+
+**Problem:**
+- The task was started through the old alias, so recents keeps that alias's icon until the task is recreated. Switching from Veil to Calculator leaves Veil's icon in recents.
+- ADR-0022 and the hint say recents shows the disguise.
+
+**Fix:** pass the icon too.
+- On API 33+: `ActivityManager.TaskDescription.Builder().setLabel(label).setIcon(iconRes)`.
+- On API 28–32: `TaskDescription(label, iconRes)`, where `iconRes = R.mipmap.veil_disguise_<name>` (or the app icon for "veil"), through a `when` in `VeilIcons`.
+
+### IC-4 (Low, MEDIUM confidence): an interrupted `VeilIcons.set` can leave two launcher entries, and the picker then shows the wrong one
+
+**Where:** `VeilNativePlugin.kt:161-180`, `current()` at `:143-158`.
+
+**Problem:**
+- `set` enables the new alias and then disables the others one call at a time. A kill, or an exception part way (caught as "Could not change the icon"), leaves two enabled.
+- `current()` returns the first enabled in `ALL` order. For Veil (DEFAULT) plus Calculator (ENABLED) that is "veil", while a Calculator icon is also on the home screen.
+- There can never be zero entries. Enable-first is correct, and a failure in the first call changes nothing.
+
+**Fix:** reconcile in `load()`:
+```kotlin
+val enabled = VeilIcons.ALL.filter { VeilIcons.isEnabled(activity, it) }
+if (enabled.size != 1) VeilIcons.set(activity, enabled.lastOrNull { it != "veil" } ?: "veil")
+```
+Here `isEnabled` is the per-name test that `current()` already does. Also note in ADR-0022 that the alias names (`.LaunchVeil` …) are now a compatibility contract. Removing or renaming an alias a user has ENABLED leaves no launcher entry after the update.
+
+### IC-5 (Low, HIGH confidence): the release check does not check what its comment says
+
+**Where:** `.github/workflows/release.yml:149-152`.
+
+**Problem:**
+- The comment says "Veil's alias enabled, every disguise there", but the check only greps the five names.
+- It would pass with every alias enabled, or with `MainActivity` still carrying its LAUNCHER filter (six launcher entries).
+
+**Fix:** use badging. It lists exactly the enabled launcher activities:
+```bash
+L=$("$BT/aapt2" dump badging out/Veil-android-arm64-unsigned.apk | grep '^launchable-activity:')
+[ "$(echo "$L" | wc -l)" = 1 ] && echo "$L" | grep -q "name='org.veil.app.LaunchVeil'" \
+  || { echo "expected exactly one launcher entry, LaunchVeil: $L"; exit 1; }
+```
+Keep the name loop for the four disabled disguises.
+
+### IC-6 (Low, MEDIUM confidence): the picker disables the focused radio while busy, and arrow keys apply every icon they pass
+
+**Where:** `app/src/components/AppIcon.tsx:79` (`disabled={busy}`, `onChange={() => void choose(i)}`).
+
+**Problem:**
+- With native radios, an arrow key moves focus and checks the next radio, which fires `onChange` and `setAppIcon` at once.
+- `disabled={busy}` then takes focus away from the element the user is on. Focus drops to `<body>`, and TalkBack or a keyboard user loses their place.
+- Each arrow step is a real launcher change, which can drop home-screen shortcuts.
+
+**Fix:**
+- Replace `disabled={busy}` with `aria-disabled={busy}`. `choose` already returns while `busy`, and `checked` is controlled, so nothing else changes.
+- Optionally apply the change only on click or Space, not on arrow navigation. The wallpaper picker's "arrow keys never open a file chooser" rule is the precedent.
+
+---
+
+## Checked and found correct
+
+**Backup:**
+- `take_rekey_budget` is `cfg(feature = "test-hooks")`, and the release app never enables it. Budget `Some(1)` handles exactly one contact and then returns `Err(Storage)`, so the flag stays, as the test needs. The `Cell` makes `Actor` `!Sync` only under the feature. The tests compile and pass, so the actor future does not need `Send` there.
+- `finish_restore_due` cannot run against the wrong database. Decoy and Purge never call `open_session`, and a decoy database has no `restore.rekey_due`.
+- The `since = -1` fallback handles everyone, which is safe. A repeat ends in `mark_unreached` at worst, never in a skip.
+- `RestoreView.unlocked` carries no secret or user content.
+- The Onboarding wording is correct in all three states.
+
+**Screenshot guard:**
+- `native_info` now returns `Res<NativeInfo>`, and `ipc.ts`'s `call` handles both shapes.
+- Lock with `Some(false)` does not lift `FLAG_SECURE`.
+- The `CodeCard` cleanup after a lock finds `None` and does nothing.
+- `onGone` runs only after the guard was released, so `refresh()` reads the real setting.
+
+**Manifest rewrite (`harden.py`), checked against Tauri's current template:**
+- The `<activity … android:name=".MainActivity" …>…</activity>` regex matches the multi-line opening tag (`[^>]*` spans newlines, `re.S` for the body).
+- The tempered `<intent-filter>` regex removes only the MAIN/LAUNCHER filter. In the template, that filter also holds `LEANBACK_LAUNCHER`, so Android TV loses its entry, which is irrelevant here.
+- `"android.intent.category.LEANBACK_LAUNCHER"` does not contain `"android.intent.category.LAUNCHER"`, so the `count == 5` sanity check is exact.
+- The aliases are inserted after `</activity>`, as aliases must follow their target. Each has `android:exported="true"` (required with a filter on API 31+) and a relative `targetActivity=".MainActivity"`.
+- The aliases resolve against the `org.veil.app` namespace that `harden.py` already enforces. That matches `ComponentName(ctx.packageName, "org.veil.app.Launch…")` after `__PACKAGE__` substitution, because applicationId equals the namespace.
+- `MainActivity` keeps `exported="true"`, which `tauri android dev` needs for `am start`.
+- `tauri-utils::update_android_manifest` inserts only at a `</activity>` line, and only for file associations, which Veil does not configure. `</activity-alias>` does not match `</activity>`.
+- `harden.py` is not idempotent for the alias step: a second run exits with "MainActivity has no LAUNCHER intent-filter". That fails loudly and safely, and CI runs it once, after a fresh `tauri android init`.
+
+**Launcher entries:**
+- At install exactly one alias, Veil, is enabled. `set` enables first and then disables, so there is never a moment with no launcher entry.
+- `getLaunchIntentForPackage` resolves the enabled alias, so new notification taps work after a switch. IC-2 covers only the older `PendingIntent`s.
+
+**Resources:**
+- The `mipmap-anydpi-v26` adaptive icon has background, foreground and monochrome. `<monochrome>` needs compileSdk 33+, and the template uses 36.
+- `mipmap-anydpi` has the layer-list fallback for API 24–25: an inline `<shape>` plus a vector, both valid there.
+- The colours and strings are in one values file. The vector path data, including the arc flags, is well formed.
+- `ic_stat_dot` is written before it is referenced, and `@string/app_name` is checked.
+
+**Kotlin compile:**
+- `ActivityManager` and `ComponentName` are imported, and `Context` was already imported.
+- `R.drawable.ic_stat_dot` resolves in `org.veil.app.R`.
+- `continue` inside the `try`/`catch` expression is valid Kotlin.
+- `replaceFirstChar { it.uppercase() }` uses the `(Char) -> CharSequence` overload.
+- `@Suppress("DEPRECATION")` on the `setTaskDescription` statement is legal, and the deprecation would be only a warning anyway.
+- `NameArgs`/`NameArg { value }` and `JSObject().put("value", …)`/`Name { value }` match on both sides of the bridge.
+- Rust: `native.rs` android `imp` has `Serialize`/`Deserialize` in scope, and `Empty` exists. The desktop stubs return `None`/`Unavailable`.
+
+**Rust commands:**
+- `set_app_icon` requires `AppState::Unlocked`.
+- `AppIcon` deserialises strictly from the five lowercase names, and serde rejects anything else.
+- The webview gets only the icon name (rule 2), and the plugin is reachable only from Rust (ADR-0012 capability).
+
+**Notifications:**
+- They are still content-free: never a sender or text. While disguised they say "Tap to open", and calls still say "Incoming call".
+- The small icon is a plain dot while disguised.
+
+**Picker accessibility and design:**
+- Accessibility: a `role="radiogroup"` with `aria-label`, native radios with visible names and "(in use)" for screen readers. The selected tile has a ring and a bolder name, so the state is not shown by colour alone. Each whole tile (input `inset: 0`, ≥ 64 px wide, `min-height: var(--tap-min)`) is the target, and `focus-visible` shows an outline.
+- Design tokens: colours only through tokens (`--surface-3`, `--warning`, `--text-1`, `--bg-1`, `--border-subtle`, `--focus`), and all of them exist. The px sizes mirror the existing `.wp-tile` rules. There is no animation.
+
+**Docs:**
+- ADR-0022 exists before the change, as rule 1 asks for anything new.
+- THREAT_MODEL §4 lists the disguise as not a security boundary.
+- The DESIGN.md row matches the component.
+
+**Verdict, part A (backup, round 4): PASS.** No Critical, High or Medium findings are open. 4 Low findings are open (BK4-1 to BK4-4).
+
+**Verdict, part B (disguised app icon, round 1): FAIL.** IC-1 (Medium) is open, plus 5 Low (IC-2 to IC-6). Fix IC-1's false claim in the UI, ideally together with IC-2, then re-review.
