@@ -472,7 +472,7 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 - *Launcher entries:* `harden.py` moves the launcher entry from `MainActivity` to five `<activity-alias>` entries: Veil, Calculator, Notes, Weather and Clock. Each has its own icon and label, and only Veil's is enabled at install. Settings → App icon (Android only, while unlocked) enables the chosen alias first and then disables the others (`PackageManager.setComponentEnabledSetting`, `DONT_KILL_APP`), so there is never no launcher entry.
 - *Icons:* the disguise icons are original, generic glyphs (adaptive icons with a themed variant, and a round fallback before Android 8). They do not copy any real app's icon.
 - *While disguised:*
-  - the recent-apps screen shows the disguise's name and icon (`setTaskDescription`);
+  - the recent-apps screen shows the disguise's name (`setTaskDescription`), and its icon on Android 9 and later;
   - notifications use the disguise's name as title, a plain dot as icon, and "Tap to open" for messages. Calls still say "Incoming call", so they can be answered.
 - *Rule 2:* the webview gets only the icon's name; the plugin is called only from Rust.
 

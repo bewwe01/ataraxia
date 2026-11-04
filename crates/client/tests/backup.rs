@@ -576,19 +576,24 @@ async fn a_restore_stopped_before_rekeying_finishes_at_unlock() {
     );
 }
 
-/// Review BK3-1: which contacts a restore already handled does not depend on any clock. The
-/// backup carries "restored" lines dated far in the future (an earlier restore on a device
-/// whose clock ran ahead), and re-keying stops after one contact; at the next unlock the other
-/// is handled, each exactly once, and nobody is wrongly marked as needing an invite.
+/// Reviews BK3-1, BK4-1, IC2-2: which contacts a restore already handled depends on no clock
+/// and no message row. The backup carries "restored" lines dated far in the future (an earlier
+/// restore on a device whose clock ran ahead), its newest message is a disappearing one that
+/// has expired (so its row goes before re-keying), one contact gave no re-key invite, and
+/// re-keying stops after one contact. At the next unlock the rest are handled: each exactly
+/// once, the reachable ones re-keyed, the other marked as needing an invite once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_partial_restore_resumes_whatever_the_clocks_say() {
     let r = relay().await;
-    let (alice, bob, carol) = (
+    let (alice, bob, carol, dave) = (
         user(&r, "Alice").await,
         user(&r, "Bob").await,
         user(&r, "Carol").await,
+        user(&r, "Dave").await,
     );
     let a = &alice.client;
+    // Dave first: the interrupted run handles him, so a repeat would show (BK4-1).
+    let (a_dave, _) = pair(a, &dave.client).await;
     let (a_bob, b_alice) = pair(a, &bob.client).await;
     let (a_carol, c_alice) = pair(a, &carol.client).await;
     within(std::time::Duration::from_secs(30), || async {
@@ -603,6 +608,19 @@ async fn a_partial_restore_resumes_whatever_the_clocks_say() {
         .await
         .unwrap();
     }
+    // Dave's re-key invite never arrived; the newest row has already expired.
+    a.test_exec(&format!(
+        "UPDATE contacts SET rekey_link = NULL, rekey_sealed = NULL WHERE id = {}",
+        a_dave.id
+    ))
+    .await
+    .unwrap();
+    a.test_exec(&format!(
+        "INSERT INTO messages (contact, mine, kind, body, at_ms, status, expires_at_ms) VALUES ({}, 0, 'text', 'gone', 1, 'received', 1)",
+        a_bob.id
+    ))
+    .await
+    .unwrap();
     let (file, code) = backup(a).await;
     drop(alice);
 
@@ -661,6 +679,24 @@ async fn a_partial_restore_resumes_whatever_the_clocks_say() {
         })
         .await;
     }
+    // Dave: marked once, not re-keyed and not repeated.
+    let dave_lines: Vec<String> = alice2
+        .messages(a_dave.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.kind == "restored" && m.mine)
+        .map(|m| m.text)
+        .collect();
+    assert_eq!(dave_lines, ["needs-invite"]);
+    assert!(
+        alice2
+            .contacts()
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.id == a_dave.id && c.needs_invite)
+    );
 }
 
 /// Reviews BK-12, BK4-4: a backup made by a newer Veil (a schema this one does not know) is

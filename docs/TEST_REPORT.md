@@ -2,6 +2,27 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Icon round 2 fixes (2026-11-04)
+
+- IC2-1: `aapt2 dump badging` ignores `<activity-alias>`, so the release check failed on a correct APK (release run 41869194737: the build passed, the check failed). The check is now `app/android/check_launchers.py` on Gradle's merged manifest. Run on the `harden.py` mock it passes, and it rejects a second enabled alias and a LAUNCHER filter left on MainActivity:
+```text
+check_launchers: .../AndroidManifest.xml: one launcher entry (LaunchVeil), four disguises disabled
+check_launchers: .../bad1.xml: enabled at install: ['LaunchVeil', 'LaunchNotes'], expected only LaunchVeil
+check_launchers: .../bad2.xml: <activity> MainActivity also has a LAUNCHER filter
+```
+- IC2-2: the partial-restore test now also has an unreachable contact, handled in the interrupted run, and an expired newest message. Without `restore_due = 0` in `mark_unreached` it fails: `left: ["needs-invite", "needs-invite"]`.
+- IC2-3: `restore_due` is migration 8.
+- IC2-4: a contact that could not be marked keeps the restore due.
+- IC2-5: the docs say the recents icon changes on Android 9 and later.
+
+```text
+$ cargo clippy --workspace --all-targets [--all-features] -- -D warnings   # exit 0 (both)
+$ cargo test --workspace --all-features
+# 260 passed, 0 failed
+$ pnpm -C app typecheck   # 0 errors
+$ pnpm -C app lint        # 24 files clean
+```
+
 ## Backup round 4 and icon round 1 fixes (2026-11-04)
 
 Backup gate: round 4 **PASS**. Its Low findings are fixed too:

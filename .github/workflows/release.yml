@@ -147,13 +147,14 @@ jobs:
           echo "$M" | grep -E 'allowBackup.*=false'
           echo "$M" | grep -q dataExtractionRules
           # The launcher icons (ADR-0022): exactly one launcher entry, Veil's alias, enabled at
-          # install, and every disguise present (disabled).
-          L=$("$BT/aapt2" dump badging out/Veil-android-arm64-unsigned.apk | grep '^launchable-activity:' || true)
-          echo "$L"
-          [ "$(printf '%s\n' "$L" | grep -c .)" = 1 ] && echo "$L" | grep -q "name='org.veil.app.LaunchVeil'" \
-            || { echo "expected exactly one launcher entry, LaunchVeil"; exit 1; }
-          for a in LaunchCalculator LaunchNotes LaunchWeather LaunchClock; do
-            echo "$M" | grep -q "$a" || { echo "missing launcher alias $a"; exit 1; }
+          # install, the four disguises disabled, and no other LAUNCHER filter. `aapt2 dump
+          # badging` ignores <activity-alias> (review IC2-1), so the check reads the manifest
+          # Gradle merged into this APK, as plain XML.
+          MERGED=$(find app/src-tauri/gen/android/app/build/intermediates -path '*merged_manifest*' -name AndroidManifest.xml)
+          [ -n "$MERGED" ] || { echo "no merged manifest found"; exit 1; }
+          python3 app/android/check_launchers.py $MERGED
+          for a in LaunchVeil LaunchCalculator LaunchNotes LaunchWeather LaunchClock; do
+            echo "$M" | grep -q "$a" || { echo "missing launcher alias $a in the APK"; exit 1; }
           done
           # Permissions: exactly the ones Veil declares (any namespace), so nothing a dependency
           # slips in goes unnoticed (review M2-5, M2R2-2). Add an entry only in the change that

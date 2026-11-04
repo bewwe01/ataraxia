@@ -7556,3 +7556,192 @@ Keep the name loop for the four disabled disguises.
 **Verdict, part A (backup, round 4): PASS.** No Critical, High or Medium findings are open. 4 Low findings are open (BK4-1 to BK4-4).
 
 **Verdict, part B (disguised app icon, round 1): FAIL.** IC-1 (Medium) is open, plus 5 Low (IC-2 to IC-6). Fix IC-1's false claim in the UI, ideally together with IC-2, then re-review.
+
+---
+
+## Disguised app icon review, round 2 (2026-11-04)
+
+**Scope:** I reviewed `git diff 44b2091 0c5aa35` (12 files; the code part is +240/−60, excluding REVIEW_REPORT/TEST_REPORT). I also read the current versions of these:
+- `app/android/VeilNativePlugin.kt`: `VeilNotify.openApp`, `VeilIcons`, `VeilService.onStartCommand`, `startService`, `load`, `applyTaskLabel`, `setAppIcon`
+- `app/android/harden.py`: the alias and disguise sections
+- `.github/workflows/release.yml`: the check step
+- `app/src-tauri/src/lib.rs`: `lock`, `release_code_guard`, `backup_code_on_screen`, `on_page_load`, `restore_part`/`max_backup`
+- `app/src/components/AppIcon.tsx` and `Backup.tsx` (`CodeCard`)
+- `crates/client/src/service/backup.rs`: `mark_rekey_due`, `strip`, `export_to`, `create_backup`, `finish_restore`, `rekey_all`, `rekey_one`, `new_rekey`, `mark_unreached`, `revoke_quietly`
+- `crates/client/src/service.rs`: `restore`, `restore_inner`, `open_session`, `on_tick`, `atomically`, `interruptible`, `Cmd::Lock`
+- `crates/client/src/db.rs`: migrations and tests
+- `crates/client/tests/backup.rs`
+- ADR-0021/0022, INV-BAK-2, THREAT_MODEL §4 item 14, the DESIGN.md row
+- AOSP `tools/aapt2/dump/DumpManifest.cpp` (main), to see how `dump badging` works
+
+I did not edit any repository files. One of my commands accidentally created an empty untracked `/home/user/ataraxia/dist/` directory, and I removed it at once (`git status` is clean).
+
+**Commands run:**
+- `CARGO_INCREMENTAL=0 cargo test -p veil-client --features test-hooks --test backup`: 8 passed in 56.05 s, including `a_newer_backup_is_refused` and `a_partial_restore_resumes_whatever_the_clocks_say`.
+- `CARGO_INCREMENTAL=0 cargo test -p veil-client --features test-hooks --lib db::tests`: 8 passed, including `migrates_a_version_6_database` and `refuses_a_newer_database`.
+- `(cd app/src-tauri && cargo clippy --all-targets -- -D warnings)`: exit 0. The `on_page_load` closure, `try_state` and `release_code_guard` compile on desktop.
+- I watched the release workflow on 0c5aa35 (run 41869194737, `workflow_dispatch`):
+  - **"Build release APK (arm64, unsigned)" passed**, so the new Kotlin compiles.
+  - **"Check the hardening reached the APK" failed**: an empty `launchable-activity` list, then `expected exactly one launcher entry, LaunchVeil`, exit 1. See IC2-1.
+
+**Verdict: FAIL.** One Medium finding is open (IC2-1). It makes the IC-5 fix break every release build.
+
+---
+
+## Status of the round 1 findings
+
+| ID | Status | Notes |
+|---|---|---|
+| IC-1 | **Fixed** | The hint now says Android puts "Veil" at the top of every notification, including on the lock screen, and that turning notifications off hides it. This matches ADR-0022's Consequences and THREAT_MODEL §4 item 14. |
+| IC-2 | **Fixed** | `openApp` targets `__PACKAGE__.MainActivity` explicitly. `harden.py` replaces `__PACKAGE__` with the checked package. `MainActivity` stays exported, and an explicit intent needs no filter match. `setAppIcon` calls `startService(true)` when background is on, so `onStartCommand` runs `startForeground` again with the same `SERVICE_ID`, the new label and smallIcon, and the `MainActivity` PendingIntent. |
+| IC-3 | **Fixed on API 28+** | API 33+ uses `TaskDescription.Builder().setLabel().setIcon(Int)`. API 28–32 uses `TaskDescription(String, Int)`. Below 28, only the label changes (residual in IC2-5). |
+| IC-4 | **Fixed** | `reconcile` runs in `load` inside `try`, before `applyTaskLabel`. It handles both 0 and 2+ enabled aliases. The compatibility contract is written in the KDoc and in ADR-0022. |
+| IC-5 | **Not fixed, now broken** | `aapt2 dump badging` never reports `<activity-alias>` launchers, so the new check fails on a correct APK (IC2-1). |
+| IC-6 | **Fixed** | `aria-disabled={busy}` replaces `disabled`, and `choose` still returns while `busy`. The optional "apply only on click or Space" part was not done. It was optional, and is acceptable. |
+| BK4-1 | **Fixed in code** (test gap in IC2-2) | Each contact now has a `restore_due` flag. It is cleared only in the same savepoint as that contact's line. Details under "Checked and found correct". |
+| BK4-2 | **Fixed (accepted and documented)** | ADR-0021 now says commands right after an unlock may wait on the relay, and that a Lock interrupts it. |
+| BK4-3 | **Fixed** | `lock` locks first and then calls `release_code_guard`. `on_page_load(Started)` releases the guard too. `c.lock()` can fail only if the actor is gone, so releasing the guard after a failed lock is not a realistic exposure. |
+| BK4-4 | **Fixed** | `a_newer_backup_is_refused` is meaningful: `export_to` copies `user_version` explicitly, and `Db::open` returns `NewerVersion`. The two arguments in INV-BAK-2 match the code: `revoke_quietly` maps only `InviteInvalid` to success, and `create_backup` removes the `.tmp` file when the sealed size is over `MAX_BACKUP`. `restore_part` limits uploads with `max_backup()`, which is the same constant. TEST_REPORT is reworded. |
+
+---
+
+## New findings
+
+### IC2-1 (Medium, HIGH confidence): the new badging check fails on every correct APK, so no release can be published
+
+**Where:** `.github/workflows/release.yml:151-154`.
+
+**Problem:**
+- In aapt2's `DumpManifest.cpp`, only the `"activity"` tag creates an `Activity` element (`kTagCheck`; there is no `"activity-alias"` entry).
+- `Action::Extract` and `Category::Extract` set `has_main_action`/`has_launcher_category` only when `ElementCast<Activity>(parent_stack[1])` matches. So the MAIN/LAUNCHER filter of an `<activity-alias>` is never reported as a `launchable-activity`.
+- After `harden.py`, `MainActivity` has no launcher filter. The badging output therefore has **zero** `launchable-activity:` lines, the count is 0, and the step exits 1.
+- This is confirmed by the real run on 0c5aa35: the build step passed, then the check printed an empty `$L` and `expected exactly one launcher entry, LaunchVeil`.
+- It fails closed, so no unsafe APK ships. But every tagged release now fails, and round 1's IC-5 goal (exactly one enabled entry, and `MainActivity` carries no LAUNCHER) is still unchecked.
+
+**Fix:** check the compiled manifest (`$M`, from `aapt2 dump xmltree`) for each alias, instead of using badging:
+```bash
+# The launcher icons (ADR-0022): five aliases, only LaunchVeil enabled, and no LAUNCHER
+# filter anywhere else (aapt2 badging ignores <activity-alias>, so it cannot check this).
+echo "$M" | awk '
+  /E: activity-alias/ { k = "alias"; n = ""; next }
+  /E: (activity|service|receiver|provider) / { k = $2; next }
+  k == "alias" && /android:name\(/ { match($0, /"[^"]+"/); n = substr($0, RSTART + 1, RLENGTH - 2); names[n] = 1 }
+  k == "alias" && /android:enabled\(/ { en[n] = ($0 ~ /=true/) }
+  /"android.intent.category.LAUNCHER"/ { if (k == "alias") l++; else bad = 1 }
+  END {
+    for (a in names) { c++; if (en[a]) { e++; on = a } }
+    if (bad || c != 5 || l != 5 || e != 1 || on != "org.veil.app.LaunchVeil") {
+      print "launcher aliases wrong: aliases=" c " launcher-filters=" l " enabled=" e " (" on ") other-launcher=" bad; exit 1 }
+  }'
+```
+Keep the name loop for the four disguises. Test the awk once against the `xmltree` output of the APK artifact from the 44b2091 run before pushing.
+
+### IC2-2 (Low, HIGH confidence): BK4-1 has no test that fails without the fix
+
+**Where:** `crates/client/tests/backup.rs`.
+
+**Problem:**
+- `a_partial_restore_resumes_whatever_the_clocks_say` passed on the old row-id design too (round 1 ran it green), so it does not cover the row-id reuse that BK4-1 described.
+- Removing `restore_due = 0` from `mark_unreached` would also go unnoticed: the test re-keys both contacts, so it never takes the "needs-invite" path mid-run.
+- ADR-0021 now claims that "no deleted message can make it skip or repeat a contact" (CLAUDE.md rule 9).
+
+**Fix:** extend the partial test, or add `a_partial_restore_with_an_unreachable_contact_marks_it_once`:
+- In the backup, give one contact no re-key invite (`UPDATE contacts SET rekey_link = NULL`), and make the newest message a disappearing message that has already expired (`expires_at_ms = 1`).
+- Call `limit_rekeys(1)`, restore, lock and unlock.
+- Assert exactly one `needs-invite` line for that contact and exactly one `''` line for the other.
+
+### IC2-3 (Low, MEDIUM confidence): `restore_due` was added to migration 7 in place, not as migration 8
+
+**Where:** `crates/client/src/db.rs:163-164`.
+
+**Problem:**
+- `MIGRATIONS` says "each runs once". Migration 7 (33d2160) is not in any tag (`v0.1.0-preview.4` predates it), so released users are unaffected.
+- But any device that ran a build from 33d2160 to 44b2091 (for example the build-only release APK artifacts) is already at `user_version = 7` without the column. On such a device:
+  - every backup fails, because `strip`'s `UPDATE bak.contacts SET … restore_due = 0` errors;
+  - restoring such a backup fails in `mark_rekey_due`;
+  - and there is no way to recover except a reset.
+- The round 1 fix proposed migration 8.
+
+**Fix:** move the `ALTER TABLE contacts ADD COLUMN restore_due …` into a new 8th entry, and add `"restore_due"` to a `migrates_a_version_7_database` test, not to the m7 list. Alternatively, state in the commit and in TEST_REPORT that pre-release databases from those commits must be reset.
+
+### IC2-4 (Low, MEDIUM confidence): if `mark_unreached` fails, the contact is silently skipped for good
+
+**Where:** `crates/client/src/service/backup.rs:633-637`, `finish_restore` at `:576-581`.
+
+**Problem:**
+- `let _ = self.atomically(... mark_unreached ...)` ignores a storage error. That contact keeps `restore_due = 1`, gets no line and no `needs_invite`, yet `rekey_all` returns `Ok`, and `finish_restore` deletes `restore.rekey_due`.
+- That is a skip, which is the outcome the per-contact flag exists to rule out. It needs a storage error, so it is Low.
+- Re-running is now safe, because handled contacts are cleared atomically. So the BK-6 "don't stop on one contact" goal and a retry are no longer in tension.
+
+**Fix:**
+```rust
+let mut failed = false;
+// in the loop:
+if !ok && self.atomically(async { mark_unreached(s.db.conn(), contact) }).await.is_err() {
+    failed = true;
+}
+// after the loop:
+self.emit(ChangeKind::Contacts, None);
+if failed { Err(ClientError::Storage) } else { Ok(()) }
+```
+With this, the flag stays and only the remaining `restore_due = 1` contacts are retried at the next unlock.
+
+### IC2-5 (Low, HIGH confidence): before API 28 the recents icon does not change, but the docs and the hint say it does
+
+**Where:** `VeilNativePlugin.kt` `applyTaskLabel` (the `else` branch), ADR-0022 "While disguised", the `AppIcon.tsx` hint, the `design/DESIGN.md:154` row.
+
+**Problem:**
+- On Android 7–8.1 (minSdk 24), `TaskDescription(label)` changes only the label.
+- With notifications now opening `MainActivity` (IC-2), a task cold-started from a notification also starts at `MainActivity`, so its recents icon is Veil's own shield on those versions.
+- Separately, the DESIGN.md row still says the hint covers only "Android's Settings → Apps", not the notification header.
+
+**Fix:**
+- Reword ADR-0022 to "the recent-apps screen shows the disguise's name, and its icon on Android 9 and later".
+- Update the DESIGN.md row: "what it does not hide (the notification header, Settings → Apps)".
+- Optionally, on API 24–27, render the mipmap to a `Bitmap` (`getDrawable(iconRes)` → `toBitmap()`) and use the deprecated `TaskDescription(label, bitmap)`.
+
+---
+
+## Checked and found correct
+
+**Kotlin compile.** The release run built the APK on 0c5aa35, which confirms the three API questions:
+- `ActivityManager.TaskDescription.Builder()`, `setLabel(String)` and `setIcon(@DrawableRes Int)` are API 33.
+- `TaskDescription(String, Int)` is API 28, deprecated in 33, and is used only for SDK 28–32, under `@Suppress("DEPRECATION")`.
+- `TaskDescription(String)` is used below 28.
+- All three branches have the type `TaskDescription`.
+- `ctx.applicationInfo.icon` is the valid `PackageItemInfo.icon` field. `harden.py` refuses an `<application>` without `android:icon`.
+- `Intent.setClassName(Context, String)` (API 1) returns `Intent`, so `.addCategory` chains.
+- `R.mipmap.veil_disguise_*` exist: `harden.py` writes both `mipmap-anydpi-v26/` and `mipmap-anydpi/` files with those names.
+
+**Icon switching:**
+- `reconcile` keeps the last enabled alias in `ALL` order. An interrupted Veil→disguise switch therefore always ends disguised (the privacy-preserving direction).
+- An interrupted disguise→Veil or disguise→disguise switch may settle on the other disguise. The picker then shows the alias that is actually enabled, so it is harmless.
+- With zero aliases (none found), `set("veil")` throws, the exception is caught in `load`, and nothing changes.
+- `startService(true)` in `load` runs before `reconcile`, but its label comes from `current()`, which already names the alias that `reconcile` keeps.
+- The Weather cloud fix (`M42,66v9h26v-9z`) gives the rectangle the same winding as the arcs (sweep 0), so the nonzero fill no longer cuts a hole. The TSX glyph matches.
+
+**Backup:**
+- `mark_rekey_due` runs on the restored `restore.db`, after `Db::open` has run the migrations, so the column exists for older backups, and before the vault re-key and rename. It sets `restore_due = 1` only for unblocked contacts.
+- `strip` runs only on the `bak` export schema, never on a restore. It clears `restore_due`, so a backup taken mid-re-key carries no flag.
+- No other code writes `restore_due`.
+- `rekey_all` cannot repeat a contact:
+  - `rekey_one` clears the flag inside the same savepoint as the `restored` line and the control row, and returns `Ok` only if that savepoint committed (`deliver` after it cannot fail the call).
+  - A failure rolls everything back, and the contact is then marked in its own `atomically` block with the flag cleared.
+  - The test-hooks budget error happens before any write.
+- It cannot skip a contact, except in the storage-error case in IC2-4.
+- No relay call runs inside a savepoint: `new_rekey` and `redeem_invite` are local, and `interruptible` wraps only relay calls. A Lock can therefore not leave a savepoint open or mark contacts as unreached. Undelivered introductions stay `sending` for `retry_failed`.
+- `atomically` around `mark_unreached` is the outermost savepoint, because `rekey_all` is not called inside another one.
+- `finish_restore` no longer parses the flag, so a malformed value cannot misfire.
+
+**Shell:**
+- `release_code_guard` resets only `Some(true)`.
+- `on_page_load(Started)` uses `try_state`, so it is safe before `manage`. It is harmless on the first load, where the guard is `None`.
+- `CodeCard` unmount → `backup_code_on_screen(false)` still covers auto-lock.
+
+**Picker:**
+- `aria-disabled` keeps focus on the radio, `checked` stays controlled, and the `busy` guard in `choose` prevents a second change.
+- The hint is honest, and its wording agrees with ADR-0022 and THREAT_MODEL.
+
+**Docs:** ADR-0021 (per-contact flag, BK4-2 accepted), ADR-0022 (notification header, `MainActivity` intents, reconcile, alias contract) and INV-BAK-2 (new test and arguments) match the code, apart from IC2-5.
+
+**Verdict: FAIL.** IC2-1 (Medium) is open: the IC-5 check fails on every correct APK (confirmed by release run 41869194737), so no release can be published. Four Low findings are open (IC2-2 to IC2-5). IC-1 to IC-4, IC-6 and BK4-1 to BK4-4 are fixed (IC-3 on API 28+). Fix IC2-1, check it against a real APK, then re-review.

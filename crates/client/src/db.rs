@@ -159,9 +159,10 @@ const MIGRATIONS: &[&str] = &[
      -- When a restore re-keyed this contact and nothing has come back from them yet (BK-5).
      ALTER TABLE contacts ADD COLUMN rekey_pending_ms INTEGER NOT NULL DEFAULT 0;
      -- No new re-key invite for them before this (after one could not be sealed; BK-2).
-     ALTER TABLE contacts ADD COLUMN rekey_retry_ms INTEGER NOT NULL DEFAULT 0;
-     -- A restore has yet to re-key or mark this contact (review BK4-1).
-     ALTER TABLE contacts ADD COLUMN restore_due INTEGER NOT NULL DEFAULT 0;",
+     ALTER TABLE contacts ADD COLUMN rekey_retry_ms INTEGER NOT NULL DEFAULT 0;",
+    // 8: a restore has yet to re-key or mark this contact (review BK4-1). Its own migration,
+    // for test builds already at 7 (review IC2-3).
+    "ALTER TABLE contacts ADD COLUMN restore_due INTEGER NOT NULL DEFAULT 0;",
 ];
 
 fn migrate(conn: &Connection) -> Result<()> {

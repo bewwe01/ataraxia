@@ -616,6 +616,9 @@ impl Actor {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
+        // A contact that could not even be marked keeps `restore_due`, and the run reports
+        // failure, so the flag stays and the next unlock tries again (review IC2-4).
+        let mut failed = false;
         for (contact, address, my_token, link, sealed) in rows {
             #[cfg(feature = "test-hooks")]
             if self.take_rekey_budget() {
@@ -630,14 +633,17 @@ impl Actor {
             };
             // Best effort: the restore is done, and one contact's row is no reason to stop
             // (review BK-6). A contact reached got the line with the re-key itself.
-            if !ok {
-                let _ = self
+            if !ok
+                && self
                     .atomically(async { mark_unreached(s.db.conn(), contact) })
-                    .await;
+                    .await
+                    .is_err()
+            {
+                failed = true;
             }
         }
         self.emit(ChangeKind::Contacts, None);
-        Ok(())
+        if failed { Err(ClientError::Storage) } else { Ok(()) }
     }
 
     async fn rekey_one(
