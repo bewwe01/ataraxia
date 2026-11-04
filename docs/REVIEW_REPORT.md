@@ -7745,3 +7745,141 @@ With this, the flag stays and only the remaining `restore_due = 1` contacts are 
 **Docs:** ADR-0021 (per-contact flag, BK4-2 accepted), ADR-0022 (notification header, `MainActivity` intents, reconcile, alias contract) and INV-BAK-2 (new test and arguments) match the code, apart from IC2-5.
 
 **Verdict: FAIL.** IC2-1 (Medium) is open: the IC-5 check fails on every correct APK (confirmed by release run 41869194737), so no release can be published. Four Low findings are open (IC2-2 to IC2-5). IC-1 to IC-4, IC-6 and BK4-1 to BK4-4 are fixed (IC-3 on API 28+). Fix IC2-1, check it against a real APK, then re-review.
+
+---
+
+## Disguised app icon review, round 3 (2026-11-04)
+
+**Scope:** `git diff 0c5aa35 9f741b7`. That covers 10 files: `check_launchers.py` (new), `release.yml`, `db.rs`, `service/backup.rs`, `tests/backup.rs`, ADR-0022, DESIGN.md, `AppIcon.tsx`, TEST_REPORT and REVIEW_REPORT. I also read the current files around the diff (`harden.py`, `finish_restore`, `take_rekey_budget`, the migration tests). No files were edited.
+
+**Release run 41874080430 on 9f741b7 (headSha 9f741b76…), android job: success.** The build step passed, "Check the hardening reached the APK" passed, and the upload passed. The job log shows that `find` matched two manifests and the script accepted both:
+```text
+check_launchers: app/src-tauri/gen/android/app/build/intermediates/merged_manifests/universalRelease/processUniversalReleaseManifest/AndroidManifest.xml: one launcher entry (LaunchVeil), four disguises disabled
+check_launchers: app/src-tauri/gen/android/app/build/intermediates/merged_manifest/universalRelease/processUniversalReleaseMainManifest/AndroidManifest.xml: one launcher entry (LaunchVeil), four disguises disabled
+```
+The aapt2 `xmltree` alias-name loop and the permission allowlist also passed. When I read the logs, the windows and app-supply-chain jobs were still running; they are not part of this review.
+
+### Status of round 2 findings
+
+| ID | Status | Notes |
+|---|---|---|
+| IC2-1 | **Fixed** | The check now parses Gradle's merged manifest instead of `aapt2 dump badging`. It passed on a real release build (run 41874080430). Residuals: IC3-1, IC3-3. |
+| IC2-2 | **Fixed** | Dave has no re-key invite and is paired first. He uses up the single re-key budget in the interrupted run (`take_rekey_budget` runs before every contact), so a second `needs-invite` line would fail `assert_eq!(dave_lines, ["needs-invite"])`. TEST_REPORT says this assertion fails when the fix is removed. The newest message is an expired disappearing one (`expires_at_ms = 1`). |
+| IC2-3 | **Fixed** (test gap in IC3-2) | `restore_due` is now migration 8. `migrate` runs 7 and then 8, so a database already at version 7 gets the column. |
+| IC2-4 | **Fixed** | If `mark_unreached` fails, `failed` is set, `rekey_all` returns `Err(Storage)`, and `finish_restore` keeps `restore.rekey_due`. The next unlock retries only the contacts still `restore_due = 1`, and handled contacts were cleared atomically, so none is repeated. |
+| IC2-5 | **Fixed** | ADR-0022 ("its icon on Android 9 and later"), the `AppIcon.tsx` hint ("its name in recent apps") and the DESIGN.md row (notification header, lock screen, Settings → Apps, notifications off) now match `applyTaskLabel`. |
+
+### Answers to the five questions
+
+1. **Path pattern.** It is right for this build. Tauri 2 builds `--target aarch64` without `--split-per-abi` as the **`universal`** flavour (`assembleUniversalRelease`), not `arm64`. The APK is `outputs/apk/universal/release/app-universal-release-unsigned.apk`. The pattern names no variant, so it still works.
+   - With AGP 8.x, `*merged_manifest*` matches `merged_manifest/<variant>/process<Variant>MainManifest/` and `merged_manifests/<variant>/process<Variant>Manifest/`. Both are the app's fully merged manifest.
+   - The search is limited to `app/build/intermediates`. Library modules (Tauri plugins) build in their own build directories, and AAR manifests sit in the Gradle transform cache, so neither is matched.
+   - A release-only `tauri android build` builds no androidTest or unitTest variant, so no test manifest appears. The CI workspace is fresh, so there are no stale variants either.
+   - It could also match `aapt_friendly_merged_manifests`, but that is the same content and would pass or fail the same way.
+   - The one gap: the manifest actually packed into the APK (`packaged_manifests/…ForPackage`) is not among those checked (IC3-1).
+2. **Relative or full names.** AGP's manifest merger rewrites relative component names (`.LaunchVeil`) to fully qualified ones (`org.veil.app.LaunchVeil`) in its output. MEDIUM confidence: this is AGP behaviour I know but did not print from the run, because the log shows only the script's verdict.
+3. **Both forms handled?** Yes. `rsplit(".", 1)[-1]` reduces both forms to the bare name. I checked this locally with synthetic manifests in both forms: both pass. The side effect: the package prefix is never checked (IC3-3).
+4. **`enabled` defaults.** Correct. A missing `android:enabled` counts as `true`, which is Android's default. Any value other than the literal `false` (for example `@bool/x`) counts as enabled, so the check fails closed. A synthetic manifest with the `enabled="false"` attributes removed was rejected, with all five aliases reported as enabled. The list comparison `enabled != ["LaunchVeil"]` is correct because exactly one alias is expected.
+5. **Libraries adding LAUNCHER.** No current release dependency does: the run passed with all of Veil's AndroidX and plugin dependencies merged.
+   - The known LAUNCHER-category activities are `androidx.test.core`'s `InstrumentationActivityInvoker$BootstrapActivity` and friends. They come only from androidTest dependencies, which are not in a release variant.
+   - If a future dependency added one, the script would reject it ("`<activity> … also has a LAUNCHER filter`"). That is the intended fail-closed result, because such a filter would put a second, undisguised icon on the home screen.
+   - The rule is a little stricter than Android's: it flags a LAUNCHER category even without MAIN. That is acceptable.
+   - Likewise, any library `<activity-alias>` without a LAUNCHER filter would fail the build ("alias … has no LAUNCHER filter"). No dependency has one today. If one appears, that error message says what happened.
+
+### New findings
+
+### IC3-1 (Low, HIGH confidence): the launcher check reads Gradle intermediates, not the manifest inside the APK
+
+**Where:** `.github/workflows/release.yml`, the `MERGED=$(find …)` line.
+
+**Problem:**
+- The checked files are `merged_manifest(s)/universalRelease/…`. The manifest packed into the APK comes from the later `process<Variant>ManifestForPackage` task (`packaged_manifests/`).
+- For this app, with no splits and no instant app, the files are the same today. But the only check on the shipped bytes is the `grep -q "$a"` name loop on `$M`, which proves an alias is present, not that it is enabled or that it is the only launcher.
+- The workflow comment ("the manifest Gradle merged into this APK") claims a bit more than is checked.
+
+**Fix:** also cover the packaged manifest, which the script already accepts as an extra path:
+```bash
+MERGED=$(find app/src-tauri/gen/android/app/build/intermediates \
+  \( -path '*/merged_manifest*/*' -o -path '*/packaged_manifests/*' \) -name AndroidManifest.xml)
+```
+Alternatively, add a step that checks `$M` directly: the awk from IC2-1, or a decode of the APK's binary XML.
+
+### IC3-2 (Low, HIGH confidence): no test upgrades a version-7 database to 8
+
+**Where:** `crates/client/src/db.rs`, test `migrates_a_version_6_database`.
+
+**Problem:**
+- IC2-3 existed for devices already at `user_version = 7` without `restore_due`. The only migration test still starts at version 6.
+- That test also lists `restore_due` among "migration 7's columns" in `m7`, which is now inaccurate.
+- If migration 8 were later merged back into 7, nothing would catch it (CLAUDE.md rule 9).
+
+**Fix:** move `"restore_due"` out of `m7` and fix the comment. Add a test for the version-7 case:
+```rust
+/// Review IC2-3: a database at version 7 (no `restore_due`) gets migration 8.
+#[test]
+fn migrates_a_version_7_database() {
+    // same setup as the v6 test, then:
+    db.conn().execute_batch("ALTER TABLE contacts DROP COLUMN restore_due; PRAGMA user_version = 7;").unwrap();
+    // reopen; assert user_version == MIGRATIONS.len() and `SELECT restore_due FROM contacts` returns 0 for the row
+}
+```
+
+### IC3-3 (Low, MEDIUM confidence): alias names are matched by their last segment only, and `targetActivity` is not checked
+
+**Where:** `app/android/check_launchers.py`, the `check()` function, `name = (…).rsplit(".", 1)[-1]`.
+
+**Problem:**
+- `com.example.lib.LaunchNotes` would be accepted as Veil's `LaunchNotes`. The script also never checks that an alias points at `MainActivity`.
+- So the "exactly Veil's five aliases" claim is weaker than stated.
+- Today `harden.py` writes all five aliases with `targetActivity=".MainActivity"`, and the run passed. The risk is only a future dependency or a `harden.py` edit.
+
+**Fix:** normalise against the manifest package and compare full names:
+```python
+root = ET.parse(path).getroot()
+pkg = root.get("package") or "org.veil.app"
+def fq(n): return pkg + n if n.startswith(".") else n
+# in the loop:
+full = fq(el.get(A + "name") or "")
+if el.tag == "activity-alias":
+    if fq(el.get(A + "targetActivity") or "") != pkg + ".MainActivity":
+        return f"alias {full} does not target MainActivity"
+    aliases[full] = ...
+# and compare with {pkg + "." + n for n in WANT}
+```
+
+### IC3-4 (Nit): the test relies on SQLite row order, and TEST_REPORT does not cite the real run
+
+**Where:**
+- `crates/client/tests/backup.rs`, the comment "Dave first: the interrupted run handles him".
+- The `rekey_all` SELECT, which has no `ORDER BY`.
+- `docs/TEST_REPORT.md`, "Icon round 2 fixes".
+
+**Problem:**
+- The test depends on SQLite returning contacts in rowid order. If the order ever changed, the test would still pass but would no longer cover BK4-1.
+- TEST_REPORT shows the script only against the `harden.py` mock. IC2-1 asked for a check against a real APK.
+
+**Fix:**
+- Add `ORDER BY id` to the `rekey_all` query, so the order is deterministic.
+- Add to TEST_REPORT the two `check_launchers:` lines from run 41874080430 quoted above.
+
+## Checked and found correct
+
+- **The script passes on the real build.** Run 41874080430 passed on both merged manifests of `universalRelease`. The bash steps still run under `bash -e`, so a script failure fails the step. The empty-`find` guard gives a clear error. `$MERGED` is unquoted on purpose so it splits into separate arguments; the paths contain no spaces.
+- **Script logic.** It looks only at the direct children of `<application>`, where all components live. `iter("category")` covers every intent filter of an element. An alias without LAUNCHER, any non-alias with LAUNCHER, a wrong alias set and anything other than exactly LaunchVeil enabled are all rejected. A missing `<application>` is reported, not a crash. Synthetic manifests with relative names, full names and no `enabled` attribute behaved as expected.
+- **No hidden second icon.** `harden.py` still removes the LAUNCHER filter from `MainActivity` and guards the LAUNCHER count (exactly 5) before the build. The merged-manifest check now confirms after the merge that no library added one.
+- **IC2-4 control flow.** Because of `&&`, `mark_unreached` runs only when `!ok`, and `failed` is set only when marking fails. `emit` still fires. The test-hook early return is unchanged. A re-run after `Err` is safe: `restore_due` is cleared in the same savepoint as the contact's line (`rekey_one`, `mark_unreached`).
+- **Migration 8.** It is a separate entry, so `MIGRATIONS.len()` is 8 and the `NewerVersion` guard moves with it. Each step runs in its own `BEGIN … user_version … COMMIT`. `migrates_a_version_6_database` still covers 6 → 8.
+- **IC2-2 test.** It covers the clock-ahead lines, the expired newest row, an unreachable contact handled before the interruption, exactly one new `''` line each for Bob and Carol, exactly one `needs-invite` for Dave, `needs_invite` set only for Dave, and the peers receiving the "restored" control message.
+- **Docs.** ADR-0022, the DESIGN.md row and the `AppIcon.tsx` hint agree with each other and with the API-level behaviour of `applyTaskLabel`. The hint gives no false assurance about the notification header or Settings → Apps.
+- **CLAUDE.md non-negotiables.** No new network access, logging, key material or IPC surface. No new GitHub Action; the existing actions are still pinned by SHA.
+
+**Verdict: PASS.** IC2-1 to IC2-5 are fixed, and IC2-1 is confirmed by release run 41874080430. No Critical, High or Medium finding is open. Three Low findings (IC3-1 to IC3-3) and one Nit (IC3-4) are open and can be fixed in a follow-up.
+
+Relevant files:
+- /home/user/ataraxia/app/android/check_launchers.py
+- /home/user/ataraxia/.github/workflows/release.yml
+- /home/user/ataraxia/crates/client/src/db.rs
+- /home/user/ataraxia/crates/client/src/service/backup.rs
+- /home/user/ataraxia/crates/client/tests/backup.rs
+- /home/user/ataraxia/docs/TEST_REPORT.md
+- Job log saved at /tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/log.txt

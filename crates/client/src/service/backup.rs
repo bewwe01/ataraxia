@@ -610,7 +610,7 @@ impl Actor {
                     "SELECT id, address, my_token,
                        CASE WHEN key_warning = 0 THEN rekey_link END,
                        CASE WHEN key_warning = 0 THEN rekey_sealed END
-                     FROM contacts WHERE blocked = 0 AND restore_due = 1",
+                     FROM contacts WHERE blocked = 0 AND restore_due = 1 ORDER BY id",
                 )?
                 .query_map([], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))

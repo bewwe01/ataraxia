@@ -19,22 +19,32 @@ def launcher(el):
 
 
 def check(path):
-    app = ET.parse(path).getroot().find("application")
+    root = ET.parse(path).getroot()
+    # Gradle's merger writes full names; the source manifest has relative ones (review IC3-3).
+    pkg = root.get("package") or "org.veil.app"
+
+    def fq(n):
+        return pkg + n if n.startswith(".") else n
+
+    app = root.find("application")
     if app is None:
         return "no <application>"
     aliases = {}
     for el in app:
-        name = (el.get(A + "name") or "").rsplit(".", 1)[-1]
+        name = fq(el.get(A + "name") or "")
         if el.tag == "activity-alias":
             if not launcher(el):
                 return f"alias {name} has no LAUNCHER filter"
+            if fq(el.get(A + "targetActivity") or "") != pkg + ".MainActivity":
+                return f"alias {name} does not target MainActivity"
             aliases[name] = el.get(A + "enabled", "true") != "false"
         elif launcher(el):
             return f"<{el.tag}> {name} also has a LAUNCHER filter"
-    if set(aliases) != WANT:
-        return f"aliases {sorted(aliases)}, expected {sorted(WANT)}"
+    want = {f"{pkg}.{n}" for n in WANT}
+    if set(aliases) != want:
+        return f"aliases {sorted(aliases)}, expected {sorted(want)}"
     enabled = [n for n, on in aliases.items() if on]
-    if enabled != ["LaunchVeil"]:
+    if enabled != [f"{pkg}.LaunchVeil"]:
         return f"enabled at install: {enabled}, expected only LaunchVeil"
     return None
 

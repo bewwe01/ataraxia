@@ -149,8 +149,8 @@ jobs:
           # The launcher icons (ADR-0022): exactly one launcher entry, Veil's alias, enabled at
           # install, the four disguises disabled, and no other LAUNCHER filter. `aapt2 dump
           # badging` ignores <activity-alias> (review IC2-1), so the check reads the manifest
-          # Gradle merged into this APK, as plain XML.
-          MERGED=$(find app/src-tauri/gen/android/app/build/intermediates -path '*merged_manifest*' -name AndroidManifest.xml)
+          # Gradle merged and packaged into this APK, as plain XML.
+          MERGED=$(find app/src-tauri/gen/android/app/build/intermediates \( -path '*/merged_manifest*/*' -o -path '*/packaged_manifests/*' \) -name AndroidManifest.xml)
           [ -n "$MERGED" ] || { echo "no merged manifest found"; exit 1; }
           python3 app/android/check_launchers.py $MERGED
           for a in LaunchVeil LaunchCalculator LaunchNotes LaunchWeather LaunchClock; do

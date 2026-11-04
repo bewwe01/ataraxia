@@ -328,7 +328,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("veil.db");
         let key = [6u8; 32];
-        let m7: [&str; 9] = [
+        let m7: [&str; 8] = [
             "rekey_link",
             "rekey_sealed",
             "rekey_mine_until",
@@ -337,7 +337,6 @@ mod tests {
             "rekey_until",
             "rekey_pending_ms",
             "rekey_retry_ms",
-            "restore_due",
         ];
         {
             let db = Db::open(&path, &key).unwrap();
@@ -348,7 +347,8 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            for c in m7 {
+            // Version 6 has neither migration 7's columns nor migration 8's.
+            for c in m7.iter().chain(&["restore_due"]) {
                 db.conn()
                     .execute_batch(&format!("ALTER TABLE contacts DROP COLUMN {c};"))
                     .unwrap();
@@ -379,6 +379,41 @@ mod tests {
             })
             .unwrap();
         assert_eq!((name.as_str(), needs), ("Ann", 0));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review IC2-3 / IC3-2: a database at version 7 (no `restore_due`) gets migration 8.
+    #[test]
+    fn migrates_a_version_7_database() {
+        let dir = std::env::temp_dir().join(format!("veil-db-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("veil.db");
+        let key = [7u8; 32];
+        {
+            let db = Db::open(&path, &key).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO contacts (address, name, mailbox, token, my_token, added_ms)
+                     VALUES ('a', 'Ann', x'00', x'00', x'00', 1)",
+                    [],
+                )
+                .unwrap();
+            db.conn()
+                .execute_batch("ALTER TABLE contacts DROP COLUMN restore_due; PRAGMA user_version = 7;")
+                .unwrap();
+        }
+        let db = Db::open(&path, &key).unwrap();
+        let v: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, i64::try_from(MIGRATIONS.len()).unwrap());
+        let due: i64 = db
+            .conn()
+            .query_row("SELECT restore_due FROM contacts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(due, 0);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

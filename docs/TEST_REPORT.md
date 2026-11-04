@@ -2,6 +2,19 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Icon round 3 (PASS) and its follow-ups (2026-11-04)
+
+Icon gate: round 3 **PASS**. Release run 41874080430 on 9f741b7, android job: build, hardening check and upload all passed. From its log:
+```text
+check_launchers: app/src-tauri/gen/android/app/build/intermediates/merged_manifests/universalRelease/processUniversalReleaseManifest/AndroidManifest.xml: one launcher entry (LaunchVeil), four disguises disabled
+check_launchers: app/src-tauri/gen/android/app/build/intermediates/merged_manifest/universalRelease/processUniversalReleaseMainManifest/AndroidManifest.xml: one launcher entry (LaunchVeil), four disguises disabled
+```
+The Lows are fixed:
+- IC3-1: the check also covers the packaged manifest.
+- IC3-2: a version-7 migration test.
+- IC3-3: full alias names, and `targetActivity` is checked.
+- IC3-4: `ORDER BY id`.
+
 ## Icon round 2 fixes (2026-11-04)
 
 - IC2-1: `aapt2 dump badging` ignores `<activity-alias>`, so the release check failed on a correct APK (release run 41869194737: the build passed, the check failed). The check is now `app/android/check_launchers.py` on Gradle's merged manifest. Run on the `harden.py` mock it passes, and it rejects a second enabled alias and a LAUNCHER filter left on MainActivity:
