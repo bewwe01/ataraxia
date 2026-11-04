@@ -208,6 +208,32 @@ mod imp {
             .map_err(|e| map(&e))
     }
 
+    #[derive(Deserialize)]
+    struct Name {
+        value: String,
+    }
+    #[derive(Serialize)]
+    struct NameArg<'a> {
+        value: &'a str,
+    }
+
+    /// The launcher icon in use (ADR-0022), as the plugin names it.
+    pub async fn app_icon<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+        let h = handle(app).ok()?;
+        h.run_mobile_plugin_async::<Name>("appIcon", ())
+            .await
+            .ok()
+            .map(|n| n.value)
+    }
+
+    pub async fn set_app_icon<R: Runtime>(app: &AppHandle<R>, name: &str) -> Result<(), NativeError> {
+        let h = handle(app)?;
+        h.run_mobile_plugin_async::<Option<Empty>>("setAppIcon", NameArg { value: name })
+            .await
+            .map(|_| ())
+            .map_err(|e| map(&e))
+    }
+
     #[derive(Serialize)]
     struct NotifyArg {
         certain: bool,
@@ -348,6 +374,15 @@ mod imp {
     }
     #[allow(clippy::unused_async)]
     pub async fn set_screenshots_allowed<R: Runtime>(_: &AppHandle<R>, _: bool) -> Result<(), NativeError> {
+        Err(NativeError::Unavailable)
+    }
+    #[allow(clippy::unused_async)]
+    pub async fn app_icon<R: Runtime>(_: &AppHandle<R>) -> Option<String> {
+        // Desktop has no launcher icon to change.
+        None
+    }
+    #[allow(clippy::unused_async)]
+    pub async fn set_app_icon<R: Runtime>(_: &AppHandle<R>, _: &str) -> Result<(), NativeError> {
         Err(NativeError::Unavailable)
     }
     #[allow(clippy::unused_async)]

@@ -2,6 +2,30 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Backup review round 3 fixes, and the disguised app icon (2026-11-04)
+
+Fixes for BK3-1 to BK3-6, plus the gaps that remained from BK2-5 and BK2-10. `a_partial_restore_resumes_whatever_the_clocks_say` was confirmed to fail on the old clock-based check (`test result: FAILED. 0 passed; 1 failed`). The disguised app icon (ADR-0022) is Android-only Kotlin, manifest and resources. `harden.py` was run on a mock of the generated project, and all of its XML parses. The APK itself is built by the release workflow, which now also checks that the launcher aliases are in the APK.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --all-features -- -D warnings   # exit 0
+$ cargo clippy --workspace --all-targets -- -D warnings                  # exit 0
+$ cargo test --workspace --all-features
+# 259 passed, 0 failed
+$ cargo test -p veil-client --features test-hooks --test backup
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 55.98s
+$ cargo test -p veil-client --features test-hooks --lib db::tests
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.98s
+$ (cd app/src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings)   # exit 0
+$ pnpm -C app typecheck   # tsc: 0 errors
+$ pnpm -C app lint
+lint: 24 files clean
+$ cd design/tools && node check.mjs
+PASS
+$ python3 app/android/harden.py <mock project>
+harden: manifest patched; ...: FLAG_SECURE + insets (edge-to-edge kept: False); plugin + biometric dependency added
+```
+
 ## Milestone 7: backup review round 2 fixes (2026-11-04)
 
 Fixes for BK2-1 to BK2-10. The BK2-1 and BK2-2 tests were confirmed to fail with their fix reverted (`test result: FAILED. 0 passed; 1 failed` each). Migration 7 was amended in place, which is safe because 33d2160 and f49e8e5 are in no tag or release (BK2-5).

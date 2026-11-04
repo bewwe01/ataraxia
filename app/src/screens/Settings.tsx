@@ -4,6 +4,7 @@ import { ipc, IpcError, type Me, type NativeInfo, type NotifySettings, type Priv
 import { applyAppearance, isDark, loadAppearance, type Accent, type Appearance, type Bubble, type Density, type Mode, type Style, type TextSize } from "../settings";
 import { HuePicker, LookPreview, WallpaperPicker } from "../components/Look";
 import { ProfileCard } from "../components/Profile";
+import { AppIconPicker } from "../components/AppIcon";
 import { BackupCard } from "../components/Backup";
 import { useChatWallpaper } from "../wallpaper";
 import { Banner, Icon, SecretField, Segmented, ToggleRow, TopBar } from "../ui";
@@ -342,6 +343,12 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
             <ToggleRow id="shots" icon="eye-off" tone={native.screenshotsAllowed ? "warning" : ""} title="Block screenshots" sub="Also hides Veil in the recent-apps screen. Turn off only for a moment, for example to send a screenshot of a problem." checked={!native.screenshotsAllowed} onChange={(v) => void toggleScreenshots(!v)} />
           ) : null}
         </div>
+        {native?.android ? (
+          <>
+            <h3 className="group-title">App icon</h3>
+            <AppIconPicker />
+          </>
+        ) : null}
         {sec && panel === "change" ? <ChangeSecret sec={sec} onDone={done} onCancel={() => setPanel(null)} /> : null}
         {sec && panel === "biometric" ? <BiometricForm sec={sec} onDone={done} onCancel={() => setPanel(null)} /> : null}
 
@@ -414,7 +421,7 @@ export function Settings({ me, nav, onLocked }: { me: Me | null; nav: Nav; onLoc
         {sec ? (
           <>
             <h3 className="group-title">Backup</h3>
-            <BackupCard kind={sec.kind} />
+            <BackupCard kind={sec.kind} onCodeGone={refresh} />
           </>
         ) : null}
 

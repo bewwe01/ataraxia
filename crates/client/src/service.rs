@@ -370,6 +370,8 @@ enum Cmd {
     NewBackupCode(Zeroizing<String>, Reply<()>),
     #[cfg(feature = "test-hooks")]
     StopRestoreBeforeRekey(Reply<()>),
+    #[cfg(feature = "test-hooks")]
+    LimitRekeys(u32, Reply<()>),
     Unlock(Zeroizing<String>, Reply<UnlockOutcome>),
     UnlockInfo(Reply<UnlockInfo>),
     Security(Reply<SecurityView>),
@@ -616,6 +618,11 @@ impl Client {
     /// Asks for the PIN or password first, as showing the code does (review BK2-1).
     pub async fn new_backup_code(&self, current: Zeroizing<String>) -> Result<()> {
         ask!(self, NewBackupCode, current)
+    }
+    /// Tests only: the next re-keying run stops after `n` contacts, once.
+    #[cfg(feature = "test-hooks")]
+    pub async fn limit_rekeys(&self, n: u32) -> Result<()> {
+        ask!(self, LimitRekeys, n)
     }
     /// Tests only: the next restore stops after writing the vault, before re-keying.
     #[cfg(feature = "test-hooks")]
@@ -1009,6 +1016,12 @@ struct Actor {
     /// Tests only: the next restore stops before re-keying, as if Veil were killed there.
     #[cfg(feature = "test-hooks")]
     stop_restore_before_rekey: bool,
+    /// Tests only: re-keying stops after this many contacts, once, as if Veil were killed.
+    #[cfg(feature = "test-hooks")]
+    rekey_budget: std::cell::Cell<Option<u32>>,
+    /// A restore's re-keying may still be due: checked on the next tick, after the unlock
+    /// has answered (review BK3-3).
+    finish_restore_due: bool,
 }
 
 struct Decoy {
@@ -1417,6 +1430,25 @@ impl Actor {
             watcher: None,
             #[cfg(feature = "test-hooks")]
             stop_restore_before_rekey: false,
+            #[cfg(feature = "test-hooks")]
+            rekey_budget: std::cell::Cell::new(None),
+            finish_restore_due: false,
+        }
+    }
+
+    /// Tests only: whether re-keying must stop here (the budget is used up, once).
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn take_rekey_budget(&self) -> bool {
+        match self.rekey_budget.get() {
+            Some(0) => {
+                self.rekey_budget.set(None);
+                true
+            }
+            Some(n) => {
+                self.rekey_budget.set(Some(n.saturating_sub(1)));
+                false
+            }
+            None => false,
         }
     }
 
@@ -1526,6 +1558,9 @@ impl Actor {
         }
         self.expire_messages();
         let _ = self.cleanup_invites().await;
+        if std::mem::take(&mut self.finish_restore_due) {
+            self.finish_restore().await;
+        }
         let Some(s) = self.session.as_ref() else { return };
         if s.relay.is_none() && Instant::now() >= s.next_attempt {
             self.connect().await;
@@ -1673,6 +1708,11 @@ impl Actor {
             Cmd::NewBackupCode(current, r) => {
                 let res = self.verify_current(&current).and_then(|_| self.new_backup_code());
                 let _ = r.send(res);
+            }
+            #[cfg(feature = "test-hooks")]
+            Cmd::LimitRekeys(n, r) => {
+                self.rekey_budget.set(Some(n));
+                let _ = r.send(Ok(()));
             }
             #[cfg(feature = "test-hooks")]
             Cmd::StopRestoreBeforeRekey(r) => {
@@ -2152,6 +2192,7 @@ impl Actor {
                 contacts: 0,
                 need_invite: 0,
                 finished: false,
+                unlocked: false,
             });
         }
         if self.open_session(&key).await.is_err() {
@@ -2160,9 +2201,12 @@ impl Actor {
                 contacts: 0,
                 need_invite: 0,
                 finished: false,
+                unlocked: false,
             });
         }
         self.emit(ChangeKind::Connection, None);
+        self.finish_restore_due = false;
+        self.finish_restore().await;
         self.restore_view()
     }
 
@@ -2334,14 +2378,9 @@ impl Actor {
         self.expire_messages();
         let _ = self.cleanup_invites().await;
         self.connect().await;
-        // A restore that did not get to re-key everyone finishes here (review BK2-2).
-        #[cfg(feature = "test-hooks")]
-        let stop = self.stop_restore_before_rekey;
-        #[cfg(not(feature = "test-hooks"))]
-        let stop = false;
-        if !stop {
-            self.finish_restore().await;
-        }
+        // A restore that did not get to re-key everyone finishes on the next tick (review
+        // BK2-2), not before the unlock answers: it can wait on the relay (BK3-3).
+        self.finish_restore_due = true;
         Ok(())
     }
 

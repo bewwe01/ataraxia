@@ -219,6 +219,9 @@ export interface SecurityView {
 }
 
 /** What this device offers. */
+/** A launcher icon (Android, ADR-0022): Veil's own, or a disguise. */
+export type AppIcon = "veil" | "calculator" | "notes" | "weather" | "clock";
+
 export interface NativeInfo {
   android: boolean;
   biometric: boolean;
@@ -294,8 +297,10 @@ export interface RestoreView {
   contacts: number;
   /** Contacts the restore could not reach: they need a new invite. */
   needInvite: number;
-  /** False when the restored data could not be opened yet: unlocking finishes the restore. */
+  /** False while re-keying contacts is still due (see `unlocked`). */
   finished: boolean;
+  /** Veil is unlocked: re-keying finishes on its own soon. If false, unlocking finishes it. */
+  unlocked: boolean;
 }
 
 /** Sends a backup file to Rust in 1 MiB parts, then restores from it. */
@@ -364,6 +369,10 @@ export const ipc = {
   biometricEnable: (current: string) => call<void>("biometric_enable", { current }),
   biometricDisable: () => call<void>("biometric_disable"),
   setScreenshotsAllowed: (allow: boolean) => call<void>("set_screenshots_allowed", { allow }),
+  /** The launcher icon in use; null where it cannot change (desktop). */
+  appIcon: () => call<AppIcon | null>("app_icon"),
+  /** Changes the launcher icon and name (Android). */
+  setAppIcon: (icon: AppIcon) => call<void>("set_app_icon", { icon }),
   /** Android: colours the status and navigation bars to match the theme. No-op elsewhere. */
   setDarkBars: (dark: boolean) => call<void>("set_dark_bars", { dark }),
   /** The user did something; postpones auto-lock. Event-driven refreshes must not call it. */

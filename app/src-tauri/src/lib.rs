@@ -150,13 +150,20 @@ struct NativeInfo {
 }
 
 #[tauri::command]
-async fn native_info(app: AppHandle) -> NativeInfo {
-    NativeInfo {
+async fn native_info(app: AppHandle, guard: State<'_, CodeOnScreen>) -> Res<NativeInfo> {
+    // While a backup code is on screen, the user's choice is what the toggle shows, and what
+    // comes back when the code goes (review BK3-4).
+    let pending = *guard.0.lock().await;
+    let screenshots_allowed = match pending {
+        Some(allowed) => allowed,
+        None => native::screenshots_allowed(&app).await,
+    };
+    Ok(NativeInfo {
         android: cfg!(target_os = "android"),
         biometric: native::biometric_available(&app).await,
         screenshot_setting: cfg!(target_os = "android"),
-        screenshots_allowed: native::screenshots_allowed(&app).await,
-    }
+        screenshots_allowed,
+    })
 }
 
 /// Turns biometric unlock on: checks the PIN or password, then has the Keystore seal a fresh
@@ -223,13 +230,66 @@ async fn set_screenshots_allowed(
         .map_err(native_err)
 }
 
+/// The launcher icons Veil can show (ADR-0022); the plugin's `VeilIcons.ALL`.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AppIcon {
+    Veil,
+    Calculator,
+    Notes,
+    Weather,
+    Clock,
+}
+
+impl AppIcon {
+    const ALL: [Self; 5] = [
+        Self::Veil,
+        Self::Calculator,
+        Self::Notes,
+        Self::Weather,
+        Self::Clock,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Veil => "veil",
+            Self::Calculator => "calculator",
+            Self::Notes => "notes",
+            Self::Weather => "weather",
+            Self::Clock => "clock",
+        }
+    }
+}
+
+/// The launcher icon in use; `None` where it cannot be changed (desktop).
+#[tauri::command]
+async fn app_icon(app: AppHandle) -> Option<AppIcon> {
+    let name = native::app_icon(&app).await?;
+    AppIcon::ALL.into_iter().find(|i| i.name() == name)
+}
+
+/// Changes the launcher icon and name (Android), from Settings while unlocked.
+#[tauri::command]
+async fn set_app_icon(app: AppHandle, c: State<'_, Client>, icon: AppIcon) -> Res<()> {
+    if c.state().await.map_err(err)? != AppState::Unlocked {
+        return Err(err(ClientError::Locked));
+    }
+    native::set_app_icon(&app, icon.name()).await.map_err(native_err)
+}
+
 #[tauri::command]
 async fn set_dark_bars(app: AppHandle, dark: bool) {
     native::set_dark_bars(&app, dark).await;
 }
 
 #[tauri::command]
-async fn lock(c: State<'_, Client>) -> Res<()> {
+async fn lock(app: AppHandle, c: State<'_, Client>, guard: State<'_, CodeOnScreen>) -> Res<()> {
+    // Locking takes any backup code off screen: the screenshot setting comes back (BK3-4).
+    if let Some(allowed) = guard.0.lock().await.take()
+        && allowed
+    {
+        let _ = native::set_screenshots_allowed(&app, true).await;
+    }
     c.lock().await.map_err(err)
 }
 
@@ -1056,6 +1116,8 @@ pub fn run() {
             biometric_disable,
             unlock_biometric,
             set_screenshots_allowed,
+            app_icon,
+            set_app_icon,
             set_dark_bars,
             touch,
             reset,

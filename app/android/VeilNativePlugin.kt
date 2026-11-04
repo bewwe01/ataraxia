@@ -6,6 +6,8 @@ package __PACKAGE__
 
 import android.Manifest
 import android.app.Activity
+import android.app.ActivityManager
+import android.content.ComponentName
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -119,16 +121,80 @@ object VeilNotify {
         ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
 }
 
+/** The launcher icon and name Veil shows (milestone 4.6, ADR-0022). Each is an
+ *  `<activity-alias>` that app/android/harden.py adds to the manifest; exactly one is enabled.
+ *  A disguise changes what the home screen, the app drawer, the recent-apps screen and
+ *  notifications show. Android's own Settings → Apps still say "Veil". */
+object VeilIcons {
+  val ALL = listOf("veil", "calculator", "notes", "weather", "clock")
+
+  fun label(name: String): String = when (name) {
+    "calculator" -> "Calculator"
+    "notes" -> "Notes"
+    "weather" -> "Weather"
+    "clock" -> "Clock"
+    else -> "Veil"
+  }
+
+  private fun component(ctx: Context, name: String) =
+    ComponentName(ctx.packageName, "__PACKAGE__.Launch" + name.replaceFirstChar { it.uppercase() })
+
+  /** The enabled one; the manifest enables only "veil" until the user picks another. */
+  fun current(ctx: Context): String {
+    val pm = ctx.packageManager
+    for (name in ALL) {
+      val state = try {
+        pm.getComponentEnabledSetting(component(ctx, name))
+      } catch (e: IllegalArgumentException) {
+        continue
+      }
+      if (state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED ||
+        (state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT && name == "veil")
+      ) {
+        return name
+      }
+    }
+    return "veil"
+  }
+
+  /** Enables `name` first, then disables the others, so there is never no launcher icon. */
+  fun set(ctx: Context, name: String): Boolean {
+    if (name !in ALL) return false
+    val pm = ctx.packageManager
+    pm.setComponentEnabledSetting(
+      component(ctx, name),
+      PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+      PackageManager.DONT_KILL_APP,
+    )
+    for (other in ALL) {
+      if (other != name) {
+        pm.setComponentEnabledSetting(
+          component(ctx, other),
+          PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+          PackageManager.DONT_KILL_APP,
+        )
+      }
+    }
+    return true
+  }
+
+  fun disguised(ctx: Context) = current(ctx) != "veil"
+
+  /** The notification icon: Veil's shield, or a plain dot while disguised. */
+  fun smallIcon(ctx: Context) = if (disguised(ctx)) R.drawable.ic_stat_dot else R.drawable.ic_stat_veil
+}
+
 /** Keeps the process, and with it the relay connection, alive in the background (opt-in). */
 class VeilService : Service() {
   override fun onBind(intent: Intent?): IBinder? = null
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     VeilNotify.channels(this)
+    val disguised = VeilIcons.disguised(this)
     val n = NotificationCompat.Builder(this, VeilNotify.CONNECTION)
-      .setSmallIcon(R.drawable.ic_stat_veil)
-      .setContentTitle("Veil")
-      .setContentText("Keeping Veil connected in the background")
+      .setSmallIcon(VeilIcons.smallIcon(this))
+      .setContentTitle(VeilIcons.label(VeilIcons.current(this)))
+      .setContentText(if (disguised) "Running in the background" else "Keeping Veil connected in the background")
       .setOngoing(true)
       .setSilent(true)
       .setContentIntent(VeilNotify.openApp(this))
@@ -142,6 +208,11 @@ class VeilService : Service() {
     // notice with no Veil running behind it (review M4-1).
     return START_NOT_STICKY
   }
+}
+
+@InvokeArg
+class NameArgs {
+  var value: String = ""
 }
 
 @InvokeArg
@@ -195,10 +266,15 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
     val certain = args.certain
     if (!resumed && VeilNotify.allowed(activity)) {
       VeilNotify.channels(activity)
+      // While disguised, the notice wears the disguise's name and says nothing about
+      // messages; a call still says it is a call, so it can be answered (ADR-0022).
+      val disguised = VeilIcons.disguised(activity)
       val n = NotificationCompat.Builder(activity, if (args.call) VeilNotify.CALLS else VeilNotify.MESSAGES)
-        .setSmallIcon(R.drawable.ic_stat_veil)
-        .setContentTitle("Veil")
-        .setContentText(if (args.call) "Incoming call" else if (certain) "New message" else "You may have new messages")
+        .setSmallIcon(VeilIcons.smallIcon(activity))
+        .setContentTitle(VeilIcons.label(VeilIcons.current(activity)))
+        .setContentText(
+          if (args.call) "Incoming call" else if (disguised) "Tap to open" else if (certain) "New message" else "You may have new messages"
+        )
         .setCategory(if (args.call) NotificationCompat.CATEGORY_CALL else NotificationCompat.CATEGORY_MESSAGE)
         .setPriority(if (args.call) NotificationCompat.PRIORITY_HIGH else NotificationCompat.PRIORITY_DEFAULT)
         .setAutoCancel(true)
@@ -329,6 +405,7 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
   override fun load(webView: WebView) {
     VeilNotify.channels(activity)
     if (prefs().getBoolean(BACKGROUND, false)) startService(true)
+    if (VeilIcons.disguised(activity)) applyTaskLabel()
     // MainActivity sets FLAG_SECURE before anything is drawn; lift it only if the user chose so.
     if (prefs().getBoolean(ALLOW_SCREENSHOTS, false)) {
       activity.runOnUiThread { activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE) }
@@ -578,6 +655,36 @@ class VeilNativePlugin(private val activity: Activity) : Plugin(activity) {
         activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
       }
     }
+    invoke.resolve()
+  }
+
+  /** The recent-apps screen shows the disguise's name too. */
+  private fun applyTaskLabel() {
+    val label = VeilIcons.label(VeilIcons.current(activity))
+    activity.runOnUiThread {
+      @Suppress("DEPRECATION")
+      activity.setTaskDescription(ActivityManager.TaskDescription(label))
+    }
+  }
+
+  @Command
+  fun appIcon(invoke: Invoke) {
+    invoke.resolve(JSObject().put("value", VeilIcons.current(activity)))
+  }
+
+  @Command
+  fun setAppIcon(invoke: Invoke) {
+    val name = invoke.parseArgs(NameArgs::class.java).value
+    try {
+      if (!VeilIcons.set(activity, name)) {
+        invoke.reject("Unknown icon", "FAILED")
+        return
+      }
+    } catch (e: Exception) {
+      invoke.reject("Could not change the icon", "FAILED")
+      return
+    }
+    applyTaskLabel()
     invoke.resolve()
   }
 

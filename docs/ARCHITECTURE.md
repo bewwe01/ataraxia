@@ -451,7 +451,8 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
   - Contacts without a re-key invite (paired before this, or never online since) are marked "needs a new invite" in their chat.
   - Only an introduction that is a `PreKey` message using exactly the prekeys of an invite we hold, with a valid proof, counts as a restore. One sent over the existing session is refused, so a contact cannot fake one (review BK-1).
   - An invite in the backup may be stale: the contact renewed it, or restored from their own backup. A re-keyed contact who sends nothing back within 7 days is then marked "needs a new invite" too (BK-5). A newer re-key invite replaces an older one, never the reverse, whatever order the relay delivers them in (BK-4).
-  - The restore counts as done once the new vault is written. Re-keying after that is best effort, contact by contact (BK-6). A flag in the restored database marks it as due until it has run to the end: if Veil is stopped part way, or the data cannot be opened at once, it finishes at the next unlock, and a contact already handled is not handled again (BK2-2).
+  - The restore counts as done once the new vault is written. Re-keying after that is best effort, contact by contact (BK-6). A flag in the restored database marks it as due until it has run to the end: if Veil is stopped part way, or the data cannot be opened at once, it finishes soon after the next unlock (on the first tick, so the unlock does not wait on the relay, BK3-3), and a contact already handled is not handled again (BK2-2). "Already handled" means a restored line with a row id above the highest id before the restore, never a time, so no device's clock can make it skip or repeat a contact (BK3-1).
+  - The export uses `secure_delete` and full auto-vacuum (set while the file is empty), so the backup has no free pages; a restored database keeps auto-vacuum on (BK2-6).
   - The Purge PIN belongs to a device and is not restored; the UI says to set it again (BK-3).
   - A backup made by a newer Veil is refused (BK-12). None is made over 1 GiB, the most a restore takes (BK-8).
 - *Getting the file out:*
@@ -463,6 +464,22 @@ Cut, and listed as future work: mailbox rotation and unlinkable deposits (so in 
 - Messages sent to the user between the backup and the restore are lost: they were sealed for sessions the backup does not hold.
 - Keeping the old device in use after a restore makes both devices fight over the same mailbox. The restore screen says to stop using it. Linked devices (next milestone) are the proper way to use two devices.
 - On Android the backup passes through memory as one buffer (base64 over the plugin bridge), which is fine for typical sizes but not for very large ones. A streaming save is a follow-up.
+
+### ADR-0022: Disguised app icon on Android (milestone 4.6). **Accepted (owner request, 2026-11-04).**
+**Context.** The owner asked for a disguised app icon: someone glancing at the phone should not see a messenger called Veil.
+
+**Decision.**
+- *Launcher entries:* `harden.py` moves the launcher entry from `MainActivity` to five `<activity-alias>` entries: Veil, Calculator, Notes, Weather and Clock. Each has its own icon and label, and only Veil's is enabled at install. Settings → App icon (Android only, while unlocked) enables the chosen alias first and then disables the others (`PackageManager.setComponentEnabledSetting`, `DONT_KILL_APP`), so there is never no launcher entry.
+- *Icons:* the disguise icons are original, generic glyphs (adaptive icons with a themed variant, and a round fallback before Android 8). They do not copy any real app's icon.
+- *While disguised:*
+  - the recent-apps screen shows the disguise's name (`setTaskDescription`);
+  - notifications use the disguise's name as title, a plain dot as icon, and "Tap to open" for messages. Calls still say "Incoming call", so they can be answered.
+- *Rule 2:* the webview gets only the icon's name; the plugin is called only from Rust.
+
+**Consequences.**
+- It hides Veil from a glance, not from a search of the phone: Android's Settings → Apps, the package name (`org.veil.app`) and the notification header (the app's own name, set by Android) still show Veil. The Settings screen says so. It is not a security boundary, and the threat model lists it as such.
+- Some launchers take a moment to update, or drop a home-screen shortcut when the alias changes; the UI says to add the new icon again.
+- Desktop has no equivalent; the setting is not shown there.
 
 ## 7. Distribution (recorded owner request)
 

@@ -146,6 +146,10 @@ jobs:
           echo "$M" | grep -E 'allowBackup|dataExtractionRules|fullBackupContent'
           echo "$M" | grep -E 'allowBackup.*=false'
           echo "$M" | grep -q dataExtractionRules
+          # The launcher icons (ADR-0022): Veil's alias enabled, every disguise there.
+          for a in LaunchVeil LaunchCalculator LaunchNotes LaunchWeather LaunchClock; do
+            echo "$M" | grep -q "$a" || { echo "missing launcher alias $a"; exit 1; }
+          done
           # Permissions: exactly the ones Veil declares (any namespace), so nothing a dependency
           # slips in goes unnoticed (review M2-5, M2R2-2). Add an entry only in the change that
           # declares it. INTERNET: the relay. CAMERA: QR codes. RECORD_AUDIO and

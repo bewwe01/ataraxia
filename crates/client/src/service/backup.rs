@@ -29,7 +29,9 @@ pub const BACKUP_FILE: &str = "backup.vbak";
 pub const EXPORT_FILE: &str = "backup-export.db";
 pub const RESTORE_FILE: &str = "restore.db";
 const CODE_KEY: &str = "backup.code";
-/// Set by a restore until every contact was re-keyed or marked: the time it started (ms, LE).
+/// Set by a restore until every contact was re-keyed or marked: the highest message row id
+/// before it started (LE). Row ids only grow, so a line written by this restore is above it
+/// whatever any clock says (review BK3-1).
 const REKEY_DUE_KEY: &str = "restore.rekey_due";
 /// Set once the user was shown the backup code after a backup that was saved (review BK-7).
 const CODE_SEEN_KEY: &str = "backup.code_seen";
@@ -88,8 +90,11 @@ pub struct RestoreView {
     /// Contacts that gave no re-key invite (paired before backups existed, or never online
     /// since): they need a new invite.
     pub need_invite: u32,
-    /// False when Veil could not open the restored data yet: unlocking finishes the restore.
+    /// False while re-keying is still due: it finishes at the next unlock (if `unlocked` is
+    /// false, Veil could not open the restored data yet) or soon after, on its own.
     pub finished: bool,
+    /// Veil is unlocked after the restore (review BK3-5).
+    pub unlocked: bool,
 }
 
 /// A path inside an SQL string literal.
@@ -99,7 +104,10 @@ fn sql_path(p: &Path) -> Result<String> {
 
 /// Marks re-keying as due in a restored database (review BK2-2).
 pub(super) fn mark_rekey_due(db: &Db) -> Result<()> {
-    db.set_setting(REKEY_DUE_KEY, &now_ms().to_le_bytes())
+    let top: i64 = db
+        .conn()
+        .query_row("SELECT coalesce(max(id), 0) FROM messages", [], |r| r.get(0))?;
+    db.set_setting(REKEY_DUE_KEY, &top.to_le_bytes())
 }
 
 /// Removes what a backup or restore that did not finish (a crash, say) left in the data
@@ -568,7 +576,8 @@ impl Actor {
         let Ok(Some(due)) = s.db.setting(REKEY_DUE_KEY) else {
             return;
         };
-        let since = <[u8; 8]>::try_from(due.as_slice()).map_or(0, i64::from_le_bytes);
+        // A malformed flag handles everyone again rather than no one.
+        let since = <[u8; 8]>::try_from(due.as_slice()).map_or(-1, i64::from_le_bytes);
         if self.rekey_all(since).await.is_ok() {
             let _ =
                 s.db.conn()
@@ -584,6 +593,7 @@ impl Actor {
             Ok(u32::try_from(n).unwrap_or(u32::MAX))
         };
         Ok(RestoreView {
+            unlocked: true,
             contacts: count("SELECT count(*) FROM contacts WHERE blocked = 0")?,
             need_invite: count("SELECT count(*) FROM contacts WHERE blocked = 0 AND needs_invite = 1")?,
             finished: s.db.setting(REKEY_DUE_KEY)?.is_none(),
@@ -593,7 +603,7 @@ impl Actor {
     /// After a restore: a new session with every contact who gave us a re-key invite (the
     /// introduction carries a fresh re-key invite for them); the others are marked as needing
     /// a new invite. Every chat says what happened. Contacts already handled by this restore
-    /// (a restored line since `since`) are skipped, so running it again is safe.
+    /// (a restored line with a row id above `since`) are skipped, so running it again is safe.
     async fn rekey_all(&self, since: i64) -> Result<()> {
         let s = self.s()?;
         let rows: Vec<RekeyRow> =
@@ -605,13 +615,17 @@ impl Actor {
                        CASE WHEN key_warning = 0 THEN rekey_link END,
                        CASE WHEN key_warning = 0 THEN rekey_sealed END
                      FROM contacts c WHERE blocked = 0 AND NOT EXISTS (SELECT 1 FROM messages m
-                       WHERE m.contact = c.id AND m.kind = 'restored' AND m.mine = 1 AND m.at_ms >= ?1)",
+                       WHERE m.contact = c.id AND m.kind = 'restored' AND m.mine = 1 AND m.id > ?1)",
                 )?
                 .query_map([since], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<rusqlite::Result<_>>()?;
         for (contact, address, my_token, link, sealed) in rows {
+            #[cfg(feature = "test-hooks")]
+            if self.take_rekey_budget() {
+                return Err(ClientError::Storage);
+            }
             let ok = match (link, sealed) {
                 (Some(link), Some(sealed)) => self
                     .rekey_one(contact, &address, &my_token, &link, &sealed)

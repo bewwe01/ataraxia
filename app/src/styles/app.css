@@ -263,6 +263,20 @@ button.sys-msg.call-line { cursor: pointer; font: inherit; font-size: var(--text
 .wp-tile input:focus-visible ~ .wp-thumb { outline: 2px solid var(--focus); outline-offset: 4px; }
 .wp-name { font-size: var(--text-xs); color: var(--text-2); }
 
+/* App icon (Android, ADR-0022): Veil's icon or a disguise, as tiles like the wallpapers. */
+.appicon-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: var(--space-3); }
+.appicon-tile { position: relative; display: flex; flex-direction: column; align-items: center; gap: 4px; min-height: var(--tap-min); }
+.appicon-tile input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; z-index: 1; }
+.appicon-tile input:disabled { cursor: progress; }
+.appicon-thumb { width: 52px; height: 52px; border-radius: var(--radius-lg); overflow: hidden; display: grid; place-items: center; background: var(--surface-3); color: var(--text-1); box-shadow: inset 0 0 0 1px var(--border-subtle); }
+.appicon-thumb .logo { width: 100%; height: 100%; }
+.appicon-glyph { width: 100%; height: 100%; fill: currentColor; }
+.appicon-glyph .appicon-sun { fill: var(--warning); }
+.appicon-tile input:checked ~ .appicon-thumb { box-shadow: 0 0 0 2px var(--bg-1), 0 0 0 4px var(--text-1); }
+.appicon-tile input:focus-visible ~ .appicon-thumb { outline: 2px solid var(--focus); outline-offset: 4px; }
+.appicon-tile input:checked ~ .appicon-name { color: var(--text-1); font-weight: var(--weight-semibold); }
+.appicon-name { font-size: var(--text-xs); color: var(--text-2); }
+
 .look-preview { position: relative; isolation: isolate; overflow: hidden; border-radius: var(--radius-lg); padding: var(--space-3); display: flex; flex-direction: column; gap: var(--space-2); background: var(--bg-1); box-shadow: inset 0 0 0 1px var(--border-subtle); pointer-events: none; }
 
 /* Profile pictures (M4.5, ADR-0020): the picture fills the avatar's circle. */

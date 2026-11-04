@@ -7051,3 +7051,214 @@ UPDATE contacts SET rekey_link = NULL, rekey_sealed = NULL, rekey_until = 0 WHER
 ---
 
 **Verdict: FAIL.** BK2-1 (High) and BK2-2, BK2-3, BK2-4 (Medium) are open. Fix BK2-1 with a regression test, then BK2-2 to BK2-4, and re-run the gate.
+
+---
+
+## Backup and restore (milestone 7) review, round 3 (2026-11-04)
+
+**Scope:** I reviewed `git diff f49e8e5 7190660` (12 files, +666/−79), plus the full current versions of these:
+- `crates/client/src/service/backup.rs`, all of it
+- `crates/client/src/service.rs`: `run`, `on_tick`, `connect`, `interruptible`, `restore`, `restore_inner`, `unlock`, `unlock_bio`, `open_session`, `verify_current`, `atomically`, `deliver`, `retry_failed`, `expire_messages`, and `SESSION_WORKS` in `process_inner`
+- `crates/client/src/db.rs`: `SCHEMA`, `MIGRATIONS`, `migrate`, `Db::open`, tests
+- `crates/client/tests/backup.rs`
+- `app/src-tauri/src/lib.rs`: `native_info`, `set_screenshots_allowed`, `CodeOnScreen`, `backup_code_on_screen`, `new_backup_code`
+- `app/src/components/Backup.tsx`, `app/src/screens/Onboarding.tsx` (Restore), `app/src/screens/Settings.tsx` (screenshot toggle), `app/src/ipc.ts`
+- ADR-0021, INV-BAK-1/2, TEST_REPORT
+- the bundled SQLCipher `sqlcipher_exportFunc` (`libsqlite3-sys-0.38.2/sqlcipher/sqlite3.c`)
+
+I did not edit any repository files.
+
+**Commands run (all pass):**
+- `CARGO_INCREMENTAL=0 cargo test -p veil-client --features test-hooks --test backup`: 6 passed in 50.95 s.
+- `CARGO_INCREMENTAL=0 cargo test -p veil-client --features test-hooks --lib db::tests`: 7 passed, including `refuses_a_newer_database`.
+- A probe I wrote, in `/tmp/claude-0/-home-user-ataraxia/929457e9-49df-558b-9ee2-363e38c8130c/scratchpad/avac/src/main.rs`. It uses the same `rusqlite =0.40.2` / bundled SQLCipher. It attaches an empty keyed database, sets `secure_delete`, runs `sqlcipher_export`, then deletes about half the rows:
+  - without `PRAGMA bak.auto_vacuum = FULL`: `auto_vacuum=0`, `freelist_count=12`;
+  - with it: `auto_vacuum=1`, `freelist_count=0`, and the file is shorter.
+
+**Verdict: FAIL.** 1 Medium (BK3-1) and 5 Low are open.
+- Of the round 2 findings, 7 are Fixed and 3 are Partially fixed (BK2-2, BK2-5, BK2-10).
+- BK2-1, the High from round 2, is Fixed and its test has teeth.
+
+---
+
+## Status of the round 2 findings
+
+| ID | Status | Notes and regression test |
+|---|---|---|
+| BK2-1 | **Fixed** | `Cmd::NewBackupCode(current, r)` runs `verify_current(&current)` before `new_backup_code()`, so wrong answers count as failed attempts and the retry delay applies. The Tauri command and `ipc.ts` take `current`, and the panel has a `SecretField` that is cleared in `finally` and on Cancel. ADR-0021 now states that without the PIN or password a code is shown only for the very first backup, until it is acknowledged. **The test would fail without the fix:** in `a_new_backup_code_takes_the_password`, the wrong password would succeed, so `unwrap_err()` panics. The test also checks that the next backup's `code` is `None`. |
+| BK2-2 | **Partially** | `restore.rekey_due` is set in `restore_inner` before `PRAGMA rekey`. `open_session` calls `finish_restore`, which runs `rekey_all(since)` and clears the flag. A failed `open_session` after the header now returns `Ok(finished: false)`, and Onboarding says so. `rekey_one` writes the "restored" line in the same transaction as the redemption, so a contact is handled once or not at all. **The test would fail without the fix:** without the flag and `finish_restore`, unlocking never re-keys Bob, and the `eventually` times out. **Not covered:** the check that a contact handled in an earlier run of *this* restore is skipped. The test's second unlock happens after the flag was cleared, so `rekey_all` never runs again; deleting the `NOT EXISTS` clause still passes. That check also depends on the clock (BK3-1). |
+| BK2-3 | **Fixed** | While a code is on screen, `set_screenshots_allowed` records the user's choice in `CodeOnScreen` and keeps `FLAG_SECURE`. "Block" is applied at once; "allow" is applied when the code goes. The stale "allowed" from the guard no longer overrides a newer "block". The suggested `refresh()` on dismiss was not done, so the toggle can misreport in the unsafe direction (BK3-4). The shell has no test; the behaviour is argued in ADR-0021. |
+| BK2-4 | **Fixed** | `expire_rekeys` is async, and each contact runs inside `self.atomically`. On a failed RELEASE, that path rolls back and checks `is_autocommit()`. It is reached only from `on_tick` → `sync_rekeys`, never from inside another `atomically`. No test of its own; it shares the `atomically` path that P4R2-2 tested. |
+| BK2-5 | **Partially** | TEST_REPORT now says migration 7 was changed in place, and that 33d2160 and f49e8e5 are in no tag. I confirmed this: `git tag --contains 33d2160` is empty. `db::tests::migrates_a_version_6_database` was not added, though round 2 asked for it either way. |
+| BK2-6 | **Fixed** | `VACUUM bak` is gone, and `PRAGMA bak.auto_vacuum = FULL` is set on the empty attached file (`remove_db(&export)` runs first). `sqlcipher_exportFunc` copies only schema and rows; it neither sets auto_vacuum nor copies meta values, so the setting survives. My probe confirms there are no free pages afterwards, and `secure_delete` zeroes deleted cells in pages still in use. The test cannot tell this apart from a regression, and INV-BAK-1 still names `VACUUM` (BK3-6). |
+| BK2-7 | **Fixed** | `SESSION_WORKS` clears both `rekey_pending_ms` and `needs_invite` on any message decrypted from a known, unblocked contact. `needs_invite = 1` is written only by the restore paths (`expire_rekeys`, `mark_unreached`), so clearing it here is safe. The optional part (removing the "no-reply" line) was not done, which is acceptable. No test. |
+| BK2-8 | **Fixed** | The old `my_token` is queued for removal inside `process`'s transaction when the token of an ordinary invite replaces it. No test. |
+| BK2-9 | **Fixed** | `receive_restore` clears `rekey_link`, `rekey_sealed` and `rekey_until` before calling `receive_rekey`, so a fresh invite wins whatever the two clocks say. No test. |
+| BK2-10 | **Partially** | Done: the version check moved into `Db::open` before `SCHEMA`, and a BK-2 back-off test was added. The back-off test would fail without the fix: `rekey_retry_ms` would stay 0. Not done: the new `refuses_a_newer_database` does not detect the reordering (BK3-2), and `BackupTooLarge` (BK-8) and `revoke_quietly` (BK-11) still have neither a test nor a written argument. The suggested "restore of a newer backup leaves Veil new" test was not added. |
+
+---
+
+## Findings
+
+### BK3-1 (Medium, HIGH confidence on the mechanism): the "already handled" check in `rekey_all` compares wall-clock times from two devices, so a skewed clock makes a restore silently skip contacts
+
+**Where:**
+- `crates/client/src/service/backup.rs:101` (`mark_rekey_due` stores `now_ms()`)
+- `backup.rs:571` (`since`, which falls back to 0)
+- `backup.rs:603-608` (`NOT EXISTS ... m.kind = 'restored' AND m.mine = 1 AND m.at_ms >= ?1`)
+
+**Problem:**
+- `strip` keeps the `restored` lines (mine = 1) from any earlier restore, so they are in the backup. Their `at_ms` comes from the clock of whichever device wrote them. `since` comes from the new device's clock at restore time.
+- **Forward skew (contacts are skipped):** this happens if the new device's clock is behind the time of an earlier restore line by more than the time since that restore. A desktop with a dead clock battery or a manually set date is enough, as is an old device whose clock ran ahead when it restored. Each such contact is then skipped on the first run, and the result is silent:
+  - it is not re-keyed;
+  - it is not marked `needs_invite`;
+  - no new chat line is written;
+  - `rekey_pending_ms` is 0 (stripped), so BK-5's 7-day rule never fires;
+  - the flag is cleared, and `sync_rekeys` fails with `NoSession` every hour.
+
+  The contact is unreachable and nothing says so, which is exactly the outcome BK2-2 was meant to remove. With the fallback `since = 0` for a malformed flag, every contact with any historical restored line is skipped.
+- **Backward skew (contacts are handled twice):** this happens if the clock steps back between `mark_rekey_due` and `rekey_one`, as an NTP correction on a phone just set up can do, and the restore is then resumed. Lines from the first run fall below `since`, so those contacts are handled again. Their `rekey_link` is already NULL, so `mark_unreached` writes a false "needs-invite" for a contact that was re-keyed successfully.
+- No test exercises either case, or the skip at all (see BK2-2 above).
+
+**Fix:**
+- Make the marker independent of the clock. `messages.id` is `INTEGER PRIMARY KEY`, so new rows always get an id above the current maximum.
+  ```rust
+  // mark_rekey_due
+  let top: i64 = db.conn().query_row("SELECT coalesce(max(id), 0) FROM messages", [], |r| r.get(0))?;
+  db.set_setting(REKEY_DUE_KEY, &top.to_le_bytes())
+  // rekey_all
+  "... AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.contact = c.id
+       AND m.kind = 'restored' AND m.mine = 1 AND m.id > ?1)"
+  ```
+- On a malformed flag, fall back to "handle everyone" (`-1`), not to 0.
+- Add a test hook that stops `rekey_all` after the first contact. Use it with two contacts, where the backup already contains a `restored` line dated in the future. Lock, unlock, and assert three things: each contact has exactly one new line, nobody gets `needs-invite`, and the flag is gone.
+
+### BK3-2 (Low, HIGH confidence): `refuses_a_newer_database` passes with the old ordering, so it does not test the BK2-10 fix
+
+**Where:** `crates/client/src/db.rs:323-350`.
+
+**Problem:**
+- The test drops `token_removals` and then asserts that a refused open does not recreate it.
+- But `token_removals` is created by migration 1, not by `SCHEMA`. With the check back inside `migrate` (after `execute_batch(SCHEMA)`), `SCHEMA`'s `CREATE ... IF NOT EXISTS` would still not recreate it, and `migrate` would still refuse before running any step.
+- So the test passes with or without the fix it claims to guard. The claim in TEST_REPORT and INV-BAK-2 overstates what is tested.
+
+**Fix:** drop a table that `SCHEMA` creates, for example `DROP TABLE invites;`, and assert that `sqlite_master` has no `invites` after the refused open. With the old ordering, `SCHEMA` would recreate it and the test would fail.
+
+### BK3-3 (Low, MEDIUM confidence): unlock waits for network delivery to every contact being re-keyed
+
+**Where:**
+- `crates/client/src/service.rs:2337-2344` (`open_session` → `finish_restore`)
+- `backup.rs:686` (`self.deliver(row).await` inside `rekey_one`)
+
+**Problem:**
+- `finish_restore` now runs inside `open_session`, so it runs on every unlock path: PIN or password, biometric, and the restore itself. The `Unlock` / `UnlockBio` reply is sent only after it returns, and the actor processes no other command meanwhile.
+- Each contact costs one relay round trip, and each `call` can take up to `CALL_TIMEOUT` (20 s). The total is bounded only by the auto-lock time left (`interruptible`).
+- A slow or hostile relay can therefore hold the unlock spinner for minutes the first time after an unfinished restore.
+- It is otherwise safe:
+  - there is no re-entry, because `open_session` is never called from inside `atomically`;
+  - a Lock request interrupts the delivery, and the remaining contacts are still committed locally;
+  - undelivered rows stay `failed`/`sending` and are sent again by `retry_failed`.
+
+**Fix:** keep the local part synchronous and leave delivery to the outbox. Either drop the inline `deliver` from `rekey_one` when called from `finish_restore` (`retry_failed` already picks up `sending` rows), or set an actor flag in `open_session` and run `finish_restore` on the first `on_tick` after the reply.
+
+### BK3-4 (Low, HIGH confidence): the screenshot toggle can show "Block screenshots" while screenshots are allowed
+
+**Where:**
+- `app/src-tauri/src/lib.rs:202-224` and `:626-655`
+- `app/src/screens/Settings.tsx:298-303` (`toggleScreenshots` → `refresh()`) and `:343`
+
+**Problem:**
+- Step by step:
+  1. The code is on screen, so the guard holds `Some(_)` and `FLAG_SECURE` is set.
+  2. The user turns the toggle to "allow". The command stores `Some(true)` and returns without applying it.
+  3. `refresh()` reads `native_info`, which still says not allowed, so the toggle snaps back to "Block screenshots" on.
+  4. When the code goes, the guard allows screenshots. Settings does not refresh, so the toggle keeps saying "blocked" while screenshots and the recent-apps preview are allowed.
+- This misreports a security setting in the unsafe direction, until Settings is reopened.
+- A secondary issue: the guard is not reference-counted, and is cleared only by an unmount cleanup. If the webview reloads while a code is shown, the cleanup's IPC never arrives and the guard stays `Some` for the life of the process. Every later "allow" is then swallowed. That fails safe, but it is confusing.
+
+**Fix:**
+- Make `native_info` report the pending choice while a code is shown: `screenshots_allowed: guard.0.lock().await.unwrap_or(native::screenshots_allowed(&app).await)`.
+- Have `BackupCard` call an `onCodeGone` prop that triggers Settings' `refresh()`.
+- Reset `CodeOnScreen` and restore the setting when the client locks, or on the shell's page-load event.
+
+### BK3-5 (Low, HIGH confidence): Onboarding tells an unlocked user to "unlock to finish"
+
+**Where:** `service.rs:2157-2166`, `backup.rs:580-589` (`restore_view`), `app/src/screens/Onboarding.tsx` (the `!done.finished` banner).
+
+**Problem:** `finished` is false in two different cases:
+- The session did not open. Veil is locked, and the banner is correct.
+- The session opened but `rekey_all` returned `Err`. Veil is unlocked, the flag stays, and re-keying waits for the next unlock. The banner still says "Veil could not open it yet. Unlock Veil…", which is wrong in this case.
+
+In the first case, `contacts: 0, need_invite: 0` is also reported, which is acceptable because the banner explains it.
+
+**Fix:** add `unlocked: bool` to `RestoreView` (or an enum `Finished | AtNextUnlock | Locked`), and word the banner for each case.
+
+### BK3-6 (Low, MEDIUM confidence): the test cannot tell auto_vacuum from no vacuum, and INV-BAK-1 still describes the removed VACUUM
+
+**Where:** `crates/client/tests/backup.rs:154` (`freelist_count = 0`), `docs/INVARIANTS.md:67` (INV-BAK-1: "`secure_delete` on the export, then `VACUUM`").
+
+**Problem:**
+- Whether `strip` frees a whole page in the test data depends on how many sessions and prekey records the fixture holds. In my probe, removing `auto_vacuum = FULL` left 12 free pages. I did not confirm that the integration fixture frees any page, so a regression that drops the pragma may pass unnoticed.
+- The invariant text no longer matches the code, which goes against rule 9.
+- A side effect, also undocumented: the restored `veil.db` keeps `auto_vacuum = FULL` for good, unlike a fresh install.
+
+**Fix:**
+- In the test, also assert `n("PRAGMA auto_vacuum") == 1`.
+- Update INV-BAK-1 to "`secure_delete` and full auto-vacuum on the export (BK2-6)".
+- Add a note to ADR-0021 that restored databases auto-vacuum.
+
+---
+
+## Checked and found correct
+
+**Re-entrancy of `finish_restore`:**
+- `open_session` has three callers: `restore`, `unlock` (`Unlocked::Key`) and `unlock_bio`. None runs inside `atomically`, and the actor is sequential, so no command, tick or push can interleave.
+- The Purge PIN and decoy paths never reach `open_session`.
+- In the restore path, `connect()` → `sync()` runs before `finish_restore`. Messages from contacts re-keyed in an earlier partial run can update `rekey_link` (`rekey_until` is 0 after `rekey_one`). The skip check stops those contacts being re-keyed a second time, subject to BK3-1.
+- A Lock request during delivery interrupts it, and the restore still completes locally.
+- The test hook `stop_restore_before_rekey` is `cfg(feature = "test-hooks")`, and the restore clears it before returning.
+
+**Transactions:**
+- `rekey_one` commits the redemption, the new re-key invite, the control row and the restored line together.
+- `mark_unreached` is two autocommit statements. If it is cut part way, the contact has no line, so a re-run handles it again, which is safe.
+- `expire_rekeys` uses `atomically`.
+- `receive_restore` (the token removal, clearing `rekey_link`) runs inside `process`'s savepoint.
+- The flag is deleted only after `rekey_all` returns `Ok`.
+
+**auto_vacuum (BK2-6):**
+- The pragma is set on a file that `remove_db` has just removed, so it is empty.
+- `sqlcipher_exportFunc` does not override the setting.
+- With FULL, freed pages are moved to the end and truncated at commit, so the file holds no free pages. `secure_delete` zeroes deleted cells in the pages that remain. Both are verified by the probe.
+- The attached database's rollback journal briefly holds stripped pages under the export key, which is sealed into the backup. Those pages are the same data the live `veil.db` holds on that device, so the journal exposes nothing new.
+
+**Screenshot guard:**
+- `Some(prev)` / `None` serialise through one tokio mutex.
+- A "block" while the code is shown is applied at once and is the value restored when the code goes, so round 2's scenario is fixed.
+- An "allow" while the code is shown is deferred.
+- Desktop is unaffected.
+
+**BK2-1 gate:**
+- `verify_current` counts failures and honours `wait_secs`.
+- No other path clears `backup.code` or `backup.code_seen` without the gate.
+
+**`SESSION_WORKS`:**
+- It runs only for unblocked known contacts, after decryption.
+- `needs_invite` has no writer other than the restore paths, so clearing it cannot hide another state.
+- INV-ID-2 is untouched: `key_warning` is independent.
+
+**Panics and secrets:**
+- The new code has no `unwrap`, `expect` or indexing outside tests: `<[u8; 8]>::try_from(..).map_or`, `u32::try_from(..).unwrap_or`, `arr32(..)?`.
+- No new logging.
+- `RestoreView` carries only counts and a bool.
+- `renewSecret` is cleared in `finally` and on Cancel.
+
+**Version check:** `Db::open` refuses a newer `user_version` after the key check and before `SCHEMA`, and `migrate` still checks too.
+
+**Tests:**
+- All 6 backup integration tests and 7 db unit tests pass.
+- These tests would fail without their fixes: BK2-1, BK2-2 (the resume part only) and BK-2's back-off.
+- `refuses_a_newer_database` would not (BK3-2).
+
+---
+
+**Verdict: FAIL.** BK3-1 (Medium) is open. Fix BK3-1 with a regression test that covers both a partial run and a historical line dated in the future. Fix BK3-2 so the newer-version test checks the reordering, then re-run the gate. BK3-3 to BK3-6 and the residual gaps in BK2-5 and BK2-10 are Low and can follow.

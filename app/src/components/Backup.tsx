@@ -3,7 +3,7 @@
 // rule 6), and Veil keeps it only inside its encrypted database. While it is on screen,
 // Android blocks screenshots (review BK-14); it lives in this component's state only, so it is
 // gone when Settings closes or Veil locks.
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { IpcError, ipc, type BackupSaved, type SecretKind } from "../ipc";
 import { Banner, Icon, SecretField } from "../ui";
 
@@ -11,11 +11,15 @@ function size(bytes: number): string {
   return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function CodeCard({ code }: { code: string }) {
+function CodeCard({ code, onGone }: { code: string; onGone?: (() => void) | undefined }) {
+  // The latest callback, without re-running the effect (which would toggle the guard).
+  const gone = useRef(onGone);
+  gone.current = onGone;
   useEffect(() => {
     void ipc.backupCodeOnScreen(true).catch(() => undefined);
     return () => {
-      void ipc.backupCodeOnScreen(false).catch(() => undefined);
+      // The screenshot setting may change when the code goes: Settings shows it afresh.
+      void ipc.backupCodeOnScreen(false).then(() => gone.current?.(), () => undefined);
     };
   }, []);
   return (
@@ -26,7 +30,7 @@ function CodeCard({ code }: { code: string }) {
   );
 }
 
-export function BackupCard({ kind }: { kind: SecretKind }) {
+export function BackupCard({ kind, onCodeGone }: { kind: SecretKind; onCodeGone?: () => void }) {
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState<BackupSaved | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -106,13 +110,13 @@ export function BackupCard({ kind }: { kind: SecretKind }) {
           {saved.code ? (
             <>
               <Banner tone="warning" icon="key"><p><b>Your backup code.</b> After this it is shown only with your {kind === "pin" ? "PIN" : "password"}.</p></Banner>
-              <CodeCard code={saved.code} />
+              <CodeCard code={saved.code} onGone={onCodeGone} />
               <button className="btn btn-primary btn-block" type="button" onClick={() => void seen()}>I wrote it down</button>
             </>
           ) : null}
         </div>
       ) : null}
-      {shown ? <CodeCard code={shown} /> : null}
+      {shown ? <CodeCard code={shown} onGone={onCodeGone} /> : null}
       {asking ? (
         <form className="stack-sm" onSubmit={(e) => void show(e)}>
           <SecretField id="bk-cur" label={kind === "pin" ? "Your PIN" : "Your password"} kind={kind} value={current} onChange={setCurrent} autoComplete="current-password" />

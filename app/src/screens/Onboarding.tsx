@@ -315,7 +315,11 @@ export function Restore({ onDone, onBack }: { onDone: () => void; onBack: () => 
           <p className="hint">A Purge PIN is not part of a backup: if you used one, set it again in Settings → Security.</p>
           {!done.finished ? (
             <Banner tone="warning" icon="alert-triangle">
-              <p>Your data is back, but Veil could not open it yet. Unlock Veil with your new PIN or password to finish; your contacts are told then.</p>
+              {done.unlocked ? (
+                <p>Your data is back, but not every contact could be told yet. Veil finishes this the next time you unlock it.</p>
+              ) : (
+                <p>Your data is back, but Veil could not open it yet. Unlock Veil with your new PIN or password to finish; your contacts are told then.</p>
+              )}
             </Banner>
           ) : null}
           {done.needInvite > 0 ? (

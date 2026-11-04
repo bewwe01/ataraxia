@@ -152,6 +152,8 @@ async fn a_restored_backup_keeps_identity_contacts_and_history() {
         assert_eq!(n("SELECT count(*) FROM messages WHERE envelope IS NOT NULL"), 0);
         assert_eq!(n("SELECT count(*) FROM contacts WHERE intro IS NOT NULL"), 0);
         assert_eq!(n("PRAGMA freelist_count"), 0);
+        // Freed pages are given back by full auto-vacuum (review BK2-6, BK3-6).
+        assert_eq!(n("PRAGMA auto_vacuum"), 1);
         assert_eq!(
             n("SELECT count(*) FROM settings WHERE k = 'purge_set' AND v = x'01'"),
             0
@@ -572,4 +574,91 @@ async fn a_restore_stopped_before_rekeying_finishes_at_unlock() {
             .unwrap(),
         0
     );
+}
+
+/// Review BK3-1: which contacts a restore already handled does not depend on any clock. The
+/// backup carries "restored" lines dated far in the future (an earlier restore on a device
+/// whose clock ran ahead), and re-keying stops after one contact; at the next unlock the other
+/// is handled, each exactly once, and nobody is wrongly marked as needing an invite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_partial_restore_resumes_whatever_the_clocks_say() {
+    let r = relay().await;
+    let (alice, bob, carol) = (
+        user(&r, "Alice").await,
+        user(&r, "Bob").await,
+        user(&r, "Carol").await,
+    );
+    let a = &alice.client;
+    let (a_bob, b_alice) = pair(a, &bob.client).await;
+    let (a_carol, c_alice) = pair(a, &carol.client).await;
+    within(std::time::Duration::from_secs(30), || async {
+        (a.has_rekey(a_bob.id).await.unwrap() && a.has_rekey(a_carol.id).await.unwrap()).then_some(())
+    })
+    .await;
+    let future = 4_102_444_800_000_i64; // 2100-01-01
+    for id in [a_bob.id, a_carol.id] {
+        a.test_exec(&format!(
+            "INSERT INTO messages (contact, mine, kind, body, at_ms, status) VALUES ({id}, 1, 'restored', '', {future}, 'sent')"
+        ))
+        .await
+        .unwrap();
+    }
+    let (file, code) = backup(a).await;
+    drop(alice);
+
+    let dir = tempfile::tempdir().unwrap();
+    let alice2 = start(dir.path(), std::sync::Arc::default());
+    alice2.limit_rekeys(1).await.unwrap();
+    let view = alice2.restore(input(&file, &code)).await.unwrap();
+    assert!(!view.finished, "stopped after one contact");
+    assert!(view.unlocked);
+    alice2.lock().await.unwrap();
+    alice2
+        .unlock(Zeroizing::new("a new phone, a new password".into()))
+        .await
+        .unwrap();
+    within(std::time::Duration::from_secs(30), || async {
+        (alice2
+            .test_query("SELECT count(*) FROM settings WHERE k = 'restore.rekey_due'")
+            .await
+            .unwrap()
+            == 0)
+            .then_some(())
+    })
+    .await;
+    for (mine, theirs, them) in [
+        (a_bob.id, b_alice.id, &bob.client),
+        (a_carol.id, c_alice.id, &carol.client),
+    ] {
+        let lines: Vec<String> = alice2
+            .messages(mine)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.kind == "restored" && m.mine)
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(
+            lines,
+            ["", ""],
+            "the old line and exactly one new one, none needs-invite"
+        );
+        assert!(
+            !alice2
+                .contacts()
+                .await
+                .unwrap()
+                .iter()
+                .any(|c| c.id == mine && c.needs_invite)
+        );
+        eventually(|| async {
+            them.messages(theirs)
+                .await
+                .unwrap()
+                .iter()
+                .any(|m| m.kind == "restored")
+                .then_some(())
+        })
+        .await;
+    }
 }

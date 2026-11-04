@@ -317,6 +317,68 @@ impl KvBackend for SqlBackend {
 mod tests {
     use super::*;
 
+    /// Review BK2-5: a database at version 6 (before backups) gets migration 7's columns and
+    /// keeps its rows.
+    #[test]
+    fn migrates_a_version_6_database() {
+        let dir = std::env::temp_dir().join(format!("veil-db-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("veil.db");
+        let key = [6u8; 32];
+        let m7: [&str; 8] = [
+            "rekey_link",
+            "rekey_sealed",
+            "rekey_mine_until",
+            "rekey_mine_id",
+            "needs_invite",
+            "rekey_until",
+            "rekey_pending_ms",
+            "rekey_retry_ms",
+        ];
+        {
+            let db = Db::open(&path, &key).unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO contacts (address, name, mailbox, token, my_token, added_ms)
+                     VALUES ('a', 'Ann', x'00', x'00', x'00', 1)",
+                    [],
+                )
+                .unwrap();
+            for c in m7 {
+                db.conn()
+                    .execute_batch(&format!("ALTER TABLE contacts DROP COLUMN {c};"))
+                    .unwrap();
+            }
+            db.conn().execute_batch("PRAGMA user_version = 6;").unwrap();
+        }
+        let db = Db::open(&path, &key).unwrap();
+        let v: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, i64::try_from(MIGRATIONS.len()).unwrap());
+        for c in m7 {
+            let n: i64 = db
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('contacts') WHERE name = ?1",
+                    [c],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{c}");
+        }
+        let (name, needs): (String, i64) = db
+            .conn()
+            .query_row("SELECT name, needs_invite FROM contacts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((name.as_str(), needs), ("Ann", 0));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review BK-12 / BK2-10: a database with a schema newer than this Veil knows is refused,
     /// and left as it was.
     #[test]
@@ -331,7 +393,9 @@ mod tests {
             db.conn()
                 .execute_batch(&format!("PRAGMA user_version = {newer};"))
                 .unwrap();
-            db.conn().execute_batch("DROP TABLE token_removals;").unwrap();
+            // A table SCHEMA itself creates: opening would recreate it if anything ran
+            // before the refusal (review BK3-2).
+            db.conn().execute_batch("DROP TABLE invites;").unwrap();
         }
         assert_eq!(Db::open(&path, &key).unwrap_err(), ClientError::NewerVersion);
         // Nothing was created or changed by the refused open.
@@ -340,7 +404,7 @@ mod tests {
             .unwrap();
         let tables: i64 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name = 'token_removals'",
+                "SELECT count(*) FROM sqlite_master WHERE name = 'invites'",
                 [],
                 |r| r.get(0),
             )
