@@ -27,6 +27,9 @@ const TAG: &str = "profile";
 /// A picture's longest side. Anything larger could make the webview decode a huge image from
 /// a few kilobytes (review PR-1); the app sends 512 px.
 pub const MAX_PICTURE_SIDE: u16 = 1024;
+/// A profile given up on is sent again only this long after it was queued, so a mailbox that
+/// never accepts it is not retried every minute (review PR2-3).
+const GIVE_UP_PAUSE_MS: i64 = 6 * 3600 * 1000;
 /// Contacts sent a changed profile per round: a change reaches everyone over a few minutes
 /// rather than as one burst that links all their mailboxes at the relay (review PR-5).
 const PER_ROUND: usize = 4;
@@ -69,27 +72,45 @@ pub struct ProfileView {
     pub visibility: PictureVisibility,
 }
 
-/// Width and height from a JPEG's start-of-frame segment; `None` if there is none or the
-/// segments do not add up.
+/// Width and height from a JPEG's start-of-frame segment; `None` unless the file reaches it
+/// through only the segments a frame header may follow. Strict on purpose: decoders skip stray
+/// bytes and parameterless markers (`TEM`, `RSTn`) that a lenient walk would read as a length,
+/// so a lenient walk could see a decoy frame size while the decoder sees the real, huge one
+/// (review PR2-1). Anything unusual is refused.
 fn jpeg_dims(b: &[u8]) -> Option<(u16, u16)> {
-    let mut i = 2usize; // after FF D8
-    while let (Some(&0xFF), Some(&m)) = (b.get(i), b.get(i.checked_add(1)?)) {
+    if b.get(..2)? != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut i = 2usize;
+    loop {
         let at = |k: usize| b.get(i.checked_add(k)?).copied();
+        if at(0)? != 0xFF {
+            return None;
+        }
         let len = usize::from(u16::from_be_bytes([at(2)?, at(3)?]));
-        if matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
-            let h = u16::from_be_bytes([at(5)?, at(6)?]);
-            let w = u16::from_be_bytes([at(7)?, at(8)?]);
-            return Some((w, h));
+        if len < 2 {
+            return None;
+        }
+        match at(1)? {
+            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+                let h = u16::from_be_bytes([at(5)?, at(6)?]);
+                let w = u16::from_be_bytes([at(7)?, at(8)?]);
+                return Some((w, h));
+            }
+            // APPn, DQT, DHT, DRI, COM, DAC: what may come before the frame header.
+            0xE0..=0xEF | 0xDB | 0xC4 | 0xDD | 0xFE | 0xCC => {}
+            // Fill bytes, stuffed zeros, TEM, RSTn, SOI, EOI, SOS before the frame: refused.
+            _ => return None,
         }
         i = i.checked_add(2)?.checked_add(len)?;
     }
-    None
 }
 
 /// An animated picture's frames, at most.
 const MAX_GIF_FRAMES: u32 = 100;
-/// All frames' canvases together, in pixels: what a browser may hold decoded (64 MiB RGBA).
-const MAX_GIF_PIXELS: u64 = 16 * 1024 * 1024;
+/// All frames' canvases together, in pixels: what a browser may hold decoded (16 MiB RGBA,
+/// the same as the largest JPEG's 1024 × 1024 four times; review PR2-6).
+const MAX_GIF_PIXELS: u64 = 4 * 1024 * 1024;
 
 fn le16(b: &[u8], i: usize) -> Option<u16> {
     Some(u16::from_le_bytes([*b.get(i)?, *b.get(i.checked_add(1)?)?]))
@@ -105,6 +126,19 @@ fn gif_sub_blocks(b: &[u8], mut i: usize) -> Option<usize> {
         }
         i = i.checked_add(len)?;
     }
+}
+
+/// The extension at `i` holds exactly one sub-block of `n` bytes at offset `k`, sized as
+/// it should be, and then its terminator at `end - 1`.
+fn at_end(b: &[u8], i: usize, k: usize, n: usize, end: usize) -> bool {
+    let Some(size_at) = k.checked_sub(1).and_then(|o| i.checked_add(o)) else {
+        return false;
+    };
+    b.get(size_at).copied() == u8::try_from(n).ok()
+        && i.checked_add(k)
+            .and_then(|o| o.checked_add(n))
+            .and_then(|o| o.checked_add(1))
+            == Some(end)
 }
 
 /// A GIF rebuilt from only what draws it: header, screen, colour tables, frames, their
@@ -137,15 +171,31 @@ fn gif_clean(b: &[u8]) -> Option<Vec<u8>> {
             0x21 => {
                 let label = *b.get(i.checked_add(1)?)?;
                 let end = gif_sub_blocks(b, i.checked_add(2)?)?;
-                let keep = match label {
+                // Kept ones are rebuilt in their one canonical form, so no extra sub-blocks
+                // (arbitrary data) ride along (review PR2-5).
+                let body = |k: usize, n: usize| b.get(i.checked_add(k)?..i.checked_add(k)?.checked_add(n)?);
+                match label {
                     // Graphic control: frame timing and transparency.
-                    0xF9 => true,
+                    0xF9 => {
+                        if at_end(b, i, 3, 4, end) {
+                            out.extend_from_slice(&[0x21, 0xF9, 4]);
+                            out.extend_from_slice(body(3, 4)?);
+                            out.push(0);
+                        } else {
+                            return None;
+                        }
+                    }
                     // Application: only the loop count.
-                    0xFF => b.get(i.checked_add(2)?..i.checked_add(14)?) == Some(b"\x0BNETSCAPE2.0"),
-                    _ => false,
-                };
-                if keep {
-                    out.extend_from_slice(b.get(i..end)?);
+                    0xFF if body(2, 12) == Some(b"\x0BNETSCAPE2.0") => {
+                        if body(14, 2) == Some(&[3, 1]) && at_end(b, i, 15, 3, end) {
+                            out.extend_from_slice(b"\x21\xFF\x0BNETSCAPE2.0\x03\x01");
+                            out.extend_from_slice(body(16, 2)?);
+                            out.push(0);
+                        } else {
+                            return None;
+                        }
+                    }
+                    _ => {}
                 }
                 i = end;
             }
@@ -528,11 +578,16 @@ impl Actor {
         if due.is_empty() {
             return;
         }
+        let Ok(s) = self.s() else { return };
         if only.is_none() {
             due.shuffle(&mut rng());
+            // A contact left for a later round loses any profile still queued for them, which
+            // may carry a picture the user has since taken back; they stay due (review PR2-2).
+            for (c, ..) in due.iter().skip(PER_ROUND) {
+                let _ = forget_sent(s.db.conn(), *c);
+            }
             due.truncate(PER_ROUND);
         }
-        let Ok(s) = self.s() else { return };
         let name = s.name.clone();
         let Ok(status) = self.setting_str(STATUS_KEY) else {
             return;
@@ -590,23 +645,27 @@ impl Actor {
             return Ok(Vec::new());
         }
         // A contact with an unresolved key-change warning gets nothing (they may be an
-        // impostor; review PR-11); one whose last profile was given up on is due again, so a
-        // picture taken back is never left on their screen (review PR-4).
+        // impostor; review PR-11); one whose last profile was given up on is due again (after a
+        // pause), so a picture taken back is never left on their screen (reviews PR-4, PR2-3).
         let mut stmt = s.db.conn().prepare(
             "SELECT c.id, c.verified, c.picture_hidden,
                CASE WHEN EXISTS (SELECT 1 FROM messages m WHERE m.contact = c.id AND m.mine = 1
-                 AND m.kind = 'control' AND m.body = ?2 AND m.attempts >= ?3) THEN NULL ELSE c.profile_sent END
+                 AND m.kind = 'control' AND m.body = ?2 AND m.attempts >= ?3 AND m.at_ms < ?4)
+               THEN NULL ELSE c.profile_sent END
              FROM contacts c WHERE c.blocked = 0 AND c.key_warning = 0 AND (?1 IS NULL OR c.id = ?1)",
         )?;
         let rows = stmt
-            .query_map(params![only, TAG, MAX_ATTEMPTS], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, bool>(1)?,
-                    r.get::<_, bool>(2)?,
-                    r.get::<_, Option<Vec<u8>>>(3)?,
-                ))
-            })?
+            .query_map(
+                params![only, TAG, MAX_ATTEMPTS, now_ms().saturating_sub(GIVE_UP_PAUSE_MS)],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, bool>(1)?,
+                        r.get::<_, bool>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )?
             .collect::<core::result::Result<Vec<_>, _>>()?;
         let mut due = Vec::new();
         for (id, verified, hidden, sent) in rows {
@@ -758,6 +817,21 @@ mod tests {
         let mut big = jpeg(10, 10);
         big.resize(MAX_PICTURE_LEN + 1, 0);
         assert_eq!(decode_picture(&enc(&big)).err(), Some(ClientError::TooLarge));
+        // Decoys (review PR2-1): a parameterless TEM marker or a stuffed zero that a decoder
+        // skips, followed by the real 60000 px frame, with a 512 px frame further on.
+        for decoy in [[0xFF, 0x01, 0x00, 0x0E], [0xFF, 0x00, 0x00, 0x0E]] {
+            let mut b = vec![0xFF, 0xD8];
+            b.extend_from_slice(&decoy);
+            b.extend_from_slice(&jpeg(60000, 60000)[2..]);
+            b.extend_from_slice(&jpeg(512, 512)[2..]);
+            assert_eq!(jpeg_dims(&b), None);
+        }
+        // Fill bytes, a restart marker, or a scan before the frame are refused too.
+        for bad in [0xFF_u8, 0xD0, 0xDA, 0xD9] {
+            let mut b = jpeg(10, 10);
+            b.splice(2..2, [0xFF, bad, 0x00, 0x04, 0, 0]);
+            assert_eq!(jpeg_dims(&b), None, "{bad:02X}");
+        }
         // Segment lengths that run off the end never panic.
         for cut in 0..jpeg(5, 5).len() {
             let _ = jpeg_dims(&jpeg(5, 5)[..cut]);
@@ -802,11 +876,14 @@ mod tests {
         assert!(gif_clean(&gif(60000, 60000, 1, &[])).is_none());
         assert!(gif_clean(&gif(1025, 1, 1, &[])).is_none());
         assert!(gif_clean(&gif(10, 10, 101, &[])).is_none());
-        assert!(
-            gif_clean(&gif(1024, 1024, 17, &[])).is_none(),
-            "17 Mpx of canvases"
-        );
-        assert!(gif_clean(&gif(1024, 1024, 16, &[])).is_some());
+        assert!(gif_clean(&gif(1024, 1024, 5, &[])).is_none(), "5 Mpx of canvases");
+        assert!(gif_clean(&gif(1024, 1024, 4, &[])).is_some());
+        // Kept extensions with extra sub-blocks (data riding along) are refused (PR2-5).
+        let fat_loop: &[u8] = b"\x21\xFF\x0BNETSCAPE2.0\x03\x01\x00\x00\x05hello\x00";
+        assert!(gif_clean(&gif(8, 8, 1, &[fat_loop])).is_none());
+        let mut fat_gce = gif(8, 8, 1, &[]);
+        fat_gce.splice(26..26, *b"\x03abc"); // a second sub-block in the frame's GCE
+        assert!(gif_clean(&fat_gce).is_none());
         assert!(gif_clean(&gif(1, 1, 0, &[])).is_none());
         let mut outside = gif(1, 1, 1, &[]);
         outside[30] = 1; // the frame's top edge at 1, on a 1-pixel canvas

@@ -2,6 +2,38 @@
 
 Real command output only. Updated at the end of every phase. Earlier phases' entries are kept for history.
 
+## Profile: review round 2 and its fixes (2026-11-04)
+
+Round 2 of the review gate failed on two High findings: PR2-1, a JPEG could show a decoy size to the check, and PR2-2, the per-round cap left stale picture rows queued. All eight findings (PR2-1 to PR2-8) were fixed in this round.
+
+```text
+$ cargo fmt --all --check   # ok
+$ cargo clippy --workspace --all-targets --locked -- -D warnings
+# exit 0
+$ cargo test --workspace --locked
+# 246 passed, 0 failed
+$ (app/src-tauri) cargo fmt --check; cargo clippy -- -D warnings
+#     Finished `dev` profile [unoptimized + debuginfo] target(s) in 59.69s
+$ (app) tsc; lint; vite build
+# tsc: 0 errors
+# lint: 22 files clean
+# contrast: 25 panels; worst white 5.4293, meta 4.5001, accentDark 4.5001, accentLight 4.5001
+# ✓ built in 2.57s
+```
+
+- **PR2-1:** `pictures_are_checked` now covers the decoys: a TEM marker or a stuffed zero hiding a 60000 px frame ahead of a 512 px one, fill bytes, RST0, a scan before the frame, and EOI. All are refused.
+- **PR2-2:** new test `a_picture_taken_back_never_arrives_with_many_contacts`, with 6 contacts (over the 4-per-round cap). While offline, a new picture is set with "All", then "Nobody". After reconnecting, no contact has the picture.
+- **PR2-3:** `a_picture_taken_back_always_leaves` now has a given-up row that is not re-queued at once. Once aged past the 6 h pause by the test hook, it is sent and the picture leaves.
+- **PR2-4:** new unit test `names_fold_lookalikes_but_keep_different_names_apart`.
+  - These fold together: Greek capitals (Ηarry, Νick, Υvonne, Ζoe), combining accents (Bo + U+0308 + b), dotless ı, and Ian / lan / 1an.
+  - These stay apart: Ian / Lan, Al / Ai, Bob / Rob, Anna / Hanna.
+- **PR2-5, PR2-6:**
+  - A GCE or loop extension carrying extra sub-blocks is refused; kept ones are rebuilt canonically.
+  - The pixel limit is now 4 Mpx (5 frames of 1024² are refused, 4 accepted).
+  - Still frames are cached.
+- **PR2-7:** in Chromium, a 60 KB GIF now opens the cropper (it becomes a still JPEG). A small GIF is sent as it is, and reduced motion shows a PNG still. No console errors.
+- **PR2-8:** `Profile` wipes its picture on drop.
+
 ## Profile: animated GIF pictures (2026-10-30)
 
 Owner request: GIF support for profile pictures (ADR-0020).

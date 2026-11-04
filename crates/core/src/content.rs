@@ -564,6 +564,13 @@ impl Drop for RekeyInvite {
     }
 }
 
+/// A profile picture is the user's own (review PR2-8).
+impl Drop for Profile {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.picture);
+    }
+}
+
 impl Drop for MailboxUpdate {
     fn drop(&mut self) {
         zeroize::Zeroize::zeroize(&mut self.new_mailbox_id);

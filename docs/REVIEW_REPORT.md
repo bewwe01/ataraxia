@@ -5596,3 +5596,237 @@ return key && state?.key === key ? state.url : null;
 - (B) Fix the High and Medium findings only (PR-1 to PR-8).
 - (C) Fix specific findings.
 - (D) Keep this as a report only.
+
+## Profile (milestone 4.5) review, round 2 (2026-11-04)
+
+**Scope:** commit a912d65 (fixes for round 1) and commit b46f9c5 (animated GIF pictures), both on top of 7fea537. I read both diffs in full. I also read the surrounding code: `deliver`, `retry_failed`, the tick, `set_blocked`/`unblock`, `accept_key_change`/`warned_about`, the `NewContact` intro path, `name_key`/`clean_name`, the message queries that filter on `kind`, `padding.rs`, `content.rs`, `settings.ts` (data-motion), the `act` helpers, `Avatar` and the `App.tsx` routing. I did not edit any files.
+
+**Verdict: FAIL.** There are 2 High, 2 Medium and 5 Low findings.
+
+**Commands run (on HEAD b46f9c5):**
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-client --test profile --lib`: lib 28 passed, profile 6 passed.
+- `CARGO_INCREMENTAL=0 cargo test --offline -p veil-core --lib content`: 8 passed.
+- `pnpm -C app typecheck`: 0 errors.
+- `pnpm -C app lint`: 22 files clean; contrast OK.
+
+---
+
+## Status of the round 1 findings
+
+| ID | Sev (r1) | Status | Notes |
+|---|---|---|---|
+| PR-1 | High | **Partly fixed** | The checks are in place: JPEG/GIF only, ≤ 1024 px, checked on set, on receipt and on read, with tests. But `jpeg_dims` and real decoders can disagree about where segments start, so a JPEG can declare 512 px to the check and 60000 px to the decoder. See PR2-1. |
+| PR-2 | High | Fixed | `carry_over` runs inside the merge transaction, before the old row is deleted. It carries `picture_hidden` (OR), the nickname and its name, the local picture, the accent and the wallpaper. Tested by `key_changes_keep_the_users_choices`. |
+| PR-3 | Medium | Fixed for blocking | `forget_sent` on block, and `sync_profiles(Some)` after unblock, both tested. The same stale-row bug comes back through the new `PER_ROUND` cap. See PR2-2. |
+| PR-4 | Medium | Fixed | Given-up rows make the contact due again (`attempts >= MAX_ATTEMPTS`; this matches `retry_failed`'s `< ?1`). Side effect: it now retries forever. See PR2-3. |
+| PR-5 | Medium | Fixed | Every profile is padded to 48 KiB of picture + pad. The varint sizes vary by a few bytes, but `pad_block` and the 64 KiB bucket absorb that, so every profile lands in the 65 536 bucket. Core rejects picture + pad > 48 KiB. The fan-out is spread, and ADR-0020 and THREAT_MODEL §4 are updated. |
+| PR-6 | Medium | **Partly fixed** | The `profile_name` comparison and the rename line are done. The fold misses obvious cases and causes false key warnings. See PR2-4. |
+| PR-7 | Medium | Fixed | The picture is hashed once per round, and `Outgoing` borrows. One BLOB read per tick remains, which is acceptable. |
+| PR-8 | Medium | Fixed | Tests cover: key warning, blocked → revoked → unblocked, merge, given up, and migration v5 → v6 including the trigger. |
+| PR-9 | Low | Mostly fixed | Base64 input, decoded bytes, BLOB reads, the `data_url` capacity and the Tauri commands use `Zeroizing`. One copy per send is still left unwiped. See PR2-8. |
+| PR-10 | Low | Fixed | `GLOB 'Contact ????'` is case-sensitive and exact, and has a test. |
+| PR-11 | Low | Fixed | The status is labelled and quoted, and `KeyWarning` comes first. `profiles_due` filters on `key_warning = 0`. |
+| PR-12 | Low | Fixed (documented) | ADR-0020 now requires backups to include `profile.rev` and restores to clear `profile_sent`. Restore does not exist yet. |
+| PR-13 | Low | Fixed | `usePicture` state is keyed by `owner:token`. |
+| PR-14 | Low | Fixed | `role="group"` plus `aria-describedby="crop-hint"` with a visible hint. |
+| PR-15 | Low | Fixed | `adopt_name` returns a bool. `nickname = 0` is written only on success, otherwise `NameTaken`. Tested. |
+| PR-16 | Low | Fixed | `localPicture` is in the view and in `ipc.ts`. A `nameEdited` ref guards the field. `ContactProfile` is not keyed by contact, but every route to another contact unmounts it, so the ref does not leak across contacts. |
+
+---
+
+## New findings
+
+### PR2-1: High [HIGH that the parsers disagree; MEDIUM on WebKit's exact handling of the libjpeg warning]. `jpeg_dims` can be fooled, so the PR-1 image bomb still gets through
+**Where:** `crates/client/src/service/profile.rs:74-87` (`jpeg_dims`), used by `accept_picture` (`:182`) on receipt.
+
+**Problem:**
+- `jpeg_dims` treats every marker as having a 2-byte length. libjpeg-turbo, which WebKitGTK and Android/Skia use, treats `TEM` (FF01) and `RST0-7` (FFD0-D7) as having no parameters. Its `next_marker` also skips non-FF "extraneous" bytes and FF fill bytes, and only warns (`JWRN_EXTRANEOUS_DATA`).
+- Crafted file: `FF D8`, then `FF 01 <len hi> <len lo>` (two non-FF bytes that libjpeg discards), then a real `SOF0` of 60000×60000 with DQT/DHT/SOS/scan/`FF D9`. The jump by `len` lands after EOI, on a fake `FF C0 … 512×512`.
+  - `jpeg_dims` returns (512, 512), so the picture is accepted and stored.
+  - The decoder reads the real SOF first and stops at EOI, so it never reaches the duplicate SOF.
+- `FF 00` (stuffed zero) before the SOF works the same way.
+- This is the PR-1 bomb, decoded on every unlock wherever the avatar is shown.
+- Smaller point: a 48 KiB progressive JPEG can carry thousands of tiny scans, each a pass over the coefficient buffers (a CPU cost bounded by 1024²). This is an argument for capping the number of SOS markers too.
+
+**Fix:** walk strictly, so the check and the decoder can never disagree.
+- Accept only these segments before SOF: `APPn` (E0-EF), `DQT` (DB), `DHT` (C4), `DRI` (DD), `COM` (FE), `DAC` (CC).
+- Refuse `00`, `01`, `D0-D9`, `FF` fill bytes and any non-`FF` byte where a marker should be.
+- Require exactly one SOF, and continue the walk to the first SOS so that nothing after the first SOF can redefine the frame.
+
+```rust
+fn jpeg_dims(b: &[u8]) -> Option<(u16, u16)> {
+    let mut i = 2usize;
+    loop {
+        if *b.get(i)? != 0xFF { return None; }
+        let m = *b.get(i.checked_add(1)?)?;
+        let at = |k: usize| b.get(i.checked_add(k)?).copied();
+        let len = usize::from(u16::from_be_bytes([at(2)?, at(3)?]));
+        if len < 2 { return None; }
+        match m {
+            0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => {
+                let h = u16::from_be_bytes([at(5)?, at(6)?]);
+                let w = u16::from_be_bytes([at(7)?, at(8)?]);
+                return Some((w, h));
+            }
+            0xE0..=0xEF | 0xDB | 0xC4 | 0xDD | 0xFE | 0xCC => {}
+            _ => return None, // TEM, RSTn, SOI, EOI, SOS before SOF, fill, 00
+        }
+        i = i.checked_add(2)?.checked_add(len)?;
+    }
+}
+```
+
+Add unit tests for the `FF 01` and `FF 00` decoys described above. A stronger option is to rebuild received JPEGs the way `gif_clean` rebuilds GIFs, keeping only DQT/DHT/DRI/SOF/SOS, the entropy data and EOI.
+
+### PR2-2: High [HIGH]. With the `PER_ROUND` cap, a picture the user took back can still be delivered (PR-3 again, without blocking)
+**Where:** `profile.rs:530-534` (`shuffle` + `truncate(PER_ROUND)`), together with the tick order at `service.rs:1357-1361` (`retry_failed` runs before `sync_profiles(None)`).
+
+**Problem:**
+- Example, while offline (or while deposits fail):
+  1. The user sets a new picture with "All contacts". `sync_profiles(None)` queues rows that carry the picture for 4 random contacts, and their deposits fail.
+  2. The user switches to "Nobody". `sync_profiles(None)` again picks only 4 random contacts out of all N due. With N > 4, most of the stale rows are not chosen and stay `failed` with an envelope.
+  3. On reconnect, the tick's `retry_failed` delivers those stale rows, carrying the picture, before any round replaces them.
+- The picture reaches contacts after the user chose "Nobody", and they may never have had it before. This breaks the INV-CONT-3 claim "reaches only the contacts the user chose", and it is a regression: before the cap, a round replaced every due contact's row.
+- The `a_picture_taken_back_always_leaves` test has only one contact, so the cap never applies and the test cannot catch this.
+
+**Fix:** after shuffling, drop the queued row of every due contact that is not sent this round, and make sure they stay due. Clearing `profile_sent` is needed, because otherwise a contact that was due only through a given-up row would stop being due:
+```rust
+if only.is_none() {
+    due.shuffle(&mut rng());
+    for (c, ..) in due.iter().skip(PER_ROUND) {
+        let _ = forget_sent(s.db.conn(), *c);
+    }
+    due.truncate(PER_ROUND);
+}
+```
+Add a test with at least 5 contacts (or a test hook that sets the cap to 1): offline → new picture with "All" → "Nobody" → online, then assert that no contact ever receives the picture.
+
+### PR2-3: Medium [HIGH]. The PR-4 fix retries forever: a 64 KiB deposit every minute to a mailbox that will never accept it
+**Where:** `profile.rs:596-599` (the `CASE WHEN EXISTS … attempts >= ?3` in `profiles_due`), together with `deliver` (`service.rs:3088-3141`), which adds 1 to `attempts` on every failed deposit.
+
+**Problem:**
+- A contact whose mailbox always rejects deposits (they uninstalled, the mailbox expired, or the token was revoked on their side) goes through this loop:
+  1. 20 attempts, one per minute.
+  2. Given up.
+  3. Due again on the next tick.
+  4. A new 64 KiB profile row is queued.
+  5. Back to step 1, forever.
+- Before the fix this stopped after 20 attempts. Now each such contact costs about 92 MiB a day of uploads and battery on mobile.
+- It also gives the relay a steady, recognisable deposit pattern, and these contacts keep taking `PER_ROUND` slots.
+
+**Fix:** back off before a given-up profile is due again. For example, bind `?4 = now_ms() - 6 * 3600 * 1000` and add `AND m.at_ms < ?4` to the `EXISTS`. Better still, store a `profile_retry_at_ms` per contact and double it each time (1 h, 2 h … 24 h). Extend `a_picture_taken_back_always_leaves` to assert that a given-up row is not re-queued on the very next round.
+
+### PR2-4: Medium [HIGH]. `fold_lookalike` misses obvious look-alikes and causes false key-change warnings
+**Where:** `service.rs:1054-1101` (`name_key` / `fold_lookalike`). It is used by the arrival clash check (`:3320-3345`), `adopt_name` (`profile.rs:487`) and the legacy `warned_about` fallback (`:4115`).
+
+**Problem (misses):**
+- The fold runs after `to_lowercase`, so Greek capitals fold through their lowercase forms, which look different:
+  - `Η`→`η`→`n` (it looks like H), so "Ηarry" is not "harry";
+  - `Ν`→`ν`→`v`, so "Νick" is not "nick";
+  - `Υ`→`υ`→`u`, so "Υvonne" is not "yvonne";
+  - `Ζ` is not mapped at all.
+- Other common confusables are not mapped:
+  - dotless `ı` (U+0131);
+  - Cyrillic `ү` and `ԝ`, Armenian `օ`;
+  - small capitals (`ʙ`, `ᴏ`);
+  - mathematical alphanumerics (`𝐁𝐨𝐛`, U+1D400…), which NFKC would fold;
+  - decomposed accents (`o` + U+0308): only precomposed letters are folded, and `clean_name` keeps combining marks.
+
+**Problem (false positives):**
+- `l`, `1` and `|` fold to `i` after lowercasing. So distinct real names collide, for example "Ian" and "Lan", or "Al" and "Ai".
+- A genuinely new contact "Lan" then arrives with a key-change warning about "Ian". The UI offers "It's them", which would merge two different people's conversations; it still takes an explicit confirmation.
+- Lowercase `i` and `l` are not confusable. Only capital `I` and lowercase `l` are.
+
+**Fix:**
+- Fold the I/l pair on the original case, before lowercasing: map `I` and `l` to one symbol, and keep `i` and `L` apart.
+- Apply NFKD, strip combining marks (`unicode-normalization`, pure Rust and offline), then map with the UTS #39 confusables skeleton (`unicode-security::skeleton`). Vet the crates with `cargo vet`/`cargo deny`, as for any new dependency.
+- If no new dependency is wanted, at least map the Greek capitals before lowercasing (`Η`→h, `Ν`→n, `Υ`→y, `Ζ`→z), and add `ı`, `ү`, `ԝ` and `օ`.
+- Add unit tests for both the misses and the false positive ("Ian" vs "Lan" must differ, "lan" vs "Ian" must match).
+- INV-ID-2 already says the fold is not UTS #39; keep that caveat.
+
+### PR2-5: Low [HIGH]. The GIF metadata stripping is incomplete: kept extensions are copied byte for byte
+**Where:** `profile.rs:139-150` (`gif_clean`, `0xF9 => true` and the `NETSCAPE2.0` arm).
+
+**Problem:**
+- A graphic-control or `NETSCAPE2.0` extension is copied with all its sub-blocks, up to its terminator. Any number of extra sub-blocks of arbitrary data after the 4-byte GCE or 3-byte loop block survive the clean.
+- Unused colour-table entries and data after the LZW end code also survive.
+- Tool metadata (comments, XMP, ICC, Photoshop app blocks) is dropped, so the risk is low. But the docs claim that only "what draws it" is kept.
+
+**Fix:**
+- Rebuild the two extensions canonically:
+  - GCE: require the first sub-block length to be 4 and the next byte to be 0, then emit `21 F9 04 <4 bytes> 00`;
+  - NETSCAPE: emit `21 FF 0B NETSCAPE2.0 03 01 <2 bytes> 00`, and refuse anything else.
+- Document in ADR-0020 that LZW padding and colour-table residue are not stripped.
+
+### PR2-6: Low [MEDIUM]. The GIF decode budget is 16 times the JPEG limit, and reduced-motion still frames are recomputed for each avatar
+**Where:** `profile.rs:92` (`MAX_GIF_PIXELS = 16 Mpx`), `app/src/pictures.ts:31, 46-60`.
+
+**Problem:**
+- A 48 KiB GIF of 16 frames at 1024² (uniform LZW, about 3 KB a frame) costs 64 MiB decoded, compared with 4 MiB for the largest JPEG. The app shows avatars at most at the `xxl` size.
+- `stillFrame` decodes the GIF and runs `toDataURL("image/png")` on a canvas up to 1024² every time an `Avatar` mounts. It is not cached; the chat list, the header and the contact page each repeat it.
+- The effect does not depend on the motion setting, so a change to reduced motion only applies when the avatar remounts.
+
+**Fix:**
+- Lower the limits for GIFs: `MAX_GIF_PIXELS = 4 * 1024 * 1024`, and/or a 512 px side.
+- Cache the still frame next to the URL, for example with `cache.set(\`${key}:still\`, …)`. Include `reducedMotion()` in the cache key, or subscribe to the setting.
+
+### PR2-7: Low [HIGH]. The `choose` helpers: rejection outside `act`, a lost error message, and no fallback for a large GIF
+**Where:** `app/src/components/Profile.tsx:166-169`, `app/src/screens/Contacts.tsx:200-203`.
+
+**Problem:**
+- `await isGifFile(f)` runs outside `act`, and the caller uses `void choose(f)`. If reading the file fails, the rejection goes unhandled, with no error and no `busy` state.
+- In Contacts, `act` shows only `IpcError` messages, so "GIFs must be under 48 KB" becomes the generic "Could not set the picture".
+- A still GIF over 48 KB is refused outright, although it could simply go to the cropper and be redrawn as a JPEG.
+
+**Fix:**
+```ts
+async function choose(f: File) {
+  const gif = await isGifFile(f).catch(() => false);
+  if (gif && f.size <= MAX_PICTURE_BYTES) await act(async () => ipc.setContactPicture(contact.id, await prepareGif(f)), "Could not set the picture");
+  else setPicked(f); // too-large GIFs are cropped to a still JPEG
+}
+```
+Export `MAX_PICTURE_BYTES` (or add a `gifFits(f)` helper), and have the Contacts `act` use `errText`, the same as Profile.tsx.
+
+### PR2-8: Low [HIGH]. One unwiped copy of the picture per send
+**Where:** `profile.rs:547-551` (`data.to_vec()` into `Profile.picture`).
+
+**Problem:** each due contact gets a plain `Vec` copy of up to 48 KiB, plus the encoded body, and these are freed without being wiped. This falls short of the PR-9 / LK-6 standard.
+
+**Fix:** encode once per round into a `Zeroizing<Vec<u8>>` and reuse it for each contact. Alternatively, zeroize after `queue_control_as`: take `picture` back out of the `Body` and wipe it with `zeroize::Zeroize::zeroize`.
+
+---
+
+## Checked and found correct
+- **`gif_clean` cannot panic.** Every access goes through `get` or `checked_add`, and `6usize << 7` cannot overflow. Each step moves `i` forward strictly, so it always ends. Every truncation is tested. It refuses a missing frame, an unknown block, an LZW code size outside 2..=8, a frame outside the canvas, a side over 1024, more than 100 frames and more than 16 Mpx in all. Pixels are counted per canvas, which errs on the safe side. The output holds only blocks the parser understood, and the check is idempotent, so `picture_ok(mime, b)` on the way out (output == input) is sound.
+- **`accept_picture`.** It is used on set, on receipt and on read. Its size check comes before any parsing. The stored MIME comes from the parser, so a stored picture cannot claim a different type.
+- **Padding.** A profile's plaintext is at most about 50 KB. With `pad_block` it always lands in the 65 536 bucket, with or without a picture or GIF.
+- **`carry_over`.** It runs inside the merge transaction and before `DELETE`. `UPDATE OR IGNORE` keeps a local picture already on the new row. `verified` and `profile_sent` are rightly not carried.
+- **`forget_sent` on block.** It runs in the same `atomically` block as the token withdrawal, and `unblock` is followed by `sync_profiles(Some)`.
+- **The `PER_ROUND` cap.** No contact is starved: sent contacts leave the due set, and the digest does not depend on `rev`. Actions that name one contact (hide, verify, unblock) bypass the cap. PR2-2 and PR2-3 are the only problems with it.
+- **Intro name kept as `profile_name`.** It is set only when the intro has a name, and only `IS NULL`. The clash check now also compares `profile_name`, so a nickname no longer hides a contact. This is not a new squatting route: a contact could already take a free shown name.
+- **The `renamed` kind.**
+  - It is added to the chat query and to delete-for-me.
+  - It is excluded from the chat-list preview and ordering, unread counts, receipts, reactions, edit/delete-for-everyone, quoting and search.
+  - It is never sent.
+  - It is written only when `announce` is set and the name really changed.
+  - `clean_name` strips `\n`, so the `old\nnew` split is safe.
+  - `RenameNotice` renders text nodes only.
+- **The test hook `give_up_profiles`.** It is behind `cfg(feature = "test-hooks")`, and its state (`failed`, `attempts = MAX_ATTEMPTS`) matches what `retry_failed` really treats as given up.
+- **The at-rest test in `pair_and_message.rs`.** This is a legitimate strengthening, not a weakening. A 3-byte needle like "Bob" in about 150 KB of ciphertext matches by chance often enough to make the test flaky; the account names are now long and both are still searched for. No assertion was dropped.
+- **Migration 6** has an exact rule and a v5 → v6 test that also covers the `pictures` trigger.
+- **Frontend.**
+  - `pictures.ts`: state is keyed, rejected promises are evicted, and the GIF still frame uses `data-motion`, which `settings.ts` sets from both the app setting and `prefers-reduced-motion`.
+  - `Profile.tsx`: the cropper has its role and a visible hint.
+  - `Contacts.tsx`: the warning comes first, the status is labelled, `nameEdited` is reset on save, and `localPicture` is used.
+  - `Chats.tsx`: `RenameNotice` is in place.
+  - The typecheck and the lint (including contrast) are clean.
+- **Docs.** ADR-0020, PROTOCOL §7, INV-CONT-3, INV-ID-2 and THREAT_MODEL §4 match the code, except for the claims affected by PR2-1, PR2-2 and PR2-5.
+
+**Verdict: FAIL.** PR2-1 and PR2-2 are High and must be fixed before re-review. PR2-3 and PR2-4 should be fixed in the same round.
+
+**Next steps:**
+- (A) Fix all findings; recommended for a FAIL.
+- (B) Fix the High and Medium findings only (PR2-1 to PR2-4).
+- (C) Fix specific findings.
+- (D) Keep this as a report only.

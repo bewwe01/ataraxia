@@ -3,7 +3,7 @@
 // GIFs kept as they are (`prepareGif`).
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type PointerEvent } from "react";
 import { IpcError, ipc, type PictureVisibility, type ProfileView } from "../ipc";
-import { centreCrop, isGifFile, prepareGif, preparePicture, type Crop } from "../pictures";
+import { centreCrop, sendsAsGif, prepareGif, preparePicture, type Crop } from "../pictures";
 import { Avatar, Icon, Segmented } from "../ui";
 
 const VIEW = 240;
@@ -164,7 +164,7 @@ export function ProfileCard({ onChanged }: { onChanged: () => void }) {
   if (!p) return null;
   /** A GIF is used as it is (it stays animated); anything else is cropped first. */
   async function choose(f: File) {
-    if (await isGifFile(f)) await act(async () => ipc.setMyPicture(await prepareGif(f)), "Could not set the picture");
+    if (await sendsAsGif(f)) await act(async () => ipc.setMyPicture(await prepareGif(f)), "Could not set the picture");
     else setPicked(f);
   }
 

@@ -8,6 +8,7 @@ const cache = new Map<string, Promise<string | null>>();
 
 export function forgetPictures(): void {
   cache.clear();
+  stills.clear();
 }
 
 /** A picture's URL: the user's own (`owner` null) or a contact's, for the given token. */
@@ -28,7 +29,7 @@ export function usePicture(owner: number | null, token: string | null): string |
     }
     let live = true;
     void p
-      .then((u) => (u && isGif(u) && reducedMotion() ? stillFrame(u) : u))
+      .then((u) => (u && isGif(u) && reducedMotion() ? still(key, u) : u))
       .then((u) => {
         if (live) setState({ key, url: u });
       });
@@ -41,6 +42,17 @@ export function usePicture(owner: number | null, token: string | null): string |
 
 const isGif = (url: string) => url.startsWith("data:image/gif;");
 const reducedMotion = () => document.documentElement.dataset["motion"] === "reduced";
+
+/** Still frames, made once per picture (review PR2-6); dropped with the rest on lock. */
+const stills = new Map<string, Promise<string | null>>();
+function still(key: string, url: string): Promise<string | null> {
+  let p = stills.get(key);
+  if (!p) {
+    p = stillFrame(url);
+    stills.set(key, p);
+  }
+  return p;
+}
 
 /** An animated picture's first frame, for reduced motion (DESIGN.md §4). */
 async function stillFrame(url: string): Promise<string | null> {
@@ -60,14 +72,19 @@ async function stillFrame(url: string): Promise<string | null> {
   }
 }
 
-/** A GIF, by its first bytes: kept as it is (animated), never redrawn or cropped. */
-export async function isGifFile(file: File): Promise<boolean> {
-  const head = new Uint8Array(await file.slice(0, 6).arrayBuffer());
-  return String.fromCharCode(...head).startsWith("GIF8");
+/** A GIF small enough to send as it is (animated, never redrawn or cropped). A larger GIF
+ *  goes through the cropper and becomes a still JPEG (review PR2-7). */
+export async function sendsAsGif(file: File): Promise<boolean> {
+  if (file.size > MAX_PICTURE_BYTES) return false;
+  try {
+    const head = new Uint8Array(await file.slice(0, 6).arrayBuffer());
+    return String.fromCharCode(...head).startsWith("GIF8");
+  } catch {
+    return false;
+  }
 }
 
-/** A GIF picture as base64, as it is: Rust checks it and drops its metadata. Too large
- *  ones are refused here, since a GIF cannot be made smaller without re-encoding it. */
+/** A GIF picture as base64, as it is: Rust checks it and drops its metadata. */
 export async function prepareGif(file: File): Promise<string> {
   if (file.size > MAX_PICTURE_BYTES) throw new Error("GIFs must be under 48 KB");
   return base64(new Uint8Array(await file.arrayBuffer()));

@@ -352,13 +352,18 @@ async fn a_picture_taken_back_always_leaves() {
     a.set_blocked(a_bob.id, false).await.unwrap();
     until(b, b_alice.id, |v| v.picture.is_none()).await;
 
-    // Taken back while offline, and that update given up on: the next round sends it again.
+    // Taken back while offline, and that update given up on: not re-sent at once (a mailbox
+    // that refuses everything is not retried every minute; review PR2-3), but once the
+    // pause is over, the next round sends it again.
     a.set_picture_visibility(PictureVisibility::All).await.unwrap();
     until(b, b_alice.id, |v| v.picture.is_some()).await;
     hop.cut();
     online(a, false).await;
     a.set_picture_visibility(PictureVisibility::Nobody).await.unwrap();
-    assert_eq!(a.give_up_profiles(a_bob.id).await.unwrap(), 1);
+    assert_eq!(a.give_up_profiles(a_bob.id, 0).await.unwrap(), 1);
+    a.set_picture_hidden(a_bob.id, false).await.unwrap(); // a sync round for Bob
+    // Still one row (given up, then aged past the pause by the hook).
+    assert_eq!(a.give_up_profiles(a_bob.id, 7 * 3600 * 1000).await.unwrap(), 1);
     hop.restore();
     online(a, true).await;
     a.set_picture_hidden(a_bob.id, false).await.unwrap(); // a sync round for Bob
@@ -401,4 +406,43 @@ async fn animated_gifs_arrive_without_their_metadata() {
             .unwrap()
             .starts_with("data:image/gif;")
     );
+}
+
+/// With more due contacts than one round sends to, a picture taken back while offline still
+/// never reaches anyone: rows left for a later round are dropped, not delivered stale
+/// (review PR2-2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_picture_taken_back_never_arrives_with_many_contacts() {
+    let r = relay().await;
+    let hop = Proxy::to(&r.addr).await;
+    let alice = user_at(&r, &hop.addr, "Alice", None).await;
+    let a = &alice.client;
+    let mut others = Vec::new();
+    for n in 0..6 {
+        let u = user(&r, &format!("Friend {n}")).await;
+        let (_, theirs) = pair(a, &u.client).await;
+        others.push((u, theirs.id));
+    }
+    a.set_profile("Alice A".into(), String::new()).await.unwrap();
+    for (u, id) in &others {
+        within(std::time::Duration::from_secs(150), || async {
+            (view(&u.client, *id).await.name == "Alice A").then_some(())
+        })
+        .await;
+    }
+
+    hop.cut();
+    online(a, false).await;
+    a.set_my_picture(Some(picture(b"many"))).await.unwrap();
+    a.set_picture_visibility(PictureVisibility::All).await.unwrap();
+    a.set_picture_visibility(PictureVisibility::Nobody).await.unwrap();
+    hop.restore();
+    online(a, true).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    for (u, id) in &others {
+        assert!(
+            view(&u.client, *id).await.picture.is_none(),
+            "a taken-back picture arrived"
+        );
+    }
 }

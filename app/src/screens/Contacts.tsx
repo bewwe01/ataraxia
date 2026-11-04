@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { INVITE_PREFIX, ipc, IpcError, TIMERS, timerName, type ContactView, type InviteView, type SafetyView } from "../ipc";
 import { Avatar, Banner, Icon, QrCode, Segmented, ToggleRow, TopBar } from "../ui";
 import { PictureCropper } from "../components/Profile";
-import { isGifFile, prepareGif, preparePicture, type Crop } from "../pictures";
+import { sendsAsGif, prepareGif, preparePicture, type Crop } from "../pictures";
 import { Scanner } from "../components/Scanner";
 import { HuePicker, WallpaperPicker } from "../components/Look";
 import { useChatWallpaper } from "../wallpaper";
@@ -150,7 +150,9 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
       await f();
       onChanged();
     } catch (err) {
-      setError(err instanceof IpcError ? err.message : fallback);
+      // A message from the webview side (a picture refused before it reaches Rust) is
+      // shown too (review PR2-7).
+      setError(err instanceof IpcError || err instanceof Error ? err.message : fallback);
     } finally {
       setBusy(false);
     }
@@ -198,7 +200,7 @@ export function ContactProfile({ contact, nav, onChanged }: { contact: ContactVi
 
   /** A GIF is used as it is (it stays animated); anything else is cropped first. */
   async function choose(f: File) {
-    if (await isGifFile(f)) await act(async () => ipc.setContactPicture(contact.id, await prepareGif(f)), "Could not set the picture");
+    if (await sendsAsGif(f)) await act(async () => ipc.setContactPicture(contact.id, await prepareGif(f)), "Could not set the picture");
     else setPicked(f);
   }
 

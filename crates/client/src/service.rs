@@ -391,7 +391,7 @@ enum Cmd {
     #[cfg(feature = "test-hooks")]
     HiddenRows(i64, Reply<i64>),
     #[cfg(feature = "test-hooks")]
-    GiveUpProfiles(i64, Reply<i64>),
+    GiveUpProfiles(i64, i64, Reply<i64>),
     #[cfg(feature = "test-hooks")]
     RawUpload(Vec<u8>, Reply<Vec<u8>>),
     #[cfg(feature = "test-hooks")]
@@ -726,10 +726,10 @@ impl Client {
         ask!(self, HiddenRows, contact)
     }
     /// Tests only: marks profiles waiting to go out to a contact as given up (as after
-    /// `MAX_ATTEMPTS` failed deposits). Returns how many there were.
+    /// `MAX_ATTEMPTS` failed deposits), queued `age_ms` ago. Returns how many there were.
     #[cfg(feature = "test-hooks")]
-    pub async fn give_up_profiles(&self, contact: i64) -> Result<i64> {
-        ask!(self, GiveUpProfiles, contact)
+    pub async fn give_up_profiles(&self, contact: i64, age_ms: i64) -> Result<i64> {
+        ask!(self, GiveUpProfiles, contact, age_ms)
     }
     /// Tests only: uploads any bytes as a blob (full-size chunks but the last) and returns its
     /// id, for crafting `Attachment` messages a hostile contact could send.
@@ -1052,7 +1052,11 @@ fn notify_enabled(db: &Db) -> bool {
 
 /// A name compared for the key-change warning: case and spacing do not make it different.
 fn name_key(name: &str) -> String {
-    name.split_whitespace()
+    name.chars()
+        .filter(|c| !is_combining(*c))
+        .map(fold_cased)
+        .collect::<String>()
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
@@ -1061,41 +1065,70 @@ fn name_key(name: &str) -> String {
         .collect()
 }
 
-/// Folds a lowercase letter into the Latin letter it looks like, so "Вob", "Ｂob", "Böb" and
-/// "B0b" compare equal to "bob" (review PR-6). Not a full Unicode confusables skeleton (UTS #39):
-/// it covers fullwidth forms, the Cyrillic and Greek letters that look Latin, common accents,
-/// and 0/o, 1/l/i. The safety number stays the real check (INV-ID-2).
-fn fold_lookalike(c: char) -> char {
-    // Fullwidth ASCII (U+FF01–FF5E) to ASCII, then lowercased.
+/// The one symbol capital I, lowercase l, 1 and | all fold to: they look alike, while i and
+/// L do not look like them, so "Ian" and "lan" match but "Ian" and "Lan" do not (review PR2-4).
+const PIPE: char = '\u{E000}';
+
+/// Combining marks (accents written as a separate character), which are dropped, so "Böb"
+/// written as "Bo" + U+0308 + "b" folds like "Böb".
+fn is_combining(c: char) -> bool {
+    matches!(u32::from(c), 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F)
+}
+
+/// The folds that depend on case, done before lowercasing: fullwidth forms to ASCII (keeping
+/// their case), the I/l family to [`PIPE`], and Greek capitals to the Latin capitals they look
+/// like (lowercased, they would look different: Η → η).
+fn fold_cased(c: char) -> char {
     let c = match u32::from(c) {
-        n @ 0xFF01..=0xFF5E => n
-            .checked_sub(0xFEE0)
-            .and_then(char::from_u32)
-            .map_or(c, |a| a.to_ascii_lowercase()),
+        n @ 0xFF01..=0xFF5E => n.checked_sub(0xFEE0).and_then(char::from_u32).unwrap_or(c),
         _ => c,
     };
     match c {
-        'а' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'α' => 'a',
-        'в' | 'β' => 'b',
-        'с' | 'ç' | 'ć' | 'č' | 'ϲ' => 'c',
-        'ԁ' | 'ď' => 'd',
-        'е' | 'ё' | 'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ε' | '3' => 'e',
-        'һ' | 'н' => 'h',
-        'і' | 'ї' | 'ì' | 'í' | 'î' | 'ï' | 'ι' | '1' | 'l' | '|' | 'ӏ' => 'i',
-        'ј' => 'j',
-        'к' | 'κ' => 'k',
-        'м' | 'μ' => 'm',
-        'п' | 'η' | 'ñ' | 'ń' => 'n',
-        'о' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ο' | 'σ' | '0' => 'o',
-        'р' | 'ρ' => 'p',
-        'ѕ' | 'š' | 'ś' | '5' | '$' => 's',
-        'т' | 'τ' => 't',
-        'ù' | 'ú' | 'û' | 'ü' | 'υ' => 'u',
-        'ν' | 'ѵ' => 'v',
-        'ш' | 'ω' => 'w',
+        'I' | 'l' | '1' | '|' | 'ӏ' | 'Ӏ' | 'ǀ' | 'Ι' | 'Ɩ' => PIPE,
+        'Α' => 'A',
+        'Β' => 'B',
+        'Ε' => 'E',
+        'Ζ' => 'Z',
+        'Η' | 'Н' => 'H',
+        'Κ' => 'K',
+        'Μ' => 'M',
+        'Ν' => 'N',
+        'Ο' => 'O',
+        'Ρ' => 'P',
+        'Τ' => 'T',
+        'Υ' => 'Y',
+        'Χ' => 'X',
+        other => other,
+    }
+}
+
+/// Folds a lowercase letter into the Latin letter it looks like, so "Вob", "Ｂob", "Böb" and
+/// "B0b" compare equal to "bob" (reviews PR-6, PR2-4). Not a full Unicode confusables skeleton
+/// (UTS #39; mathematical alphanumerics, for one, are not folded). The safety number stays
+/// the real check (INV-ID-2).
+fn fold_lookalike(c: char) -> char {
+    match c {
+        'а' | 'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'α' | 'ɑ' | 'ᴀ' => 'a',
+        'в' | 'β' | 'ʙ' => 'b',
+        'с' | 'ç' | 'ć' | 'č' | 'ϲ' | 'ᴄ' => 'c',
+        'ԁ' | 'ď' | 'ᴅ' => 'd',
+        'е' | 'ё' | 'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ε' | '3' | 'ᴇ' => 'e',
+        'һ' | 'н' | 'ʜ' => 'h',
+        'і' | 'ї' | 'ì' | 'í' | 'î' | 'ï' | 'ι' | 'ı' => 'i',
+        'ј' | 'ᴊ' => 'j',
+        'к' | 'κ' | 'ᴋ' => 'k',
+        'м' | 'μ' | 'ᴍ' => 'm',
+        'п' | 'η' | 'ñ' | 'ń' | 'ɴ' => 'n',
+        'о' | 'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ο' | 'σ' | '0' | 'օ' | 'ᴏ' => 'o',
+        'р' | 'ρ' | 'ᴘ' => 'p',
+        'ѕ' | 'š' | 'ś' | '5' | '$' | 'ꜱ' => 's',
+        'т' | 'τ' | 'ᴛ' => 't',
+        'ù' | 'ú' | 'û' | 'ü' | 'υ' | 'ᴜ' => 'u',
+        'ν' | 'ѵ' | 'ᴠ' => 'v',
+        'ш' | 'ω' | 'ԝ' | 'ᴡ' => 'w',
         'х' | 'χ' => 'x',
-        'у' | 'ý' | 'ÿ' | 'γ' => 'y',
-        'ž' | 'ź' | 'ż' => 'z',
+        'у' | 'ý' | 'ÿ' | 'γ' | 'ү' | 'ʏ' => 'y',
+        'ž' | 'ź' | 'ż' | 'ᴢ' => 'z',
         other => other,
     }
 }
@@ -1615,12 +1648,12 @@ impl Actor {
                 let _ = r.send(res);
             }
             #[cfg(feature = "test-hooks")]
-            Cmd::GiveUpProfiles(c, r) => {
+            Cmd::GiveUpProfiles(c, age, r) => {
                 let res = self.s().and_then(|s| {
                     let n = s.db.conn().execute(
-                        "UPDATE messages SET status = 'failed', attempts = ?2
+                        "UPDATE messages SET status = 'failed', attempts = ?2, at_ms = at_ms - ?3
                          WHERE contact = ?1 AND kind = 'control' AND body = 'profile'",
-                        params![c, MAX_ATTEMPTS],
+                        params![c, MAX_ATTEMPTS, age],
                     )?;
                     Ok(i64::try_from(n).unwrap_or(i64::MAX))
                 });
@@ -4166,6 +4199,31 @@ mod tests {
 
     /// Warnings raised before the warned-about contact was recorded (preview.5): only an
     /// unambiguous name picks a contact (review P6R2-3).
+    #[test]
+    fn names_fold_lookalikes_but_keep_different_names_apart() {
+        let same = |a: &str, b: &str| name_key(a) == name_key(b);
+        for (a, b) in [
+            ("Bob", " bob "),
+            ("Bob", "Вob"),
+            ("Bob", "Ｂob"),
+            ("Bob", "B0b"),
+            ("Bob", "Böb"),
+            ("Bob", "Bo\u{308}b"),
+            ("Harry", "Ηarry"),
+            ("Nick", "Νick"),
+            ("Yvonne", "Υvonne"),
+            ("Zoe", "Ζoe"),
+            ("Ian", "lan"),
+            ("Ian", "1an"),
+            ("ibis", "ıbis"),
+        ] {
+            assert!(same(a, b), "{a} / {b}");
+        }
+        for (a, b) in [("Ian", "Lan"), ("Al", "Ai"), ("Bob", "Rob"), ("Anna", "Hanna")] {
+            assert!(!same(a, b), "{a} / {b}");
+        }
+    }
+
     #[test]
     fn legacy_warnings_merge_only_an_unambiguous_contact() {
         let dir = tempfile::tempdir().unwrap();
